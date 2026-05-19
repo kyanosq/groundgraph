@@ -29,8 +29,19 @@ enum Commands {
     Init,
     /// Index docs and code into the graph store.
     Index(IndexArgs),
+    /// Resolve a requirement into docs, implementation and tests.
+    Slice(SliceArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SliceArgs {
+    /// The requirement ID (e.g. `REQ-WATERMARK-001`).
+    requirement: String,
+    /// Output a machine-readable JSON document instead of human text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -75,6 +86,7 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Init => commands::init::run(&cli.repo_root),
         Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only),
+        Commands::Slice(args) => commands::slice::run(&cli.repo_root, &args.requirement, args.json),
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
     }
 }

@@ -10,6 +10,7 @@ pub mod docs_indexer;
 pub mod export;
 pub mod index;
 pub mod init;
+pub mod slice;
 
 pub use config::EngineConfig;
 pub use docs_indexer::{
@@ -18,3 +19,4 @@ pub use docs_indexer::{
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
 pub use index::{index_repository, IndexOptions, IndexResult};
 pub use init::{init_repository, InitOptions, InitOutcome};
+pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
