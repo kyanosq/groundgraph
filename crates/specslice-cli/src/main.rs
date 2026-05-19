@@ -55,9 +55,9 @@ struct CheckArgs {
 struct ContextArgs {
     /// The requirement ID (e.g. `REQ-WATERMARK-001`).
     requirement: String,
-    /// Include doc/code/test source snippets inline.
-    #[arg(long, default_value_t = true)]
-    include_snippets: bool,
+    /// Skip inlining doc/code/test source snippets.
+    #[arg(long)]
+    no_snippets: bool,
     /// Output a machine-readable JSON document.
     #[arg(long)]
     json: bool,
@@ -141,7 +141,7 @@ fn run() -> Result<()> {
         Commands::Context(args) => commands::context::run(
             &cli.repo_root,
             &args.requirement,
-            args.include_snippets,
+            !args.no_snippets,
             args.json,
         ),
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),

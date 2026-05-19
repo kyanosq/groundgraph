@@ -163,6 +163,154 @@ fn file_index_upserts_and_reads_back_hash() {
 }
 
 #[test]
+fn evidence_can_round_trip_every_kind() {
+    let (_tmp, mut store) = fresh_store();
+    use specslice_core::EvidenceKind;
+    for (idx, kind) in [
+        EvidenceKind::DocSection,
+        EvidenceKind::DartDocComment,
+        EvidenceKind::DartTestCall,
+        EvidenceKind::DartGroupCall,
+        EvidenceKind::Import,
+        EvidenceKind::GitDiff,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = ArtifactId::new(format!("ev::{idx}"));
+        let artifact = ArtifactId::new(format!("a::{idx}"));
+        let ev = Evidence {
+            id: id.clone(),
+            artifact_id: artifact.clone(),
+            kind: *kind,
+            path: None,
+            start_line: None,
+            end_line: None,
+            snippet: None,
+            hash: None,
+            metadata_json: None,
+        };
+        store.upsert_evidence(&ev).unwrap();
+        let listed = store.list_evidence_for_artifact(&artifact).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, *kind);
+    }
+}
+
+#[test]
+fn edges_can_round_trip_every_kind_and_source_and_status() {
+    let (_tmp, mut store) = fresh_store();
+    use specslice_core::{EdgeAssertion, EdgeKind, EdgeSource};
+    let kinds = [
+        EdgeKind::Contains,
+        EdgeKind::Imports,
+        EdgeKind::Documents,
+        EdgeKind::DeclaresImplementation,
+        EdgeKind::DeclaresVerification,
+        EdgeKind::RelatedTo,
+    ];
+    let sources = [
+        EdgeSource::Filesystem,
+        EdgeSource::LanguageAdapter,
+        EdgeSource::Markdown,
+        EdgeSource::ExplicitTrace,
+        EdgeSource::GitDiff,
+    ];
+    for (idx, kind) in kinds.iter().enumerate() {
+        let mut edge = EdgeAssertion::declared(
+            ArtifactId::new(format!("from-{idx}")),
+            ArtifactId::new(format!("to-{idx}")),
+            *kind,
+            sources[idx % sources.len()],
+        );
+        // Toggle status to Deprecated to cover both states.
+        if idx % 2 == 0 {
+            edge.status = specslice_core::EdgeStatus::Deprecated;
+        }
+        store.upsert_edge(&edge).unwrap();
+        let reloaded = store.list_edges_by_kind(*kind).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].kind, *kind);
+    }
+    let all = store.list_all_edges().unwrap();
+    assert_eq!(all.len(), kinds.len());
+}
+
+#[test]
+fn list_all_nodes_returns_every_inserted_kind() {
+    let (_tmp, mut store) = fresh_store();
+    use specslice_core::NodeKind;
+    for (idx, kind) in [
+        NodeKind::File,
+        NodeKind::Requirement,
+        NodeKind::AcceptanceCriterion,
+        NodeKind::Adr,
+        NodeKind::DocSection,
+        NodeKind::DartClass,
+        NodeKind::DartMethod,
+        NodeKind::DartFunction,
+        NodeKind::DartConstructor,
+        NodeKind::TestCase,
+        NodeKind::TestGroup,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut node = Node::new(ArtifactId::new(format!("n::{idx}")), *kind);
+        node.name = Some(format!("{kind:?}"));
+        store.upsert_node(&node).unwrap();
+    }
+    let all = store.list_all_nodes().unwrap();
+    assert_eq!(all.len(), 11);
+}
+
+#[test]
+fn decode_error_surfaces_when_raw_sql_writes_unknown_kind() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("graph.db");
+    {
+        let mut store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+    }
+    // Use a separate rusqlite connection to inject an invalid kind.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO nodes (id, kind) VALUES ('bad', 'martian_kind')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(&db_path).unwrap();
+    let err = store
+        .find_node(&ArtifactId::new("bad"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("martian_kind") || err.contains("unknown node kind"));
+}
+
+#[test]
+fn decode_error_for_edge_kind_when_raw_sql_writes_unknown_value() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("graph.db");
+    {
+        let mut store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) \
+         VALUES ('e', 'a', 'b', 'mystery_kind', 'filesystem', 'fact', 'confirmed', 1.0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&db_path).unwrap();
+    let err = store.list_all_edges().unwrap_err().to_string();
+    assert!(err.contains("mystery_kind") || err.contains("unknown edge kind"));
+}
+
+#[test]
 fn clear_indexer_outputs_removes_relevant_rows() {
     let (_tmp, mut store) = fresh_store();
     let mut node = Node::new(

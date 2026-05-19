@@ -175,3 +175,66 @@ pub fn declared_requirements_for(store: &Store, from: &ArtifactId) -> Result<Vec
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn is_implementation_kind_matches_all_dart_symbol_kinds() {
+        assert!(is_implementation_kind(NodeKind::DartClass));
+        assert!(is_implementation_kind(NodeKind::DartMethod));
+        assert!(is_implementation_kind(NodeKind::DartFunction));
+        assert!(is_implementation_kind(NodeKind::DartConstructor));
+        assert!(!is_implementation_kind(NodeKind::Requirement));
+        assert!(!is_implementation_kind(NodeKind::DocSection));
+        assert!(!is_implementation_kind(NodeKind::File));
+    }
+
+    #[test]
+    fn resolve_storage_path_returns_absolute_when_already_absolute() {
+        let cfg = EngineConfig {
+            storage: crate::config::StorageConfig {
+                path: "/tmp/a/b.db".into(),
+            },
+            ..EngineConfig::default()
+        };
+        let resolved = resolve_storage_path(Path::new("/elsewhere"), &cfg);
+        assert_eq!(resolved.to_string_lossy(), "/tmp/a/b.db");
+    }
+
+    #[test]
+    fn declared_requirements_for_collects_implements_and_verifies_edges() {
+        use specslice_core::{artifact_id::dart_class_id, EdgeAssertion, EdgeSource};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(tmp.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let from = dart_class_id("lib/x.dart", "X");
+        store
+            .upsert_edge(&EdgeAssertion::declared(
+                from.clone(),
+                requirement_id("REQ-A"),
+                EdgeKind::DeclaresImplementation,
+                EdgeSource::ExplicitTrace,
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&EdgeAssertion::declared(
+                from.clone(),
+                requirement_id("REQ-B"),
+                EdgeKind::DeclaresVerification,
+                EdgeSource::ExplicitTrace,
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&EdgeAssertion::fact(
+                from.clone(),
+                requirement_id("REQ-C"),
+                EdgeKind::RelatedTo,
+                EdgeSource::ExplicitTrace,
+            ))
+            .unwrap();
+        let reqs = declared_requirements_for(&store, &from).unwrap();
+        assert_eq!(reqs.len(), 2);
+    }
+}

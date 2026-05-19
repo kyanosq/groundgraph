@@ -824,4 +824,98 @@ mod tests {
         assert_eq!(parse_test_call("test('foo', ...)").as_deref(), Some("foo"));
         assert_eq!(parse_group_call("  group('g', ...)").as_deref(), Some("g"));
     }
+
+    #[test]
+    fn unterminated_quote_in_test_call_is_ignored() {
+        assert!(parse_test_call("test('foo, ...)").is_none());
+    }
+
+    #[test]
+    fn constructor_requires_class_name_match() {
+        assert_eq!(parse_constructor("Foo();", "Foo").as_deref(), Some(""));
+        assert_eq!(
+            parse_constructor("Foo.named();", "Foo").as_deref(),
+            Some("named")
+        );
+        assert!(parse_constructor("Foo.weird", "Foo").is_none());
+        assert!(parse_constructor("Other()", "Foo").is_none());
+    }
+
+    #[test]
+    fn method_filter_skips_control_flow_keywords() {
+        assert!(parse_method("if (x) {").is_none());
+        assert!(parse_method("return foo();").is_none());
+        assert!(parse_method("while(true) {").is_none());
+        assert!(parse_method("// comment").is_none());
+    }
+
+    #[test]
+    fn imports_inside_strings_are_not_extracted() {
+        let r = parse("import 'a.dart';\nvoid main() { var s = 'import not-a-file'; }\n");
+        assert_eq!(r.imports.len(), 1);
+        assert_eq!(r.imports[0].to_path, "a.dart");
+    }
+
+    #[test]
+    fn class_without_brace_is_recorded_without_body_range() {
+        let r = parse("abstract class Foo;\n");
+        let class = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartClass)
+            .unwrap();
+        assert_eq!(class.name, "Foo");
+        // No body so we should not emit a range for the class.
+        assert!(r
+            .ranges
+            .iter()
+            .all(|rg| rg.symbol_kind != NodeKind::DartClass));
+    }
+
+    #[test]
+    fn trace_tokens_handle_multiple_tags_per_doc_block() {
+        let toks =
+            extract_trace_tokens("@implements REQ-1\n@verifies REQ-2\n@related REQ-3\nbody text\n");
+        let tags: Vec<_> = toks.iter().map(|(t, _)| *t).collect();
+        assert!(tags.contains(&TraceTag::Implements));
+        assert!(tags.contains(&TraceTag::Verifies));
+        assert!(tags.contains(&TraceTag::Related));
+    }
+
+    #[test]
+    fn doc_comment_with_blank_line_keeps_attaching_to_next_decl() {
+        // The doc buffer should be preserved through blank lines until a
+        // declaration consumes it.
+        let src = "/// @implements REQ-1\n\nclass Foo {}\n";
+        let r = parse(src);
+        assert!(r
+            .traces
+            .iter()
+            .any(|t| t.tag == TraceTag::Implements && t.target == "REQ-1"));
+    }
+
+    #[test]
+    fn empty_source_returns_only_file_artifact() {
+        let r = parse("");
+        assert!(r.symbols.is_empty());
+        assert!(r.tests.is_empty());
+        assert!(r.imports.is_empty());
+        assert!(r.traces.is_empty());
+        assert!(r.ranges.is_empty());
+        assert_eq!(r.file.path, "lib/a.dart");
+    }
+
+    #[test]
+    fn update_depth_skips_braces_inside_strings_and_line_comments() {
+        let mut d = 0usize;
+        update_depth("var x = '{{{'; // }", &mut d);
+        assert_eq!(d, 0);
+        update_depth("class X {", &mut d);
+        assert_eq!(d, 1);
+        update_depth("}", &mut d);
+        assert_eq!(d, 0);
+        // Underflow safety.
+        update_depth("}", &mut d);
+        assert_eq!(d, 0);
+    }
 }
