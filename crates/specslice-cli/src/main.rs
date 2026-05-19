@@ -31,8 +31,23 @@ enum Commands {
     Index(IndexArgs),
     /// Resolve a requirement into docs, implementation and tests.
     Slice(SliceArgs),
+    /// Report which requirements, docs and tests are affected by a git diff.
+    Impact(ImpactArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ImpactArgs {
+    /// Base git ref to diff against (default: `origin/main`).
+    #[arg(long, default_value = "origin/main")]
+    base: String,
+    /// Head git ref (default: `HEAD`).
+    #[arg(long, default_value = "HEAD")]
+    head: String,
+    /// Output a machine-readable JSON document.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -87,6 +102,9 @@ fn run() -> Result<()> {
         Commands::Init => commands::init::run(&cli.repo_root),
         Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only),
         Commands::Slice(args) => commands::slice::run(&cli.repo_root, &args.requirement, args.json),
+        Commands::Impact(args) => {
+            commands::impact::run(&cli.repo_root, &args.base, &args.head, args.json)
+        }
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
     }
 }
