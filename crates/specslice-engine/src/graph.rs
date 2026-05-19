@@ -244,7 +244,7 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
     if let Some(focus_raw) = options.focus.as_deref() {
         match resolve_focus(&nodes, focus_raw) {
             Some(target_id) => {
-                let kept = neighbourhood(&nodes, &edges, &target_id);
+                let kept = focus_subgraph(&nodes, &edges, &target_id);
                 nodes.retain(|n| kept.contains(n.id.as_str()));
                 edges.retain(|e| kept.contains(e.from.as_str()) && kept.contains(e.to.as_str()));
                 findings.retain(|f| match &f.target_id {
@@ -588,6 +588,16 @@ fn apply_view(
     for n in nodes.iter_mut() {
         n.default_visible = false;
     }
+    // When `--focus` is set we already narrowed the model to a useful
+    // subgraph in [`focus_subgraph`]. Independently of the requested view,
+    // mark every survivor as default-visible so the UI does not collapse
+    // back to "only top-level modules".
+    if focus_raw.is_some() {
+        for n in nodes.iter_mut() {
+            n.default_visible = true;
+        }
+        return;
+    }
     match view {
         GraphView::Overview | GraphView::Code => {
             for n in nodes.iter_mut() {
@@ -661,18 +671,68 @@ fn resolve_focus(nodes: &[GraphNode], focus_raw: &str) -> Option<String> {
         .map(|n| n.id.clone())
 }
 
-fn neighbourhood(nodes: &[GraphNode], edges: &[GraphEdge], target_id: &str) -> HashSet<String> {
-    let mut kept = HashSet::new();
+/// The focus subgraph is what the UI shows when `--focus` is set.
+///
+/// For aggregator-style focus targets (module / file / class), returning
+/// only the focus node + immediate edge neighbours is useless: a module has
+/// no outgoing edges, so the focus collapses to a single button. Instead
+/// we expand to:
+///
+/// 1. The focus node itself.
+/// 2. Every transitive descendant via `parent_id` *and* via outgoing
+///    `contains` edges. `parent_id` covers module → file containment;
+///    `contains` covers class → method, since methods are parented under
+///    the file (not the class) for layout reasons but are reachable from
+///    the class via the parser-emitted `contains` edge.
+/// 3. The one-hop edge neighbourhood of every node already in the set.
+///
+/// Parent chains of edge neighbours are intentionally not pulled in: that
+/// keeps method-level focus tight (the chain "caller → method → referenced
+/// class" stays visible without dragging the whole module tree along).
+fn focus_subgraph(nodes: &[GraphNode], edges: &[GraphEdge], target_id: &str) -> HashSet<String> {
+    let valid: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+
+    let mut kept: HashSet<String> = HashSet::new();
     kept.insert(target_id.to_string());
-    for e in edges {
-        if e.from == target_id {
-            kept.insert(e.to.clone());
+
+    loop {
+        let before = kept.len();
+        let snapshot: HashSet<String> = kept.clone();
+        // parent_id descendants (module → file)
+        for n in nodes {
+            if kept.contains(n.id.as_str()) {
+                continue;
+            }
+            if let Some(p) = n.parent_id.as_deref() {
+                if snapshot.contains(p) {
+                    kept.insert(n.id.clone());
+                }
+            }
         }
-        if e.to == target_id {
-            kept.insert(e.from.clone());
+        // contains-edge descendants (class → method)
+        for e in edges {
+            if e.kind == "contains" && snapshot.contains(&e.from) {
+                kept.insert(e.to.clone());
+            }
+        }
+        if kept.len() == before {
+            break;
         }
     }
-    let valid: BTreeSet<_> = nodes.iter().map(|n| n.id.clone()).collect();
+
+    let mut neighbours: Vec<String> = Vec::new();
+    for e in edges {
+        if kept.contains(&e.from) {
+            neighbours.push(e.to.clone());
+        }
+        if kept.contains(&e.to) {
+            neighbours.push(e.from.clone());
+        }
+    }
+    for id in neighbours {
+        kept.insert(id);
+    }
+
     kept.retain(|id| valid.contains(id));
     kept
 }
@@ -916,5 +976,327 @@ mod tests {
         assert_eq!(column_for_dir("test/integration"), GraphColumn::Tests);
         assert_eq!(column_for_dir("lib/features"), GraphColumn::Code);
         assert_eq!(column_for_dir(""), GraphColumn::Code);
+    }
+
+    fn fake_node(id: &str, kind: &str, parent: Option<&str>) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            kind: kind.into(),
+            column: GraphColumn::Code,
+            layer: GraphLayer::Fact,
+            label: id.into(),
+            path: None,
+            line_range: None,
+            status: GraphStatus::Confirmed,
+            parent_id: parent.map(|s| s.into()),
+            child_count: 0,
+            default_visible: false,
+            confidence: None,
+            source: None,
+            badges: Vec::new(),
+        }
+    }
+
+    fn fake_edge(from: &str, to: &str, kind: &str) -> GraphEdge {
+        GraphEdge {
+            id: format!("e::{from}::{kind}::{to}"),
+            from: from.into(),
+            to: to.into(),
+            kind: kind.into(),
+            layer: GraphLayer::Fact,
+            status: GraphStatus::Confirmed,
+            confidence: None,
+            source: None,
+            rationale: None,
+        }
+    }
+
+    #[test]
+    fn focus_subgraph_follows_contains_edges_into_descendants() {
+        // class → method via `contains`. Focus on the class must surface
+        // the method even though parent_id points at the file, not the
+        // class.
+        let nodes = vec![
+            fake_node("file::lib/a.dart", "file", None),
+            fake_node(
+                "dart_class::lib/a.dart#C",
+                "dart_class",
+                Some("file::lib/a.dart"),
+            ),
+            fake_node(
+                "dart_method::lib/a.dart#C.go",
+                "dart_method",
+                Some("file::lib/a.dart"),
+            ),
+        ];
+        let edges = vec![fake_edge(
+            "dart_class::lib/a.dart#C",
+            "dart_method::lib/a.dart#C.go",
+            "contains",
+        )];
+        let kept = focus_subgraph(&nodes, &edges, "dart_class::lib/a.dart#C");
+        assert!(kept.contains("dart_method::lib/a.dart#C.go"));
+    }
+
+    #[test]
+    fn focus_subgraph_returns_empty_set_when_target_missing() {
+        let nodes = vec![fake_node("only", "module", None)];
+        let kept = focus_subgraph(&nodes, &[], "does_not_exist");
+        // After `kept.retain(|id| valid.contains(id))`, the inserted bogus
+        // target is dropped because it does not exist in `nodes`.
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn resolve_focus_matches_by_id_prefix_badge_or_req_form() {
+        let mut req_node = fake_node("req::FOO", "requirement", None);
+        req_node.badges = vec!["badge-1".into()];
+        let nodes = vec![fake_node("module::lib", "module", None), req_node];
+        // Direct id match.
+        assert_eq!(
+            resolve_focus(&nodes, "module::lib"),
+            Some("module::lib".into())
+        );
+        // `req::` synthesised prefix.
+        assert_eq!(resolve_focus(&nodes, "FOO"), Some("req::FOO".into()));
+        // module-path synthesis (e.g. `lib`).
+        assert_eq!(resolve_focus(&nodes, "lib"), Some("module::lib".into()));
+        // Badge match falls back last.
+        assert_eq!(resolve_focus(&nodes, "badge-1"), Some("req::FOO".into()));
+        // Empty input is rejected outright.
+        assert_eq!(resolve_focus(&nodes, "  "), None);
+        // Total miss.
+        assert_eq!(resolve_focus(&nodes, "nope"), None);
+    }
+
+    #[test]
+    fn apply_view_overview_marks_only_top_level_modules() {
+        let mut nodes = vec![
+            fake_node("module::lib", "module", None),
+            fake_node("module::lib/iap", "module", Some("module::lib")),
+            fake_node("file::lib/a.dart", "file", Some("module::lib")),
+        ];
+        apply_view(&mut nodes, &[], GraphView::Overview, None);
+        assert!(nodes[0].default_visible);
+        assert!(!nodes[1].default_visible);
+        assert!(!nodes[2].default_visible);
+    }
+
+    #[test]
+    fn apply_view_business_marks_requirement_neighbours() {
+        let mut nodes = vec![
+            fake_node("req::FOO", "requirement", None),
+            fake_node("dart_class::lib/a.dart#C", "dart_class", None),
+            fake_node("test_case::lib/a_test.dart#t", "test_case", None),
+        ];
+        let edges = vec![
+            fake_edge(
+                "req::FOO",
+                "dart_class::lib/a.dart#C",
+                "declares_implementation",
+            ),
+            fake_edge(
+                "test_case::lib/a_test.dart#t",
+                "req::FOO",
+                "declares_verification",
+            ),
+        ];
+        apply_view(&mut nodes, &edges, GraphView::Business, None);
+        assert!(nodes.iter().all(|n| n.default_visible));
+    }
+
+    #[test]
+    fn apply_view_focus_without_id_falls_back_to_overview() {
+        let mut nodes = vec![
+            fake_node("module::lib", "module", None),
+            fake_node("dart_class::lib/a.dart#C", "dart_class", None),
+        ];
+        apply_view(&mut nodes, &[], GraphView::Focus, None);
+        // Without a focus string, focus mode is overview-equivalent.
+        assert!(nodes[0].default_visible);
+        assert!(!nodes[1].default_visible);
+    }
+
+    #[test]
+    fn layer_for_edge_promotes_external_manifest_only() {
+        use specslice_core::{ArtifactId, EdgeKind};
+        let mut e = EdgeAssertion::fact(
+            ArtifactId::new("a"),
+            ArtifactId::new("b"),
+            EdgeKind::Contains,
+            EdgeSource::ExternalManifest,
+        );
+        assert!(matches!(layer_for_edge(&e), GraphLayer::Confirmed));
+        e.source = EdgeSource::LanguageAdapter;
+        assert!(matches!(layer_for_edge(&e), GraphLayer::Fact));
+        e.source = EdgeSource::GitDiff;
+        assert!(matches!(layer_for_edge(&e), GraphLayer::Fact));
+    }
+
+    #[test]
+    fn column_for_handles_every_node_kind() {
+        use specslice_core::NodeKind;
+        assert_eq!(column_for(NodeKind::Adr), GraphColumn::Documents);
+        assert_eq!(
+            column_for(NodeKind::AcceptanceCriterion),
+            GraphColumn::Documents
+        );
+        assert_eq!(column_for(NodeKind::Requirement), GraphColumn::Business);
+        assert_eq!(column_for(NodeKind::File), GraphColumn::Code);
+        assert_eq!(column_for(NodeKind::DartClass), GraphColumn::Code);
+        assert_eq!(column_for(NodeKind::DartMethod), GraphColumn::Code);
+        assert_eq!(column_for(NodeKind::DartFunction), GraphColumn::Code);
+        assert_eq!(column_for(NodeKind::DartConstructor), GraphColumn::Code);
+        assert_eq!(column_for(NodeKind::TestCase), GraphColumn::Tests);
+        assert_eq!(column_for(NodeKind::TestGroup), GraphColumn::Tests);
+    }
+
+    #[test]
+    fn kind_rank_falls_back_to_default_bucket() {
+        assert!(kind_rank("module") < kind_rank("file"));
+        assert!(kind_rank("file") < kind_rank("dart_class"));
+        assert!(kind_rank("dart_class") < kind_rank("dart_method"));
+        assert!(kind_rank("test_case") > kind_rank("test_group"));
+        assert_eq!(kind_rank("alien"), 10);
+    }
+
+    fn confirmed(id: &str, kind: &str) -> GraphNode {
+        let mut n = fake_node(id, kind, None);
+        n.layer = GraphLayer::Confirmed;
+        n
+    }
+
+    #[test]
+    fn priority_order_pulls_focus_then_confirmed_then_neighbours_then_rest() {
+        // Focus + confirmed + neighbours + rest, all distinct buckets.
+        let req = confirmed("req::A", "requirement");
+        let neighbour = fake_node("dart_class::lib/x.dart#X", "dart_class", None);
+        let rest = fake_node("module::lib", "module", None);
+        let nodes = vec![req.clone(), neighbour.clone(), rest.clone()];
+        let edges = vec![fake_edge(
+            "req::A",
+            "dart_class::lib/x.dart#X",
+            "declares_implementation",
+        )];
+        // No focus → confirmed comes first, neighbour second, rest last.
+        let order = priority_order(&nodes, &edges, None);
+        assert_eq!(order[0], "req::A");
+        assert_eq!(order[1], "dart_class::lib/x.dart#X");
+        assert_eq!(order[2], "module::lib");
+
+        // With focus → focused id leads, confirmed/neighbour follow.
+        let order2 = priority_order(&nodes, &edges, Some("dart_class::lib/x.dart#X"));
+        assert_eq!(order2[0], "dart_class::lib/x.dart#X");
+        assert!(order2.contains(&"req::A".to_string()));
+        assert!(order2.contains(&"module::lib".to_string()));
+    }
+
+    #[test]
+    fn compute_stats_counts_each_column_correctly() {
+        let mut requirement = fake_node("req::A", "requirement", None);
+        requirement.column = GraphColumn::Business;
+        requirement.default_visible = true;
+        let mut doc = fake_node("doc::A", "doc_section", None);
+        doc.column = GraphColumn::Documents;
+        let mut file = fake_node("file::a.dart", "file", None);
+        file.column = GraphColumn::Code;
+        let mut method = fake_node("dart_method::a.dart#C.go", "dart_method", None);
+        method.column = GraphColumn::Code;
+        let mut test_case = fake_node("test_case::t", "test_case", None);
+        test_case.column = GraphColumn::Tests;
+        let mut module_node = fake_node("module::lib", "module", None);
+        module_node.column = GraphColumn::Code;
+        let nodes = vec![requirement, doc, file, method, test_case, module_node];
+        let mut confirmed_edge = fake_edge("a", "b", "contains");
+        confirmed_edge.layer = GraphLayer::Confirmed;
+        let mut candidate_edge = fake_edge("c", "d", "documents");
+        candidate_edge.layer = GraphLayer::Candidate;
+        let edges = vec![confirmed_edge, candidate_edge];
+        let findings = vec![
+            GraphFinding {
+                code: "warn-1".into(),
+                severity: "warning".into(),
+                message: "w".into(),
+                target_id: None,
+            },
+            GraphFinding {
+                code: "err-1".into(),
+                severity: "error".into(),
+                message: "e".into(),
+                target_id: None,
+            },
+            GraphFinding {
+                code: "info-1".into(),
+                severity: "info".into(),
+                message: "i".into(),
+                target_id: None,
+            },
+        ];
+        let stats = compute_stats(&nodes, &edges, &findings);
+        assert_eq!(stats.modules, 1);
+        assert_eq!(stats.documents, 1);
+        assert_eq!(stats.business_logic, 1);
+        assert_eq!(
+            stats.code_symbols, 1,
+            "file & module excluded from code_symbols"
+        );
+        assert_eq!(stats.tests, 1);
+        assert_eq!(stats.confirmed_edges, 1);
+        assert_eq!(stats.candidate_edges, 1);
+        assert_eq!(stats.risks, 2, "warning + error counted, info excluded");
+        assert_eq!(stats.default_visible, 1);
+    }
+
+    #[test]
+    fn sort_findings_orders_by_severity_then_code_then_target() {
+        let mut findings = vec![
+            GraphFinding {
+                code: "z".into(),
+                severity: "error".into(),
+                message: "".into(),
+                target_id: Some("t2".into()),
+            },
+            GraphFinding {
+                code: "a".into(),
+                severity: "info".into(),
+                message: "".into(),
+                target_id: None,
+            },
+            GraphFinding {
+                code: "a".into(),
+                severity: "warning".into(),
+                message: "".into(),
+                target_id: Some("t1".into()),
+            },
+        ];
+        sort_findings(&mut findings);
+        // severities sort lexicographically: error < info < warning
+        assert_eq!(findings[0].severity, "error");
+        assert_eq!(findings[1].severity, "info");
+        assert_eq!(findings[2].severity, "warning");
+    }
+
+    #[test]
+    fn load_config_returns_clear_error_when_config_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = load_config(tmp.path()).expect_err("missing config must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("no SpecSlice workspace"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_storage_path_prefers_absolute_path() {
+        let mut cfg = EngineConfig::default();
+        cfg.storage.path = "/tmp/abs/graph.db".into();
+        let path = resolve_storage_path(Path::new("/repo"), &cfg);
+        assert_eq!(path, PathBuf::from("/tmp/abs/graph.db"));
+    }
+
+    #[test]
+    fn resolve_storage_path_joins_relative_path_against_repo_root() {
+        let mut cfg = EngineConfig::default();
+        cfg.storage.path = "graph.db".into();
+        let path = resolve_storage_path(Path::new("/repo"), &cfg);
+        assert_eq!(path, PathBuf::from("/repo/graph.db"));
     }
 }

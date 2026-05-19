@@ -420,6 +420,8 @@ fn parse_edge_kind(raw: &str) -> Result<EdgeKind, rusqlite::Error> {
         "documents" => EdgeKind::Documents,
         "declares_implementation" => EdgeKind::DeclaresImplementation,
         "declares_verification" => EdgeKind::DeclaresVerification,
+        "references" => EdgeKind::References,
+        "calls" => EdgeKind::Calls,
         other => return Err(decode_error(3, format!("unknown edge kind {other}"))),
     })
 }
@@ -457,4 +459,346 @@ fn decode_error(col: usize, message: String) -> rusqlite::Error {
         rusqlite::types::Type::Text,
         Box::<dyn std::error::Error + Send + Sync>::from(message),
     )
+}
+
+#[cfg(test)]
+mod decode_tests {
+    //! Drives every `parse_*` / `*_from_row` branch — including the error
+    //! arms — through the public Store APIs by inserting raw SQL with
+    //! known-bad enum strings and observing the read-back error.
+
+    use super::*;
+    use crate::Store;
+    use rusqlite::params;
+    use tempfile::NamedTempFile;
+
+    fn fresh_store() -> Store {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::mem::forget(file);
+        let mut store = Store::open(&path).unwrap();
+        store.migrate().unwrap();
+        store
+    }
+
+    #[test]
+    fn parse_edge_kind_recognises_every_known_value_and_rejects_unknown() {
+        let store = fresh_store();
+        // Insert one edge per known kind, then one with a bogus kind.
+        let kinds = [
+            "contains",
+            "imports",
+            "documents",
+            "declares_implementation",
+            "declares_verification",
+            "references",
+            "calls",
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            store.conn.execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES (?1, 'a', 'b', ?2, 'language_adapter', 'fact', 'confirmed', 1.0)",
+                params![format!("ek-{i}"), k],
+            ).unwrap();
+        }
+        let edges = store.list_all_edges().expect("known kinds must decode");
+        assert_eq!(edges.len(), kinds.len());
+
+        // Now insert a bogus kind and confirm read fails with a decode error.
+        store
+            .conn
+            .execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES ('bad-kind', 'a', 'b', 'mystery', 'language_adapter', 'fact', 'confirmed', 1.0)",
+                params![],
+            )
+            .unwrap();
+        let err = store.list_all_edges().expect_err("bogus kind must error");
+        assert!(
+            format!("{err}").contains("unknown edge kind mystery"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_edge_source_rejects_unknown_value() {
+        let store = fresh_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES ('bad-src', 'a', 'b', 'contains', 'wat', 'fact', 'confirmed', 1.0)",
+                params![],
+            )
+            .unwrap();
+        let err = store.list_all_edges().expect_err("bogus source must error");
+        assert!(
+            format!("{err}").contains("unknown edge source wat"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_edge_certainty_rejects_unknown_value() {
+        let store = fresh_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES ('bad-c', 'a', 'b', 'contains', 'filesystem', 'maybe', 'confirmed', 1.0)",
+                params![],
+            )
+            .unwrap();
+        let err = store
+            .list_all_edges()
+            .expect_err("bogus certainty must error");
+        assert!(
+            format!("{err}").contains("unknown edge certainty maybe"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_edge_status_rejects_unknown_value() {
+        let store = fresh_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES ('bad-st', 'a', 'b', 'contains', 'filesystem', 'fact', 'paused', 1.0)",
+                params![],
+            )
+            .unwrap();
+        let err = store.list_all_edges().expect_err("bogus status must error");
+        assert!(
+            format!("{err}").contains("unknown edge status paused"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_edge_source_recognises_external_manifest_and_git_diff() {
+        let store = fresh_store();
+        for (i, s) in [
+            "filesystem",
+            "language_adapter",
+            "markdown",
+            "external_manifest",
+            "git_diff",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store.conn.execute(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence) VALUES (?1, 'a', 'b', 'contains', ?2, 'fact', 'confirmed', 1.0)",
+                params![format!("src-{i}"), s],
+            ).unwrap();
+        }
+        let edges = store.list_all_edges().unwrap();
+        assert_eq!(edges.len(), 5);
+        // Each enum variant must round-trip back to a recognisable string.
+        let raw: std::collections::BTreeSet<_> = edges.iter().map(|e| e.source.as_str()).collect();
+        assert!(raw.contains("external_manifest"));
+        assert!(raw.contains("git_diff"));
+        assert!(raw.contains("markdown"));
+    }
+
+    #[test]
+    fn node_from_row_recognises_all_kinds_and_rejects_unknown() {
+        let store = fresh_store();
+        let kinds = [
+            "file",
+            "requirement",
+            "acceptance_criterion",
+            "adr",
+            "doc_section",
+            "dart_class",
+            "dart_method",
+            "dart_function",
+            "dart_constructor",
+            "test_case",
+            "test_group",
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO nodes (id, kind) VALUES (?1, ?2)",
+                    params![format!("nk-{i}"), k],
+                )
+                .unwrap();
+        }
+        let nodes = store.list_all_nodes().unwrap();
+        assert_eq!(nodes.len(), kinds.len());
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO nodes (id, kind) VALUES ('bad', 'cosmic')",
+                params![],
+            )
+            .unwrap();
+        let err = store.list_all_nodes().expect_err("bogus node kind");
+        assert!(
+            format!("{err}").contains("unknown node kind cosmic"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn evidence_from_row_recognises_all_kinds_and_rejects_unknown() {
+        let store = fresh_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO nodes (id, kind) VALUES ('node-1', 'file')",
+                params![],
+            )
+            .unwrap();
+        for (i, k) in [
+            "doc_section",
+            "dart_doc_comment",
+            "dart_test_call",
+            "dart_group_call",
+            "import",
+            "git_diff",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO evidence (id, artifact_id, kind) VALUES (?1, 'node-1', ?2)",
+                    params![format!("ev-{i}"), k],
+                )
+                .unwrap();
+        }
+        let evs = store
+            .list_evidence_for_artifact(&ArtifactId::new("node-1"))
+            .unwrap();
+        assert_eq!(evs.len(), 6);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO evidence (id, artifact_id, kind) VALUES ('bad', 'node-1', 'movie')",
+                params![],
+            )
+            .unwrap();
+        let err = store
+            .list_evidence_for_artifact(&ArtifactId::new("node-1"))
+            .expect_err("bogus evidence kind");
+        assert!(
+            format!("{err}").contains("unknown evidence kind movie"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn symbol_range_decoder_rejects_unsupported_kind() {
+        let store = fresh_store();
+        for (i, k) in [
+            "dart_class",
+            "dart_method",
+            "dart_function",
+            "dart_constructor",
+            "test_case",
+            "test_group",
+            "doc_section",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name) VALUES ('p.dart', ?1, 1, 2, ?2, ?1)",
+                    params![format!("sr-{i}"), k],
+                )
+                .unwrap();
+        }
+        let ranges = store.list_symbol_ranges_for_file("p.dart").unwrap();
+        assert_eq!(ranges.len(), 7);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name) VALUES ('p.dart', 'bad', 1, 2, 'plane', 'bad')",
+                params![],
+            )
+            .unwrap();
+        let err = store
+            .list_symbol_ranges_for_file("p.dart")
+            .expect_err("bogus symbol kind");
+        assert!(
+            format!("{err}").contains("unsupported symbol kind plane"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn opt_u32_and_required_u32_reject_out_of_range_values() {
+        let store = fresh_store();
+        // start_line = -1 → fails required_u32 conversion when reading
+        // back via list_symbol_ranges_for_file.
+        store
+            .conn
+            .execute(
+                "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name) VALUES ('x.dart', 'sym', -1, 1, 'dart_class', 'C')",
+                params![],
+            )
+            .unwrap();
+        let err = store
+            .list_symbol_ranges_for_file("x.dart")
+            .expect_err("negative start_line must error");
+        assert!(format!("{err}").contains("line number"), "{err}");
+
+        // opt_u32: nodes.start_line stored as -1 should fail decoding.
+        store
+            .conn
+            .execute(
+                "INSERT INTO nodes (id, kind, start_line) VALUES ('node-2', 'dart_class', -42)",
+                params![],
+            )
+            .unwrap();
+        let err = store
+            .list_all_nodes()
+            .expect_err("negative node start_line must error");
+        assert!(format!("{err}").contains("does not fit in u32"), "{err}");
+    }
+
+    #[test]
+    fn list_helpers_round_trip_full_node_and_edge() {
+        // Cover non-error decoding for nodes and edges with every optional
+        // field populated, so opt_i64 / opt_u32 / required_u32 happy paths
+        // are exercised.
+        let mut store = fresh_store();
+        let mut node = Node::new(ArtifactId::new("file::lib/a.dart"), NodeKind::File);
+        node.path = Some("lib/a.dart".into());
+        node.name = Some("a.dart".into());
+        node.start_line = Some(10);
+        node.end_line = Some(20);
+        node.content_hash = Some("h".into());
+        node.stable_key = Some("k".into());
+        node.source_file = Some("lib/a.dart".into());
+        node.source_hash = Some("hh".into());
+        node.indexer = Some("dart_lightweight".into());
+        node.index_generation = Some(3);
+        node.metadata_json = Some("{}".into());
+        store.upsert_node(&node).unwrap();
+
+        let mut edge = EdgeAssertion::fact(
+            ArtifactId::new("a"),
+            ArtifactId::new("b"),
+            EdgeKind::Contains,
+            EdgeSource::LanguageAdapter,
+        );
+        edge.indexer = Some("dart_lightweight".into());
+        edge.index_generation = Some(7);
+        edge.metadata_json = Some("{}".into());
+        store.upsert_edge(&edge).unwrap();
+
+        let found = store.find_node(&node.id).unwrap().unwrap();
+        assert_eq!(found.start_line, Some(10));
+        assert_eq!(found.index_generation, Some(3));
+        let edges = store.list_edges_from(&edge.from_id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].index_generation, Some(7));
+    }
 }

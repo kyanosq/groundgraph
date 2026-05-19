@@ -311,6 +311,150 @@ fn graph_html_business_view_embeds_no_business_finding_when_empty() {
     assert!(html.contains("\"view\":\"business\""));
 }
 
+// ---------------------------------------------------------------------------
+// P6.2: code-fact graph regression tests against the pixcraft IAP fixture.
+// ---------------------------------------------------------------------------
+
+fn pixcraft_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("pixcraft_iap")
+}
+
+fn bootstrap_pixcraft(tmp_root: &Path) {
+    copy_dir(&pixcraft_fixture_path(), tmp_root);
+    let db = tmp_root.join(".specslice/graph.db");
+    if db.exists() {
+        std::fs::remove_file(&db).unwrap();
+    }
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp_root)
+        .arg("init")
+        .assert()
+        .success();
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp_root)
+        .arg("index")
+        .assert()
+        .success();
+}
+
+#[test]
+fn graph_focus_on_iap_module_returns_file_and_class_nodes() {
+    // Mirrors the user's complaint: `--focus lib/core/iap` previously
+    // returned a single module node with `edges: []`. After P6.2 it must
+    // include at least the file and the `IapProductIds` class.
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_pixcraft(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json", "--focus", "lib/core/iap"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let ids: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"module::lib/core/iap"), "{ids:?}");
+    assert!(
+        ids.contains(&"file::lib/core/iap/iap_constants.dart"),
+        "{ids:?}"
+    );
+    assert!(
+        ids.contains(&"dart_class::lib/core/iap/iap_constants.dart#IapProductIds"),
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn graph_focus_on_apply_purchase_emits_calls_and_references_chain() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_pixcraft(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args([
+            "graph",
+            "--format",
+            "json",
+            "--focus",
+            "dart_method::lib/core/settings/pro_provider.dart#ProNotifier.applyPurchase",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let edges: Vec<(&str, &str, &str)> = v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap(),
+                e["from"].as_str().unwrap(),
+                e["to"].as_str().unwrap(),
+            )
+        })
+        .collect();
+
+    // Outgoing references to IapProductIds.
+    assert!(
+        edges.iter().any(|(k, f, t)| *k == "references"
+            && *f == "dart_method::lib/core/settings/pro_provider.dart#ProNotifier.applyPurchase"
+            && *t == "dart_class::lib/core/iap/iap_constants.dart#IapProductIds"),
+        "missing references edge in focus output: {edges:?}",
+    );
+    // Incoming calls from PaywallScreen.listenToPurchaseUpdates.
+    assert!(
+        edges
+            .iter()
+            .any(|(k, f, t)| *k == "calls"
+                && *f
+                    == "dart_method::lib/features/paywall/paywall_screen.dart#PaywallScreen.listenToPurchaseUpdates"
+                && *t == "dart_method::lib/core/settings/pro_provider.dart#ProNotifier.applyPurchase"),
+        "missing calls edge from listener: {edges:?}",
+    );
+}
+
+#[test]
+fn graph_json_default_view_includes_calls_and_references_edge_kinds() {
+    // Confirms that the unfiltered `graph --format json` no longer reports
+    // only `contains` / `imports` for a code-only repo — the new fact
+    // edges must show up.
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_pixcraft(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let kinds: std::collections::BTreeSet<&str> = v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains("calls"), "{kinds:?}");
+    assert!(kinds.contains("references"), "{kinds:?}");
+}
+
 #[test]
 fn graph_json_max_nodes_emits_truncation_finding() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -332,4 +476,100 @@ fn graph_json_max_nodes_emits_truncation_finding() {
         .collect();
     assert!(codes.contains(&"graph_truncated"), "{codes:?}");
     assert!(v["nodes"].as_array().unwrap().len() <= 2);
+}
+
+#[test]
+fn graph_json_pretty_flag_emits_indented_output() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json", "--pretty"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // Pretty JSON contains newlines and 2-space indentation; compact does
+    // neither.
+    assert!(
+        stdout.contains("\n  \""),
+        "expected pretty-printed indentation, got: {stdout}"
+    );
+}
+
+#[test]
+fn graph_mermaid_writes_to_out_path_when_given() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    let out = tmp.path().join("graph.mmd");
+
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "mermaid", "--out"])
+        .arg(&out)
+        .assert()
+        .success();
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(body.starts_with("flowchart LR"), "got: {body}");
+}
+
+#[test]
+fn graph_focus_unknown_id_emits_focus_not_found_finding() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json", "--focus", "no-such-id-here"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"focus_not_found"), "{codes:?}");
+    // Unknown focus clears nodes/edges.
+    assert!(v["nodes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn graph_command_fails_when_no_specslice_workspace_present() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Do NOT init or index — there's no .specslice/ directory.
+
+    let output = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "expected non-zero exit code");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("no SpecSlice workspace") || stderr.contains("specslice init"),
+        "stderr did not explain missing workspace: {stderr}"
+    );
+}
+
+#[test]
+fn graph_view_code_default_visible_is_modules_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json", "--view", "code"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["view"], "code");
 }

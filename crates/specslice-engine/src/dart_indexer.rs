@@ -208,6 +208,23 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         store.upsert_edge(&edge)?;
     }
 
+    for reference in &batch.references {
+        if !matches!(reference.kind, EdgeKind::References | EdgeKind::Calls) {
+            // Defensive: adapter contract restricts these to References /
+            // Calls; ignore any future kinds we do not yet understand
+            // instead of corrupting the store.
+            continue;
+        }
+        let mut edge = EdgeAssertion::fact(
+            reference.from_symbol_id.clone(),
+            reference.to_symbol_id.clone(),
+            reference.kind,
+            EdgeSource::LanguageAdapter,
+        );
+        edge.indexer = Some(DART_INDEXER_NAME.into());
+        store.upsert_edge(&edge)?;
+    }
+
     for range in &batch.symbol_ranges {
         store.upsert_symbol_range(range)?;
     }
@@ -281,5 +298,158 @@ mod glob_tests {
         assert!(path_matches_glob("*.dart", "x.dart"));
         assert!(path_matches_glob("*.dart", "lib/x.dart"));
         assert!(!path_matches_glob("*.dart", "x.yaml"));
+    }
+
+    #[test]
+    fn regex_like_fallback_handles_star_in_middle_of_pattern() {
+        // `lib/*.dart` exercises the head/tail split in matches_regex_like
+        // (head literal: `(?:^|/)lib/`, tail literal: `.dart$`).
+        assert!(path_matches_glob("lib/*.dart", "lib/x.dart"));
+        assert!(!path_matches_glob("lib/*.dart", "src/x.dart"));
+        // Pattern with two `*`s is unsupported and must fall through to
+        // false rather than panic.
+        assert!(!path_matches_glob("a*b*c", "anything"));
+    }
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+    use specslice_core::{
+        artifact_id::{dart_method_id, file_id},
+        EdgeKind, FileArtifact, LanguageIndexBatch, ReferenceEdge,
+    };
+
+    #[test]
+    fn ingest_skips_unknown_edge_kinds_defensively() {
+        // The Dart adapter's contract restricts batch.references to
+        // References / Calls. If a future kind sneaks in we must not
+        // corrupt the store; the loop should just `continue`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.files.push(FileArtifact {
+            id: file_id("x.dart"),
+            path: "x.dart".into(),
+            language: "dart".into(),
+            content_hash: "h".into(),
+        });
+        batch.references.push(ReferenceEdge {
+            from_symbol_id: dart_method_id("x.dart", "A", "a"),
+            to_symbol_id: dart_method_id("x.dart", "B", "b"),
+            kind: EdgeKind::Contains, // <-- defensive: must be ignored
+        });
+
+        let result = ingest(&mut store, &batch).unwrap();
+        assert_eq!(result.files, 1);
+
+        // No Calls/References edge should have been inserted because the
+        // adapter sent a Contains kind that the ingest guard rejects.
+        let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
+        let refs = store.list_edges_by_kind(EdgeKind::References).unwrap();
+        assert!(
+            calls.is_empty() && refs.is_empty(),
+            "defensive guard must drop unknown reference kinds"
+        );
+    }
+
+    #[test]
+    fn ingest_accepts_calls_and_references_normally() {
+        use specslice_core::artifact_id::dart_class_id;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.files.push(FileArtifact {
+            id: file_id("x.dart"),
+            path: "x.dart".into(),
+            language: "dart".into(),
+            content_hash: "h".into(),
+        });
+        batch.references.push(ReferenceEdge {
+            from_symbol_id: dart_method_id("x.dart", "A", "a"),
+            to_symbol_id: dart_method_id("x.dart", "B", "b"),
+            kind: EdgeKind::Calls,
+        });
+        batch.references.push(ReferenceEdge {
+            from_symbol_id: dart_method_id("x.dart", "A", "a"),
+            to_symbol_id: dart_class_id("x.dart", "C"),
+            kind: EdgeKind::References,
+        });
+        ingest(&mut store, &batch).unwrap();
+        assert_eq!(store.list_edges_by_kind(EdgeKind::Calls).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_edges_by_kind(EdgeKind::References)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ingest_normalises_symbol_without_parent_to_file_contains() {
+        // Symbol with `parent_symbol_id == None` should be parented under
+        // the file via a synthesised contains edge.
+        use specslice_core::{artifact_id::dart_function_id, SymbolArtifact};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.files.push(FileArtifact {
+            id: file_id("x.dart"),
+            path: "x.dart".into(),
+            language: "dart".into(),
+            content_hash: "h".into(),
+        });
+        let fn_id = dart_function_id("x.dart", "top");
+        batch.symbols.push(SymbolArtifact {
+            id: fn_id.clone(),
+            kind: specslice_core::NodeKind::DartFunction,
+            path: "x.dart".into(),
+            name: "top".into(),
+            qualified_name: "top".into(),
+            start_line: 1,
+            end_line: 5,
+            parent_symbol_id: None,
+        });
+        ingest(&mut store, &batch).unwrap();
+        let contains = store.list_edges_by_kind(EdgeKind::Contains).unwrap();
+        assert!(
+            contains
+                .iter()
+                .any(|e| e.from_id == file_id("x.dart") && e.to_id == fn_id),
+            "synthesised file→symbol contains edge missing: {contains:?}"
+        );
+    }
+
+    #[test]
+    fn index_dart_drops_files_matching_exclude_glob() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/keep.dart"), "class Keep {}\n").unwrap();
+        std::fs::write(tmp.path().join("lib/skip.g.dart"), "class Skip {}\n").unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let result = index_dart(
+            &mut store,
+            &DartIndexOptions {
+                repo_root: tmp.path().to_path_buf(),
+                code_roots: vec!["lib".into()],
+                exclude_globs: vec!["**/*.g.dart".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(result.symbols, 1, "*.g.dart files must be excluded");
     }
 }

@@ -26,6 +26,12 @@ pub struct ParseResult {
     pub imports: Vec<ImportEdge>,
     pub ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
+    /// Per-class field-name → type-name mapping discovered by the
+    /// lightweight parser. Used downstream by [`references`] to resolve
+    /// `field.member` access into a reference to the field's class.
+    /// Intentionally local: never persisted in `LanguageIndexBatch`.
+    pub field_types:
+        std::collections::BTreeMap<ArtifactId, std::collections::BTreeMap<String, String>>,
 }
 
 struct ClassFrame {
@@ -34,12 +40,21 @@ struct ClassFrame {
     depth: usize,
 }
 
+struct PendingSymbol {
+    id: ArtifactId,
+    start_line: u32,
+}
+
 pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
     let mut symbols = Vec::new();
     let mut tests = Vec::new();
     let mut imports = Vec::new();
     let mut ranges = Vec::new();
     let diagnostics = Vec::new();
+    let mut field_types: std::collections::BTreeMap<
+        ArtifactId,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
 
     let file_artifact = FileArtifact {
         id: file_id(path),
@@ -50,6 +65,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
 
     let mut class_stack: Vec<ClassFrame> = Vec::new();
     let mut open_symbol_starts: Vec<(ArtifactId, u32, usize)> = Vec::new();
+    let mut pending_symbol: Option<PendingSymbol> = None;
     let mut depth = 0usize;
     let mut total_lines = 0u32;
 
@@ -58,6 +74,38 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         total_lines = line_no;
         let line = strip_inline_string_braces(raw_line);
         let trimmed = line.trim_start();
+
+        if let Some(pending) = pending_symbol.take() {
+            let depth_before = depth;
+            update_depth(&line, &mut depth);
+            if depth > depth_before {
+                open_symbol_starts.push((pending.id, pending.start_line, depth));
+            } else if declaration_finished_without_open_body(&line) {
+                finalize_symbol(
+                    &pending.id,
+                    pending.start_line,
+                    line_no,
+                    path,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    &class_stack,
+                );
+            } else {
+                pending_symbol = Some(pending);
+            }
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
 
         // Ignore comments completely. Links are declared outside business
         // source files in `.specslice/links.yaml`.
@@ -221,12 +269,45 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
                 });
-                if line.contains('{') {
-                    update_depth(&line, &mut depth);
+                let depth_before = depth;
+                update_depth(&line, &mut depth);
+                if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
                 } else {
-                    update_depth(&line, &mut depth);
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
                 }
+                close_symbols(
+                    &mut open_symbol_starts,
+                    &mut class_stack,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    depth,
+                    line_no,
+                    path,
+                );
+                continue;
+            }
+            if let Some((field_name, type_name)) = parse_field(trimmed) {
+                field_types
+                    .entry(class.0.clone())
+                    .or_default()
+                    .insert(field_name, type_name);
+                update_depth(&line, &mut depth);
                 close_symbols(
                     &mut open_symbol_starts,
                     &mut class_stack,
@@ -251,11 +332,26 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
                 });
-                if line.contains('{') {
-                    update_depth(&line, &mut depth);
+                let depth_before = depth;
+                update_depth(&line, &mut depth);
+                if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
                 } else {
-                    update_depth(&line, &mut depth);
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
                 }
                 close_symbols(
                     &mut open_symbol_starts,
@@ -282,11 +378,26 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: None,
                 });
-                if line.contains('{') {
-                    update_depth(&line, &mut depth);
+                let depth_before = depth;
+                update_depth(&line, &mut depth);
+                if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
                 } else {
-                    update_depth(&line, &mut depth);
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
                 }
                 close_symbols(
                     &mut open_symbol_starts,
@@ -316,6 +427,19 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         );
     }
 
+    if let Some(pending) = pending_symbol.take() {
+        finalize_symbol(
+            &pending.id,
+            pending.start_line,
+            total_lines,
+            path,
+            &mut ranges,
+            &mut symbols,
+            &mut tests,
+            &class_stack,
+        );
+    }
+
     // Anything still open closes at EOF.
     while let Some((id, start, _depth)) = open_symbol_starts.pop() {
         finalize_symbol(
@@ -339,7 +463,106 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         imports,
         ranges,
         diagnostics,
+        field_types,
     }
+}
+
+/// Detect simple Dart class field declarations.
+///
+/// Recognised shapes (all single-line):
+///   `Type name;`
+///   `Type name = expr;`
+///   `final Type name = expr;`
+///   `late final Type name;`
+///   `static const Type name = expr;`
+///
+/// Generic types are accepted; the recorded `type_name` is the *first*
+/// identifier of the type expression (e.g. `List<String>` ⇒ `List`,
+/// `Future<void>` ⇒ `Future`). This is intentionally coarse; downstream
+/// reference resolution only needs to match a *class name* the symbol
+/// index already knows about.
+///
+/// Returns `(field_name, type_name)` or `None` if the line does not look
+/// like a field declaration.
+fn parse_field(line: &str) -> Option<(String, String)> {
+    if line.starts_with("//") || line.starts_with("///") {
+        return None;
+    }
+    // Method or constructor declarations always contain `(` before any `=`
+    // or `;`. Field initialisers may contain `(` *after* `=`, so reject
+    // only when `(` appears before `=` and `;`.
+    let paren = line.find('(');
+    let eq = line.find('=');
+    let semi = line.find(';');
+    let stop = match (eq, semi) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+    let stop = stop?;
+    if let Some(p) = paren {
+        if p < stop {
+            return None;
+        }
+    }
+    let head = line[..stop].trim();
+    if head.is_empty() {
+        return None;
+    }
+
+    let mut tokens = head.split_whitespace().peekable();
+    let mut buf: Vec<&str> = Vec::new();
+    while let Some(tok) = tokens.peek().copied() {
+        if matches!(
+            tok,
+            "static" | "final" | "late" | "const" | "var" | "external" | "covariant"
+        ) {
+            tokens.next();
+            continue;
+        }
+        break;
+    }
+    for tok in tokens {
+        buf.push(tok);
+    }
+    if buf.len() < 2 {
+        return None;
+    }
+    let type_token = buf[0];
+    let name_token = buf[buf.len() - 1];
+
+    let type_name: String = type_token
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    let field_name: String = name_token
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if type_name.is_empty() || field_name.is_empty() {
+        return None;
+    }
+    // Skip statement-like patterns that would otherwise look like
+    // `Type name;` after split: `return foo;`, `await foo;`, etc.
+    if matches!(
+        type_name.as_str(),
+        "return" | "await" | "yield" | "throw" | "assert" | "if" | "for" | "while" | "switch"
+    ) {
+        return None;
+    }
+    // Type and field name cannot be Dart reserved keywords.
+    if matches!(
+        field_name.as_str(),
+        "return" | "true" | "false" | "null" | "this" | "super" | "if" | "for"
+    ) {
+        return None;
+    }
+    Some((field_name, type_name))
+}
+
+fn declaration_finished_without_open_body(line: &str) -> bool {
+    line.contains(';') || line.contains("=>") || line.contains('{')
 }
 
 fn disambiguate_duplicate_test_ids(tests: &mut [TestArtifact]) {
@@ -564,6 +787,12 @@ fn parse_method(line: &str) -> Option<String> {
     let paren = line.find('(')?;
     let head = &line[..paren];
     let head_trim = head.trim_end();
+    // Reject field initializers like `ProNotifier pro = ProNotifier();`.
+    // A method head never contains `=` between the return type and the
+    // opening `(`; only an assignment / default-value expression would.
+    if head_trim.contains('=') {
+        return None;
+    }
     let name_part = head_trim.split_whitespace().last()?;
     let cleaned: String = name_part
         .chars()
@@ -615,6 +844,71 @@ mod tests {
 
     fn parse(src: &str) -> ParseResult {
         parse_dart("lib/a.dart", src, "hash")
+    }
+
+    #[test]
+    fn one_line_bodyless_method_does_not_swallow_following_methods() {
+        // Regression: a method whose `{}` are on the same line (e.g.
+        // `Future<void> foo(...) async {}`) used to leave its range
+        // open and absorb every following method body, producing false
+        // calls/references edges. The range must stay on its own line.
+        let src =
+            "class C {\n  Future<void> foo(int x) async {}\n  void bar() {\n    foo(1);\n  }\n}\n";
+        let r = parse(src);
+        let foo_range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "C.foo")
+            .expect("foo should produce a range");
+        assert_eq!(foo_range.start_line, foo_range.end_line);
+        assert_eq!(foo_range.start_line, 2, "foo must stay on line 2");
+        let bar_range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "C.bar")
+            .expect("bar should produce a range");
+        assert_eq!(bar_range.start_line, 3);
+        assert!(bar_range.end_line >= 5);
+    }
+
+    #[test]
+    fn multiline_method_signature_keeps_body_range() {
+        // Pixcraft's `_listenToPurchaseUpdates` signature spans multiple
+        // lines. The parser used to finalise it on the first line, so the
+        // reference scanner never saw the body and missed
+        // `notifier.applyPurchase(...)`.
+        let src = "class Paywall {\n  void listen(\n    List<String> purchases,\n  ) async {\n    notifier.applyPurchase(purchases.first);\n  }\n}\n";
+        let r = parse(src);
+        let range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "Paywall.listen")
+            .expect("listen should produce a range");
+        assert_eq!(range.start_line, 2);
+        assert!(
+            range.end_line >= 5,
+            "multi-line method must include its body, got {range:?}"
+        );
+    }
+
+    #[test]
+    fn class_field_emits_field_type_entry() {
+        // The lightweight parser must record class-level fields so
+        // references resolution can later map `pro.state` ⇒ ProNotifier.
+        let src = "class E {\n  ProNotifier pro = ProNotifier();\n  bool flag = false;\n}\n";
+        let r = parse(src);
+        let class_id = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartClass)
+            .map(|s| s.id.clone())
+            .unwrap();
+        let fields = r
+            .field_types
+            .get(&class_id)
+            .expect("class field map must exist");
+        assert_eq!(fields.get("pro").map(String::as_str), Some("ProNotifier"));
+        assert_eq!(fields.get("flag").map(String::as_str), Some("bool"));
     }
 
     #[test]
@@ -863,5 +1157,115 @@ mod tests {
         // Underflow safety.
         update_depth("}", &mut d);
         assert_eq!(d, 0);
+    }
+
+    #[test]
+    fn parse_field_recognises_modifier_combinations() {
+        // Field with all combinations of static / final / late / const /
+        // covariant / external. `var name = expr;` (no explicit type) is
+        // intentionally NOT recognised because the field-type tracker has
+        // nothing to map back to a class.
+        for src in [
+            "Type name;",
+            "final Type name;",
+            "late Type name;",
+            "late final Type name;",
+            "static const Type name = expr;",
+            "covariant Type name;",
+            "external Type name;",
+        ] {
+            let parsed = parse_field(src);
+            assert!(
+                parsed.is_some(),
+                "expected `{src}` to be recognised as a field, got None"
+            );
+        }
+        // `var name = expr;` is currently rejected by design.
+        assert!(parse_field("var name = expr;").is_none());
+    }
+
+    #[test]
+    fn parse_field_rejects_method_signature_and_statements() {
+        // Statements should not look like fields.
+        assert!(parse_field("return foo();").is_none());
+        assert!(parse_field("await something;").is_none());
+        assert!(parse_field("if (x) {").is_none());
+        // Method head: `( ` before `=` / `;` ⇒ not a field.
+        assert!(parse_field("Future<void> foo() async {").is_none());
+        // No identifiers at all.
+        assert!(parse_field(";").is_none());
+        // Reserved field-name keywords.
+        assert!(parse_field("Type this = 1;").is_none());
+        // Comment-only.
+        assert!(parse_field("/// docs only").is_none());
+        assert!(parse_field("// inline").is_none());
+        // Single token with `;` only ⇒ not enough tokens for type+name.
+        assert!(parse_field("name;").is_none());
+    }
+
+    #[test]
+    fn parse_class_header_modifiers_cover_all_branches() {
+        // base, final, interface modifiers.
+        assert_eq!(parse_class_header("base class B {").as_deref(), Some("B"));
+        assert_eq!(parse_class_header("final class F {").as_deref(), Some("F"));
+        assert_eq!(
+            parse_class_header("interface class I {").as_deref(),
+            Some("I")
+        );
+    }
+
+    #[test]
+    fn parse_method_rejects_field_initialiser_with_constructor_call() {
+        // Field initialisers like `ProNotifier pro = ProNotifier();` used to
+        // be mis-recognised as a method whose head was `ProNotifier pro =
+        // ProNotifier`. The head-has-`=` reject must bite.
+        assert!(parse_method("ProNotifier pro = ProNotifier();").is_none());
+        // But a regular method head must still be recognised.
+        assert_eq!(parse_method("void foo() {").as_deref(), Some("foo"));
+        // `test(...)` is reserved for test-call detection.
+        assert!(parse_method("test('x', () {});").is_none());
+    }
+
+    #[test]
+    fn empty_doc_only_file_is_ignored() {
+        let r = parse("/// just docs\n/// more docs\n");
+        assert!(
+            r.symbols.is_empty(),
+            "doc-only file must not produce symbols: {:?}",
+            r.symbols
+        );
+    }
+
+    #[test]
+    fn parse_handles_import_with_unterminated_quote() {
+        // Best-effort: if the import quote is unterminated, skip cleanly.
+        let r = parse("import 'oops\n");
+        assert!(r.imports.is_empty(), "broken import must be dropped");
+    }
+
+    #[test]
+    fn class_declared_on_same_line_as_brace_close_is_recorded() {
+        // `class X {}` on one line should produce a class symbol.
+        let r = parse("class X {}\n");
+        assert!(r.symbols.iter().any(|s| s.kind == NodeKind::DartClass));
+    }
+
+    #[test]
+    fn comment_inside_method_body_is_not_a_test_call() {
+        // `/// test('x', ...)` is a doc comment, never a test artefact.
+        let r = parse("class C {\n  void m() {\n    /// test('inside doc', () {});\n  }\n}\n");
+        assert!(
+            r.tests.iter().all(|t| t.name != "inside doc"),
+            "doc-comment test() must not produce an artefact"
+        );
+    }
+
+    #[test]
+    fn imports_outside_class_body_are_attached_to_file_id() {
+        // Imports do not depend on which class they appear before / after.
+        let r = parse("import 'a.dart';\nclass C {}\nimport 'b.dart';\n");
+        assert_eq!(r.imports.len(), 2);
+        // Both originate from the same file artefact id.
+        assert_eq!(r.imports[0].from_file, r.imports[1].from_file);
     }
 }

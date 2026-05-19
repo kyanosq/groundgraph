@@ -12,6 +12,14 @@ pub enum EdgeKind {
     Documents,
     DeclaresImplementation,
     DeclaresVerification,
+    /// Body-level reference from a method/function/constructor to a class or
+    /// other symbol. Emitted by the lightweight Dart adapter when an
+    /// identifier in a method body matches a known symbol's name.
+    References,
+    /// Same shape as [`EdgeKind::References`] but specifically for callable
+    /// targets (identifier followed by `(`). Lets the UI distinguish "uses
+    /// constant" from "invokes method" without inspecting evidence.
+    Calls,
 }
 
 impl EdgeKind {
@@ -22,6 +30,8 @@ impl EdgeKind {
             EdgeKind::Documents => "documents",
             EdgeKind::DeclaresImplementation => "declares_implementation",
             EdgeKind::DeclaresVerification => "declares_verification",
+            EdgeKind::References => "references",
+            EdgeKind::Calls => "calls",
         }
     }
 }
@@ -147,6 +157,8 @@ mod tests {
             EdgeKind::DeclaresVerification.as_str(),
             "declares_verification"
         );
+        assert_eq!(EdgeKind::References.as_str(), "references");
+        assert_eq!(EdgeKind::Calls.as_str(), "calls");
 
         assert_eq!(EdgeSource::Filesystem.as_str(), "filesystem");
         assert_eq!(EdgeSource::LanguageAdapter.as_str(), "language_adapter");

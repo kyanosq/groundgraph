@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_id::ArtifactId;
+use crate::edge::EdgeKind;
 use crate::node::NodeKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,18 @@ pub struct ImportEdge {
     pub to_path: String,
 }
 
+/// Lightweight body-level reference produced by a language adapter.
+///
+/// `kind` must be [`EdgeKind::References`] (class / constant) or
+/// [`EdgeKind::Calls`] (callable target). The engine maps the edge through
+/// `EdgeAssertion::fact` with `EdgeSource::LanguageAdapter`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceEdge {
+    pub from_symbol_id: ArtifactId,
+    pub to_symbol_id: ArtifactId,
+    pub kind: EdgeKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolRange {
     pub file_path: String,
@@ -71,6 +84,10 @@ pub struct LanguageIndexBatch {
     pub imports: Vec<ImportEdge>,
     pub symbol_ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
+    /// Body-level lightweight references (calls / class refs). Optional in
+    /// JSON for forward compatibility with older adapters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<ReferenceEdge>,
 }
 
 #[cfg(test)]
