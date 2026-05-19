@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/specslice-core",
+    "crates/specslice-store",
+    "crates/specslice-lang-dart",
+    "crates/specslice-engine",
+    "crates/specslice-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/specslice/specslice"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+globset = "0.4"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# dev-dependencies (shared)
+assert_cmd = "2"
+predicates = "3"
+assert_fs = "1"
+tempfile = "3"
+insta = { version = "1", features = ["json"] }

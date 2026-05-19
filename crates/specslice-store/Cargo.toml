@@ -1,0 +1,17 @@
+[package]
+name = "specslice-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite-backed graph store for SpecSlice."
+
+[dependencies]
+specslice-core = { path = "../specslice-core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
