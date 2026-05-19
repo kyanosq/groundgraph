@@ -42,6 +42,7 @@ fn fresh_store_with_index() -> (TempDir, Store) {
         &DartIndexOptions {
             repo_root: fixture,
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -173,6 +174,7 @@ fn context_pack_includes_slice_snippets_and_edges() {
         &DartIndexOptions {
             repo_root: tmp.path().into(),
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -194,6 +196,82 @@ fn context_pack_includes_slice_snippets_and_edges() {
         .docs_snippets
         .iter()
         .any(|s| s.text.contains("Auto watermark placement")));
+}
+
+#[test]
+fn context_pack_exposes_files_to_read_and_tests_to_run() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = fixture_path();
+    fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let target = dst.join(entry.file_name());
+            if path.is_dir() {
+                copy_dir(&path, &target);
+            } else {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+    copy_dir(&fixture, tmp.path());
+    write_workspace(tmp.path());
+
+    let db_path = tmp.path().join(".specslice/graph.db");
+    let mut store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    index_docs(
+        &mut store,
+        &DocsIndexOptions {
+            repo_root: tmp.path().into(),
+            doc_roots: vec![PathBuf::from("docs")],
+        },
+    )
+    .unwrap();
+    index_dart(
+        &mut store,
+        &DartIndexOptions {
+            repo_root: tmp.path().into(),
+            code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(store);
+
+    let pack = build_context(ContextOptions {
+        repo_root: tmp.path().into(),
+        requirement: "REQ-WATERMARK-001".into(),
+        include_snippets: false,
+    })
+    .unwrap();
+
+    // PRD §7: the JSON contract exposes a flat list of files an Agent must
+    // read and a flat list of test files it must run.
+    assert!(pack.files_to_read.iter().any(|p| p == "docs/watermark.md"));
+    assert!(pack
+        .files_to_read
+        .iter()
+        .any(|p| p == "lib/domain/watermark/auto_placement_service.dart"));
+    assert!(pack
+        .files_to_read
+        .iter()
+        .any(|p| p == "test/watermark/auto_placement_service_test.dart"));
+    assert!(pack
+        .tests_to_run
+        .iter()
+        .any(|p| p == "test/watermark/auto_placement_service_test.dart"));
+
+    // Both lists must be deduplicated.
+    let mut sorted = pack.files_to_read.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        pack.files_to_read.len(),
+        "duplicates not allowed"
+    );
 }
 
 #[test]

@@ -38,6 +38,11 @@ pub struct ImpactReport {
     pub affected_requirements: Vec<SliceItem>,
     pub affected_docs: Vec<SliceItem>,
     pub linked_tests: Vec<SliceItem>,
+    /// Implementation symbols that declare any affected requirement.
+    /// Populated regardless of whether the implementation was itself changed
+    /// — this is what PRD §4.4 "Doc Impact" requires so the report stays
+    /// actionable for doc-only changes.
+    pub related_implementations: Vec<SliceItem>,
     pub warnings: Vec<String>,
     pub info: Vec<String>,
 }
@@ -143,6 +148,7 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
     // Resolve affected requirements → docs, tests, implementations.
     let mut docs_set: BTreeSet<ArtifactId> = BTreeSet::new();
     let mut tests_set: BTreeSet<ArtifactId> = BTreeSet::new();
+    let mut impl_set: BTreeSet<ArtifactId> = BTreeSet::new();
     for req_id in &affected_reqs {
         for edge in store.list_edges_to(req_id)? {
             match edge.kind {
@@ -151,6 +157,9 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
                 }
                 EdgeKind::DeclaresVerification => {
                     tests_set.insert(edge.from_id);
+                }
+                EdgeKind::DeclaresImplementation => {
+                    impl_set.insert(edge.from_id);
                 }
                 _ => {}
             }
@@ -190,12 +199,27 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
             });
         }
     }
+    for impl_id in &impl_set {
+        if let Some(node) = store.find_node(impl_id)? {
+            report.related_implementations.push(SliceItem {
+                id: node.id.to_string(),
+                kind: node.kind.as_str().to_string(),
+                path: node.path,
+                name: node.name,
+                line_range: match (node.start_line, node.end_line) {
+                    (Some(s), Some(e)) => Some((s, e)),
+                    _ => None,
+                },
+            });
+        }
+    }
 
     sort_items(&mut report.changed_symbols);
     sort_items(&mut report.changed_doc_sections);
     sort_items(&mut report.affected_requirements);
     sort_items(&mut report.affected_docs);
     sort_items(&mut report.linked_tests);
+    sort_items(&mut report.related_implementations);
 
     // Warnings & info.
     if !report.affected_requirements.is_empty()

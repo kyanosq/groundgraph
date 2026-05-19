@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use specslice_core::{
     artifact_id::{doc_section_id, file_id, requirement_id, slugify},
-    EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
+    ArtifactId, EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
 };
 use specslice_store::Store;
 
@@ -236,10 +236,27 @@ fn index_one_file(
         }
     }
 
-    // Record related references as unresolved (resolved later by other
-    // indexers / checks).
+    // Record related references both as unresolved (in-memory, for the CLI
+    // status line) and as `Requirement --RelatedTo--> <uri>` edges so the
+    // checks layer can detect broken links across re-runs.
     if let Some(req) = &requirement_node {
         for link in &parsed.related {
+            let scheme = match link.kind {
+                UnresolvedKind::Symbol => "symbol://",
+                UnresolvedKind::Test => "test://",
+                UnresolvedKind::Other => "ref://",
+            };
+            let target_id = ArtifactId::new(format!("{scheme}{}", link.target));
+            let mut edge = EdgeAssertion::declared(
+                req.id.clone(),
+                target_id,
+                EdgeKind::RelatedTo,
+                EdgeSource::Markdown,
+            );
+            edge.indexer = Some(DOCS_INDEXER_NAME.into());
+            store.upsert_edge(&edge)?;
+            result.edges += 1;
+
             result.unresolved_references.push(UnresolvedReference {
                 from_requirement: req.stable_key.clone().unwrap_or_else(|| req.id.to_string()),
                 kind: link.kind,

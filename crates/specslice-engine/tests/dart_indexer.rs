@@ -30,6 +30,7 @@ fn indexing_dart_fixture_yields_expected_counts() {
     let opts = DartIndexOptions {
         repo_root: fixture_path(),
         code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+        ..Default::default()
     };
     let result = index_dart(&mut store, &opts).unwrap();
 
@@ -102,6 +103,7 @@ fn re_indexing_is_idempotent() {
     let opts = DartIndexOptions {
         repo_root: fixture_path(),
         code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+        ..Default::default()
     };
     let first = index_dart(&mut store, &opts).unwrap();
     store.clear_indexer_outputs(DART_INDEXER_NAME).unwrap();

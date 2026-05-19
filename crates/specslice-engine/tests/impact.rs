@@ -36,6 +36,7 @@ fn fresh_store_with_index() -> (TempDir, Store) {
         &DartIndexOptions {
             repo_root: fixture,
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+            ..Default::default()
         },
     )
     .unwrap();
@@ -119,6 +120,50 @@ fn no_changes_yield_empty_report() {
     assert!(report.affected_requirements.is_empty());
     assert!(report.warnings.is_empty());
     assert!(report.info.is_empty());
+}
+
+#[test]
+fn doc_change_surfaces_related_implementations() {
+    // PRD §4.4 Doc Impact: changing a requirement doc must produce, in
+    // addition to affected requirements and linked tests, the *implementation*
+    // symbols that declare the requirement. This makes the report directly
+    // actionable for "doc change → re-read these files".
+    let (_tmp, store) = fresh_store_with_index();
+
+    let changed = vec![ChangedFile {
+        path: "docs/watermark.md".into(),
+        status: ChangeStatus::Modified,
+        hunks: vec![Hunk {
+            new_start: 8,
+            new_end: 8,
+        }],
+    }];
+    let report = compute_impact(&store, &changed).unwrap();
+
+    assert!(
+        !report.related_implementations.is_empty(),
+        "related_implementations must not be empty when REQ is affected"
+    );
+    assert!(report.related_implementations.iter().any(
+        |item| item.path.as_deref() == Some("lib/domain/watermark/auto_placement_service.dart")
+    ));
+}
+
+#[test]
+fn related_implementations_field_is_empty_when_only_tests_change() {
+    let (_tmp, store) = fresh_store_with_index();
+    let changed = vec![ChangedFile {
+        path: "test/watermark/auto_placement_service_test.dart".into(),
+        status: ChangeStatus::Modified,
+        hunks: vec![Hunk {
+            new_start: 6,
+            new_end: 6,
+        }],
+    }];
+    let report = compute_impact(&store, &changed).unwrap();
+    // The test file alone does not affect any requirement (no doc trace),
+    // so there should be no related implementations either.
+    assert!(report.related_implementations.is_empty());
 }
 
 #[test]

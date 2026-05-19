@@ -62,6 +62,17 @@ fn print_human(report: &ImpactReport) {
             println!("- {} {}", r.id, r.name.clone().unwrap_or_default());
         }
     }
+    if !report.related_implementations.is_empty() {
+        println!();
+        println!("Related implementation:");
+        for i in &report.related_implementations {
+            println!(
+                "- {} ({})",
+                i.name.clone().unwrap_or_else(|| i.id.clone()),
+                i.path.clone().unwrap_or_else(|| i.id.clone())
+            );
+        }
+    }
     if !report.linked_tests.is_empty() {
         println!();
         println!("Linked tests:");

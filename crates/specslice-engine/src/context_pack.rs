@@ -30,6 +30,12 @@ pub struct ContextPack {
     pub impl_snippets: Vec<CodeSnippet>,
     pub test_snippets: Vec<CodeSnippet>,
     pub edges: Vec<EdgeSummary>,
+    /// PRD §7: flat, deduplicated list of file paths an Agent must read to
+    /// understand the requirement. Order is `docs → implementation → tests`.
+    pub files_to_read: Vec<String>,
+    /// PRD §7: test files (not individual test cases) the Agent should run
+    /// after touching this requirement.
+    pub tests_to_run: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +110,13 @@ pub fn build_context(options: ContextOptions) -> Result<ContextPack> {
         }
     }
 
+    let files_to_read = collect_unique_paths(&[
+        slice.docs.as_slice(),
+        slice.implementation.as_slice(),
+        slice.linked_tests.as_slice(),
+    ]);
+    let tests_to_run = collect_unique_paths(&[slice.linked_tests.as_slice()]);
+
     Ok(ContextPack {
         requirement_id: options.requirement.clone(),
         title: slice.title.clone(),
@@ -112,7 +125,24 @@ pub fn build_context(options: ContextOptions) -> Result<ContextPack> {
         impl_snippets,
         test_snippets,
         edges: edges_summary,
+        files_to_read,
+        tests_to_run,
     })
+}
+
+fn collect_unique_paths(groups: &[&[SliceItem]]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ordered = Vec::new();
+    for group in groups {
+        for item in *group {
+            if let Some(p) = &item.path {
+                if seen.insert(p.clone()) {
+                    ordered.push(p.clone());
+                }
+            }
+        }
+    }
+    ordered
 }
 
 fn read_snippet(repo_root: &Path, item: &SliceItem) -> Result<Option<String>> {

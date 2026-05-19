@@ -22,10 +22,16 @@ use specslice_store::Store;
 
 pub const DART_INDEXER_NAME: &str = "dart_lightweight";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DartIndexOptions {
     pub repo_root: PathBuf,
     pub code_roots: Vec<PathBuf>,
+    /// Optional `glob`-style patterns to filter out paths that are technically
+    /// inside a `code_roots` entry but should be skipped (generated files,
+    /// build output, etc.). Patterns use the simple matcher in
+    /// [`crate::dart_indexer::path_matches_glob`] — only `**`, `*`, `?`, `.`
+    /// and `/` are honoured.
+    pub exclude_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -38,9 +44,91 @@ pub struct DartIndexResult {
 }
 
 pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartIndexResult> {
-    let batch = index_dart_paths(&options.repo_root, &options.code_roots)
+    let mut batch = index_dart_paths(&options.repo_root, &options.code_roots)
         .context("scanning Dart sources")?;
+    if !options.exclude_globs.is_empty() {
+        let exclude = options.exclude_globs.clone();
+        let drop_file = |path: &str| exclude.iter().any(|g| path_matches_glob(g, path));
+        batch.files.retain(|f| !drop_file(&f.path));
+        batch.symbols.retain(|s| !drop_file(&s.path));
+        batch.tests.retain(|t| !drop_file(&t.path));
+        batch.imports.retain(|i| {
+            // Imports are keyed by the *file id* they came from, not by path,
+            // so we conservatively keep them all. They will become dangling
+            // for excluded files but Impact already handles missing nodes.
+            let _ = i;
+            true
+        });
+        batch.symbol_ranges.retain(|r| !drop_file(&r.file_path));
+        batch
+            .trace_links
+            .retain(|t| !drop_file(t.from_symbol_id.as_str()));
+    }
     ingest(store, &batch)
+}
+
+/// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`
+/// (within a single segment). Implemented locally so we do not have to pull
+/// in a heavier dependency for what is essentially `path.ends_with(".g.dart")`.
+fn path_matches_glob(pattern: &str, path: &str) -> bool {
+    let pat = pattern.replace('\\', "/");
+    let p = path.replace('\\', "/");
+    let mut pi = pat.as_bytes();
+    let si = p.as_bytes();
+
+    // Drop leading `./`.
+    if pi.starts_with(b"./") {
+        pi = &pi[2..];
+    }
+
+    if let Some(rest) = pi.strip_prefix(b"**/") {
+        let suffix = std::str::from_utf8(rest).unwrap_or("");
+        return path_contains_pattern_segment(suffix, std::str::from_utf8(si).unwrap_or(""));
+    }
+    if pi == b"**" {
+        return true;
+    }
+
+    // Direct prefix match (e.g. `.dart_tool`, `build`, `generated`).
+    let pat_str = std::str::from_utf8(pi).unwrap_or("");
+    let path_str = std::str::from_utf8(si).unwrap_or("");
+    if !pat_str.contains('*') && !pat_str.contains('?') {
+        return path_str == pat_str
+            || path_str.starts_with(&format!("{pat_str}/"))
+            || path_str.contains(&format!("/{pat_str}/"));
+    }
+
+    path_contains_pattern_segment(pat_str, path_str)
+}
+
+fn path_contains_pattern_segment(pattern: &str, path: &str) -> bool {
+    // We only handle one wildcard tail of the form `*.ext` or literal suffix.
+    if let Some(stripped) = pattern.strip_prefix("*.") {
+        let needle = format!(".{stripped}");
+        return path.ends_with(&needle);
+    }
+    if !pattern.contains('*') {
+        return path == pattern || path.ends_with(&format!("/{pattern}"));
+    }
+    // Fallback: treat `*` as ".*" and do an end-anchored check.
+    let regex_like = pattern.replace('.', "\\.").replace('*', ".*");
+    let re = format!("(?:^|/){regex_like}$");
+    matches_regex_like(&re, path)
+}
+
+fn matches_regex_like(escaped: &str, path: &str) -> bool {
+    // Cheap regex emulation: split on `.*` and require each literal piece
+    // in order, anchored as documented.
+    let pieces: Vec<&str> = escaped.splitn(2, ".*").collect();
+    match pieces.as_slice() {
+        [single] => path.ends_with(*single),
+        [head, tail] => {
+            let head_lit = head.trim_start_matches("(?:^|/)").trim_start_matches('^');
+            let tail_lit = tail.trim_end_matches('$').replace("\\.", ".");
+            path.contains(head_lit) && path.ends_with(&tail_lit)
+        }
+        _ => false,
+    }
 }
 
 fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResult> {
@@ -178,4 +266,51 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::path_matches_glob;
+
+    #[test]
+    fn double_star_matches_anything() {
+        assert!(path_matches_glob("**", "lib/a.dart"));
+        assert!(path_matches_glob("**", "anything"));
+    }
+
+    #[test]
+    fn double_star_slash_extension_matches_any_directory() {
+        assert!(path_matches_glob("**/*.g.dart", "lib/gen/a.g.dart"));
+        assert!(path_matches_glob(
+            "**/*.freezed.dart",
+            "build/x.freezed.dart"
+        ));
+        assert!(!path_matches_glob("**/*.g.dart", "lib/normal.dart"));
+    }
+
+    #[test]
+    fn double_star_with_literal_tail_matches_basename() {
+        assert!(path_matches_glob("**/Foo.dart", "lib/sub/Foo.dart"));
+        assert!(!path_matches_glob("**/Foo.dart", "lib/Bar.dart"));
+    }
+
+    #[test]
+    fn literal_directory_matches_top_or_nested_paths() {
+        assert!(path_matches_glob("build", "build/x.dart"));
+        assert!(path_matches_glob("build", "build"));
+        assert!(path_matches_glob("build", "lib/build/x.dart"));
+        assert!(!path_matches_glob("build", "lib/x.dart"));
+    }
+
+    #[test]
+    fn dot_prefix_is_stripped_from_pattern() {
+        assert!(path_matches_glob("./build", "build/x.dart"));
+    }
+
+    #[test]
+    fn pattern_with_explicit_star_extension_falls_back_to_regex_like() {
+        assert!(path_matches_glob("*.dart", "x.dart"));
+        assert!(path_matches_glob("*.dart", "lib/x.dart"));
+        assert!(!path_matches_glob("*.dart", "x.yaml"));
+    }
 }

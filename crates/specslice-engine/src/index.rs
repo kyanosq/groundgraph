@@ -57,11 +57,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             .context("clearing previous docs index outputs")?;
         let docs_options = DocsIndexOptions {
             repo_root: options.repo_root.clone(),
-            doc_roots: vec![
-                PathBuf::from("docs"),
-                PathBuf::from("specs"),
-                PathBuf::from("adr"),
-            ],
+            doc_roots: config.docs.paths.iter().map(PathBuf::from).collect(),
         };
         let docs = index_docs(&mut store, &docs_options).context("indexing docs")?;
         result.docs = Some(docs);
@@ -75,7 +71,8 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             &mut store,
             &crate::dart_indexer::DartIndexOptions {
                 repo_root: options.repo_root.clone(),
-                code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+                code_roots: config.code.paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.code.exclude.clone(),
             },
         )
         .context("indexing Dart sources")?;

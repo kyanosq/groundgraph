@@ -36,6 +36,7 @@ fn fresh_store_with_index() -> (TempDir, Store) {
         &DartIndexOptions {
             repo_root: fixture,
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
+            ..Default::default()
         },
     )
     .unwrap();

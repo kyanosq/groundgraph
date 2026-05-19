@@ -38,6 +38,20 @@ fn print_human(pack: &specslice_engine::ContextPack) {
     for d in &pack.slice.linked_tests {
         println!("- {}", d.path.clone().unwrap_or_else(|| d.id.clone()));
     }
+    if !pack.files_to_read.is_empty() {
+        println!();
+        println!("Files to read:");
+        for f in &pack.files_to_read {
+            println!("- {f}");
+        }
+    }
+    if !pack.tests_to_run.is_empty() {
+        println!();
+        println!("Tests to run:");
+        for t in &pack.tests_to_run {
+            println!("- {t}");
+        }
+    }
     if !pack.docs_snippets.is_empty()
         || !pack.impl_snippets.is_empty()
         || !pack.test_snippets.is_empty()

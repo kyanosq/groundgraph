@@ -265,6 +265,14 @@ fn check_human_output_includes_warn_severity_marker() {
     // Remove the impl + test to make REQ-WATERMARK-001 an orphan (warning).
     std::fs::remove_dir_all(tmp.path().join("lib")).unwrap();
     std::fs::remove_dir_all(tmp.path().join("test")).unwrap();
+    // Also strip the `## Related` section so the doc's `symbol://`/`test://`
+    // references do not surface as `broken_related` errors. We want this
+    // test to focus on the orphan-requirement warning path.
+    let doc = tmp.path().join("docs/watermark.md");
+    let body = std::fs::read_to_string(&doc).unwrap();
+    let trimmed = body.split("## Related").next().unwrap_or(&body).to_string();
+    std::fs::write(&doc, trimmed).unwrap();
+
     Command::cargo_bin("specslice")
         .unwrap()
         .current_dir(tmp.path())

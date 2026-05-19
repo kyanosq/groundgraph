@@ -246,10 +246,13 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         }
 
         // Constructor and method/function declarations.
-        // Determine whether we are inside a class scope.
+        // Only parse declarations at the class's *direct* child layer.
+        // Anything deeper (`depth > class_depth`) is inside a method body
+        // and must not be re-parsed — otherwise expressions like
+        // `candidates.sort(...)` get misidentified as method declarations.
         let inside_class = current_class
             .as_ref()
-            .map(|(_, _, class_depth)| depth >= *class_depth)
+            .map(|(_, _, class_depth)| depth == *class_depth)
             .unwrap_or(false);
 
         if inside_class {
@@ -903,6 +906,43 @@ mod tests {
         assert!(r.traces.is_empty());
         assert!(r.ranges.is_empty());
         assert_eq!(r.file.path, "lib/a.dart");
+    }
+
+    #[test]
+    fn method_body_calls_are_not_misdetected_as_method_declarations() {
+        // Regression: `depth >= class_depth` used to let `candidates.sort(...)`
+        // inside a method body be parsed as a sibling method of the enclosing
+        // class. The only legitimate method declarations live at the class's
+        // *direct* child layer (depth == class_depth).
+        let src = "class AutoPlacementService {\n  AutoPlacementService();\n\n  PlacementCandidate placeWatermark(List<PlacementCandidate> candidates) {\n    candidates.sort((a, b) => b.score.compareTo(a.score));\n    return candidates.first;\n  }\n\n  double scoreCandidate(PlacementCandidate candidate) {\n    return candidate.score;\n  }\n}\n";
+        let r = parse(src);
+        let method_names: Vec<_> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartMethod)
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(
+            method_names,
+            vec!["placeWatermark".to_string(), "scoreCandidate".to_string()],
+            "no body-call noise allowed, got {method_names:?}"
+        );
+    }
+
+    #[test]
+    fn nested_blocks_do_not_emit_phantom_methods() {
+        // `if (...) { ... }` inside a method body must not introduce a new
+        // method symbol just because the outer brace depth increased.
+        let src =
+            "class Box {\n  void open() {\n    if (locked) {\n      throw 'no';\n    }\n  }\n}\n";
+        let r = parse(src);
+        let methods: Vec<_> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartMethod)
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(methods, vec!["open".to_string()]);
     }
 
     #[test]
