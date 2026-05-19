@@ -50,11 +50,16 @@ struct GraphArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = GraphFormatArg::Html)]
     format: GraphFormatArg,
+    /// Default visible surface: overview (modules), code (modules+drilldown),
+    /// business (REQ subgraph) or focus (focus + 1-hop neighbourhood).
+    #[arg(long, value_enum, default_value_t = GraphViewArg::Overview)]
+    view: GraphViewArg,
     /// Where to write the rendered output. Defaults to stdout for JSON and
     /// Mermaid, and to `.specslice/export/graph.html` for HTML.
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Focus on a single business id (`REQ-…`) or full artifact id.
+    /// Focus on a single business id (`REQ-…`), module path or full
+    /// artifact id.
     #[arg(long)]
     focus: Option<String>,
     /// Hide check/risk findings from the export. Defaults to true (include).
@@ -78,12 +83,31 @@ enum GraphFormatArg {
     Mermaid,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum GraphViewArg {
+    Overview,
+    Code,
+    Business,
+    Focus,
+}
+
 impl From<GraphFormatArg> for commands::graph::GraphFormat {
     fn from(value: GraphFormatArg) -> Self {
         match value {
             GraphFormatArg::Json => commands::graph::GraphFormat::Json,
             GraphFormatArg::Html => commands::graph::GraphFormat::Html,
             GraphFormatArg::Mermaid => commands::graph::GraphFormat::Mermaid,
+        }
+    }
+}
+
+impl From<GraphViewArg> for specslice_engine::graph::GraphView {
+    fn from(value: GraphViewArg) -> Self {
+        match value {
+            GraphViewArg::Overview => specslice_engine::graph::GraphView::Overview,
+            GraphViewArg::Code => specslice_engine::graph::GraphView::Code,
+            GraphViewArg::Business => specslice_engine::graph::GraphView::Business,
+            GraphViewArg::Focus => specslice_engine::graph::GraphView::Focus,
         }
     }
 }
@@ -247,6 +271,7 @@ fn run() -> Result<()> {
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
             format: args.format.into(),
+            view: args.view.into(),
             out: args.out,
             focus: args.focus,
             include_risks: args.include_risks,

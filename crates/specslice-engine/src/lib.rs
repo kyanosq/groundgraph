@@ -35,7 +35,7 @@ pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
 pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
-    GraphStats, GraphStatus, GraphViewModel, GRAPH_SCHEMA_VERSION,
+    GraphStats, GraphStatus, GraphView, GraphViewModel, GRAPH_SCHEMA_VERSION,
 };
 pub use impact::{run_impact, ImpactOptions, ImpactReport};
 pub use index::{index_repository, IndexOptions, IndexResult};

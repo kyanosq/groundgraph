@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use specslice_engine::graph::{build_graph_view, GraphOptions, GraphViewModel};
+use specslice_engine::graph::{build_graph_view, GraphOptions, GraphView, GraphViewModel};
 
 use super::graph_html::render_html;
 use super::graph_mermaid::render_mermaid;
@@ -29,6 +29,7 @@ pub enum GraphFormat {
 pub struct GraphRunArgs {
     pub repo_root: PathBuf,
     pub format: GraphFormat,
+    pub view: GraphView,
     pub out: Option<PathBuf>,
     pub focus: Option<String>,
     pub include_risks: bool,
@@ -38,7 +39,11 @@ pub struct GraphRunArgs {
 }
 
 pub fn run(args: GraphRunArgs) -> Result<()> {
+    // HTML embeds the full graph; the renderer enforces an 80-visible-node
+    // cap on top of `default_visible` so users see manageable starts even on
+    // giant repos. Engine-level `max_nodes` remains an explicit opt-in cap.
     let options = GraphOptions {
+        view: args.view,
         focus: args.focus.clone(),
         include_risks: args.include_risks,
         include_candidates: args.include_candidates,

@@ -66,7 +66,8 @@ fn graph_json_prints_view_model() {
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["view"], "overview");
     assert!(v["nodes"].as_array().unwrap().len() >= 4);
     assert!(!v["edges"].as_array().unwrap().is_empty());
     let kinds: Vec<&str> = v["nodes"]
@@ -194,6 +195,120 @@ fn graph_html_supports_explicit_out_path() {
         .assert()
         .success();
     assert!(out.exists());
+}
+
+#[test]
+fn graph_json_default_visibility_only_marks_top_level_modules_in_overview() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let visible: Vec<&serde_json::Value> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["default_visible"].as_bool().unwrap_or(false))
+        .collect();
+    assert!(!visible.is_empty(), "no visible nodes in overview");
+    for n in &visible {
+        assert_eq!(n["kind"], "module", "non-module visible by default: {n}");
+        assert!(n["parent_id"].is_null());
+    }
+}
+
+#[test]
+fn graph_json_business_view_emits_no_business_finding_when_pixcraft_style() {
+    // Bootstrap fixture but wipe links.yaml so no requirements exist.
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    let manifest = tmp.path().join(".specslice/links.yaml");
+    std::fs::write(&manifest, "requirements: {}\n").unwrap();
+    // Re-index to reflect the change.
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .arg("index")
+        .assert()
+        .success();
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "json", "--view", "business"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["view"], "business");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&"no_business_logic"),
+        "missing no_business_logic finding: {codes:?}"
+    );
+}
+
+#[test]
+fn graph_html_renders_three_pane_explorer_with_tree_canvas_detail() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "html"])
+        .assert()
+        .success();
+    let html = std::fs::read_to_string(tmp.path().join(".specslice/export/graph.html")).unwrap();
+    assert!(html.contains("class=\"tree\""));
+    assert!(html.contains("class=\"canvas\""));
+    assert!(html.contains("class=\"detail\""));
+    // The view selector and tree-item / node-card CSS classes are the
+    // explorer's contract surface.
+    assert!(html.contains("id=\"view\""));
+    assert!(html.contains("tree-item"));
+    assert!(html.contains("node-card"));
+    // module aggregator must be embedded (proves new contract).
+    assert!(html.contains("\"kind\":\"module\""));
+    assert!(!html.contains("https://"));
+    assert!(!html.contains("http://"));
+}
+
+#[test]
+fn graph_html_business_view_embeds_no_business_finding_when_empty() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    std::fs::write(
+        tmp.path().join(".specslice/links.yaml"),
+        "requirements: {}\n",
+    )
+    .unwrap();
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .arg("index")
+        .assert()
+        .success();
+
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "html", "--view", "business"])
+        .assert()
+        .success();
+    let html = std::fs::read_to_string(tmp.path().join(".specslice/export/graph.html")).unwrap();
+    assert!(html.contains("no_business_logic"));
+    assert!(html.contains("\"view\":\"business\""));
 }
 
 #[test]

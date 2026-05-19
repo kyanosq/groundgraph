@@ -74,7 +74,8 @@ mod tests {
 
     fn view() -> GraphViewModel {
         GraphViewModel {
-            schema_version: 1,
+            schema_version: 2,
+            view: "overview".into(),
             repo_root: "/tmp".into(),
             generated_at: "now".into(),
             focus: None,
@@ -89,6 +90,9 @@ mod tests {
                     path: Some("docs/a.md".into()),
                     line_range: None,
                     status: GraphStatus::Confirmed,
+                    parent_id: None,
+                    child_count: 0,
+                    default_visible: true,
                     confidence: None,
                     source: None,
                     badges: vec![],
@@ -102,6 +106,9 @@ mod tests {
                     path: None,
                     line_range: None,
                     status: GraphStatus::Confirmed,
+                    parent_id: None,
+                    child_count: 0,
+                    default_visible: true,
                     confidence: None,
                     source: None,
                     badges: vec![],

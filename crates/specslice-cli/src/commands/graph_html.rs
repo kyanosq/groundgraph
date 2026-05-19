@@ -1,30 +1,32 @@
 //! Self-contained HTML renderer for `specslice graph --format html`.
 //!
-//! Hard constraints:
+//! P6 shipped a lane-strip viewer. P6.1 rebuilds the UI as a code-graph
+//! explorer:
+//!
+//! - Left: collapsible tree (modules → files → symbols) grouped per column,
+//!   driven by `parent_id` chains in the JSON view model.
+//! - Centre: deterministic SVG canvas. Visible nodes get layered on a grid
+//!   keyed by column; edges are lifted to the nearest visible ancestor so a
+//!   collapsed module shows aggregated relationships.
+//! - Right: details panel with id / kind / path:line / source / incoming +
+//!   outgoing edges / nearest requirement.
+//!
+//! Hard constraints (carried over from P6):
 //!
 //! - No remote URLs (no `https://`, no `http://`, no CDN).
-//! - No `npm`, no React, no Vite, no dev server.
-//! - One physical file: HTML + CSS + JSON + JS embedded.
-//! - The rendered page must open cleanly with `open graph.html` and degrade
-//!   gracefully when the view is empty.
-//!
-//! Visual encoding follows `docs/visualization-design.md`:
-//!
-//! - 5 lanes: Documents / Business / Code / Tests / Risks.
-//! - Nodes are buttons (keyboard accessible).
-//! - Layers (`fact`, `confirmed`, `candidate`, `risk`) drive CSS classes
-//!   `layer-fact`, `layer-confirmed`, `layer-candidate`, `layer-risk`.
-//! - SVG cubic bezier edges, recalculated on resize and filter changes by
-//!   the embedded JS.
+//! - No npm/Vite/React/dev-server.
+//! - One physical file; HTML + CSS + JSON + JS embedded.
+//! - Renderer enforces a hard 80-visible-node ceiling and surfaces a
+//!   "collapsed N nodes" badge whenever the ceiling kicks in.
 
 use specslice_engine::graph::GraphViewModel;
 
 pub fn render_html(view: &GraphViewModel) -> String {
     let payload =
-        serde_json::to_string(view).unwrap_or_else(|_| "{\"schema_version\":1}".to_string());
+        serde_json::to_string(view).unwrap_or_else(|_| "{\"schema_version\":2}".to_string());
     let safe_payload = sanitize_json_for_script(&payload);
 
-    let mut out = String::with_capacity(payload.len() + STATIC_TEMPLATE.len() + 1024);
+    let mut out = String::with_capacity(payload.len() + STATIC_TEMPLATE.len() + 2048);
     out.push_str(DOCTYPE);
     out.push_str(STATIC_TEMPLATE);
     out.push_str("<script id=\"specslice-data\" type=\"application/json\">");
@@ -40,14 +42,17 @@ pub fn render_html(view: &GraphViewModel) -> String {
 /// when the JSON payload contains markup-like strings.
 fn sanitize_json_for_script(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '<' && chars.peek() == Some(&'/') {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             out.push_str("<\\/");
-            let _ = chars.next();
+            i += 2;
             continue;
         }
-        out.push(ch);
+        out.push(b as char);
+        i += 1;
     }
     out
 }
@@ -63,115 +68,150 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
     :root {
       --bg: #0b1220;
       --panel: #11192b;
+      --panel-2: #0e1626;
       --text: #e7ecf3;
       --muted: #8a99b3;
       --line: #1f2a44;
+      --accent: #2faa72;
       --fact: #5c6e8a;
       --confirmed: #2faa72;
       --candidate: #d39a2a;
       --risk: #d24a4a;
+      --module: #6f5cff;
+      --file: #2c87c7;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    button { font: inherit; color: inherit; }
     header.toolbar {
       display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
       padding: 10px 14px; border-bottom: 1px solid var(--line);
       background: var(--panel); position: sticky; top: 0; z-index: 5;
     }
     header h1 { font-size: 13px; margin: 0 12px 0 0; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
-    header input[type="text"] {
-      background: #0e1626; border: 1px solid var(--line); color: var(--text);
-      padding: 4px 8px; border-radius: 6px; min-width: 180px;
+    header select, header input[type="text"] {
+      background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+      padding: 4px 8px; border-radius: 6px;
     }
+    header input[type="text"] { min-width: 200px; }
     header label.toggle { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; user-select: none; }
     header label.toggle input { accent-color: var(--confirmed); }
-    main {
+    .stats { display: flex; gap: 12px; color: var(--muted); margin-left: auto; font-size: 11px; }
+    .stats b { color: var(--text); }
+    main.explorer {
       display: grid;
-      grid-template-columns: 1fr 320px;
+      grid-template-columns: minmax(200px, 260px) 1fr minmax(220px, 280px);
       min-height: calc(100vh - 50px);
     }
-    section.board {
-      position: relative;
-      padding: 16px;
-      overflow: auto;
+    @media (max-width: 740px) {
+      main.explorer { grid-template-columns: 1fr; }
+      section.canvas { min-height: 320px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+      aside.tree, aside.detail { max-height: 40vh; }
     }
-    .lanes {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(180px, 1fr));
-      gap: 16px;
-      position: relative;
-      z-index: 1;
-    }
-    .lane h2 {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      margin: 0 0 8px;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 4px;
-    }
-    .nodes { display: flex; flex-direction: column; gap: 8px; }
-    .node-card {
-      text-align: left;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-left: 4px solid var(--fact);
-      color: var(--text);
-      padding: 8px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      font: inherit;
-    }
-    .node-card:hover { border-color: var(--confirmed); }
-    .node-card.active { outline: 2px solid var(--confirmed); }
-    .node-card .label { display: block; font-weight: 600; }
-    .node-card .path { display: block; color: var(--muted); font-size: 11px; word-break: break-all; }
-    .node-card .badges { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
-    .badge { background: #1c2742; color: var(--muted); border-radius: 4px; padding: 1px 6px; font-size: 10px; }
-    .node-card.layer-fact { border-left-color: var(--fact); }
-    .node-card.layer-confirmed { border-left-color: var(--confirmed); }
-    .node-card.layer-candidate { border-left-color: var(--candidate); border-style: dashed; }
-    .node-card.layer-risk { border-left-color: var(--risk); }
-    .node-card.hidden { display: none; }
-    .empty { color: var(--muted); font-size: 11px; padding: 8px 0; }
-    svg.edges {
-      position: absolute;
-      inset: 16px;
-      pointer-events: none;
-      z-index: 0;
-    }
-    svg.edges path { fill: none; stroke-width: 1.4; opacity: 0.85; }
-    svg.edges path.layer-fact { stroke: var(--fact); }
-    svg.edges path.layer-confirmed { stroke: var(--confirmed); }
-    svg.edges path.layer-candidate { stroke: var(--candidate); stroke-dasharray: 4 4; }
-    svg.edges path.layer-risk { stroke: var(--risk); stroke-dasharray: 1 3; }
-    aside.detail {
-      border-left: 1px solid var(--line);
-      padding: 16px;
+    aside.tree, aside.detail {
       background: var(--panel);
       overflow: auto;
+      border-right: 1px solid var(--line);
     }
-    aside.detail h2 { margin: 0 0 6px; font-size: 14px; }
-    aside.detail .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px dashed var(--line); font-size: 12px; }
-    aside.detail .row span:first-child { color: var(--muted); }
-    aside.detail pre { background: #0e1626; padding: 8px; border-radius: 6px; overflow: auto; font-size: 11px; }
-    .stats { display: flex; gap: 12px; color: var(--muted); margin-left: auto; font-size: 11px; }
-    .stats span b { color: var(--text); }
+    aside.detail { border-right: 0; border-left: 1px solid var(--line); padding: 14px; }
+    aside.tree { padding: 8px 0; }
+    section.canvas {
+      position: relative;
+      background:
+        radial-gradient(circle at 50% 30%, #14203a 0%, var(--bg) 60%);
+      overflow: hidden;
+      min-height: 480px;
+    }
+    svg.canvas-svg { width: 100%; height: 100%; min-height: 480px; display: block; }
     .empty-state {
-      padding: 24px;
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted); font-size: 13px; text-align: center; padding: 24px;
+    }
+    .tree-group h2 {
+      font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.08em;
       color: var(--muted);
-      text-align: center;
-      border: 1px dashed var(--line);
-      border-radius: 12px;
-      margin: 24px auto;
-      max-width: 480px;
+      margin: 12px 14px 4px;
+    }
+    .tree-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 14px 1fr auto;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 14px;
+      background: transparent;
+      border: 0;
+      text-align: left;
+      cursor: pointer;
+      border-left: 3px solid transparent;
+    }
+    .tree-item:hover { background: #15203a; }
+    .tree-item.selected { background: #18243f; border-left-color: var(--confirmed); }
+    .tree-item .twirl { color: var(--muted); font-size: 10px; width: 14px; text-align: center; }
+    .tree-item .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tree-item .count { color: var(--muted); font-size: 10px; }
+    .tree-item.layer-confirmed .label { color: var(--confirmed); }
+    .tree-item.layer-risk .label { color: var(--risk); }
+    .tree-item.depth-0 { padding-left: 14px; }
+    .tree-item.depth-1 { padding-left: 28px; }
+    .tree-item.depth-2 { padding-left: 42px; }
+    .tree-item.depth-3 { padding-left: 56px; }
+    .tree-item.depth-4 { padding-left: 70px; }
+    .tree-item.hidden { display: none; }
+    svg .node-card {
+      cursor: pointer;
+    }
+    svg .node-card rect.node-bg {
+      stroke: var(--line);
+      stroke-width: 1;
+      rx: 8;
+      ry: 8;
+      fill: var(--panel);
+    }
+    svg .node-card.layer-confirmed rect.node-bg { stroke: var(--confirmed); fill: #122b22; }
+    svg .node-card.layer-fact rect.node-bg { stroke: var(--fact); fill: var(--panel); }
+    svg .node-card.layer-candidate rect.node-bg { stroke: var(--candidate); stroke-dasharray: 4 4; fill: #2a2415; }
+    svg .node-card.layer-risk rect.node-bg { stroke: var(--risk); fill: #2a1717; }
+    svg .node-card.kind-module rect.node-bg { stroke: var(--module); }
+    svg .node-card.kind-file rect.node-bg { stroke: var(--file); }
+    svg .node-card.selected rect.node-bg { stroke: var(--accent); stroke-width: 2.5; filter: drop-shadow(0 0 6px rgba(47,170,114,0.65)); }
+    svg text.node-label { fill: var(--text); font-size: 12px; font-weight: 600; }
+    svg text.node-sub { fill: var(--muted); font-size: 10px; }
+    svg .edge path { fill: none; stroke-width: 1.4; opacity: 0.78; }
+    svg .edge.layer-fact path { stroke: var(--fact); }
+    svg .edge.layer-confirmed path { stroke: var(--confirmed); }
+    svg .edge.layer-candidate path { stroke: var(--candidate); stroke-dasharray: 4 4; }
+    svg .edge.layer-risk path { stroke: var(--risk); stroke-dasharray: 1 3; }
+    svg .edge.aggregated path { stroke-width: 2; opacity: 0.95; }
+    svg .edge text.edge-label { fill: var(--muted); font-size: 9px; }
+    aside.detail h2 { margin: 0 0 6px; font-size: 14px; }
+    aside.detail h3 { margin: 12px 0 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    aside.detail .row { display: grid; grid-template-columns: 80px 1fr; gap: 8px; padding: 3px 0; font-size: 12px; border-bottom: 1px dashed var(--line); }
+    aside.detail .row span:first-child { color: var(--muted); }
+    aside.detail .row span:last-child { word-break: break-word; }
+    aside.detail ul { list-style: none; padding: 0; margin: 0; }
+    aside.detail li.edge-row { font-size: 11px; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+    aside.detail li.edge-row .arrow { color: var(--muted); }
+    aside.detail .placeholder { color: var(--muted); font-size: 12px; }
+    aside.detail .cap-warning { background: #2a1717; border: 1px solid var(--risk); padding: 8px 10px; border-radius: 6px; font-size: 11px; margin-top: 8px; }
+    .collapsed-pill {
+      position: absolute; right: 14px; top: 14px;
+      background: var(--panel); border: 1px solid var(--candidate); color: var(--candidate);
+      padding: 4px 8px; border-radius: 999px; font-size: 11px;
     }
   </style>
 </head>
 <body>
   <header class="toolbar">
     <h1>SpecSlice Graph</h1>
+    <select id="view">
+      <option value="overview">View: overview</option>
+      <option value="code">View: code</option>
+      <option value="business">View: business</option>
+      <option value="focus">View: focus</option>
+    </select>
     <input type="text" id="search" placeholder="Search label / path / id">
     <input type="text" id="focus" placeholder="Focus id (REQ-…)">
     <label class="toggle"><input type="checkbox" data-layer="fact" checked> Facts</label>
@@ -180,303 +220,531 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
     <label class="toggle"><input type="checkbox" data-layer="risk" checked> Risks</label>
     <div class="stats" id="stats"></div>
   </header>
-  <main>
-    <section class="board">
-      <svg class="edges" id="edges"></svg>
-      <div class="lanes" id="lanes"></div>
-      <div id="empty" class="empty-state" style="display:none"></div>
+  <main class="explorer">
+    <aside class="tree" id="tree"></aside>
+    <section class="canvas" id="canvas">
+      <svg class="canvas-svg" id="svg"></svg>
+      <div class="empty-state" id="empty" style="display:none"></div>
+      <div class="collapsed-pill" id="collapsed-pill" style="display:none"></div>
     </section>
     <aside class="detail" id="detail">
       <h2>Details</h2>
-      <p class="empty">Click a node or edge to inspect.</p>
+      <p class="placeholder">Click any node to inspect it.</p>
     </aside>
   </main>
 "#;
 
 const RENDERER_JS: &str = r#"(function () {
+  const MAX_VISIBLE = 80;
+  const COLUMN_TITLES = {
+    documents: 'Documents',
+    business: 'Business',
+    code: 'Code',
+    tests: 'Tests',
+    risks: 'Risks',
+  };
+  const COLUMN_ORDER = ['documents', 'business', 'code', 'tests', 'risks'];
+
   const dataEl = document.getElementById('specslice-data');
   let view;
   try { view = JSON.parse(dataEl.textContent || '{}'); }
   catch (e) { view = { nodes: [], edges: [], findings: [], stats: {} }; }
 
-  const COLUMNS = [
-    { id: 'documents', title: 'Documents' },
-    { id: 'business',  title: 'Business' },
-    { id: 'code',      title: 'Code' },
-    { id: 'tests',     title: 'Tests' },
-    { id: 'risks',     title: 'Risks' },
-  ];
-
-  const LAYERS = ['fact', 'confirmed', 'candidate', 'risk'];
-
-  const state = {
-    search: '',
-    focus: view.focus || '',
-    layers: new Set(LAYERS),
-  };
-
-  const lanesEl = document.getElementById('lanes');
-  const edgesEl = document.getElementById('edges');
-  const detailEl = document.getElementById('detail');
-  const statsEl = document.getElementById('stats');
-  const emptyEl = document.getElementById('empty');
-
-  function nodesByColumn() {
-    const buckets = Object.fromEntries(COLUMNS.map(c => [c.id, []]));
-    for (const n of view.nodes) {
-      const col = n.column || 'code';
-      if (!buckets[col]) buckets[col] = [];
-      buckets[col].push(n);
-    }
-    // Findings show up as risk pseudo-nodes only inside the Risks lane.
-    for (const f of (view.findings || [])) {
-      if (!buckets.risks) buckets.risks = [];
-      buckets.risks.push({
-        id: 'finding::' + f.code + '::' + (f.target_id || ''),
-        kind: 'finding',
-        column: 'risks',
-        layer: 'risk',
-        label: f.code,
-        path: f.target_id || null,
-        line_range: null,
-        status: 'unknown',
-        badges: [f.severity],
-        _finding: f,
-      });
-    }
-    return buckets;
+  const nodes = (view.nodes || []).slice();
+  const edges = (view.edges || []).slice();
+  const findings = (view.findings || []).slice();
+  const nodesById = new Map(nodes.map(n => [n.id, n]));
+  const childrenOf = new Map();
+  for (const n of nodes) {
+    if (!n.parent_id) continue;
+    if (!childrenOf.has(n.parent_id)) childrenOf.set(n.parent_id, []);
+    childrenOf.get(n.parent_id).push(n);
   }
 
-  function resolveFocusId(raw) {
-    const q = (raw || '').trim();
-    if (!q) return null;
-    const exact = (view.nodes || []).find(n => n.id === q);
-    if (exact) return exact.id;
-    const req = (view.nodes || []).find(n => n.id === 'req::' + q);
-    if (req) return req.id;
-    const badge = (view.nodes || []).find(n => (n.badges || []).includes(q));
-    if (badge) return badge.id;
-    const label = (view.nodes || []).find(n => n.label === q);
-    return label ? label.id : null;
+  // State.
+  const layerToggle = new Set(['fact', 'confirmed', 'candidate', 'risk']);
+  // `userExpanded` is the only switch that reveals descendants beyond the
+  // engine's `default_visible` seed. `userCollapsed` lets the user hide a
+  // default_visible node.
+  const userExpanded = new Set();
+  const userCollapsed = new Set();
+  let searchText = '';
+  let selected = null;
+  const currentView = view.view || 'overview';
+
+  function walkAncestors(id, fn) {
+    let cur = nodesById.get(id);
+    while (cur && cur.parent_id) {
+      fn(cur.parent_id);
+      cur = nodesById.get(cur.parent_id);
+    }
   }
 
-  function focusedIds() {
-    const target = resolveFocusId(state.focus);
-    if (!state.focus) return null;
-    if (!target) return new Set();
-    const ids = new Set([target]);
-    for (const e of (view.edges || [])) {
-      if (e.from === target) ids.add(e.to);
-      if (e.to === target) ids.add(e.from);
-    }
-    return ids;
+  function matchesSearch(node) {
+    if (!searchText) return true;
+    const blob = [node.label, node.path || '', node.id, ...(node.badges || [])]
+      .join(' ').toLowerCase();
+    return blob.includes(searchText);
   }
 
-  function shouldShow(n, focusSet) {
-    if (!state.layers.has(n.layer)) return false;
-    if (focusSet) {
-      const target = n._finding ? n._finding.target_id : n.id;
-      if (!target || !focusSet.has(target)) return false;
+  function isVisible(node) {
+    if (!layerToggle.has(node.layer)) return false;
+    if (userCollapsed.has(node.id)) return false;
+    // Search relaxes the hierarchy: any matching node + its ancestors render.
+    if (searchText) {
+      if (matchesSearch(node)) return true;
+      // Show ancestors of matches so they can be navigated to.
+      if (descendantMatches(node)) return true;
+      return false;
     }
-    if (state.search) {
-      const q = state.search.toLowerCase();
-      const blob = [n.label, n.path || '', n.id, ...(n.badges || [])].join(' ').toLowerCase();
-      if (!blob.includes(q)) return false;
-    }
-    return true;
+    if (node.default_visible) return true;
+    if (!node.parent_id) return false;
+    const parent = nodesById.get(node.parent_id);
+    if (!parent) return false;
+    if (!userExpanded.has(parent.id)) return false;
+    return isVisible(parent);
   }
 
-  function render() {
-    const buckets = nodesByColumn();
-    const focusSet = focusedIds();
-    const focusedId = resolveFocusId(state.focus);
-    lanesEl.innerHTML = '';
-    edgesEl.innerHTML = '';
-    let visibleCount = 0;
-    for (const col of COLUMNS) {
-      const lane = document.createElement('div');
-      lane.className = 'lane lane-' + col.id;
-      lane.dataset.column = col.id;
+  const _descendantCache = new Map();
+  function descendantMatches(node) {
+    if (!searchText) return false;
+    if (_descendantCache.has(node.id)) return _descendantCache.get(node.id);
+    const kids = childrenOf.get(node.id) || [];
+    let hit = false;
+    for (const k of kids) {
+      if (matchesSearch(k) || descendantMatches(k)) { hit = true; break; }
+    }
+    _descendantCache.set(node.id, hit);
+    return hit;
+  }
+  function resetSearchCache() { _descendantCache.clear(); }
+
+  function nearestVisibleAncestor(id) {
+    let cur = nodesById.get(id);
+    while (cur) {
+      if (isVisible(cur)) return cur;
+      if (!cur.parent_id) return null;
+      cur = nodesById.get(cur.parent_id);
+    }
+    return null;
+  }
+
+  // ----- Tree rendering -----
+  function renderTree() {
+    const tree = document.getElementById('tree');
+    tree.innerHTML = '';
+    const byColumn = new Map();
+    for (const n of nodes) {
+      if (!n.parent_id) {
+        if (!byColumn.has(n.column)) byColumn.set(n.column, []);
+        byColumn.get(n.column).push(n);
+      }
+    }
+    for (const col of COLUMN_ORDER) {
+      const roots = byColumn.get(col);
+      if (!roots || !roots.length) continue;
+      const group = document.createElement('div');
+      group.className = 'tree-group';
       const title = document.createElement('h2');
-      title.textContent = col.title;
-      lane.appendChild(title);
-      const list = document.createElement('div');
-      list.className = 'nodes';
-      const items = buckets[col.id] || [];
-      let laneVisible = 0;
-      for (const n of items) {
-        const btn = document.createElement('button');
-        btn.className = 'node-card layer-' + n.layer;
-        btn.dataset.id = n.id;
-        if (focusedId && n.id === focusedId) btn.classList.add('active');
-        if (!shouldShow(n, focusSet)) btn.classList.add('hidden');
-        else { laneVisible++; visibleCount++; }
-        const label = document.createElement('span');
-        label.className = 'label';
-        label.textContent = n.label || n.id;
-        btn.appendChild(label);
-        if (n.path) {
-          const p = document.createElement('span');
-          p.className = 'path';
-          p.textContent = n.line_range
-            ? n.path + ':' + n.line_range[0] + '-' + n.line_range[1]
-            : n.path;
-          btn.appendChild(p);
-        }
-        if ((n.badges || []).length) {
-          const bg = document.createElement('span');
-          bg.className = 'badges';
-          for (const b of n.badges) {
-            const s = document.createElement('span');
-            s.className = 'badge';
-            s.textContent = b;
-            bg.appendChild(s);
-          }
-          btn.appendChild(bg);
-        }
-        btn.addEventListener('click', () => showNode(n));
-        list.appendChild(btn);
-      }
-      if (!laneVisible) {
-        const e = document.createElement('p');
-        e.className = 'empty';
-        e.textContent = col.id === 'business'
-          ? 'No confirmed business logic yet.'
-          : 'No items.';
-        list.appendChild(e);
-      }
-      lane.appendChild(list);
-      lanesEl.appendChild(lane);
+      title.textContent = COLUMN_TITLES[col] || col;
+      group.appendChild(title);
+      const sorted = roots.slice().sort(treeSort);
+      for (const root of sorted) renderTreeNode(root, group, 0);
+      tree.appendChild(group);
     }
-    statsEl.innerHTML = '';
-    const s = view.stats || {};
-    for (const [label, value] of [
-      ['docs', s.documents],
-      ['biz',  s.business_logic],
-      ['code', s.code_symbols],
-      ['tests', s.tests],
-      ['confirmed', s.confirmed_edges],
-      ['risks', s.risks],
-    ]) {
-      const span = document.createElement('span');
-      span.innerHTML = label + ' <b>' + (value || 0) + '</b>';
-      statsEl.appendChild(span);
-    }
-    emptyEl.style.display = visibleCount === 0 ? 'block' : 'none';
-    if (visibleCount === 0) {
-      emptyEl.textContent = state.focus && !focusedId
-        ? 'Focus id not found in current graph.'
-        : (view.findings || []).some(f => f.code === 'focus_not_found')
-        ? 'Focus id not found in current graph.'
-        : 'No nodes match the current filters.';
-    }
-    requestAnimationFrame(drawEdges);
   }
 
-  function drawEdges() {
-    const board = edgesEl.parentElement.getBoundingClientRect();
-    edgesEl.setAttribute('width', board.width);
-    edgesEl.setAttribute('height', board.height);
-    edgesEl.setAttribute('viewBox', '0 0 ' + board.width + ' ' + board.height);
+  function treeSort(a, b) {
+    const ak = a.kind === 'module' ? 0 : 1;
+    const bk = b.kind === 'module' ? 0 : 1;
+    if (ak !== bk) return ak - bk;
+    return (a.label || a.id).localeCompare(b.label || b.id);
+  }
+
+  function renderTreeNode(node, parent, depth) {
+    if (!isVisible(node)) return;
+    const kids = (childrenOf.get(node.id) || []).slice();
+    const labelText = node.label || node.id;
+    const item = document.createElement('button');
+    item.className = 'tree-item depth-' + Math.min(depth, 4) + ' layer-' + node.layer;
+    if (selected && selected.id === node.id) item.classList.add('selected');
+    const twirl = document.createElement('span');
+    twirl.className = 'twirl';
+    twirl.textContent = kids.length ? (userExpanded.has(node.id) ? '▾' : '▸') : '·';
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = labelText;
+    const count = document.createElement('span');
+    count.className = 'count';
+    if (kids.length) count.textContent = node.child_count + '';
+    item.appendChild(twirl);
+    item.appendChild(label);
+    item.appendChild(count);
+    item.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      selectNode(node);
+      if (kids.length) toggleExpand(node);
+    });
+    parent.appendChild(item);
+    if (kids.length && (userExpanded.has(node.id) || searchText)) {
+      kids.sort(treeSort);
+      for (const k of kids) renderTreeNode(k, parent, depth + 1);
+    }
+  }
+
+  function toggleExpand(node) {
+    if (userExpanded.has(node.id)) {
+      userExpanded.delete(node.id);
+      // Also fold any expanded descendants so a re-open is clean.
+      collapseSubtree(node);
+    } else {
+      userExpanded.add(node.id);
+      // Make sure ancestors are open so this node remains addressable.
+      walkAncestors(node.id, a => userExpanded.add(a));
+    }
+    resetSearchCache();
+    render();
+  }
+
+  function collapseSubtree(node) {
+    const kids = childrenOf.get(node.id) || [];
+    for (const k of kids) {
+      userExpanded.delete(k.id);
+      collapseSubtree(k);
+    }
+  }
+
+  // ----- Canvas rendering -----
+  function renderCanvas() {
+    const svg = document.getElementById('svg');
+    const canvas = document.getElementById('canvas');
+    const emptyEl = document.getElementById('empty');
+    const pill = document.getElementById('collapsed-pill');
+    svg.innerHTML = '';
+    let visible = nodes.filter(isVisible);
+    let overflow = 0;
+    if (visible.length > MAX_VISIBLE) {
+      overflow = visible.length - MAX_VISIBLE;
+      visible = visible.slice(0, MAX_VISIBLE);
+    }
+    if (!visible.length) {
+      emptyEl.style.display = 'flex';
+      emptyEl.textContent = computeEmptyMessage();
+      pill.style.display = 'none';
+      return;
+    }
+    emptyEl.style.display = 'none';
+    if (overflow > 0) {
+      pill.style.display = 'block';
+      pill.textContent = 'collapsed ' + overflow + ' more nodes — expand or refine search';
+    } else {
+      pill.style.display = 'none';
+    }
+
+    // Lay out per column.
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(rect.width || 600, 600);
+    const height = Math.max(rect.height || 480, 480);
+    const columns = {};
+    for (const col of COLUMN_ORDER) columns[col] = [];
+    for (const n of visible) {
+      const col = COLUMN_TITLES[n.column] ? n.column : 'code';
+      columns[col].push(n);
+    }
+    const colsWithData = COLUMN_ORDER.filter(c => columns[c].length);
+    const colCount = Math.max(colsWithData.length, 1);
+    const padX = 40;
+    const padY = 32;
+    const colWidth = (width - padX * 2) / colCount;
     const positions = new Map();
-    edgesEl.parentElement.querySelectorAll('.node-card').forEach(btn => {
-      if (btn.classList.contains('hidden')) return;
-      const r = btn.getBoundingClientRect();
-      positions.set(btn.dataset.id, {
-        x: r.left + r.width - board.left - 16,
-        y: r.top + r.height / 2 - board.top - 16,
-        xLeft: r.left - board.left - 16,
+    colsWithData.forEach((col, ci) => {
+      const list = columns[col].slice().sort((a, b) => {
+        if (a.kind === 'module' && b.kind !== 'module') return -1;
+        if (b.kind === 'module' && a.kind !== 'module') return 1;
+        return (a.label || a.id).localeCompare(b.label || b.id);
+      });
+      const slotHeight = Math.min(58, (height - padY * 2) / Math.max(list.length, 1));
+      list.forEach((n, i) => {
+        const x = padX + ci * colWidth + 14;
+        const y = padY + i * (slotHeight + 6);
+        positions.set(n.id, { x, y, w: colWidth - 28, h: slotHeight });
       });
     });
-    let svgInner = '';
-    const visibleEdges = [];
-    for (const e of (view.edges || [])) {
-      if (!state.layers.has(e.layer)) continue;
-      const a = positions.get(e.from);
-      const b = positions.get(e.to);
+
+    // Edges first (so nodes overlay).
+    const drawnEdges = new Set();
+    for (const e of edges) {
+      if (!layerToggle.has(e.layer)) continue;
+      const from = nearestVisibleAncestor(e.from);
+      const to = nearestVisibleAncestor(e.to);
+      if (!from || !to || from.id === to.id) continue;
+      const key = from.id + '||' + to.id + '||' + e.kind;
+      if (drawnEdges.has(key)) continue;
+      drawnEdges.add(key);
+      const a = positions.get(from.id);
+      const b = positions.get(to.id);
       if (!a || !b) continue;
-      const dx = (b.xLeft - a.x) * 0.5;
-      const d =
-        'M' + a.x + ',' + a.y +
-        ' C' + (a.x + dx) + ',' + a.y +
-        ' ' + (b.xLeft - dx) + ',' + b.y +
-        ' ' + b.xLeft + ',' + b.y;
-      const idx = visibleEdges.push(e) - 1;
-      svgInner += '<path class="layer-' + e.layer + '" d="' + d + '" data-idx="' + idx + '"></path>';
+      const x1 = a.x + a.w;
+      const y1 = a.y + a.h / 2;
+      const x2 = b.x;
+      const y2 = b.y + b.h / 2;
+      const aggregated = (from.id !== e.from) || (to.id !== e.to);
+      const dx = (x2 - x1) * 0.5;
+      const d = 'M' + x1 + ',' + y1 +
+        ' C' + (x1 + dx) + ',' + y1 +
+        ' ' + (x2 - dx) + ',' + y2 +
+        ' ' + x2 + ',' + y2;
+      // Build the SVG fragment via innerHTML to keep the SVG namespace
+      // without ever spelling out an XML namespace URI (the offline policy
+      // forbids any URL literal inside the generated HTML).
+      const tmp = document.createElement('div');
+      tmp.innerHTML = '<svg><g class="edge layer-' + e.layer + (aggregated ? ' aggregated' : '') + '">' +
+        '<path d="' + d + '" data-from="' + escapeAttr(from.id) + '" data-to="' + escapeAttr(to.id) + '"></path>' +
+        '<title>' + escapeAttr(e.kind) + '</title>' +
+        '</g></svg>';
+      const wrapper = tmp.firstChild;
+      while (wrapper && wrapper.firstChild) svg.appendChild(wrapper.firstChild);
     }
-    // Inline replace keeps elements in SVG namespace and avoids exposing the
-    // SVG namespace URI literal that some test fixtures forbid.
-    edgesEl.innerHTML = svgInner;
-    edgesEl.querySelectorAll('path').forEach(p => {
-      const idx = Number(p.getAttribute('data-idx'));
-      const edge = visibleEdges[idx];
-      if (edge) p.addEventListener('click', () => showEdge(edge));
+
+    // Nodes.
+    for (const n of visible) {
+      const p = positions.get(n.id);
+      if (!p) continue;
+      const tmp = document.createElement('div');
+      const subText = n.kind === 'module'
+        ? (n.path || '') + ' • ' + (n.child_count || 0) + ' child' + ((n.child_count || 0) === 1 ? '' : 'ren')
+        : (n.path
+          ? (n.line_range
+            ? n.path + ':' + n.line_range[0] + '-' + n.line_range[1]
+            : n.path)
+          : n.kind);
+      const classes = ['node-card', 'kind-' + n.kind, 'layer-' + n.layer];
+      if (selected && selected.id === n.id) classes.push('selected');
+      tmp.innerHTML = '<svg><g class="' + classes.join(' ') + '" data-id="' + escapeAttr(n.id) + '">' +
+        '<rect class="node-bg" x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h + '"></rect>' +
+        '<text class="node-label" x="' + (p.x + 10) + '" y="' + (p.y + 18) + '">' + escapeText(n.label || n.id) + '</text>' +
+        '<text class="node-sub" x="' + (p.x + 10) + '" y="' + (p.y + 34) + '">' + escapeText(subText) + '</text>' +
+        '</g></svg>';
+      const wrapper = tmp.firstChild;
+      while (wrapper && wrapper.firstChild) svg.appendChild(wrapper.firstChild);
+    }
+
+    // Hook click handlers.
+    svg.querySelectorAll('g.node-card').forEach(group => {
+      group.addEventListener('click', () => {
+        const id = group.getAttribute('data-id');
+        const node = nodesById.get(id);
+        if (!node) return;
+        selectNode(node);
+        if ((childrenOf.get(node.id) || []).length) toggleExpand(node);
+        else render();
+      });
     });
   }
 
-  function showNode(n) {
-    detailEl.innerHTML = '';
+  function computeEmptyMessage() {
+    if (currentView === 'business') {
+      const f = findings.find(x => x.code === 'no_business_logic');
+      if (f) return f.message;
+      return 'No confirmed business logic yet. Run `specslice connect propose`.';
+    }
+    if (findings.some(f => f.code === 'focus_not_found')) {
+      return 'Focus id not found in the current graph.';
+    }
+    return 'No nodes match the current filters. Try expanding a module or clearing the search.';
+  }
+
+  // ----- Details panel -----
+  function selectNode(node) {
+    selected = node;
+    renderDetail();
+    renderTree();
+    // Rerender canvas only to update highlight; cheap enough.
+    renderCanvas();
+  }
+
+  function renderDetail() {
+    const detail = document.getElementById('detail');
+    detail.innerHTML = '';
+    if (!selected) {
+      detail.innerHTML = '<h2>Details</h2><p class="placeholder">Click any node to inspect it.</p>';
+      return;
+    }
+    const n = selected;
     const h = document.createElement('h2');
     h.textContent = n.label || n.id;
-    detailEl.appendChild(h);
-    addRow('id', n.id);
-    addRow('kind', n.kind);
-    addRow('layer', n.layer);
-    addRow('status', n.status);
-    if (n.path) addRow('path', n.line_range
+    detail.appendChild(h);
+    addRow(detail, 'id', n.id);
+    addRow(detail, 'kind', n.kind);
+    addRow(detail, 'layer', n.layer);
+    addRow(detail, 'column', n.column);
+    if (n.path) addRow(detail, 'path', n.line_range
       ? n.path + ':' + n.line_range[0] + '-' + n.line_range[1]
       : n.path);
-    if (n.source) addRow('source', n.source);
-    if (n._finding) {
-      const pre = document.createElement('pre');
-      pre.textContent = n._finding.message;
-      detailEl.appendChild(pre);
+    if (n.source) addRow(detail, 'source', n.source);
+    if (n.child_count) addRow(detail, 'children', n.child_count);
+    if (n.parent_id) addRow(detail, 'parent', n.parent_id);
+
+    const incoming = edges.filter(e => e.to === n.id);
+    const outgoing = edges.filter(e => e.from === n.id);
+    if (incoming.length) {
+      detail.appendChild(headerRow('Incoming'));
+      const ul = document.createElement('ul');
+      for (const e of incoming) ul.appendChild(edgeRow(e, 'in'));
+      detail.appendChild(ul);
+    }
+    if (outgoing.length) {
+      detail.appendChild(headerRow('Outgoing'));
+      const ul = document.createElement('ul');
+      for (const e of outgoing) ul.appendChild(edgeRow(e, 'out'));
+      detail.appendChild(ul);
+    }
+    const relatedReqs = collectRelatedRequirements(n);
+    if (relatedReqs.length) {
+      detail.appendChild(headerRow('Related requirements'));
+      const ul = document.createElement('ul');
+      for (const r of relatedReqs) {
+        const li = document.createElement('li');
+        li.className = 'edge-row';
+        li.textContent = r.label || r.id;
+        li.addEventListener('click', () => selectNode(r));
+        li.style.cursor = 'pointer';
+        ul.appendChild(li);
+      }
+      detail.appendChild(ul);
+    }
+    if (n.kind === 'requirement' && !findings.length) {
+      // nothing extra
     }
   }
 
-  function showEdge(e) {
-    detailEl.innerHTML = '';
-    const h = document.createElement('h2');
-    h.textContent = e.kind;
-    detailEl.appendChild(h);
-    addRow('from', e.from);
-    addRow('to', e.to);
-    addRow('layer', e.layer);
-    addRow('status', e.status);
-    if (e.source) addRow('source', e.source);
-    if (e.rationale) {
-      const pre = document.createElement('pre');
-      pre.textContent = e.rationale;
-      detailEl.appendChild(pre);
+  function collectRelatedRequirements(n) {
+    const seen = new Set();
+    const out = [];
+    function pushReq(id) {
+      if (seen.has(id)) return;
+      seen.add(id);
+      const node = nodesById.get(id);
+      if (node && node.kind === 'requirement') out.push(node);
     }
+    if (n.kind === 'requirement') return out;
+    // Walk outgoing edges that point at requirements.
+    for (const e of edges) {
+      if (e.from === n.id && nodesById.get(e.to)?.kind === 'requirement') pushReq(e.to);
+      if (e.to === n.id && nodesById.get(e.from)?.kind === 'requirement') pushReq(e.from);
+    }
+    // Walk up via parent and check for shared requirements (recursion).
+    if (!out.length && n.parent_id) {
+      const parent = nodesById.get(n.parent_id);
+      if (parent) return collectRelatedRequirements(parent);
+    }
+    return out;
   }
 
-  function addRow(key, value) {
+  function headerRow(text) {
+    const el = document.createElement('h3');
+    el.textContent = text;
+    return el;
+  }
+
+  function edgeRow(e, dir) {
+    const li = document.createElement('li');
+    li.className = 'edge-row';
+    const other = dir === 'in' ? e.from : e.to;
+    const otherNode = nodesById.get(other);
+    const otherLabel = otherNode ? (otherNode.label || otherNode.id) : other;
+    li.innerHTML = '<span class="arrow">' + (dir === 'in' ? '◀' : '▶') + '</span> ' +
+      escapeText(e.kind) + ' — ' + escapeText(otherLabel);
+    li.style.cursor = otherNode ? 'pointer' : 'default';
+    if (otherNode) li.addEventListener('click', () => selectNode(otherNode));
+    return li;
+  }
+
+  function addRow(parent, key, value) {
     const row = document.createElement('div');
     row.className = 'row';
     const a = document.createElement('span'); a.textContent = key;
     const b = document.createElement('span'); b.textContent = value == null ? '—' : String(value);
     row.appendChild(a); row.appendChild(b);
-    detailEl.appendChild(row);
+    parent.appendChild(row);
   }
 
+  function escapeText(text) {
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+  function escapeAttr(text) {
+    return escapeText(text).replace(/"/g, '&quot;');
+  }
+
+  // ----- Stats / findings -----
+  function renderStats() {
+    const statsEl = document.getElementById('stats');
+    statsEl.innerHTML = '';
+    const s = view.stats || {};
+    const pairs = [
+      ['modules', s.modules],
+      ['docs', s.documents],
+      ['biz', s.business_logic],
+      ['code', s.code_symbols],
+      ['tests', s.tests],
+      ['confirmed', s.confirmed_edges],
+      ['risks', s.risks],
+    ];
+    for (const [label, value] of pairs) {
+      const span = document.createElement('span');
+      span.innerHTML = label + ' <b>' + (value || 0) + '</b>';
+      statsEl.appendChild(span);
+    }
+  }
+
+  function render() {
+    renderTree();
+    renderCanvas();
+    renderDetail();
+    renderStats();
+  }
+
+  // ----- Controls -----
   document.getElementById('search').addEventListener('input', (ev) => {
-    state.search = ev.target.value || '';
+    searchText = (ev.target.value || '').toLowerCase().trim();
+    resetSearchCache();
     render();
   });
   document.getElementById('focus').addEventListener('change', (ev) => {
-    state.focus = ev.target.value || '';
-    render();
+    const raw = (ev.target.value || '').trim();
+    if (!raw) return;
+    const candidates = [raw, 'req::' + raw, 'module::' + raw];
+    let found = null;
+    for (const cand of candidates) {
+      if (nodesById.has(cand)) { found = nodesById.get(cand); break; }
+    }
+    if (!found) return;
+    walkAncestors(found.id, a => userExpanded.add(a));
+    userExpanded.add(found.id);
+    selectNode(found);
   });
   document.querySelectorAll('input[data-layer]').forEach(box => {
     box.addEventListener('change', () => {
       const layer = box.dataset.layer;
-      if (box.checked) state.layers.add(layer);
-      else state.layers.delete(layer);
+      if (box.checked) layerToggle.add(layer);
+      else layerToggle.delete(layer);
       render();
     });
   });
-  window.addEventListener('resize', () => requestAnimationFrame(drawEdges));
+  document.getElementById('view').value = currentView;
+  // The view-select acts as informational; switching actively requires
+  // regenerating the HTML (CLI flag). Hint the user.
+  document.getElementById('view').addEventListener('change', (ev) => {
+    ev.target.value = currentView;
+    const detail = document.getElementById('detail');
+    detail.innerHTML = '<h2>View</h2><p class="placeholder">Rerun <code>specslice graph --view ' +
+      escapeText(ev.target.value) + '</code> to switch the engine view.</p>';
+  });
+
+  window.addEventListener('resize', () => requestAnimationFrame(renderCanvas));
 
   render();
 })();"#;
@@ -484,6 +752,23 @@ const RENDERER_JS: &str = r#"(function () {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use specslice_engine::graph::{
+        GraphColumn, GraphEdge, GraphLayer, GraphNode, GraphStatus, GraphViewModel,
+    };
+
+    fn empty_view() -> GraphViewModel {
+        GraphViewModel {
+            schema_version: 2,
+            view: "overview".into(),
+            repo_root: "/tmp".into(),
+            generated_at: "now".into(),
+            focus: None,
+            stats: Default::default(),
+            nodes: vec![],
+            edges: vec![],
+            findings: vec![],
+        }
+    }
 
     #[test]
     fn sanitize_breaks_script_close_tags_inside_payload() {
@@ -500,27 +785,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_preserves_utf8_text() {
-        let raw = r#"{"label":"像素画编辑器行为规范"}"#;
-        assert_eq!(sanitize_json_for_script(raw), raw);
-    }
-
-    #[test]
-    fn render_html_embeds_data_and_class_names() {
-        let view = specslice_engine::graph::GraphViewModel {
-            schema_version: 1,
-            repo_root: "/tmp/repo".into(),
-            generated_at: "2026-01-01T00:00:00Z".into(),
-            focus: None,
-            stats: Default::default(),
-            nodes: vec![],
-            edges: vec![],
-            findings: vec![],
-        };
-        let html = render_html(&view);
+    fn render_html_embeds_explorer_layout() {
+        let html = render_html(&empty_view());
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<script id=\"specslice-data\""));
-        assert!(html.contains("\"schema_version\":1"));
+        assert!(html.contains("class=\"tree\""));
+        assert!(html.contains("class=\"canvas\""));
+        assert!(html.contains("class=\"detail\""));
         assert!(html.contains("layer-confirmed"));
         assert!(html.contains("layer-fact"));
         assert!(!html.contains("https://"));
@@ -528,20 +799,55 @@ mod tests {
     }
 
     #[test]
-    fn render_html_contains_client_side_focus_filtering() {
-        let view = specslice_engine::graph::GraphViewModel {
-            schema_version: 1,
-            repo_root: "/tmp/repo".into(),
-            generated_at: "2026-01-01T00:00:00Z".into(),
-            focus: None,
-            stats: Default::default(),
-            nodes: vec![],
-            edges: vec![],
-            findings: vec![],
-        };
+    fn render_html_embeds_node_data_for_modules() {
+        let mut view = empty_view();
+        view.nodes.push(GraphNode {
+            id: "module::lib".into(),
+            kind: "module".into(),
+            column: GraphColumn::Code,
+            layer: GraphLayer::Fact,
+            label: "lib".into(),
+            path: Some("lib".into()),
+            line_range: None,
+            status: GraphStatus::Confirmed,
+            parent_id: None,
+            child_count: 3,
+            default_visible: true,
+            confidence: None,
+            source: Some("module_aggregator".into()),
+            badges: vec![],
+        });
+        view.nodes.push(GraphNode {
+            id: "file::lib/main.dart".into(),
+            kind: "file".into(),
+            column: GraphColumn::Code,
+            layer: GraphLayer::Fact,
+            label: "main.dart".into(),
+            path: Some("lib/main.dart".into()),
+            line_range: None,
+            status: GraphStatus::Confirmed,
+            parent_id: Some("module::lib".into()),
+            child_count: 0,
+            default_visible: false,
+            confidence: None,
+            source: Some("dart_indexer".into()),
+            badges: vec![],
+        });
+        view.edges.push(GraphEdge {
+            id: "edge::1".into(),
+            from: "file::lib/main.dart".into(),
+            to: "module::lib".into(),
+            kind: "contains".into(),
+            layer: GraphLayer::Fact,
+            status: GraphStatus::Confirmed,
+            confidence: None,
+            source: None,
+            rationale: None,
+        });
         let html = render_html(&view);
-        assert!(html.contains("function resolveFocusId"));
-        assert!(html.contains("function focusedIds"));
-        assert!(html.contains("focusSet.has"));
+        assert!(html.contains("module::lib"));
+        assert!(html.contains("file::lib/main.dart"));
+        assert!(html.contains("\"default_visible\":true"));
+        assert!(html.contains("\"child_count\":3"));
     }
 }

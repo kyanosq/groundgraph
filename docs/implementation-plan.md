@@ -399,6 +399,54 @@ MVP 完成时必须满足：
 - `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --quiet`、`git diff --check` 全部通过。
 - 真实冷启动：`cargo run -- graph --format html` 在 `tests/fixtures/flutter_watermark_app` 上 30s 内产出 26KB HTML，离线 grep 无任何远程 URL。
 
+### P6.1：可视化重构为代码图浏览器
+
+P6 的 lane 平铺布局在 ≥1k 符号的真实仓库（pixcraft 1786 符号 / 334 测试）上会退化成事实堆。P6.1 把可视化重做成「分层、可展开、可聚焦的代码图浏览器」。
+
+**视图模式：**
+
+- `overview`（默认）：顶层 module（按目录聚合），可展开到子 module、文件、符号。
+- `code`：与 overview 同构，强调代码结构图样式（模块 box、imports 边）。
+- `business`：仅渲染 requirement + 其单跳邻居（docs/impl/test），无 requirement 时显式空状态提示 `specslice connect propose`。
+- `focus`：单节点邻域图，复用现有 focus 解析。
+
+CLI：
+
+```bash
+specslice graph --format html --view overview      # 默认
+specslice graph --format html --view code --focus lib/features/editor
+specslice graph --format html --view business
+```
+
+**聚合节点：**
+
+- `module`：合成节点，按文件父目录递归聚合，形成 `lib → lib/features → lib/features/editor` 的多层 hierarchy。
+- `file` / `dart_class` / `dart_method` / `dart_function` / `dart_constructor` / `test_case` / `test_group` / `doc_section` / `requirement`：保留原有 NodeKind，并通过 `parent_id` 链上溯到 module。
+- 每个聚合节点带 `child_count`，UI 折叠态显示 "12 files / 87 symbols"。
+
+**默认规模硬规则：**
+
+- HTML 默认 `--max-nodes` = 80（CLI 在 format=html 且未显式指定时填默认）。
+- 引擎按 view 设置 `default_visible`：overview 只对顶层 module 置 true；business 对 requirement + 1-hop neighbours 置 true；focus 对 focus + 1-hop 置 true；code 与 overview 相同。
+- 超出 max_nodes 仍走原 priority_order 截断逻辑 + `graph_truncated` finding。
+
+**前端重构：**
+
+- 三栏：左侧可折叠树（按 column 分组）、中央 SVG 画布、右侧详情面板。
+- 节点点击=展开/折叠 children；canvas 双击=聚焦邻域。
+- 边聚合：渲染前对 hidden 端点沿 parent_id 上溯到可见祖先并去重。
+- 搜索同时过滤树与画布。
+- 不引入 cytoscape/d3 等外部库；保持自包含、离线、无 CDN。
+
+**验收（必须达成）：**
+
+- pixcraft 冷启动：HTML 打开后默认看到顶层 module 列表，而非 2000+ 节点平铺。
+- 点击 `lib/features/editor` 树节点可展开其子 module 或文件。
+- 点击 Dart class 节点，右侧详情面板显示 path:line、incoming/outgoing 边、关联测试。
+- 业务视图在 pixcraft 上显式空状态（"no business logic yet"），不退化成代码堆。
+- `cargo fmt`/`clippy -D warnings`/`cargo test --workspace` 全绿。
+- HTML 自包含、零远程 URL（沿用 P6 离线断言）。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：

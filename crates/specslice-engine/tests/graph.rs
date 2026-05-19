@@ -8,7 +8,8 @@
 use std::path::Path;
 
 use specslice_engine::graph::{
-    build_graph_view, GraphFinding, GraphLayer, GraphOptions, GraphStatus, GraphViewModel,
+    build_graph_view, GraphFinding, GraphLayer, GraphOptions, GraphStatus, GraphView,
+    GraphViewModel,
 };
 use specslice_engine::index::{index_repository, IndexOptions};
 use specslice_engine::init::{init_repository, InitOptions};
@@ -132,7 +133,8 @@ fn graph_view_contains_layered_confirmed_nodes() {
 
     let view = build_graph_view(tmp.path(), GraphOptions::default()).unwrap();
 
-    assert_eq!(view.schema_version, 1);
+    assert_eq!(view.schema_version, 2);
+    assert_eq!(view.view, "overview");
     assert_eq!(view.stats.business_logic, 1);
     assert!(view.stats.documents >= 1);
     assert!(view.stats.code_symbols >= 1);
@@ -322,6 +324,233 @@ fn graph_include_risks_disabled_yields_zero_findings_for_missing_test() {
         .findings
         .iter()
         .all(|f| f.code != "missing_linked_test"));
+}
+
+// ---------------------------------------------------------------------------
+// P6.1: code graph explorer
+// ---------------------------------------------------------------------------
+
+fn multi_module_workspace() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    init_repository(InitOptions {
+        repo_root: tmp.path().into(),
+    })
+    .unwrap();
+    write(
+        &tmp.path().join("lib/features/editor/canvas.dart"),
+        "class Canvas {\n  void draw() {}\n}\n",
+    );
+    write(
+        &tmp.path().join("lib/features/editor/toolbar.dart"),
+        "class Toolbar {\n  void render() {}\n}\n",
+    );
+    write(
+        &tmp.path().join("lib/core/utils.dart"),
+        "class Utils {\n  static int double(int x) => x * 2;\n}\n",
+    );
+    write(
+        &tmp.path().join("test/features/editor/canvas_test.dart"),
+        "void main() {\n  test('paints rectangles', () {});\n  test('paints text', () {});\n}\n",
+    );
+    write(
+        &tmp.path().join("docs/overview.md"),
+        "# Overview\n\nAn editor.\n",
+    );
+    index_repository(IndexOptions::all(tmp.path())).unwrap();
+    tmp
+}
+
+#[test]
+fn overview_view_emits_module_nodes_with_child_counts() {
+    let tmp = multi_module_workspace();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Overview,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.view, "overview");
+
+    let modules: Vec<&specslice_engine::graph::GraphNode> =
+        view.nodes.iter().filter(|n| n.kind == "module").collect();
+    assert!(!modules.is_empty(), "no module nodes emitted");
+    let module_paths: Vec<&str> = modules
+        .iter()
+        .map(|n| n.path.as_deref().unwrap_or(""))
+        .collect();
+    // Nested module hierarchy must include the leaf editor module.
+    assert!(
+        module_paths.contains(&"lib/features/editor"),
+        "missing leaf module: {module_paths:?}"
+    );
+    assert!(
+        module_paths.contains(&"lib"),
+        "missing root lib module: {module_paths:?}"
+    );
+
+    // Top-level modules (no module parent) carry a child_count summarising
+    // their direct subtree.
+    let lib = modules
+        .iter()
+        .find(|n| n.path.as_deref() == Some("lib"))
+        .expect("lib module");
+    assert!(lib.parent_id.is_none());
+    assert!(lib.child_count >= 2, "lib should aggregate ≥2 children");
+}
+
+#[test]
+fn overview_view_links_files_and_symbols_to_modules() {
+    let tmp = multi_module_workspace();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Overview,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let canvas_class = view
+        .nodes
+        .iter()
+        .find(|n| n.id == "dart_class::lib/features/editor/canvas.dart#Canvas")
+        .expect("canvas class node");
+    let parent = canvas_class.parent_id.as_deref().expect("class parent_id");
+    let parent_file = view
+        .nodes
+        .iter()
+        .find(|n| n.id == parent)
+        .expect("parent file node");
+    assert_eq!(parent_file.kind, "file");
+    assert_eq!(
+        parent_file.parent_id.as_deref(),
+        Some("module::lib/features/editor"),
+        "file should point at its module"
+    );
+    let leaf_module = view
+        .nodes
+        .iter()
+        .find(|n| n.id == "module::lib/features/editor")
+        .expect("leaf module");
+    assert_eq!(
+        leaf_module.parent_id.as_deref(),
+        Some("module::lib/features"),
+        "leaf module should chain up"
+    );
+}
+
+#[test]
+fn overview_default_visible_marks_only_top_level_modules() {
+    let tmp = multi_module_workspace();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Overview,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let visible: Vec<&specslice_engine::graph::GraphNode> =
+        view.nodes.iter().filter(|n| n.default_visible).collect();
+    assert!(!visible.is_empty(), "no nodes visible by default");
+    for n in &visible {
+        assert_eq!(n.kind, "module", "non-module shown by default: {n:?}");
+        assert!(
+            n.parent_id.is_none(),
+            "non-root module shown by default: {n:?}"
+        );
+    }
+    // Symbols hidden.
+    assert!(view
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "dart_class")
+        .all(|n| !n.default_visible));
+}
+
+#[test]
+fn code_view_matches_overview_aggregation_but_marks_view_field() {
+    let tmp = multi_module_workspace();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Code,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.view, "code");
+    assert!(view.nodes.iter().any(|n| n.kind == "module"));
+}
+
+#[test]
+fn business_view_on_empty_repo_emits_no_business_finding() {
+    let tmp = multi_module_workspace();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Business,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.view, "business");
+    // No requirement nodes exist → engine surfaces a guidance finding.
+    assert!(view
+        .nodes
+        .iter()
+        .all(|n| n.kind != "requirement" || !n.default_visible));
+    assert!(
+        view.findings.iter().any(|f| f.code == "no_business_logic"),
+        "missing no_business_logic finding: {:?}",
+        view.findings
+    );
+}
+
+#[test]
+fn business_view_with_manifest_shows_requirement_plus_neighbours() {
+    let tmp = fixture_with_manifest();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Business,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let visible: Vec<&specslice_engine::graph::GraphNode> =
+        view.nodes.iter().filter(|n| n.default_visible).collect();
+    let req = visible
+        .iter()
+        .find(|n| n.id == "req::REQ-WATERMARK-001")
+        .expect("requirement visible");
+    assert_eq!(req.layer, GraphLayer::Confirmed);
+    // Direct neighbours (doc section, class, test case) are also visible.
+    assert!(visible.iter().any(|n| n.kind == "doc_section"));
+    assert!(visible.iter().any(|n| n.kind == "dart_class"));
+    assert!(visible.iter().any(|n| n.kind == "test_case"));
+}
+
+#[test]
+fn focus_view_overrides_default_visibility_to_neighbourhood() {
+    let tmp = fixture_with_manifest();
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Focus,
+            focus: Some("REQ-WATERMARK-001".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(view.view, "focus");
+    let visible: Vec<&specslice_engine::graph::GraphNode> =
+        view.nodes.iter().filter(|n| n.default_visible).collect();
+    assert!(visible.iter().any(|n| n.id == "req::REQ-WATERMARK-001"));
+    // Modules are not the primary visible surface in focus view.
+    assert!(visible.iter().all(|n| n.kind != "module"));
 }
 
 #[test]
