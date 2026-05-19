@@ -103,7 +103,7 @@ checks:
 
 #[test]
 fn index_repository_honours_configured_docs_paths() {
-    // Create a workspace where requirements live under `requirements/`
+    // Create a workspace where docs live under `requirements/`
     // rather than `docs/` — only succeeds if the engine reads `docs.paths`
     // from `.specslice.yaml` instead of hard-coding `docs/specs/adr`.
     let tmp = TempDir::new().unwrap();
@@ -134,14 +134,16 @@ fn index_repository_honours_configured_docs_paths() {
     let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
     let docs = result.docs.expect("docs result present");
     // Only the requirements/ tree should have been scanned.
-    assert_eq!(docs.requirements, 1);
+    assert_eq!(docs.files, 1);
+    assert_eq!(docs.doc_sections, 1);
+    assert_eq!(docs.requirements, 0);
     let store = Store::open(root.join(".specslice/graph.db")).unwrap();
-    let reqs = store
-        .list_nodes_by_kind(specslice_core::NodeKind::Requirement)
+    let sections = store
+        .list_nodes_by_kind(specslice_core::NodeKind::DocSection)
         .unwrap();
-    assert_eq!(reqs.len(), 1);
+    assert_eq!(sections.len(), 1);
     assert_eq!(
-        reqs[0].path.as_deref(),
+        sections[0].path.as_deref(),
         Some("requirements/r1.md"),
         "config-defined doc root must take precedence"
     );
@@ -209,13 +211,15 @@ fn index_repository_honours_configured_docs_include_globs() {
 
     let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
     let docs = result.docs.expect("docs result present");
-    assert_eq!(docs.requirements, 1);
+    assert_eq!(docs.files, 1);
+    assert_eq!(docs.doc_sections, 1);
+    assert_eq!(docs.requirements, 0);
     let store = Store::open(root.join(".specslice/graph.db")).unwrap();
-    let reqs = store
-        .list_nodes_by_kind(specslice_core::NodeKind::Requirement)
+    let sections = store
+        .list_nodes_by_kind(specslice_core::NodeKind::DocSection)
         .unwrap();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].path.as_deref(), Some("docs/keep.spec.md"));
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].path.as_deref(), Some("docs/keep.spec.md"));
 }
 
 #[test]

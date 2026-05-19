@@ -1,4 +1,5 @@
 pub mod check;
+pub mod connect;
 pub mod context;
 pub mod export;
 pub mod impact;

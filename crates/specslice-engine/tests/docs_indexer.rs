@@ -1,9 +1,9 @@
-//! Integration tests for the markdown / requirement indexer.
+//! Integration tests for the markdown document indexer.
 
 use std::path::PathBuf;
 
 use specslice_core::{
-    artifact_id::{doc_section_id, file_id, requirement_id},
+    artifact_id::{doc_section_id, file_id},
     EdgeKind, NodeKind,
 };
 use specslice_engine::docs_indexer::{index_docs, DocsIndexOptions, DOCS_INDEXER_NAME};
@@ -27,7 +27,7 @@ fn fresh_store() -> (TempDir, Store) {
 }
 
 #[test]
-fn indexing_watermark_fixture_creates_requirement_and_doc_section() {
+fn indexing_watermark_fixture_creates_doc_sections_without_semantic_requirements() {
     let (_tmp, mut store) = fresh_store();
     let fixture = fixture_path();
     let opts = DocsIndexOptions {
@@ -38,15 +38,19 @@ fn indexing_watermark_fixture_creates_requirement_and_doc_section() {
     let result = index_docs(&mut store, &opts).unwrap();
 
     assert_eq!(result.files, 1, "expected exactly 1 file");
-    assert_eq!(result.requirements, 1, "expected exactly 1 requirement");
+    assert_eq!(
+        result.requirements, 0,
+        "docs index must not infer business requirements from frontmatter"
+    );
     assert!(result.doc_sections >= 1, "expected at least 1 doc section");
 
-    let req = store
-        .find_node(&requirement_id("REQ-WATERMARK-001"))
-        .unwrap()
-        .expect("requirement node");
-    assert_eq!(req.kind, NodeKind::Requirement);
-    assert_eq!(req.name.as_deref(), Some("Auto watermark placement"));
+    assert!(
+        store
+            .list_nodes_by_kind(NodeKind::Requirement)
+            .unwrap()
+            .is_empty(),
+        "business logic nodes are AI-confirmed graph data, not markdown rules"
+    );
 
     let section = store
         .find_node(&doc_section_id(
@@ -65,11 +69,10 @@ fn indexing_watermark_fixture_creates_requirement_and_doc_section() {
     assert_eq!(file.kind, NodeKind::File);
     assert!(file.content_hash.is_some());
 
-    // documents edge: section -> requirement
+    // No documents edge is emitted by the markdown indexer. Business
+    // relationships come from AI-generated candidates after human acceptance.
     let docs_edges = store.list_edges_by_kind(EdgeKind::Documents).unwrap();
-    assert_eq!(docs_edges.len(), 1);
-    assert_eq!(docs_edges[0].from_id, section.id);
-    assert_eq!(docs_edges[0].to_id, req.id);
+    assert!(docs_edges.is_empty());
 
     // contains edge: file -> section (at least one)
     let contains_edges = store.list_edges_by_kind(EdgeKind::Contains).unwrap();
@@ -97,11 +100,11 @@ fn re_indexing_is_idempotent_and_clears_previous_outputs() {
             .list_nodes_by_kind(NodeKind::Requirement)
             .unwrap()
             .len(),
-        1
+        0
     );
     assert_eq!(
         store.list_edges_by_kind(EdgeKind::Documents).unwrap().len(),
-        1
+        0
     );
 }
 
@@ -129,5 +132,5 @@ fn duplicate_doc_roots_do_not_double_count_files() {
     };
     let result = index_docs(&mut store, &opts).unwrap();
     assert_eq!(result.files, 1);
-    assert_eq!(result.requirements, 1);
+    assert_eq!(result.requirements, 0);
 }

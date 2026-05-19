@@ -54,7 +54,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
     let mut total_lines = 0u32;
 
     for (idx, raw_line) in source.lines().enumerate() {
-        let line_no = (idx + 1) as u32;
+        let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
         total_lines = line_no;
         let line = strip_inline_string_braces(raw_line);
         let trimmed = line.trim_start();
@@ -199,13 +199,11 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         // Anything deeper (`depth > class_depth`) is inside a method body
         // and must not be re-parsed — otherwise expressions like
         // `candidates.sort(...)` get misidentified as method declarations.
-        let inside_class = current_class
+        let class_for_decl = current_class
             .as_ref()
-            .map(|(_, _, class_depth)| depth == *class_depth)
-            .unwrap_or(false);
+            .filter(|(_, _, class_depth)| depth == *class_depth);
 
-        if inside_class {
-            let class = current_class.as_ref().unwrap();
+        if let Some(class) = class_for_decl {
             if let Some(ctor_name) = parse_constructor(trimmed, &class.1) {
                 let id = dart_constructor_id(path, &class.1, &ctor_name);
                 let qname = if ctor_name.is_empty() {
@@ -332,6 +330,8 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         );
     }
 
+    disambiguate_duplicate_test_ids(&mut tests);
+
     ParseResult {
         file: file_artifact,
         symbols,
@@ -339,6 +339,30 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         imports,
         ranges,
         diagnostics,
+    }
+}
+
+fn disambiguate_duplicate_test_ids(tests: &mut [TestArtifact]) {
+    for idx in 0..tests.len() {
+        let slug = slugify(&tests[idx].name);
+        let duplicate_count = tests
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == tests[idx].kind
+                    && candidate.path == tests[idx].path
+                    && slugify(&candidate.name) == slug
+            })
+            .count();
+        if duplicate_count <= 1 {
+            continue;
+        }
+
+        let unique_slug = format!("{slug}-line-{}", tests[idx].start_line);
+        tests[idx].id = match tests[idx].kind {
+            NodeKind::TestCase => dart_test_id(&tests[idx].path, &unique_slug),
+            NodeKind::TestGroup => dart_group_id(&tests[idx].path, &unique_slug),
+            _ => tests[idx].id.clone(),
+        };
     }
 }
 
@@ -352,30 +376,33 @@ fn close_symbols(
     line_no: u32,
     path: &str,
 ) {
-    while let Some(&(_, _, sym_depth)) = open_symbols.last() {
-        if depth < sym_depth {
-            let (id, start, _) = open_symbols.pop().unwrap();
-            finalize_symbol(
-                &id,
-                start,
-                line_no,
-                path,
-                ranges,
-                symbols,
-                tests,
-                class_stack,
-            );
-        } else {
-            break;
+    loop {
+        match open_symbols.last() {
+            Some(&(_, _, sym_depth)) if depth < sym_depth => {}
+            _ => break,
         }
+        let Some((id, start, _)) = open_symbols.pop() else {
+            break;
+        };
+        finalize_symbol(
+            &id,
+            start,
+            line_no,
+            path,
+            ranges,
+            symbols,
+            tests,
+            class_stack,
+        );
     }
-    while let Some(frame) = class_stack.last() {
-        if depth < frame.depth {
-            let frame = class_stack.pop().unwrap();
-            // The class symbol's end_line is set when we close its
-            // corresponding open_symbol entry above.
-            let _ = frame;
-        } else {
+    loop {
+        match class_stack.last() {
+            Some(frame) if depth < frame.depth => {}
+            _ => break,
+        }
+        // The class symbol's end_line is set when we close its corresponding
+        // open_symbol entry above. We just discard the frame here.
+        if class_stack.pop().is_none() {
             break;
         }
     }
@@ -648,6 +675,22 @@ mod tests {
             .find(|t| t.kind == NodeKind::TestGroup)
             .unwrap();
         assert_eq!(group.name, "Outer");
+    }
+
+    #[test]
+    fn duplicate_test_names_get_distinct_artifact_ids() {
+        let src = "void main() {\n  test('same name', () {});\n  test('same name', () {});\n}\n";
+        let r = parse(src);
+        let tests: Vec<_> = r
+            .tests
+            .iter()
+            .filter(|t| t.kind == NodeKind::TestCase)
+            .collect();
+        assert_eq!(tests.len(), 2);
+        assert_ne!(
+            tests[0].id, tests[1].id,
+            "same path + same test name must not collapse into one graph node"
+        );
     }
 
     #[test]

@@ -12,3 +12,6 @@ specslice-core = { path = "../specslice-core" }
 anyhow = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }
+
+[lints]
+workspace = true

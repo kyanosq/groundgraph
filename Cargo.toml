@@ -15,6 +15,17 @@ rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/specslice/specslice"
 
+[workspace.lints.rust]
+# SpecSlice is a non-invasive, deterministic indexer. There is no scenario in
+# which unsafe Rust is justified here.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Catch narrowing casts that historically caused silent line-number wraps when
+# reading mutated SQLite payloads.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "1"

@@ -355,3 +355,40 @@ fn clear_indexer_outputs_removes_relevant_rows() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn decoding_a_corrupted_line_number_returns_an_error_not_silent_wrap() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("graph.db");
+    {
+        let mut store = Store::open(&db_path).expect("open store");
+        store.migrate().expect("migrate");
+        store
+            .upsert_node(&Node::new(
+                ArtifactId::new("req::REQ-CORRUPT"),
+                NodeKind::Requirement,
+            ))
+            .unwrap();
+    }
+    // Open the DB directly to inject values SQLite is happy to store but that
+    // do not fit in u32 — simulates a buggy producer writing the graph file.
+    {
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.execute(
+            "UPDATE nodes SET start_line = ?1, end_line = ?2 WHERE id = 'req::REQ-CORRUPT'",
+            rusqlite::params![-1_i64, (u32::MAX as i64) + 1],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&db_path).expect("reopen store");
+    let err = store
+        .find_node(&ArtifactId::new("req::REQ-CORRUPT"))
+        .expect_err("decoder must reject out-of-range line numbers");
+    let msg = format!("{err:#}");
+    let msg_lc = msg.to_lowercase();
+    assert!(
+        msg_lc.contains("line") || msg_lc.contains("range") || msg_lc.contains("u32"),
+        "unexpected error: {msg}"
+    );
+}

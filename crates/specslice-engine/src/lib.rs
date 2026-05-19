@@ -6,6 +6,7 @@
 
 pub mod checks;
 pub mod config;
+pub mod connect;
 pub mod context_pack;
 pub mod dart_indexer;
 pub mod docs_indexer;
@@ -21,6 +22,11 @@ pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,
 };
 pub use config::EngineConfig;
+pub use connect::{
+    apply_candidates, propose_evidence, AcceptedCandidate, ApplyOptions, ApplyOutcome,
+    CandidatesDocument, ClarifyingQuestion, EvidenceDocSection, EvidencePack, EvidenceRequirement,
+    EvidenceSymbol, EvidenceTest, LinkCandidate, RejectedCandidate,
+};
 pub use context_pack::{
     build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
 };

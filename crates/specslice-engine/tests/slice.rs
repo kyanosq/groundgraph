@@ -66,7 +66,11 @@ fn slicing_watermark_requirement_returns_docs_impl_and_tests() {
     let slice = slice_from_store(&store, "REQ-WATERMARK-001").unwrap();
 
     assert_eq!(slice.requirement_id, "REQ-WATERMARK-001");
-    assert_eq!(slice.title.as_deref(), Some("Auto watermark placement"));
+    assert_eq!(
+        slice.title.as_deref(),
+        None,
+        "links manifest creates confirmed IDs, not AI-parsed business titles"
+    );
 
     let docs = item_paths(&slice.docs);
     assert!(

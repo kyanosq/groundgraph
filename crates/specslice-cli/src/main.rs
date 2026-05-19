@@ -37,8 +37,49 @@ enum Commands {
     Check(CheckArgs),
     /// Produce an agent-ready context pack for a requirement.
     Context(ContextArgs),
+    /// Bridge AI candidate links into the confirmed graph.
+    Connect(ConnectArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ConnectArgs {
+    #[command(subcommand)]
+    sub: ConnectSub,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectSub {
+    /// Emit an evidence pack (JSON) describing requirements, orphan symbols
+    /// and orphan tests. Pipe this to an AI to generate candidate links.
+    Propose(ConnectProposeArgs),
+    /// Validate AI-generated candidates and merge accepted ones into
+    /// `.specslice/links.yaml`.
+    Apply(ConnectApplyArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ConnectProposeArgs {
+    /// Write the evidence pack to a file instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Pretty-print the JSON output.
+    #[arg(long)]
+    pretty: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConnectApplyArgs {
+    /// Path to the AI-generated candidates YAML.
+    #[arg(long)]
+    candidates: PathBuf,
+    /// Validate only — do not modify `.specslice/links.yaml`.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit a machine-readable JSON outcome.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -144,6 +185,19 @@ fn run() -> Result<()> {
             !args.no_snippets,
             args.json,
         ),
+        Commands::Connect(args) => match args.sub {
+            ConnectSub::Propose(p) => {
+                commands::connect::run_propose(&cli.repo_root, p.out.as_deref(), p.pretty)
+            }
+            ConnectSub::Apply(a) => {
+                let exit =
+                    commands::connect::run_apply(&cli.repo_root, a.candidates, a.dry_run, a.json)?;
+                if exit != 0 {
+                    std::process::exit(exit);
+                }
+                Ok(())
+            }
+        },
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
     }
 }

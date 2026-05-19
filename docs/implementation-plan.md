@@ -5,22 +5,23 @@
 SpecSlice MVP 先证明一个非侵入式闭环：
 
 ```text
-REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .specslice/links.yaml -> PR Impact -> Agent Context Pack
+文档事实 / Dart 事实 / 测试事实 -> AI 业务逻辑候选与关联候选 -> 人工确认 -> confirmed graph -> PR Impact -> Agent Context Pack
 ```
 
-第一阶段不做 Dart analyzer sidecar、不做 GraphRAG、不做 MCP。MVP 的价值判断看两件事：AI 能否基于事实生成高质量候选关联；确认后的 links manifest 能否在不改业务代码/业务文档的前提下稳定查询和反查。
+第一阶段不做 Dart analyzer sidecar、不做 GraphRAG、不做 MCP。MVP 的价值判断看两件事：AI 能否基于事实生成高质量业务逻辑候选和候选关联；确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询和反查。
 
 ## 非侵入式约束
 
 - 业务代码、业务测试、业务文档默认只读扫描。
 - 不支持在业务代码/业务测试中加入工具专用注解。
 - 不支持在业务文档中加入工具专用关系段落。
-- 已有 Markdown frontmatter 可以兼容读取，但不能作为接入前置条件。
+- Markdown frontmatter 只能作为普通文档内容的结构边界处理，不能被规则解释为业务需求、ADR 或验收标准。
 - SpecSlice 只能写 `.specslice.yaml`、`.specslice/links.yaml`、`.specslice/graph.db`、`.specslice/export/`，以及后续 `.specslice/requirements.yaml`、`.specslice/candidates/`。
 - LLM 只能生成候选、问题和解释，不能写回业务代码、业务测试或业务文档。
-- 业务逻辑文档与代码/测试的关联不能由人工标注产生，也不能由规则匹配产生。
-- 规则只负责解析事实、校验 AI 候选引用、维护已确认外置关系。
-- 人工负责确认、编辑、拒绝 AI 候选；确认结果写入 `.specslice/links.yaml`。
+- 业务逻辑单元的抽取、业务文档与代码/测试的关联候选，不能由人工初始标注产生，也不能由规则匹配产生。
+- 规则只负责解析物理事实、校验 AI 候选引用、维护已确认外置关系。
+- AI 负责从事实中生成业务逻辑候选、关联候选、可信度和澄清问题。
+- 人工负责确认、编辑、拒绝 AI 候选；确认结果写入 SpecSlice 自有目录。
 
 ## 工程落地顺序
 
@@ -41,25 +42,25 @@ REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .s
 - 再写 store integration 测试：migration 后表存在，重复执行 migration 不报错。
 - 最后写 export 测试：空图也能输出合法 JSONL 文件。
 
-### MVP-1：Markdown Requirement 索引
+### MVP-1：Markdown 文档事实索引
 
-**目标：** 从 `docs / specs / adr` 中索引 Requirement、ADR、DocSection。
+**目标：** 从 `docs / specs / adr` 中索引 Markdown 文件和文档段落事实，不做业务语义判断。
 
 **实现范围：**
 
 - 提取 Markdown File / DocSection。
-- 兼容读取已有 frontmatter 中的 `id / type / title / status`。
 - 不要求业务文档新增 frontmatter。
-- Requirement 可由已有 frontmatter、`.specslice/links.yaml` 或后续 `.specslice/requirements.yaml` 创建。
-- 建立 `DocSection --documents--> Requirement`。
-- 不解析业务文档中的工具专用关系标记；需求到实现/测试的关系由 `.specslice/links.yaml` 声明。
+- 不把 frontmatter、标题、编号规则解释为 Requirement、ADR 或业务逻辑。
+- 不建立 `DocSection --documents--> Requirement`。
+- 只建立 `File --contains--> DocSection` 事实边。
+- 后续 AI 基于 DocSection 文本、代码符号和测试事实生成业务逻辑候选。
 
 **TDD 起点：**
 
 - Fixture：`docs/watermark.md`。
-- 先断言 `specslice index docs` 输出 `Requirements: 1`、`DocSections: 1`。
-- 再断言数据库里有 requirement node、doc section node 和 documents edge。
-- 再写 broken doc reference 测试。
+- 先断言 `specslice index --docs-only` 输出 `Requirements: 0`、`DocSections: 1`。
+- 再断言数据库里只有 file/doc section 和 contains edge，没有 requirement node 和 documents edge。
+- 再写 frontmatter 文档回归测试，确认规则不会从 frontmatter 推导业务语义。
 
 ### MVP-2：Dart Lightweight Adapter 与外置关系声明
 
@@ -82,18 +83,18 @@ REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .s
 
 ### MVP-3：Feature Slice
 
-**目标：** 从一个 Requirement 找到文档、实现和测试。
+**目标：** 从一个已确认业务逻辑 ID 找到文档、实现和测试。
 
 **实现范围：**
 
-- `specslice slice REQ-ID`。
+- `specslice slice <confirmed-business-logic-id>`。
 - 只走 confirmed/declared 高可信边。
 - 默认不走 imports、calls、references、candidate edges。
 - 输出 Docs、Linked Implementation、Linked Tests、Risks。
 
 **TDD 起点：**
 
-- 使用 fixture 中的 `REQ-WATERMARK-001`。
+- 使用 fixture 中已确认的 `REQ-WATERMARK-001`。
 - 断言 slice 包含 `docs/watermark.md`、`AutoPlacementService`、`auto_placement_service_test.dart`。
 - 断言无测试时给出 missing linked test risk。
 
@@ -135,13 +136,13 @@ REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .s
 
 ### Phase-1：AI 候选关联、逻辑可信度与澄清候选
 
-**目标：** 在不侵入业务仓库的前提下，由 AI 生成业务文档与代码/测试的候选关联，人工确认后进入 confirmed graph；同时识别“关系存在但业务逻辑未验证”、“业务文档缺失”、“文档与代码/测试信号可能不一致”的风险。
+**目标：** 在不侵入业务仓库的前提下，由 AI 从文档事实、代码事实和测试事实中生成业务逻辑候选与候选关联，人工确认后进入 confirmed graph；同时识别“关系存在但业务逻辑未验证”、“业务文档缺失”、“文档与代码/测试信号可能不一致”的风险。
 
 **实现范围：**
 
 - 新增 `specslice connect`：
   - 输入 docs/code/tests 的事实节点和 evidence pack。
-  - AI 生成 candidate links。
+  - AI 生成 business logic candidates、candidate links、clarifying questions。
   - 系统校验 candidate 引用是否存在、唯一、可定位。
   - 人工确认、编辑或拒绝。
   - 确认后写入 `.specslice/links.yaml`。
@@ -153,15 +154,15 @@ REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .s
   - `mismatch_candidate`：文档描述与代码/测试信号可能冲突。
   - `unknown`：证据不足。
 - 新增 candidate 输出到 `.specslice/candidates/`。
-- 新增可选 `.specslice/requirements.yaml`，用于没有业务文档时保存外置需求描述。
+- 新增可选 `.specslice/requirements.yaml`，用于保存人工确认后的 AI 业务逻辑草案，尤其是没有业务文档时的外置需求描述。
 - 新增 `specslice ask`，根据 evidence 生成需要用户回答的问题。
 - AI 只生成 candidate / questions，不直接写 confirmed graph。
 - 禁止用规则匹配生成业务关联。
 
 **TDD 起点：**
 
-- 有业务文档、实现和测试但无 links 时，AI candidate 经确认后写入 `.specslice/links.yaml`。
-- 无业务文档但有实现/测试时，输出 `missing_doc` 和澄清问题。
+- 有业务文档、实现和测试但无 links 时，AI 从 DocSection 与代码/测试事实生成 candidate，经确认后写入 `.specslice/links.yaml`。
+- 无业务文档但有实现/测试时，AI 可生成低可信业务逻辑草案，同时输出 `missing_doc` 和澄清问题。
 - links 指向的文件 hash 变化后，输出 `stale_link`。
 - AI 判断文档与代码/测试信号可能冲突时，只输出 `mismatch_candidate`，不作为 error。
 - 用户确认 candidate 后，只更新 `.specslice/links.yaml` 或 `.specslice/requirements.yaml`。
@@ -180,7 +181,7 @@ REQ 文档 / Dart 事实 / 测试事实 -> AI 候选关联 -> 人工确认 -> .s
 
 3. **Docs indexer tests**
    - 使用小型 Markdown fixture。
-   - 覆盖 frontmatter、REQ/AC/ADR 识别、doc section line range。
+   - 覆盖 frontmatter 不产生语义节点、doc section line range、File contains DocSection。
 
 4. **Dart adapter tests**
    - 使用内联 Dart 源码和 fixture 文件。
@@ -267,8 +268,9 @@ cargo test --workspace
 
 ### MVP-1 验收
 
-- fixture 中 `docs/watermark.md` 能生成 1 个 Requirement 和 1 个 DocSection。
-- `DocSection --documents--> Requirement` edge 存在。
+- fixture 中 `docs/watermark.md` 能生成 1 个 File 和至少 1 个 DocSection。
+- 即使文档含 frontmatter，Markdown 索引也不生成 Requirement、ADR 或 AcceptanceCriterion。
+- Markdown 索引不生成 `DocSection --documents--> Requirement` edge。
 - 文档 line range 能定位到对应 section。
 
 ### MVP-2 验收
@@ -322,7 +324,7 @@ MVP 完成时必须满足：
 ### P0：非侵入式边界固化
 
 - 清理所有代码、测试、CLI 文案、PRD 中的工具专用关系残留。
-- 确认 Markdown frontmatter 只是兼容输入，不是接入要求。
+- 确认 Markdown frontmatter 不再被规则解释成业务需求。
 - fixture 增加“无 frontmatter + links manifest”的端到端用例。
 - 验收：全文搜索无工具注解/业务 Related 语义残留；`cargo test --workspace` 通过。
 
@@ -330,7 +332,7 @@ MVP 完成时必须满足：
 
 - 增加 `specslice connect`。
 - 生成 evidence pack：docs sections、symbols、tests、paths、line ranges、hash。
-- 调用 AI 生成 candidate links 和澄清问题。
+- 调用 AI 生成 business logic candidates、candidate links 和澄清问题。
 - 系统只校验 candidate 引用是否存在、唯一、可定位，不用规则匹配生成候选。
 - 用户确认、编辑或拒绝 candidate。
 - 确认后写入 `.specslice/links.yaml`。
@@ -364,6 +366,25 @@ MVP 完成时必须满足：
 - 增加 `.specslice/candidates/` 保存候选关系和候选需求。
 - 增加 `specslice accept-candidate`，用户确认后写入 `.specslice/links.yaml` 或 `.specslice/requirements.yaml`。
 - 验收：LLM/candidate 不进入 confirmed graph；CI 默认不信任 candidate。
+
+### P6：可视化与审阅界面
+
+- 先增加只读可视化导出，不直接修改业务仓库：
+  - `specslice graph --format mermaid`：输出当前 confirmed graph。
+  - `specslice graph --format html`：生成 `.specslice/export/graph.html` 静态页面。
+  - `specslice graph --include-candidates`：可选叠加 AI 候选边，用不同状态标识 proposed / accepted / rejected / stale。
+- 可视化节点分层：
+  - DocumentChunk / DocSection。
+  - BusinessLogic / Requirement。
+  - CodeSymbol。
+  - TestCase / TestGroup。
+  - Candidate / Question / Risk。
+- 可视化边分层：
+  - fact：文件包含段落、文件包含符号。
+  - confirmed：人工确认后的文档、实现、测试关系。
+  - candidate：AI 候选，默认不参与 impact/check。
+  - risk：missing_doc、missing_test、stale_link、mismatch_candidate。
+- 验收：可视化只读、可复现、能从节点跳回文件路径和行号；CI 默认只验证导出可生成，不要求浏览器环境。
 
 ## 后续验收方式
 

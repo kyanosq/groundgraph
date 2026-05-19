@@ -263,10 +263,12 @@ fn check_human_output_includes_warn_severity_marker() {
     // Remove the impl + test to make REQ-WATERMARK-001 an orphan (warning).
     std::fs::remove_dir_all(tmp.path().join("lib")).unwrap();
     std::fs::remove_dir_all(tmp.path().join("test")).unwrap();
-    // Clear links so this test focuses on the orphan-requirement warning path.
+    // Keep an externally confirmed business logic entry so this test focuses
+    // on the orphan-requirement warning path without relying on Markdown
+    // frontmatter inference.
     std::fs::write(
         tmp.path().join(".specslice/links.yaml"),
-        "requirements: {}\n",
+        "requirements:\n  REQ-WATERMARK-001:\n    docs:\n      - docs/watermark.md#auto-watermark-placement\n",
     )
     .unwrap();
 

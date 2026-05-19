@@ -1,14 +1,13 @@
-//! Markdown / requirement indexer.
+//! Markdown document indexer.
 //!
 //! MVP-1 scope (PRD §3.1, implementation plan §MVP-1):
 //! - Walk every `*.md` and `*.mdx` file under the configured docs roots.
-//! - Parse YAML frontmatter for `id / type / title / status`.
-//! - Build a [`Node`] per file and per heading section, plus a
-//!   `Requirement` / `AcceptanceCriterion` / `Adr` node when the frontmatter
-//!   asks for one.
-//! - Emit `File --contains--> DocSection` (Fact) and the first DocSection of
-//!   a requirement-typed file gets a `DocSection --documents--> Requirement`
-//!   (Declared) edge.
+//! - Treat Markdown as physical evidence only: file, heading sections, line
+//!   ranges and content hash.
+//! - Never infer business requirements from frontmatter or heading text. AI
+//!   may later propose business logic candidates from these document facts,
+//!   and only accepted external graph data creates `Requirement` nodes.
+//! - Emit `File --contains--> DocSection` (Fact).
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use specslice_core::{
-    artifact_id::{doc_section_id, file_id, requirement_id, slugify},
+    artifact_id::{doc_section_id, file_id, slugify},
     EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
 };
 use specslice_store::Store;
@@ -31,15 +30,6 @@ pub struct DocsIndexResult {
     pub edges: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Frontmatter {
-    id: Option<String>,
-    #[serde(rename = "type")]
-    doc_type: Option<String>,
-    title: Option<String>,
-    status: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Heading {
     level: u8,
@@ -49,7 +39,6 @@ struct Heading {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedDoc {
-    frontmatter: Frontmatter,
     headings: Vec<Heading>,
     total_lines: u32,
     content_hash: String,
@@ -144,40 +133,9 @@ fn index_one_file(
     store.upsert_node(&file_node)?;
     result.files += 1;
 
-    let requirement_node = match (
-        parsed.frontmatter.id.as_deref(),
-        parsed.frontmatter.doc_type.as_deref(),
-    ) {
-        (Some(id), Some(ty)) => {
-            let kind = match ty {
-                "requirement" => Some(NodeKind::Requirement),
-                "acceptance" | "acceptance_criterion" => Some(NodeKind::AcceptanceCriterion),
-                "adr" => Some(NodeKind::Adr),
-                _ => None,
-            };
-            kind.map(|kind| {
-                let mut req = Node::new(requirement_id(id), kind);
-                req.name = parsed.frontmatter.title.clone();
-                req.path = Some(rel_path.to_string());
-                req.stable_key = Some(id.to_string());
-                req.indexer = Some(DOCS_INDEXER_NAME.into());
-                req
-            })
-        }
-        _ => None,
-    };
-
-    if let Some(req) = &requirement_node {
-        store.upsert_node(req)?;
-        if req.kind == NodeKind::Requirement {
-            result.requirements += 1;
-        }
-    }
-
     // Build doc sections from headings. A section runs from its heading line
     // until the next heading of equal or lower level (smaller `level` value
     // means a higher heading), or EOF.
-    let mut first_section_id = None;
     for (idx, heading) in parsed.headings.iter().enumerate() {
         let end_line = parsed
             .headings
@@ -205,23 +163,6 @@ fn index_one_file(
         ));
         store.upsert_edge(&contains_edge)?;
         result.edges += 1;
-
-        if first_section_id.is_none() {
-            first_section_id = Some(section_id);
-        }
-    }
-
-    if let (Some(section_id), Some(req)) = (first_section_id.as_ref(), requirement_node.as_ref()) {
-        if req.kind == NodeKind::Requirement {
-            let edge = make_indexed_edge(EdgeAssertion::declared(
-                section_id.clone(),
-                req.id.clone(),
-                EdgeKind::Documents,
-                EdgeSource::Markdown,
-            ));
-            store.upsert_edge(&edge)?;
-            result.edges += 1;
-        }
     }
 
     Ok(())
@@ -234,11 +175,11 @@ fn make_indexed_edge(mut edge: EdgeAssertion) -> EdgeAssertion {
 
 fn parse_markdown(raw: &str) -> ParsedDoc {
     let mut total_lines = 0u32;
-    let mut frontmatter_text = String::new();
     let mut headings = Vec::new();
     let mut content_hasher = Sha256::new();
 
-    // 1. Frontmatter. Consume from the opening `---` to the closing `---`.
+    // Treat frontmatter as a physical prelude only. We skip it so YAML keys do
+    // not become headings, but we never parse it into business semantics.
     let mut consumed_lines = 0usize;
     if raw.starts_with("---\n") || raw.starts_with("---\r\n") {
         let mut closed = false;
@@ -248,33 +189,14 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
                 closed = true;
                 break;
             }
-            frontmatter_text.push_str(line);
-            frontmatter_text.push('\n');
         }
         if !closed {
             consumed_lines = 0;
-            frontmatter_text.clear();
         }
     }
 
-    let frontmatter = if frontmatter_text.is_empty() {
-        Frontmatter {
-            id: None,
-            doc_type: None,
-            title: None,
-            status: None,
-        }
-    } else {
-        serde_yaml::from_str::<Frontmatter>(&frontmatter_text).unwrap_or(Frontmatter {
-            id: None,
-            doc_type: None,
-            title: None,
-            status: None,
-        })
-    };
-
     for (idx, line) in raw.lines().enumerate() {
-        total_lines = (idx + 1) as u32;
+        total_lines = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
         content_hasher.update(line.as_bytes());
         content_hasher.update(b"\n");
         if idx < consumed_lines {
@@ -296,7 +218,6 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
     let content_hash = format!("{:x}", content_hasher.finalize());
 
     ParsedDoc {
-        frontmatter,
         headings,
         total_lines,
         content_hash,
@@ -343,12 +264,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_markdown_handles_frontmatter_and_headings() {
+    fn parse_markdown_skips_frontmatter_without_semantic_parsing() {
         let src = "---\nid: REQ-1\ntype: requirement\ntitle: T\n---\n\n# Top\n\nBody\n\n## Details\n\nMore text.\n";
         let parsed = parse_markdown(src);
-        assert_eq!(parsed.frontmatter.id.as_deref(), Some("REQ-1"));
-        assert_eq!(parsed.frontmatter.doc_type.as_deref(), Some("requirement"));
-        assert_eq!(parsed.frontmatter.title.as_deref(), Some("T"));
         assert_eq!(parsed.headings.len(), 2);
         assert_eq!(parsed.headings[0].level, 1);
         assert_eq!(parsed.headings[0].text, "Top");
@@ -358,7 +276,6 @@ mod tests {
     #[test]
     fn parse_markdown_handles_no_frontmatter() {
         let parsed = parse_markdown("# Hello\n\nBody\n");
-        assert!(parsed.frontmatter.id.is_none());
         assert_eq!(parsed.headings.len(), 1);
     }
 
@@ -366,6 +283,7 @@ mod tests {
     fn parse_markdown_handles_unterminated_frontmatter() {
         let parsed = parse_markdown("---\nid: REQ-1\n# Hello\n");
         // The frontmatter is unterminated → must fall back gracefully.
-        assert!(parsed.frontmatter.id.is_none());
+        assert_eq!(parsed.headings.len(), 1);
+        assert_eq!(parsed.headings[0].text, "Hello");
     }
 }

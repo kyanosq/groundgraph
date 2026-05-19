@@ -140,28 +140,77 @@ fn resolve_manifest_path(repo_root: &Path, manifest_path: &Path) -> PathBuf {
 }
 
 fn resolve_doc_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
+    if let Some(id) = strict_resolve_doc(store, spec)? {
+        return Ok(id);
+    }
     let (path, fragment) = split_ref(spec);
     if let Some(fragment) = fragment {
-        let slug = slugify_or_keep(fragment);
-        let id = doc_section_id(path, &slug);
-        if store.find_node(&id)?.is_some() {
-            return Ok(id);
-        }
-        if let Some(id) =
-            find_node_by_path_and_name(store, &[NodeKind::DocSection], path, fragment)?
-        {
-            return Ok(id);
-        }
-        Ok(doc_section_id(path, &slug))
+        Ok(doc_section_id(path, &slugify_or_keep(fragment)))
     } else {
         Ok(file_id(path))
     }
 }
 
 fn resolve_implementation_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
+    if let Some(id) = strict_resolve_implementation(store, spec)? {
+        return Ok(id);
+    }
     let (path, fragment) = split_ref(spec);
     let Some(fragment) = fragment else {
         return Ok(file_id(path));
+    };
+    if let Some((class, member)) = fragment.split_once('.') {
+        Ok(dart_method_id(path, class, member))
+    } else {
+        Ok(dart_class_id(path, fragment))
+    }
+}
+
+fn resolve_test_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
+    if let Some(id) = strict_resolve_test(store, spec)? {
+        return Ok(id);
+    }
+    let (path, fragment) = split_ref(spec);
+    let Some(fragment) = fragment else {
+        return Ok(file_id(path));
+    };
+    Ok(dart_test_id(path, &slugify_or_keep(fragment)))
+}
+
+/// Resolve a doc reference strictly: returns `Some(id)` only if a matching
+/// node already exists in the store. Used by `connect::apply` to reject
+/// candidates whose targets we cannot locate.
+pub(crate) fn strict_resolve_doc(store: &Store, spec: &str) -> Result<Option<ArtifactId>> {
+    let (path, fragment) = split_ref(spec);
+    let Some(fragment) = fragment else {
+        let id = file_id(path);
+        return Ok(if store.find_node(&id)?.is_some() {
+            Some(id)
+        } else {
+            None
+        });
+    };
+    let slug = slugify_or_keep(fragment);
+    let id = doc_section_id(path, &slug);
+    if store.find_node(&id)?.is_some() {
+        return Ok(Some(id));
+    }
+    find_node_by_path_and_name(store, &[NodeKind::DocSection], path, fragment)
+}
+
+/// Strict implementation resolver used by `connect::apply`.
+pub(crate) fn strict_resolve_implementation(
+    store: &Store,
+    spec: &str,
+) -> Result<Option<ArtifactId>> {
+    let (path, fragment) = split_ref(spec);
+    let Some(fragment) = fragment else {
+        let id = file_id(path);
+        return Ok(if store.find_node(&id)?.is_some() {
+            Some(id)
+        } else {
+            None
+        });
     };
     if let Some(id) = find_node_by_path_and_name(
         store,
@@ -174,35 +223,40 @@ fn resolve_implementation_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
         path,
         fragment,
     )? {
-        return Ok(id);
+        return Ok(Some(id));
     }
     if let Some((class, member)) = fragment.split_once('.') {
         let method_id = dart_method_id(path, class, member);
         if store.find_node(&method_id)?.is_some() {
-            return Ok(method_id);
+            return Ok(Some(method_id));
         }
         let ctor_id = dart_constructor_id(path, class, member);
         if store.find_node(&ctor_id)?.is_some() {
-            return Ok(ctor_id);
+            return Ok(Some(ctor_id));
         }
-        Ok(method_id)
     } else {
         let class_id = dart_class_id(path, fragment);
         if store.find_node(&class_id)?.is_some() {
-            return Ok(class_id);
+            return Ok(Some(class_id));
         }
         let fn_id = dart_function_id(path, fragment);
         if store.find_node(&fn_id)?.is_some() {
-            return Ok(fn_id);
+            return Ok(Some(fn_id));
         }
-        Ok(class_id)
     }
+    Ok(None)
 }
 
-fn resolve_test_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
+/// Strict test resolver used by `connect::apply`.
+pub(crate) fn strict_resolve_test(store: &Store, spec: &str) -> Result<Option<ArtifactId>> {
     let (path, fragment) = split_ref(spec);
     let Some(fragment) = fragment else {
-        return Ok(file_id(path));
+        let id = file_id(path);
+        return Ok(if store.find_node(&id)?.is_some() {
+            Some(id)
+        } else {
+            None
+        });
     };
     if let Some(id) = find_node_by_path_and_name(
         store,
@@ -210,18 +264,18 @@ fn resolve_test_ref(store: &Store, spec: &str) -> Result<ArtifactId> {
         path,
         fragment,
     )? {
-        return Ok(id);
+        return Ok(Some(id));
     }
     let slug = slugify_or_keep(fragment);
     let test_id = dart_test_id(path, &slug);
     if store.find_node(&test_id)?.is_some() {
-        return Ok(test_id);
+        return Ok(Some(test_id));
     }
     let group_id = dart_group_id(path, &slug);
     if store.find_node(&group_id)?.is_some() {
-        return Ok(group_id);
+        return Ok(Some(group_id));
     }
-    Ok(test_id)
+    Ok(None)
 }
 
 fn find_node_by_path_and_name(

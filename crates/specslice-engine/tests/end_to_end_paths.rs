@@ -100,18 +100,20 @@ fn index_then_slice_path_entrypoint_returns_fixture_artifacts() {
 #[test]
 fn index_docs_only_via_path_entrypoint() {
     let tmp = setup_repo();
-    index_repository(IndexOptions::docs_only(tmp.path().to_path_buf())).unwrap();
+    let result = index_repository(IndexOptions::docs_only(tmp.path().to_path_buf())).unwrap();
+    let docs = result.docs.expect("docs result");
+    assert_eq!(docs.files, 1);
+    assert_eq!(docs.requirements, 0);
+    assert!(docs.doc_sections >= 1);
+
     let checks = run_checks(CheckOptions {
         repo_root: tmp.path().into(),
         impact: None,
     })
     .unwrap();
-    // We did not index code or external links, so the requirement is
-    // technically orphan in this graph.
-    assert!(checks
-        .findings
-        .iter()
-        .any(|f| f.code == "orphan_requirement"));
+    // Docs-only indexing is physical evidence only. It should not create
+    // business logic nodes that checks can treat as orphan requirements.
+    assert!(checks.findings.is_empty(), "{:?}", checks.findings);
 }
 
 #[test]

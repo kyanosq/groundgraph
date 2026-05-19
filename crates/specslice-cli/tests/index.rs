@@ -34,7 +34,7 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 #[test]
-fn index_docs_reports_requirements_and_doc_sections() {
+fn index_docs_reports_doc_sections_without_rule_requirements() {
     let tmp = tempfile::TempDir::new().unwrap();
     copy_fixture(tmp.path());
 
@@ -51,7 +51,7 @@ fn index_docs_reports_requirements_and_doc_sections() {
         .args(["index", "--docs-only"])
         .assert()
         .success()
-        .stdout(contains("Requirements: 1"))
+        .stdout(contains("Requirements: 0"))
         .stdout(contains("DocSections: 1"));
 }
 

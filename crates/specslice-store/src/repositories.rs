@@ -285,7 +285,25 @@ impl Store {
 
 fn opt_u32(row: &Row<'_>, idx: usize) -> Result<Option<u32>, rusqlite::Error> {
     let v: Option<i64> = row.get(idx)?;
-    Ok(v.map(|n| n as u32))
+    match v {
+        None => Ok(None),
+        Some(n) => u32::try_from(n).map(Some).map_err(|_| {
+            decode_error(
+                idx,
+                format!("line number {n} does not fit in u32 (column {idx})"),
+            )
+        }),
+    }
+}
+
+fn required_u32(row: &Row<'_>, idx: usize) -> Result<u32, rusqlite::Error> {
+    let n: i64 = row.get(idx)?;
+    u32::try_from(n).map_err(|_| {
+        decode_error(
+            idx,
+            format!("line number {n} does not fit in u32 (column {idx})"),
+        )
+    })
 }
 
 fn opt_i64(row: &Row<'_>, idx: usize) -> Result<Option<i64>, rusqlite::Error> {
@@ -334,6 +352,9 @@ fn edge_from_row(row: &Row<'_>) -> Result<EdgeAssertion, rusqlite::Error> {
         source: parse_edge_source(&row.get::<_, String>(4)?)?,
         certainty: parse_edge_certainty(&row.get::<_, String>(5)?)?,
         status: parse_edge_status(&row.get::<_, String>(6)?)?,
+        // SQLite stores REAL as f64; our domain type is f32. Closest-value
+        // rounding is the desired behaviour for confidences in [0,1].
+        #[allow(clippy::cast_possible_truncation)]
         confidence: row.get::<_, f64>(7)? as f32,
         evidence_json: row.get(8)?,
         source_file: row.get(9)?,
@@ -384,8 +405,8 @@ fn symbol_range_from_row(row: &Row<'_>) -> Result<SymbolRange, rusqlite::Error> 
     Ok(SymbolRange {
         file_path: row.get(0)?,
         symbol_id: ArtifactId::new(row.get::<_, String>(1)?),
-        start_line: row.get::<_, i64>(2)? as u32,
-        end_line: row.get::<_, i64>(3)? as u32,
+        start_line: required_u32(row, 2)?,
+        end_line: required_u32(row, 3)?,
         symbol_kind,
         qualified_name: row.get(5)?,
         parent_symbol_id: parent.map(ArtifactId::new),

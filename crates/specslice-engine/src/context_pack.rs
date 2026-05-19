@@ -159,8 +159,12 @@ fn read_snippet(repo_root: &Path, item: &SliceItem) -> Result<Option<String>> {
         return Ok(Some(text));
     };
     let lines: Vec<&str> = text.lines().collect();
-    let start_idx = (start.saturating_sub(1)) as usize;
-    let end_idx = (end.min(lines.len() as u32)) as usize;
+    // `lines.len()` may not fit in `u32` on truly massive inputs (theoretical
+    // — we have no such files in practice). Saturate explicitly so the bound
+    // check below stays sound.
+    let total_lines = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    let start_idx = usize::try_from(start.saturating_sub(1)).unwrap_or(usize::MAX);
+    let end_idx = usize::try_from(end.min(total_lines)).unwrap_or(usize::MAX);
     if start_idx >= lines.len() {
         return Ok(Some(String::new()));
     }
