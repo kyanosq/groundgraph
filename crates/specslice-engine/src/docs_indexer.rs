@@ -1,0 +1,445 @@
+//! Markdown / requirement indexer.
+//!
+//! MVP-1 scope (PRD §3.1, implementation plan §MVP-1):
+//! - Walk every `*.md` and `*.mdx` file under the configured docs roots.
+//! - Parse YAML frontmatter for `id / type / title / status`.
+//! - Build a [`Node`] per file and per heading section, plus a
+//!   `Requirement` / `AcceptanceCriterion` / `Adr` node when the frontmatter
+//!   asks for one.
+//! - Emit `File --contains--> DocSection` (Fact) and the first DocSection of
+//!   a requirement-typed file gets a `DocSection --documents--> Requirement`
+//!   (Declared) edge.
+//! - Collect `symbol://` / `test://` style entries from a `## Related`
+//!   section as unresolved references so later checks can flag broken trace.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use specslice_core::{
+    artifact_id::{doc_section_id, file_id, requirement_id, slugify},
+    EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
+};
+use specslice_store::Store;
+
+pub const DOCS_INDEXER_NAME: &str = "docs_markdown";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DocsIndexResult {
+    pub files: usize,
+    pub requirements: usize,
+    pub doc_sections: usize,
+    pub edges: usize,
+    pub unresolved_references: Vec<UnresolvedReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedReference {
+    pub from_requirement: String,
+    pub kind: UnresolvedKind,
+    pub target: String,
+    pub doc_path: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedKind {
+    Symbol,
+    Test,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Frontmatter {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    doc_type: Option<String>,
+    title: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Heading {
+    level: u8,
+    text: String,
+    line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDoc {
+    frontmatter: Frontmatter,
+    headings: Vec<Heading>,
+    total_lines: u32,
+    related: Vec<RelatedLink>,
+    content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelatedLink {
+    line: u32,
+    kind: UnresolvedKind,
+    target: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DocsIndexOptions {
+    pub repo_root: PathBuf,
+    pub doc_roots: Vec<PathBuf>,
+}
+
+/// Walk all configured doc roots and merge results into the given store.
+pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsIndexResult> {
+    let mut result = DocsIndexResult::default();
+    let mut visited = Vec::new();
+    for root in &options.doc_roots {
+        let abs_root = options.repo_root.join(root);
+        if !abs_root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&abs_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let is_md = matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("md") | Some("mdx")
+            );
+            if !is_md {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&options.repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if visited.iter().any(|v| v == &rel) {
+                continue;
+            }
+            visited.push(rel.clone());
+            index_one_file(store, &rel, path, &mut result)
+                .with_context(|| format!("indexing markdown file {rel}"))?;
+        }
+    }
+    Ok(result)
+}
+
+fn index_one_file(
+    store: &mut Store,
+    rel_path: &str,
+    abs_path: &Path,
+    result: &mut DocsIndexResult,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(abs_path)
+        .with_context(|| format!("reading {}", abs_path.display()))?;
+    let parsed = parse_markdown(&raw);
+
+    let mut file_node = Node::new(file_id(rel_path), NodeKind::File);
+    file_node.path = Some(rel_path.to_string());
+    file_node.name = abs_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned());
+    file_node.start_line = Some(1);
+    file_node.end_line = Some(parsed.total_lines);
+    file_node.content_hash = Some(parsed.content_hash.clone());
+    file_node.indexer = Some(DOCS_INDEXER_NAME.into());
+    store.upsert_node(&file_node)?;
+    result.files += 1;
+
+    let requirement_node = match (
+        parsed.frontmatter.id.as_deref(),
+        parsed.frontmatter.doc_type.as_deref(),
+    ) {
+        (Some(id), Some(ty)) => {
+            let kind = match ty {
+                "requirement" => Some(NodeKind::Requirement),
+                "acceptance" | "acceptance_criterion" => Some(NodeKind::AcceptanceCriterion),
+                "adr" => Some(NodeKind::Adr),
+                _ => None,
+            };
+            kind.map(|kind| {
+                let mut req = Node::new(requirement_id(id), kind);
+                req.name = parsed.frontmatter.title.clone();
+                req.path = Some(rel_path.to_string());
+                req.stable_key = Some(id.to_string());
+                req.indexer = Some(DOCS_INDEXER_NAME.into());
+                req
+            })
+        }
+        _ => None,
+    };
+
+    if let Some(req) = &requirement_node {
+        store.upsert_node(req)?;
+        if req.kind == NodeKind::Requirement {
+            result.requirements += 1;
+        }
+    }
+
+    // Build doc sections from headings. A section runs from its heading line
+    // until the next heading of equal or lower level (smaller `level` value
+    // means a higher heading), or EOF. We skip the well-known `Related`
+    // sub-section so its body (a list of unresolved references) does not
+    // pollute the doc-section count.
+    let mut first_section_id = None;
+    for (idx, heading) in parsed.headings.iter().enumerate() {
+        if is_related_heading(heading) {
+            continue;
+        }
+        let end_line = parsed
+            .headings
+            .iter()
+            .skip(idx + 1)
+            .find(|h| h.level <= heading.level)
+            .map(|h| h.line.saturating_sub(1))
+            .unwrap_or(parsed.total_lines);
+        let slug = slugify(&heading.text);
+        let section_id = doc_section_id(rel_path, &slug);
+        let mut node = Node::new(section_id.clone(), NodeKind::DocSection);
+        node.path = Some(rel_path.to_string());
+        node.name = Some(heading.text.clone());
+        node.start_line = Some(heading.line);
+        node.end_line = Some(end_line);
+        node.indexer = Some(DOCS_INDEXER_NAME.into());
+        store.upsert_node(&node)?;
+        result.doc_sections += 1;
+
+        let contains_edge = make_indexed_edge(EdgeAssertion::fact(
+            file_node.id.clone(),
+            section_id.clone(),
+            EdgeKind::Contains,
+            EdgeSource::Markdown,
+        ));
+        store.upsert_edge(&contains_edge)?;
+        result.edges += 1;
+
+        if first_section_id.is_none() {
+            first_section_id = Some(section_id);
+        }
+    }
+
+    if let (Some(section_id), Some(req)) = (first_section_id.as_ref(), requirement_node.as_ref()) {
+        if req.kind == NodeKind::Requirement {
+            let edge = make_indexed_edge(EdgeAssertion::declared(
+                section_id.clone(),
+                req.id.clone(),
+                EdgeKind::Documents,
+                EdgeSource::Markdown,
+            ));
+            store.upsert_edge(&edge)?;
+            result.edges += 1;
+        }
+    }
+
+    // Record related references as unresolved (resolved later by other
+    // indexers / checks).
+    if let Some(req) = &requirement_node {
+        for link in &parsed.related {
+            result.unresolved_references.push(UnresolvedReference {
+                from_requirement: req.stable_key.clone().unwrap_or_else(|| req.id.to_string()),
+                kind: link.kind,
+                target: link.target.clone(),
+                doc_path: rel_path.to_string(),
+                line: link.line,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn make_indexed_edge(mut edge: EdgeAssertion) -> EdgeAssertion {
+    edge.indexer = Some(DOCS_INDEXER_NAME.into());
+    edge
+}
+
+fn is_related_heading(heading: &Heading) -> bool {
+    heading.text.trim().eq_ignore_ascii_case("related")
+}
+
+fn parse_markdown(raw: &str) -> ParsedDoc {
+    let mut total_lines = 0u32;
+    let mut frontmatter_text = String::new();
+    let mut headings = Vec::new();
+    let mut related = Vec::new();
+    let mut content_hasher = Sha256::new();
+
+    // 1. Frontmatter. Consume from the opening `---` to the closing `---`.
+    let mut consumed_lines = 0usize;
+    if raw.starts_with("---\n") || raw.starts_with("---\r\n") {
+        let mut closed = false;
+        for (idx, line) in raw.lines().enumerate().skip(1) {
+            consumed_lines = idx + 1;
+            if line.trim_end() == "---" {
+                closed = true;
+                break;
+            }
+            frontmatter_text.push_str(line);
+            frontmatter_text.push('\n');
+        }
+        if !closed {
+            consumed_lines = 0;
+            frontmatter_text.clear();
+        }
+    }
+
+    let frontmatter = if frontmatter_text.is_empty() {
+        Frontmatter {
+            id: None,
+            doc_type: None,
+            title: None,
+            status: None,
+        }
+    } else {
+        serde_yaml::from_str::<Frontmatter>(&frontmatter_text).unwrap_or(Frontmatter {
+            id: None,
+            doc_type: None,
+            title: None,
+            status: None,
+        })
+    };
+
+    let mut in_related_section = false;
+    for (idx, line) in raw.lines().enumerate() {
+        total_lines = (idx + 1) as u32;
+        content_hasher.update(line.as_bytes());
+        content_hasher.update(b"\n");
+        if idx < consumed_lines {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some((level, text)) = parse_heading(trimmed) {
+            headings.push(Heading {
+                level,
+                text: text.to_string(),
+                line: total_lines,
+            });
+            in_related_section = text.trim().eq_ignore_ascii_case("related");
+            continue;
+        }
+        if in_related_section {
+            if let Some((kind, target)) = parse_related_line(trimmed) {
+                related.push(RelatedLink {
+                    line: total_lines,
+                    kind,
+                    target,
+                });
+            }
+        }
+    }
+    if total_lines == 0 {
+        total_lines = 1;
+    }
+    let content_hash = format!("{:x}", content_hasher.finalize());
+
+    ParsedDoc {
+        frontmatter,
+        headings,
+        total_lines,
+        related,
+        content_hash,
+    }
+}
+
+fn parse_heading(line: &str) -> Option<(u8, &str)> {
+    if !line.starts_with('#') {
+        return None;
+    }
+    let mut level = 0u8;
+    let bytes = line.as_bytes();
+    for &b in bytes {
+        if b == b'#' && level < 6 {
+            level += 1;
+        } else {
+            break;
+        }
+    }
+    if level == 0 {
+        return None;
+    }
+    let rest = &line[level as usize..];
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((level, rest))
+}
+
+fn parse_related_line(line: &str) -> Option<(UnresolvedKind, String)> {
+    let bullet = line.trim_start_matches(['-', '*', '+']).trim();
+    if bullet.is_empty() {
+        return None;
+    }
+    if let Some(rest) = bullet.strip_prefix("symbol://") {
+        return Some((UnresolvedKind::Symbol, rest.to_string()));
+    }
+    if let Some(rest) = bullet.strip_prefix("test://") {
+        return Some((UnresolvedKind::Test, rest.to_string()));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_heading_levels_and_text() {
+        assert_eq!(parse_heading("# Hello"), Some((1, "Hello")));
+        assert_eq!(parse_heading("## World"), Some((2, "World")));
+        assert_eq!(parse_heading("###### Six"), Some((6, "Six")));
+        assert_eq!(parse_heading("####### Seven"), Some((6, "# Seven")));
+        assert_eq!(parse_heading("nope"), None);
+        assert_eq!(parse_heading("#"), None);
+        assert_eq!(parse_heading("#    "), None);
+    }
+
+    #[test]
+    fn parse_related_line_classifies_links() {
+        assert_eq!(
+            parse_related_line("- symbol://lib/a.dart#Foo"),
+            Some((UnresolvedKind::Symbol, "lib/a.dart#Foo".into()))
+        );
+        assert_eq!(
+            parse_related_line("* test://test/a_test.dart#x"),
+            Some((UnresolvedKind::Test, "test/a_test.dart#x".into()))
+        );
+        assert_eq!(parse_related_line("- not a link"), None);
+        assert_eq!(parse_related_line(""), None);
+    }
+
+    #[test]
+    fn parse_markdown_handles_frontmatter_and_headings() {
+        let src = "---\nid: REQ-1\ntype: requirement\ntitle: T\n---\n\n# Top\n\nBody\n\n## Related\n\n- symbol://a.dart#Foo\n- test://a_test.dart#b\n";
+        let parsed = parse_markdown(src);
+        assert_eq!(parsed.frontmatter.id.as_deref(), Some("REQ-1"));
+        assert_eq!(parsed.frontmatter.doc_type.as_deref(), Some("requirement"));
+        assert_eq!(parsed.frontmatter.title.as_deref(), Some("T"));
+        assert_eq!(parsed.headings.len(), 2);
+        assert_eq!(parsed.headings[0].level, 1);
+        assert_eq!(parsed.headings[0].text, "Top");
+        assert_eq!(parsed.headings[1].text, "Related");
+        assert_eq!(parsed.related.len(), 2);
+        assert_eq!(parsed.related[0].kind, UnresolvedKind::Symbol);
+        assert_eq!(parsed.related[1].kind, UnresolvedKind::Test);
+    }
+
+    #[test]
+    fn parse_markdown_handles_no_frontmatter() {
+        let parsed = parse_markdown("# Hello\n\nBody\n");
+        assert!(parsed.frontmatter.id.is_none());
+        assert_eq!(parsed.headings.len(), 1);
+    }
+
+    #[test]
+    fn parse_markdown_handles_unterminated_frontmatter() {
+        let parsed = parse_markdown("---\nid: REQ-1\n# Hello\n");
+        // The frontmatter is unterminated → must fall back gracefully.
+        assert!(parsed.frontmatter.id.is_none());
+    }
+}

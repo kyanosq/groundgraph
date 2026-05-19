@@ -27,8 +27,17 @@ struct Cli {
 enum Commands {
     /// Initialise a SpecSlice workspace: create `.specslice.yaml` and `.specslice/graph.db`.
     Init,
+    /// Index docs and code into the graph store.
+    Index(IndexArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct IndexArgs {
+    /// Only index documentation (Markdown). Useful before any code adapter is ready.
+    #[arg(long)]
+    docs_only: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -65,6 +74,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init => commands::init::run(&cli.repo_root),
+        Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only),
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
     }
 }

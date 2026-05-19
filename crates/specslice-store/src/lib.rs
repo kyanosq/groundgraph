@@ -6,6 +6,9 @@
 //! - [`Store::connection`] — borrow the underlying connection (read access).
 
 mod migrations;
+mod repositories;
+
+pub use repositories::FileIndexEntry;
 
 use std::path::{Path, PathBuf};
 
@@ -34,13 +37,28 @@ pub enum StoreError {
         #[source]
         source: rusqlite::Error,
     },
+
+    #[error("sqlite error: {0}")]
+    Sqlite(#[source] rusqlite::Error),
+}
+
+impl StoreError {
+    pub(crate) fn sqlite(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
+    }
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
 /// Handle to the SpecSlice SQLite graph store.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
     path: PathBuf,
 }
 

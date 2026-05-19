@@ -1,5 +1,19 @@
 //! SpecSlice core types.
 //!
-//! Phase MVP-0 only requires the crate to compile so that downstream crates can
-//! depend on it. Concrete artifact, edge and evidence types will land in
-//! MVP-1/MVP-2 alongside their first behavioural tests.
+//! Defines the shared vocabulary used by every other crate: artifact IDs,
+//! node kinds, edge assertions, evidence, language adapter batches.
+
+pub mod artifact_id;
+pub mod edge;
+pub mod evidence;
+pub mod language_batch;
+pub mod node;
+
+pub use artifact_id::ArtifactId;
+pub use edge::{EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus};
+pub use evidence::{Evidence, EvidenceKind};
+pub use language_batch::{
+    AdapterDiagnostic, DeclaredTrace, FileArtifact, ImportEdge, LanguageIndexBatch, SymbolArtifact,
+    SymbolRange, TestArtifact, TraceTag,
+};
+pub use node::{Node, NodeKind};
