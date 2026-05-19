@@ -7,3 +7,10 @@ target/
 
 # Rust/editor local files.
 *.swp
+
+# Dart sidecar local build artefacts (we commit pubspec.yaml but not the
+# resolved pubspec.lock or the on-disk pub cache).
+tool/specslice_dart_analyzer/.dart_tool/
+tool/specslice_dart_analyzer/build/
+tool/specslice_dart_analyzer/pubspec.lock
+

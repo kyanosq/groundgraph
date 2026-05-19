@@ -27,6 +27,12 @@ fn print_result(result: &IndexResult) {
         println!("  Dart files: {}", code.files);
         println!("  Symbols: {}", code.symbols);
         println!("  TestCases: {}", code.tests);
+        if !code.resolver_used.is_empty() {
+            println!("  Resolver: {}", code.resolver_used);
+        }
+        if !code.sidecar_skip_reason.is_empty() {
+            println!("  Sidecar skipped: {}", code.sidecar_skip_reason);
+        }
     }
     if let Some(links) = &result.links {
         println!("Links index:");

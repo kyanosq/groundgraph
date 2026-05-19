@@ -17,7 +17,15 @@ use specslice_core::{EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind};
 use specslice_lang_dart::index_dart_paths;
 use specslice_store::Store;
 
+use crate::dart_sidecar::{self, SidecarOutcome};
+
 pub const DART_INDEXER_NAME: &str = "dart_lightweight";
+
+/// Resolver tag stored on `DartIndexResult.resolver_used`. `dart_analyzer`
+/// means the P7 sidecar produced this batch; `dart_lightweight` means we
+/// fell back to the heuristic adapter.
+pub const RESOLVER_DART_ANALYZER: &str = "dart_analyzer";
+pub const RESOLVER_DART_LIGHTWEIGHT: &str = "dart_lightweight";
 
 #[derive(Debug, Clone, Default)]
 pub struct DartIndexOptions {
@@ -38,11 +46,37 @@ pub struct DartIndexResult {
     pub tests: usize,
     pub declared_implementations: usize,
     pub declared_verifications: usize,
+    /// Which resolver produced the batch — `dart_analyzer` when the
+    /// P7 sidecar ran successfully, `dart_lightweight` when we fell back
+    /// to the heuristic adapter. Empty string is preserved for backward
+    /// compatibility with stored results from before P7.
+    #[serde(default)]
+    pub resolver_used: String,
+    /// Optional explanation if the sidecar was attempted but skipped
+    /// (env disabled, Dart SDK missing, JSON malformed, etc.). Empty
+    /// when the sidecar was used or when it wasn't attempted at all.
+    #[serde(default)]
+    pub sidecar_skip_reason: String,
 }
 
 pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartIndexResult> {
-    let mut batch = index_dart_paths(&options.repo_root, &options.code_roots)
-        .context("scanning Dart sources")?;
+    // P7: try the analyzer sidecar first (opt-in via SPECSLICE_DART_ANALYZER=1).
+    // When the sidecar is enabled and succeeds, we use its resolved-AST output;
+    // otherwise we silently fall back to the heuristic adapter so existing
+    // workflows keep working without a Dart SDK.
+    let (mut batch, resolver_used, skip_reason) = match dart_sidecar::try_run(
+        &options.repo_root,
+        &options.code_roots,
+        &options.exclude_globs,
+    ) {
+        SidecarOutcome::Used(b) => (b, RESOLVER_DART_ANALYZER.to_string(), String::new()),
+        SidecarOutcome::Skipped { reason } => (
+            index_dart_paths(&options.repo_root, &options.code_roots)
+                .context("scanning Dart sources")?,
+            RESOLVER_DART_LIGHTWEIGHT.to_string(),
+            reason,
+        ),
+    };
     if !options.exclude_globs.is_empty() {
         let exclude = options.exclude_globs.clone();
         let drop_file = |path: &str| exclude.iter().any(|g| path_matches_glob(g, path));
@@ -58,7 +92,10 @@ pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartI
         });
         batch.symbol_ranges.retain(|r| !drop_file(&r.file_path));
     }
-    ingest(store, &batch)
+    let mut result = ingest(store, &batch)?;
+    result.resolver_used = resolver_used;
+    result.sidecar_skip_reason = skip_reason;
+    Ok(result)
 }
 
 /// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`

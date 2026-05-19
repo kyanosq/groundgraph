@@ -9,6 +9,7 @@ pub mod config;
 pub mod connect;
 pub mod context_pack;
 pub mod dart_indexer;
+pub mod dart_sidecar;
 pub mod docs_indexer;
 pub mod export;
 pub mod git_diff;
