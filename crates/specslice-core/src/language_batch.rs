@@ -51,11 +51,26 @@ pub struct ImportEdge {
 /// `kind` must be [`EdgeKind::References`] (class / constant) or
 /// [`EdgeKind::Calls`] (callable target). The engine maps the edge through
 /// `EdgeAssertion::fact` with `EdgeSource::LanguageAdapter`.
+///
+/// P6.3 — every reference now carries evidence: `source_file`, the line the
+/// match was found on, and a trimmed `snippet` of the source line. `resolver`
+/// names the analyser that produced the edge (today: `dart_lightweight`;
+/// the analyzer sidecar in P7 will emit `dart_analyzer`). Confidence is
+/// kept on [`crate::EdgeAssertion`] so the engine can blend heuristic
+/// matches with analyzer / AI candidates without changing this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceEdge {
     pub from_symbol_id: ArtifactId,
     pub to_symbol_id: ArtifactId,
     pub kind: EdgeKind,
+    #[serde(default)]
+    pub source_file: String,
+    #[serde(default)]
+    pub line: u32,
+    #[serde(default)]
+    pub snippet: String,
+    #[serde(default)]
+    pub resolver: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

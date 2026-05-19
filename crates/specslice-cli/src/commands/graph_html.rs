@@ -843,6 +843,10 @@ mod tests {
             confidence: None,
             source: None,
             rationale: None,
+            source_file: None,
+            line_range: None,
+            snippet: None,
+            resolver: None,
         });
         let html = render_html(&view);
         assert!(html.contains("module::lib"));

@@ -10,7 +10,10 @@ pub mod parser;
 pub mod references;
 
 pub use parser::{parse_dart, ParseResult};
-pub use references::{compute_references, FileSource};
+pub use references::{
+    compute_references, compute_references_with_options, FileSource, ReferenceOptions,
+    RESOLVER_DART_LIGHTWEIGHT,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

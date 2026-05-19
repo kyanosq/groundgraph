@@ -28,10 +28,49 @@ use std::collections::{BTreeMap, HashMap};
 use specslice_core::language_batch::{ReferenceEdge, SymbolArtifact, SymbolRange};
 use specslice_core::{ArtifactId, EdgeKind, NodeKind};
 
+/// String constant the Dart lightweight adapter writes into
+/// [`ReferenceEdge::resolver`]. The analyzer sidecar will use
+/// `dart_analyzer`; AI-derived edges will use `ai_candidate`.
+pub const RESOLVER_DART_LIGHTWEIGHT: &str = "dart_lightweight";
+
 #[derive(Debug, Clone)]
 pub struct FileSource {
     pub path: String,
     pub source: String,
+}
+
+/// Maximum number of characters kept from a source line as evidence.
+///
+/// Long lines (auto-generated tables, embedded base64, etc.) would bloat the
+/// `edge_assertions` table and the JSON exports. 200 characters keeps the
+/// snippet legible in the UI without truncating typical Dart statements.
+const SNIPPET_MAX_LEN: usize = 200;
+
+/// Names that mostly produce noise when treated as calls/references:
+/// every Flutter widget overrides them, so a homonym-only scanner would
+/// otherwise wire every widget to every other widget. The list is
+/// deliberately small — only entries whose value as a code-fact signal is
+/// near-zero. Anything language-specific (Future, Stream, Map) stays
+/// scannable.
+const FRAMEWORK_NOISE_METHODS: &[&str] = &[
+    "toString",
+    "hashCode",
+    "noSuchMethod",
+    "runtimeType",
+    "copyWith",
+    "dispose",
+    "initState",
+    "build",
+    "didChangeDependencies",
+    "didUpdateWidget",
+    "deactivate",
+    "reassemble",
+    "createState",
+    "createElement",
+];
+
+fn is_framework_noise(name: &str) -> bool {
+    FRAMEWORK_NOISE_METHODS.contains(&name)
 }
 
 #[derive(Default)]
@@ -62,11 +101,49 @@ impl<'a> SymbolIndex<'a> {
     }
 }
 
+/// Options for [`compute_references`].
+///
+/// The adapter ships *all* edges by default so the store stays a complete
+/// record of what the scanner saw. Filtering is done at view time in the
+/// engine, which keeps a single index usable for both the clean default
+/// view and the `--include-noise` debug view.
+#[derive(Debug, Clone)]
+pub struct ReferenceOptions {
+    /// When `false`, framework noise method names (toString, dispose,
+    /// initState, …) are dropped at extraction time. Default is `true`
+    /// — emit everything and let the engine filter on demand.
+    pub include_noise: bool,
+}
+
+impl Default for ReferenceOptions {
+    fn default() -> Self {
+        Self {
+            include_noise: true,
+        }
+    }
+}
+
 pub fn compute_references(
     sources: &[FileSource],
     symbols: &[SymbolArtifact],
     ranges: &[SymbolRange],
     field_types: &BTreeMap<ArtifactId, BTreeMap<String, String>>,
+) -> Vec<ReferenceEdge> {
+    compute_references_with_options(
+        sources,
+        symbols,
+        ranges,
+        field_types,
+        &ReferenceOptions::default(),
+    )
+}
+
+pub fn compute_references_with_options(
+    sources: &[FileSource],
+    symbols: &[SymbolArtifact],
+    ranges: &[SymbolRange],
+    field_types: &BTreeMap<ArtifactId, BTreeMap<String, String>>,
+    opts: &ReferenceOptions,
 ) -> Vec<ReferenceEdge> {
     if symbols.is_empty() {
         return Vec::new();
@@ -77,6 +154,29 @@ pub fn compute_references(
         std::collections::HashSet::new();
     let mut out: Vec<ReferenceEdge> = Vec::new();
 
+    let mut emit = |from: &ArtifactId,
+                    to: &ArtifactId,
+                    kind: EdgeKind,
+                    src_path: &str,
+                    line_no: u32,
+                    raw_line: &str| {
+        if from == to {
+            return;
+        }
+        if !emitted.insert((from.clone(), to.clone(), kind)) {
+            return;
+        }
+        out.push(ReferenceEdge {
+            from_symbol_id: from.clone(),
+            to_symbol_id: to.clone(),
+            kind,
+            source_file: src_path.into(),
+            line: line_no,
+            snippet: shrink_snippet(raw_line),
+            resolver: RESOLVER_DART_LIGHTWEIGHT.into(),
+        });
+    };
+
     for symbol in symbols {
         if !matches!(
             symbol.kind,
@@ -84,17 +184,10 @@ pub fn compute_references(
         ) {
             continue;
         }
-        // Resolve the enclosing class's field types (if any). Lets us treat
-        // `pro.state` as `ProNotifier.state` when `pro: ProNotifier` was
-        // declared at class-body scope.
         let enclosing_fields = symbol
             .parent_symbol_id
             .as_ref()
             .and_then(|cid| field_types.get(cid));
-        // Use the range row when present; fall back to the declared
-        // [start_line, end_line] otherwise. The parser sets both to the
-        // declaration line for bodyless symbols (abstract methods, declared
-        // overrides, …) so we must avoid scanning meaningless ranges.
         let (start, end) = ranges
             .iter()
             .find(|r| r.symbol_id == symbol.id)
@@ -106,46 +199,46 @@ pub fn compute_references(
         let Some(lines) = lines_by_path.get(symbol.path.as_str()) else {
             continue;
         };
-        // Body excludes the declaration line. End is inclusive, but we
-        // saturate against the file length defensively.
         let body_start = start as usize; // skip declaration line
         let body_end = (end as usize).min(lines.len());
         if body_start >= body_end {
             continue;
         }
 
-        for line in &lines[body_start..body_end] {
-            let cleaned = strip_strings_and_comments(line);
+        for (offset, raw_line) in lines[body_start..body_end].iter().enumerate() {
+            // 1-based. Saturate when a file is absurdly long (>4 G lines)
+            // rather than truncating silently — we'd already have stopped
+            // scanning meaningfully by then.
+            let line_no = u32::try_from(body_start + offset + 1).unwrap_or(u32::MAX);
+            let cleaned = strip_strings_and_comments(raw_line);
             scan_identifiers(&cleaned, |ident, before, after| {
-                // First, try a direct field → type resolution: `field.X`
-                // where `field` is a class-level field declared with a known
-                // class type ⇒ emit a `references` edge to that class.
+                if !opts.include_noise && is_framework_noise(ident) {
+                    return;
+                }
+                // Field → type resolution: `field.X` where `field` is a
+                // class-level field declared with a known class type ⇒
+                // emit a `references` edge to that class.
                 if !matches!(before, Some('.')) && matches!(after, Some('.')) {
                     if let Some(matches) = enclosing_fields
                         .and_then(|fields| fields.get(ident))
                         .and_then(|type_name| index.classes_by_name.get(type_name.as_str()))
                     {
                         for target in matches {
-                            if target.id == symbol.id {
-                                continue;
-                            }
-                            let key = (symbol.id.clone(), target.id.clone(), EdgeKind::References);
-                            if !emitted.insert(key) {
-                                continue;
-                            }
-                            out.push(ReferenceEdge {
-                                from_symbol_id: symbol.id.clone(),
-                                to_symbol_id: target.id.clone(),
-                                kind: EdgeKind::References,
-                            });
+                            emit(
+                                &symbol.id,
+                                &target.id,
+                                EdgeKind::References,
+                                symbol.path.as_str(),
+                                line_no,
+                                raw_line,
+                            );
                         }
                     }
                 }
 
                 let kind_hint = classify(before, after);
                 let candidates = match kind_hint {
-                    Hint::MemberCall => index.callables_by_name.get(ident),
-                    Hint::FreeCall => index.callables_by_name.get(ident),
+                    Hint::MemberCall | Hint::FreeCall => index.callables_by_name.get(ident),
                     Hint::ClassReference => index.classes_by_name.get(ident),
                     Hint::Skip => None,
                 };
@@ -156,22 +249,33 @@ pub fn compute_references(
                     Hint::Skip => return,
                 };
                 for target in matches {
-                    if target.id == symbol.id {
-                        continue;
-                    }
-                    let key = (symbol.id.clone(), target.id.clone(), edge_kind);
-                    if !emitted.insert(key) {
-                        continue;
-                    }
-                    out.push(ReferenceEdge {
-                        from_symbol_id: symbol.id.clone(),
-                        to_symbol_id: target.id.clone(),
-                        kind: edge_kind,
-                    });
+                    emit(
+                        &symbol.id,
+                        &target.id,
+                        edge_kind,
+                        symbol.path.as_str(),
+                        line_no,
+                        raw_line,
+                    );
                 }
             });
         }
     }
+    out
+}
+
+fn shrink_snippet(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= SNIPPET_MAX_LEN {
+        return trimmed.to_string();
+    }
+    // Avoid splitting in the middle of a multi-byte character — count
+    // chars, not bytes.
+    let mut out = String::with_capacity(SNIPPET_MAX_LEN + 1);
+    for c in trimmed.chars().take(SNIPPET_MAX_LEN) {
+        out.push(c);
+    }
+    out.push('…');
     out
 }
 
@@ -630,5 +734,117 @@ mod tests {
         // `$foo` starts with `$` which is not is_ident_start, so the `$`
         // is skipped and `foo` is captured. `bar` is captured too.
         assert_eq!(seen, vec!["foo", "bar"]);
+    }
+
+    // -----------------------------------------------------------------
+    // P6.3 evidence + noise coverage.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn p63_shrink_snippet_trims_and_truncates_long_lines() {
+        // Short → trimmed, no ellipsis.
+        assert_eq!(shrink_snippet("   foo  "), "foo");
+        // Empty input stays empty.
+        assert_eq!(shrink_snippet("   "), "");
+        // Long input gets cut at SNIPPET_MAX_LEN with a `…` marker.
+        let long = "x".repeat(SNIPPET_MAX_LEN + 50);
+        let s = shrink_snippet(&long);
+        assert!(s.ends_with('…'), "{s}");
+        assert!(s.chars().count() == SNIPPET_MAX_LEN + 1);
+    }
+
+    #[test]
+    fn p63_shrink_snippet_handles_multibyte_chars() {
+        // CJK chars are 3 bytes each in UTF-8 but should be counted as 1
+        // char each by the truncator.
+        let cjk = "中".repeat(SNIPPET_MAX_LEN + 5);
+        let s = shrink_snippet(&cjk);
+        assert!(s.ends_with('…'));
+        assert!(s.chars().count() == SNIPPET_MAX_LEN + 1);
+    }
+
+    #[test]
+    fn p63_emits_evidence_fields_on_every_edge() {
+        let pro = method("lib/pro.dart", "ProNotifier", "applyPurchase", 5, 7);
+        let pay = method("lib/pay.dart", "Pay", "go", 3, 5);
+        let symbols = vec![pro.clone(), pay.clone()];
+        let ranges = vec![range_for(&pro), range_for(&pay)];
+        let sources = vec![
+            FileSource {
+                path: "lib/pay.dart".into(),
+                source: "class Pay {\n  ProNotifier n = ProNotifier();\n  void go() {\n    n.applyPurchase('x');\n  }\n}\n".into(),
+            },
+            FileSource {
+                path: "lib/pro.dart".into(),
+                source: "class ProNotifier {\n  ProNotifier();\n  void applyPurchase(String id) {\n  }\n}\n".into(),
+            },
+        ];
+        let edges = compute_references(&sources, &symbols, &ranges, &BTreeMap::new());
+        let call = edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls)
+            .expect("calls edge");
+        assert_eq!(call.source_file, "lib/pay.dart");
+        assert!(call.line > 0);
+        assert!(call.snippet.contains("applyPurchase"));
+        assert_eq!(call.resolver, RESOLVER_DART_LIGHTWEIGHT);
+    }
+
+    #[test]
+    fn p63_default_options_emit_noise_for_engine_to_filter() {
+        // We deliberately ship noise calls upstream so the engine can offer
+        // both clean and verbose views from a single index. Verify the
+        // adapter does NOT drop a toString call when include_noise is true.
+        let target = method("lib/x.dart", "X", "toString", 1, 3);
+        let caller = method("lib/y.dart", "Y", "go", 1, 3);
+        let symbols = vec![target.clone(), caller.clone()];
+        let ranges = vec![range_for(&target), range_for(&caller)];
+        let sources = vec![FileSource {
+            path: "lib/y.dart".into(),
+            source: "class Y {\n  X x = X();\n  void go() { x.toString(); }\n}\n".into(),
+        }];
+        let edges = compute_references(&sources, &symbols, &ranges, &BTreeMap::new());
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.to_symbol_id == target.id),
+            "default ReferenceOptions must emit noise edges; engine filters at view time. got: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn p63_include_noise_false_drops_framework_methods() {
+        let target = method("lib/x.dart", "X", "toString", 1, 3);
+        let caller = method("lib/y.dart", "Y", "go", 1, 3);
+        let symbols = vec![target.clone(), caller.clone()];
+        let ranges = vec![range_for(&target), range_for(&caller)];
+        let sources = vec![FileSource {
+            path: "lib/y.dart".into(),
+            source: "class Y {\n  X x = X();\n  void go() { x.toString(); }\n}\n".into(),
+        }];
+        let edges = compute_references_with_options(
+            &sources,
+            &symbols,
+            &ranges,
+            &BTreeMap::new(),
+            &ReferenceOptions {
+                include_noise: false,
+            },
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.to_symbol_id == target.id),
+            "include_noise=false must filter framework methods upstream"
+        );
+    }
+
+    #[test]
+    fn p63_is_framework_noise_recognises_every_declared_name() {
+        for name in FRAMEWORK_NOISE_METHODS {
+            assert!(is_framework_noise(name), "expected {name} to be noise");
+        }
+        assert!(!is_framework_noise("applyPurchase"));
+        assert!(!is_framework_noise("listenToPurchaseUpdates"));
     }
 }

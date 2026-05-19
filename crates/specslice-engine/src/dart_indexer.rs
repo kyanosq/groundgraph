@@ -64,6 +64,32 @@ pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartI
 /// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`
 /// (within a single segment). Implemented locally so we do not have to pull
 /// in a heavier dependency for what is essentially `path.ends_with(".g.dart")`.
+/// Build the `evidence_json` payload stored on each Dart `calls` /
+/// `references` edge. The shape is deliberately tiny so the engine and
+/// the future analyzer sidecar can both populate / parse it without a
+/// dedicated schema crate.
+///
+/// ```json
+/// { "line": 42, "snippet": "notifier.applyPurchase(p);", "resolver": "dart_lightweight" }
+/// ```
+fn build_reference_evidence_json(line: u32, snippet: &str, resolver: &str) -> String {
+    use serde_json::{Map, Value};
+    let mut obj: Map<String, Value> = Map::new();
+    if line > 0 {
+        obj.insert("line".into(), Value::from(line));
+    }
+    if !snippet.is_empty() {
+        obj.insert("snippet".into(), Value::from(snippet.to_string()));
+    }
+    let resolver = if resolver.is_empty() {
+        "dart_lightweight"
+    } else {
+        resolver
+    };
+    obj.insert("resolver".into(), Value::from(resolver.to_string()));
+    Value::Object(obj).to_string()
+}
+
 fn path_matches_glob(pattern: &str, path: &str) -> bool {
     let pat = pattern.replace('\\', "/");
     let p = path.replace('\\', "/");
@@ -222,6 +248,18 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
             EdgeSource::LanguageAdapter,
         );
         edge.indexer = Some(DART_INDEXER_NAME.into());
+        // P6.3 — propagate evidence so the UI can show file:line + snippet
+        // and the user can judge how trustworthy a heuristic edge is.
+        if !reference.source_file.is_empty() {
+            edge.source_file = Some(reference.source_file.clone());
+        }
+        if reference.line > 0 || !reference.snippet.is_empty() || !reference.resolver.is_empty() {
+            edge.evidence_json = Some(build_reference_evidence_json(
+                reference.line,
+                &reference.snippet,
+                &reference.resolver,
+            ));
+        }
         store.upsert_edge(&edge)?;
     }
 
@@ -342,6 +380,10 @@ mod ingest_tests {
             from_symbol_id: dart_method_id("x.dart", "A", "a"),
             to_symbol_id: dart_method_id("x.dart", "B", "b"),
             kind: EdgeKind::Contains, // <-- defensive: must be ignored
+            source_file: "x.dart".into(),
+            line: 1,
+            snippet: "".into(),
+            resolver: "dart_lightweight".into(),
         });
 
         let result = ingest(&mut store, &batch).unwrap();
@@ -377,11 +419,19 @@ mod ingest_tests {
             from_symbol_id: dart_method_id("x.dart", "A", "a"),
             to_symbol_id: dart_method_id("x.dart", "B", "b"),
             kind: EdgeKind::Calls,
+            source_file: "x.dart".into(),
+            line: 4,
+            snippet: "b();".into(),
+            resolver: "dart_lightweight".into(),
         });
         batch.references.push(ReferenceEdge {
             from_symbol_id: dart_method_id("x.dart", "A", "a"),
             to_symbol_id: dart_class_id("x.dart", "C"),
             kind: EdgeKind::References,
+            source_file: "x.dart".into(),
+            line: 5,
+            snippet: "C().method();".into(),
+            resolver: "dart_lightweight".into(),
         });
         ingest(&mut store, &batch).unwrap();
         assert_eq!(store.list_edges_by_kind(EdgeKind::Calls).unwrap().len(), 1);
@@ -451,5 +501,74 @@ mod ingest_tests {
         )
         .unwrap();
         assert_eq!(result.symbols, 1, "*.g.dart files must be excluded");
+    }
+
+    // -----------------------------------------------------------------
+    // P6.3 coverage for the evidence_json builder.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn p63_build_reference_evidence_json_round_trips() {
+        let raw = build_reference_evidence_json(42, "applyPurchase(p);", "dart_lightweight");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["line"], 42);
+        assert_eq!(parsed["snippet"], "applyPurchase(p);");
+        assert_eq!(parsed["resolver"], "dart_lightweight");
+    }
+
+    #[test]
+    fn p63_build_reference_evidence_json_omits_zero_line_and_empty_snippet() {
+        let raw = build_reference_evidence_json(0, "", "dart_lightweight");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.get("line").is_none());
+        assert!(parsed.get("snippet").is_none());
+        assert_eq!(parsed["resolver"], "dart_lightweight");
+    }
+
+    #[test]
+    fn p63_build_reference_evidence_json_defaults_resolver_when_missing() {
+        let raw = build_reference_evidence_json(1, "x", "");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Empty resolver gets replaced with the canonical default so the UI
+        // never has to render `null` or an empty source label.
+        assert_eq!(parsed["resolver"], "dart_lightweight");
+    }
+
+    #[test]
+    fn p63_ingest_propagates_evidence_to_edge_assertion() {
+        // End-to-end: ReferenceEdge with line + snippet flows into the
+        // store via EdgeAssertion.evidence_json + EdgeAssertion.source_file.
+        use specslice_core::artifact_id::dart_class_id;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.files.push(FileArtifact {
+            id: file_id("x.dart"),
+            path: "x.dart".into(),
+            language: "dart".into(),
+            content_hash: "h".into(),
+        });
+        batch.references.push(ReferenceEdge {
+            from_symbol_id: dart_method_id("x.dart", "A", "a"),
+            to_symbol_id: dart_class_id("x.dart", "C"),
+            kind: EdgeKind::References,
+            source_file: "lib/x.dart".into(),
+            line: 17,
+            snippet: "C.constant;".into(),
+            resolver: "dart_lightweight".into(),
+        });
+        ingest(&mut store, &batch).unwrap();
+        let edges = store.list_edges_by_kind(EdgeKind::References).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_file.as_deref(), Some("lib/x.dart"));
+        let ev = edges[0].evidence_json.as_deref().expect("evidence_json");
+        let parsed: serde_json::Value = serde_json::from_str(ev).unwrap();
+        assert_eq!(parsed["line"], 17);
+        assert_eq!(parsed["snippet"], "C.constant;");
+        assert_eq!(parsed["resolver"], "dart_lightweight");
     }
 }

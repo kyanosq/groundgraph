@@ -124,6 +124,24 @@ pub struct GraphEdge {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+    // ---- P6.3 evidence -----------------------------------------------------
+    /// Repo-relative path of the file the edge was extracted from. Surfaces
+    /// for any edge whose parser/indexer recorded a file (today: every
+    /// Dart `calls` / `references` edge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    /// `(start_line, end_line)` 1-based; equal values mean a single line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_range: Option<(u32, u32)>,
+    /// Trimmed copy of the source line (≤ 200 chars). Lets users judge
+    /// whether the heuristic guessed correctly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// Which analyser produced this edge. `dart_lightweight` for the
+    /// current heuristic Dart scanner; `dart_analyzer` after the analyzer
+    /// sidecar lands; `ai_candidate` for AI-derived edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +213,12 @@ pub struct GraphOptions {
     pub include_risks: bool,
     pub include_candidates: bool,
     pub max_nodes: Option<usize>,
+    /// When `false` (default) the view drops framework-noise edges:
+    /// `toString`, `copyWith`, `dispose`, `initState`, `build`, etc.
+    /// The Dart adapter avoids emitting them in the first place, but the
+    /// engine also filters defensively at view time so older `.specslice`
+    /// stores stay clean.
+    pub include_noise: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +245,14 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
         .iter()
         .map(map_edge)
         .collect();
+
+    // 1b. Default noise filter — drop `calls` edges targeting framework
+    // helper methods (toString / dispose / initState / …) so the focus
+    // view does not get drowned in same-name calls. Users can opt back in
+    // via `include_noise = true`.
+    if !options.include_noise {
+        edges.retain(|e| !is_noise_edge(e));
+    }
 
     // 2. Inject synthetic module aggregations from file paths.
     inject_modules(&mut nodes);
@@ -510,6 +542,7 @@ fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
         EdgeStatus::Confirmed => GraphStatus::Confirmed,
         EdgeStatus::Deprecated => GraphStatus::Stale,
     };
+    let (line_range, snippet, resolver) = parse_reference_evidence(edge.evidence_json.as_deref());
     GraphEdge {
         id: edge.id.to_string(),
         from: edge.from_id.to_string(),
@@ -520,7 +553,90 @@ fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
         confidence: Some(edge.confidence),
         source: Some(edge.source.as_str().into()),
         rationale: None,
+        source_file: edge.source_file.clone(),
+        line_range,
+        snippet,
+        resolver,
     }
+}
+
+/// Names whose `calls` edges are almost always framework noise.
+/// Mirrors `FRAMEWORK_NOISE_METHODS` in the Dart adapter — the engine
+/// re-applies the filter at view time so existing stores from before
+/// P6.3 also benefit without a reindex.
+const NOISE_TARGET_METHODS: &[&str] = &[
+    "toString",
+    "hashCode",
+    "noSuchMethod",
+    "runtimeType",
+    "copyWith",
+    "dispose",
+    "initState",
+    "build",
+    "didChangeDependencies",
+    "didUpdateWidget",
+    "deactivate",
+    "reassemble",
+    "createState",
+    "createElement",
+];
+
+/// True when an edge points at a known noise method. We only filter
+/// `calls` so `references` (class / constant uses) and structural edges
+/// (`contains`, `imports`) are unaffected.
+fn is_noise_edge(edge: &GraphEdge) -> bool {
+    if edge.kind != "calls" {
+        return false;
+    }
+    let target_name = target_method_name(&edge.to);
+    NOISE_TARGET_METHODS.contains(&target_name.as_str())
+}
+
+/// Strip the `dart_method::path#Class.method` prefix down to `method`.
+/// Returns the empty string for non-symbol ids.
+fn target_method_name(id: &str) -> String {
+    let Some((_, tail)) = id.split_once('#') else {
+        return String::new();
+    };
+    match tail.rsplit_once('.') {
+        Some((_, method)) => method.into(),
+        None => tail.into(),
+    }
+}
+
+/// Parse the tiny `{"line":N,"snippet":"…","resolver":"…"}` envelope the
+/// Dart indexer writes onto `calls` / `references` edges. Returns `None`
+/// for any field that is missing or malformed so the UI can show `--`.
+fn parse_reference_evidence(
+    evidence_json: Option<&str>,
+) -> (Option<(u32, u32)>, Option<String>, Option<String>) {
+    let Some(raw) = evidence_json else {
+        return (None, None, None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return (None, None, None);
+    };
+    let obj = match value {
+        serde_json::Value::Object(m) => m,
+        _ => return (None, None, None),
+    };
+    let line = obj
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .and_then(|n| u32::try_from(n).ok());
+    let line_range = line.map(|n| (n, n));
+    let snippet = obj
+        .get("snippet")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let resolver = obj
+        .get("resolver")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    (line_range, snippet, resolver)
 }
 
 fn map_check(finding: &CheckFinding) -> GraphFinding {
@@ -689,6 +805,36 @@ fn resolve_focus(nodes: &[GraphNode], focus_raw: &str) -> Option<String> {
 /// Parent chains of edge neighbours are intentionally not pulled in: that
 /// keeps method-level focus tight (the chain "caller → method → referenced
 /// class" stays visible without dragging the whole module tree along).
+/// Walk `contains` edges and `parent_id` links from `target_id` to collect
+/// every transitively-contained node (file → class → method → …). Used by
+/// `priority_order` so descendants of the focus win truncation over
+/// 1-hop neighbours.
+fn focus_descendants(nodes: &[GraphNode], edges: &[GraphEdge], target_id: &str) -> HashSet<String> {
+    let mut kept: HashSet<String> = HashSet::new();
+    kept.insert(target_id.to_string());
+    loop {
+        let before = kept.len();
+        let snapshot = kept.clone();
+        for n in nodes {
+            if let Some(p) = n.parent_id.as_deref() {
+                if snapshot.contains(p) {
+                    kept.insert(n.id.clone());
+                }
+            }
+        }
+        for e in edges {
+            if e.kind == "contains" && snapshot.contains(&e.from) {
+                kept.insert(e.to.clone());
+            }
+        }
+        if kept.len() == before {
+            break;
+        }
+    }
+    kept.remove(target_id); // caller already counts the focus itself
+    kept
+}
+
 fn focus_subgraph(nodes: &[GraphNode], edges: &[GraphEdge], target_id: &str) -> HashSet<String> {
     let valid: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
 
@@ -746,9 +892,25 @@ fn priority_order(nodes: &[GraphNode], edges: &[GraphEdge], focus: Option<&str>)
         }
     };
 
-    if let Some(f) = focus {
-        if let Some(resolved) = resolve_focus(nodes, f) {
-            push(&resolved, &mut out, &mut seen);
+    // Tier 1 — the focus itself.
+    let focus_id = focus.and_then(|f| resolve_focus(nodes, f));
+    if let Some(ref resolved) = focus_id {
+        push(resolved, &mut out, &mut seen);
+    }
+
+    // Tier 2 — descendants of the focus (via `contains` edges + parent_id).
+    // These are the nodes the user almost certainly cares about: PaywallScreen
+    // is a more useful neighbour than IapProductIds when you focused on the
+    // paywall module.
+    if let Some(ref resolved) = focus_id {
+        let descendants = focus_descendants(nodes, edges, resolved);
+        let mut ordered: Vec<&GraphNode> = nodes
+            .iter()
+            .filter(|n| descendants.contains(&n.id) && !seen.contains(&n.id))
+            .collect();
+        ordered.sort_by(|a, b| compare_business_priority(a, b).then(compare_node_order(a, b)));
+        for n in &ordered {
+            push(&n.id, &mut out, &mut seen);
         }
     }
 
@@ -781,14 +943,66 @@ fn priority_order(nodes: &[GraphNode], edges: &[GraphEdge], focus: Option<&str>)
         push(&n.id, &mut out, &mut seen);
     }
 
+    // P6.3: when nothing is confirmed (the common case for a freshly
+    // indexed repo with no manifest yet), the "rest" bucket carries
+    // everything. Truncation will then trim from the tail of `rest`, so
+    // we must pull business-keyword nodes (Pay / Purchase / Subscription
+    // / Entitlement / Iap / Pro / Premium / Restore) to the head and
+    // push framework-noise method nodes (initState / dispose / build /
+    // …) to the tail.
     let mut rest: Vec<&GraphNode> = nodes.iter().filter(|n| !seen.contains(&n.id)).collect();
-    rest.sort_by(|a, b| compare_node_order(a, b));
+    rest.sort_by(|a, b| compare_business_priority(a, b).then(compare_node_order(a, b)));
     for n in &rest {
         push(&n.id, &mut out, &mut seen);
     }
 
     out
 }
+
+/// Lower scores sort earlier. `0` = business / important, `1` = neutral,
+/// `2` = framework noise. Pure heuristic, only used as a head-of-bucket
+/// tiebreaker for truncation; the visible sort still uses
+/// `compare_node_order`.
+fn compare_business_priority(a: &GraphNode, b: &GraphNode) -> std::cmp::Ordering {
+    business_rank(a).cmp(&business_rank(b))
+}
+
+fn business_rank(node: &GraphNode) -> u8 {
+    // Noise demotion runs first: a method named `dispose` should sink to
+    // the tail even when it lives in a business-named file.
+    if matches!(node.kind.as_str(), "dart_method" | "dart_function") {
+        let method_name = node.label.as_str();
+        if NOISE_TARGET_METHODS.contains(&method_name) {
+            return 2;
+        }
+    }
+    let label_lower = node.label.to_ascii_lowercase();
+    let path_lower = node.path.as_deref().unwrap_or("").to_ascii_lowercase();
+    let is_business = BUSINESS_KEYWORDS
+        .iter()
+        .any(|kw| label_lower.contains(kw) || path_lower.contains(kw));
+    if is_business {
+        return 0;
+    }
+    1
+}
+
+/// Keywords used by [`business_rank`] to pull a node toward the head of
+/// the truncation queue. Lower-cased substrings — match label or path.
+const BUSINESS_KEYWORDS: &[&str] = &[
+    "pay",
+    "paywall",
+    "purchase",
+    "subscription",
+    "subscribe",
+    "entitlement",
+    "iap",
+    "billing",
+    "checkout",
+    "restore",
+    "pro_",
+    "premium",
+];
 
 fn compare_node_order(a: &GraphNode, b: &GraphNode) -> std::cmp::Ordering {
     let key_a = (
@@ -1008,6 +1222,10 @@ mod tests {
             confidence: None,
             source: None,
             rationale: None,
+            source_file: None,
+            line_range: None,
+            snippet: None,
+            resolver: None,
         }
     }
 
@@ -1298,5 +1516,176 @@ mod tests {
         cfg.storage.path = "graph.db".into();
         let path = resolve_storage_path(Path::new("/repo"), &cfg);
         assert_eq!(path, PathBuf::from("/repo/graph.db"));
+    }
+
+    // -----------------------------------------------------------------
+    // P6.3 unit coverage — evidence, noise, business priority.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn p63_target_method_name_extracts_trailing_segment() {
+        assert_eq!(target_method_name("dart_method::lib/a.dart#Foo.bar"), "bar");
+        assert_eq!(target_method_name("dart_class::lib/a.dart#Foo"), "Foo");
+        // Non-symbol id (no `#`) → empty.
+        assert_eq!(target_method_name("module::lib/iap"), "");
+    }
+
+    #[test]
+    fn p63_is_noise_edge_only_filters_calls() {
+        // `calls` to `toString` is noise.
+        let noisy = GraphEdge {
+            id: "e".into(),
+            from: "dart_method::lib/x.dart#A.go".into(),
+            to: "dart_method::lib/x.dart#B.toString".into(),
+            kind: "calls".into(),
+            layer: GraphLayer::Fact,
+            status: GraphStatus::Confirmed,
+            confidence: None,
+            source: None,
+            rationale: None,
+            source_file: None,
+            line_range: None,
+            snippet: None,
+            resolver: None,
+        };
+        assert!(is_noise_edge(&noisy));
+
+        // `references` is never filtered, even to a noise target.
+        let mut refs = noisy.clone();
+        refs.kind = "references".into();
+        assert!(!is_noise_edge(&refs));
+
+        // A `calls` edge to a non-noise method survives.
+        let mut real = noisy.clone();
+        real.to = "dart_method::lib/x.dart#B.applyPurchase".into();
+        assert!(!is_noise_edge(&real));
+    }
+
+    #[test]
+    fn p63_parse_reference_evidence_extracts_line_and_resolver() {
+        let raw = r#"{"line":42,"snippet":"a.b();","resolver":"dart_lightweight"}"#;
+        let (lr, sn, res) = parse_reference_evidence(Some(raw));
+        assert_eq!(lr, Some((42, 42)));
+        assert_eq!(sn.as_deref(), Some("a.b();"));
+        assert_eq!(res.as_deref(), Some("dart_lightweight"));
+    }
+
+    #[test]
+    fn p63_parse_reference_evidence_returns_all_none_on_missing_input() {
+        let (lr, sn, res) = parse_reference_evidence(None);
+        assert!(lr.is_none() && sn.is_none() && res.is_none());
+    }
+
+    #[test]
+    fn p63_parse_reference_evidence_rejects_invalid_json_safely() {
+        let (lr, sn, res) = parse_reference_evidence(Some("{not json"));
+        assert!(lr.is_none() && sn.is_none() && res.is_none());
+    }
+
+    #[test]
+    fn p63_parse_reference_evidence_rejects_non_object_payload() {
+        // JSON array — well-formed but wrong shape. Must not panic.
+        let (lr, sn, res) = parse_reference_evidence(Some("[1,2,3]"));
+        assert!(lr.is_none() && sn.is_none() && res.is_none());
+    }
+
+    #[test]
+    fn p63_parse_reference_evidence_drops_zero_or_oversized_line() {
+        // Zero is not a real line number.
+        let (lr, _, _) = parse_reference_evidence(Some(r#"{"line":0}"#));
+        assert!(lr.is_none());
+        // u64::MAX cannot fit u32.
+        let (lr, _, _) = parse_reference_evidence(Some(r#"{"line":18446744073709551615}"#));
+        assert!(lr.is_none());
+    }
+
+    #[test]
+    fn p63_business_rank_demotes_noise_methods_even_in_business_paths() {
+        // `dispose` lives under lib/features/paywall but is still noise.
+        let dispose = GraphNode {
+            id: "dart_method::lib/features/paywall/paywall_screen.dart#PaywallScreen.dispose"
+                .into(),
+            kind: "dart_method".into(),
+            column: GraphColumn::Code,
+            layer: GraphLayer::Fact,
+            label: "dispose".into(),
+            path: Some("lib/features/paywall/paywall_screen.dart".into()),
+            line_range: None,
+            status: GraphStatus::Confirmed,
+            parent_id: None,
+            child_count: 0,
+            default_visible: false,
+            confidence: None,
+            source: None,
+            badges: vec![],
+        };
+        assert_eq!(business_rank(&dispose), 2);
+
+        // `listenToPurchaseUpdates` matches "purchase" — rank 0.
+        let listener = GraphNode {
+            label: "listenToPurchaseUpdates".into(),
+            ..dispose.clone()
+        };
+        assert_eq!(business_rank(&listener), 0);
+
+        // Plain helper with no keyword and no noise name — neutral rank.
+        let neutral = GraphNode {
+            label: "encodeFooBar".into(),
+            path: Some("lib/utils/codec.dart".into()),
+            ..dispose
+        };
+        assert_eq!(business_rank(&neutral), 1);
+    }
+
+    #[test]
+    fn p63_focus_descendants_walks_contains_and_parent_id() {
+        let nodes = vec![
+            fake_node("module::lib", "module", None),
+            fake_node("file::lib/a.dart", "file", Some("module::lib")),
+            fake_node(
+                "dart_class::lib/a.dart#C",
+                "dart_class",
+                Some("file::lib/a.dart"),
+            ),
+            fake_node(
+                "dart_method::lib/a.dart#C.m",
+                "dart_method",
+                Some("file::lib/a.dart"),
+            ),
+            // Outside the focus subtree:
+            fake_node("file::other.dart", "file", None),
+        ];
+        let edges = vec![fake_edge(
+            "dart_class::lib/a.dart#C",
+            "dart_method::lib/a.dart#C.m",
+            "contains",
+        )];
+        let descendants = focus_descendants(&nodes, &edges, "module::lib");
+        assert!(descendants.contains("file::lib/a.dart"));
+        assert!(descendants.contains("dart_class::lib/a.dart#C"));
+        assert!(descendants.contains("dart_method::lib/a.dart#C.m"));
+        assert!(!descendants.contains("module::lib")); // focus itself is excluded
+        assert!(!descendants.contains("file::other.dart"));
+    }
+
+    #[test]
+    fn p63_map_edge_surfaces_evidence_fields_on_graph_edge() {
+        use specslice_core::{ArtifactId, EdgeAssertion, EdgeKind, EdgeSource};
+        let mut edge = EdgeAssertion::fact(
+            ArtifactId::new("dart_method::lib/a.dart#A.x"),
+            ArtifactId::new("dart_method::lib/b.dart#B.y"),
+            EdgeKind::Calls,
+            EdgeSource::LanguageAdapter,
+        );
+        edge.source_file = Some("lib/a.dart".into());
+        edge.evidence_json =
+            Some(r#"{"line":11,"snippet":"y();","resolver":"dart_lightweight"}"#.into());
+
+        let g = map_edge(&edge);
+        assert_eq!(g.source_file.as_deref(), Some("lib/a.dart"));
+        assert_eq!(g.line_range, Some((11, 11)));
+        assert_eq!(g.snippet.as_deref(), Some("y();"));
+        assert_eq!(g.resolver.as_deref(), Some("dart_lightweight"));
+        assert_eq!(g.kind, "calls");
     }
 }

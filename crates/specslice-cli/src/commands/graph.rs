@@ -36,6 +36,9 @@ pub struct GraphRunArgs {
     pub include_candidates: bool,
     pub max_nodes: Option<usize>,
     pub pretty: bool,
+    /// `--include-noise` — surface framework noise (toString / dispose
+    /// / initState / build / …) instead of hiding it by default.
+    pub include_noise: bool,
 }
 
 pub fn run(args: GraphRunArgs) -> Result<()> {
@@ -48,6 +51,7 @@ pub fn run(args: GraphRunArgs) -> Result<()> {
         include_risks: args.include_risks,
         include_candidates: args.include_candidates,
         max_nodes: args.max_nodes,
+        include_noise: args.include_noise,
     };
     let view = build_graph_view(&args.repo_root, options)
         .with_context(|| format!("building graph view at {}", args.repo_root.display()))?;

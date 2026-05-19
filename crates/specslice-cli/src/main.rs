@@ -74,6 +74,10 @@ struct GraphArgs {
     /// Pretty-print the JSON output.
     #[arg(long)]
     pretty: bool,
+    /// Show framework-noise edges (toString / dispose / initState / build /
+    /// hashCode / …). Off by default; on means "give me the full noisy graph".
+    #[arg(long, default_value_t = false)]
+    include_noise: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -278,6 +282,7 @@ fn run() -> Result<()> {
             include_candidates: args.include_candidates,
             max_nodes: args.max_nodes,
             pretty: args.pretty,
+            include_noise: args.include_noise,
         }),
     }
 }
