@@ -33,8 +33,34 @@ enum Commands {
     Slice(SliceArgs),
     /// Report which requirements, docs and tests are affected by a git diff.
     Impact(ImpactArgs),
+    /// Run consistency checks (broken trace, missing linked test, orphan REQ).
+    Check(CheckArgs),
+    /// Produce an agent-ready context pack for a requirement.
+    Context(ContextArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CheckArgs {
+    /// Output a machine-readable JSON document.
+    #[arg(long)]
+    json: bool,
+    /// Exit with code 1 even when only warnings are reported.
+    #[arg(long)]
+    fail_on_warning: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ContextArgs {
+    /// The requirement ID (e.g. `REQ-WATERMARK-001`).
+    requirement: String,
+    /// Include doc/code/test source snippets inline.
+    #[arg(long, default_value_t = true)]
+    include_snippets: bool,
+    /// Output a machine-readable JSON document.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -105,6 +131,19 @@ fn run() -> Result<()> {
         Commands::Impact(args) => {
             commands::impact::run(&cli.repo_root, &args.base, &args.head, args.json)
         }
+        Commands::Check(args) => {
+            let exit = commands::check::run(&cli.repo_root, args.json, args.fail_on_warning)?;
+            if exit != 0 {
+                std::process::exit(exit);
+            }
+            Ok(())
+        }
+        Commands::Context(args) => commands::context::run(
+            &cli.repo_root,
+            &args.requirement,
+            args.include_snippets,
+            args.json,
+        ),
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
     }
 }

@@ -4,7 +4,9 @@
 //! - [`EngineConfig`] — workspace-level config persisted to `.specslice.yaml`.
 //! - [`init_repository`] — generate the config file and graph database.
 
+pub mod checks;
 pub mod config;
+pub mod context_pack;
 pub mod dart_indexer;
 pub mod docs_indexer;
 pub mod export;
@@ -14,7 +16,13 @@ pub mod index;
 pub mod init;
 pub mod slice;
 
+pub use checks::{
+    compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,
+};
 pub use config::EngineConfig;
+pub use context_pack::{
+    build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
+};
 pub use docs_indexer::{
     DocsIndexOptions, DocsIndexResult, UnresolvedKind, UnresolvedReference, DOCS_INDEXER_NAME,
 };
