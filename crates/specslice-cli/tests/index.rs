@@ -55,3 +55,27 @@ fn index_docs_reports_requirements_and_doc_sections() {
         .stdout(contains("DocSections: 1"))
         .stdout(contains("Unresolved references: 2"));
 }
+
+#[test]
+fn index_full_reports_dart_symbols_tests_and_traces() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    copy_fixture(tmp.path());
+
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["index"])
+        .assert()
+        .success()
+        .stdout(contains("Requirements: 1"))
+        .stdout(contains("TestCases: 1"))
+        .stdout(contains("Declared implementations: 1"))
+        .stdout(contains("Declared verifications: 1"));
+}
