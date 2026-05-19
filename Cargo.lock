@@ -802,6 +802,7 @@ name = "specslice-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "globset",
  "rusqlite",
  "serde",
  "serde_json",

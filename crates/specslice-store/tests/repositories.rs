@@ -50,7 +50,7 @@ fn upsert_edge_is_idempotent_and_indexes_by_kind() {
         ArtifactId::new("dart_class::a.dart#Foo"),
         ArtifactId::new("req::REQ-1"),
         EdgeKind::DeclaresImplementation,
-        EdgeSource::ExplicitTrace,
+        EdgeSource::ExternalManifest,
     );
     store.upsert_edge(&edge).expect("first upsert");
     store.upsert_edge(&edge).expect("second upsert idempotent");
@@ -207,13 +207,12 @@ fn edges_can_round_trip_every_kind_and_source_and_status() {
         EdgeKind::Documents,
         EdgeKind::DeclaresImplementation,
         EdgeKind::DeclaresVerification,
-        EdgeKind::RelatedTo,
     ];
     let sources = [
         EdgeSource::Filesystem,
         EdgeSource::LanguageAdapter,
         EdgeSource::Markdown,
-        EdgeSource::ExplicitTrace,
+        EdgeSource::ExternalManifest,
         EdgeSource::GitDiff,
     ];
     for (idx, kind) in kinds.iter().enumerate() {
@@ -324,7 +323,7 @@ fn clear_indexer_outputs_removes_relevant_rows() {
         ArtifactId::new("dart_class::a.dart#Foo"),
         ArtifactId::new("req::REQ-1"),
         EdgeKind::DeclaresImplementation,
-        EdgeSource::ExplicitTrace,
+        EdgeSource::ExternalManifest,
     );
     edge.indexer = Some("dart_lightweight".into());
     store.upsert_edge(&edge).unwrap();

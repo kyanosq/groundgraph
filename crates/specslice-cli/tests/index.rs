@@ -52,12 +52,11 @@ fn index_docs_reports_requirements_and_doc_sections() {
         .assert()
         .success()
         .stdout(contains("Requirements: 1"))
-        .stdout(contains("DocSections: 1"))
-        .stdout(contains("Unresolved references: 2"));
+        .stdout(contains("DocSections: 1"));
 }
 
 #[test]
-fn index_full_reports_dart_symbols_tests_and_traces() {
+fn index_full_reports_dart_symbols_tests_and_manifest_links() {
     let tmp = tempfile::TempDir::new().unwrap();
     copy_fixture(tmp.path());
 
@@ -76,6 +75,7 @@ fn index_full_reports_dart_symbols_tests_and_traces() {
         .success()
         .stdout(contains("Requirements: 1"))
         .stdout(contains("TestCases: 1"))
-        .stdout(contains("Declared implementations: 1"))
-        .stdout(contains("Declared verifications: 1"));
+        .stdout(contains("Links index:"))
+        .stdout(contains("Implementations: 1"))
+        .stdout(contains("Tests: 1"));
 }

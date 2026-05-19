@@ -13,7 +13,7 @@ pub use artifact_id::ArtifactId;
 pub use edge::{EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus};
 pub use evidence::{Evidence, EvidenceKind};
 pub use language_batch::{
-    AdapterDiagnostic, DeclaredTrace, FileArtifact, ImportEdge, LanguageIndexBatch, SymbolArtifact,
-    SymbolRange, TestArtifact, TraceTag,
+    AdapterDiagnostic, FileArtifact, ImportEdge, LanguageIndexBatch, SymbolArtifact, SymbolRange,
+    TestArtifact,
 };
 pub use node::{Node, NodeKind};

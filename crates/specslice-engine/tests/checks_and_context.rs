@@ -11,6 +11,7 @@ use specslice_engine::context_pack::{node_kind_counts, ContextOptions};
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions};
 use specslice_engine::docs_indexer::{index_docs, DocsIndexOptions};
 use specslice_engine::impact::ImpactReport;
+use specslice_engine::links_indexer::{index_links, LinksIndexOptions};
 use specslice_engine::{build_context, EngineConfig};
 use specslice_store::Store;
 use tempfile::TempDir;
@@ -34,6 +35,7 @@ fn fresh_store_with_index() -> (TempDir, Store) {
         &DocsIndexOptions {
             repo_root: fixture.clone(),
             doc_roots: vec![PathBuf::from("docs")],
+            include_globs: Vec::new(),
         },
     )
     .unwrap();
@@ -43,6 +45,14 @@ fn fresh_store_with_index() -> (TempDir, Store) {
             repo_root: fixture,
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
             ..Default::default()
+        },
+    )
+    .unwrap();
+    index_links(
+        &mut store,
+        &LinksIndexOptions {
+            repo_root: fixture_path(),
+            manifest_path: PathBuf::from(".specslice/links.yaml"),
         },
     )
     .unwrap();
@@ -76,7 +86,7 @@ fn watermark_fixture_has_clean_checks() {
 }
 
 #[test]
-fn broken_trace_is_reported_as_error() {
+fn broken_link_is_reported_as_error() {
     let tmp = TempDir::new().unwrap();
     let mut store = Store::open(tmp.path().join("graph.db")).unwrap();
     store.migrate().unwrap();
@@ -90,7 +100,7 @@ fn broken_trace_is_reported_as_error() {
             cls.id.clone(),
             requirement_id("REQ-MISSING"),
             EdgeKind::DeclaresImplementation,
-            EdgeSource::ExplicitTrace,
+            EdgeSource::ExternalManifest,
         ))
         .unwrap();
     let report = compute_checks(&store, None).unwrap();
@@ -98,7 +108,7 @@ fn broken_trace_is_reported_as_error() {
     assert!(report
         .findings
         .iter()
-        .any(|f| f.code == "broken_trace" && f.message.contains("REQ-MISSING")));
+        .any(|f| f.code == "broken_link" && f.message.contains("REQ-MISSING")));
 }
 
 #[test]
@@ -166,6 +176,7 @@ fn context_pack_includes_slice_snippets_and_edges() {
         &DocsIndexOptions {
             repo_root: tmp.path().into(),
             doc_roots: vec![PathBuf::from("docs")],
+            include_globs: Vec::new(),
         },
     )
     .unwrap();
@@ -175,6 +186,14 @@ fn context_pack_includes_slice_snippets_and_edges() {
             repo_root: tmp.path().into(),
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
             ..Default::default()
+        },
+    )
+    .unwrap();
+    index_links(
+        &mut store,
+        &LinksIndexOptions {
+            repo_root: tmp.path().into(),
+            manifest_path: PathBuf::from(".specslice/links.yaml"),
         },
     )
     .unwrap();
@@ -226,6 +245,7 @@ fn context_pack_exposes_files_to_read_and_tests_to_run() {
         &DocsIndexOptions {
             repo_root: tmp.path().into(),
             doc_roots: vec![PathBuf::from("docs")],
+            include_globs: Vec::new(),
         },
     )
     .unwrap();
@@ -235,6 +255,14 @@ fn context_pack_exposes_files_to_read_and_tests_to_run() {
             repo_root: tmp.path().into(),
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
             ..Default::default()
+        },
+    )
+    .unwrap();
+    index_links(
+        &mut store,
+        &LinksIndexOptions {
+            repo_root: tmp.path().into(),
+            manifest_path: PathBuf::from(".specslice/links.yaml"),
         },
     )
     .unwrap();

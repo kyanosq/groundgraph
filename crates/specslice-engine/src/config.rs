@@ -1,8 +1,8 @@
 //! Workspace configuration stored in `.specslice.yaml`.
 //!
-//! MVP-0 only persisted `repo + storage`. MVP-7 collapsing the PRD §8 schema
-//! requires the full set of sections (docs / code / trace / slice / impact /
-//! checks). To keep backward compatibility we:
+//! MVP-0 only persisted `repo + storage`. The non-invasive MVP schema keeps
+//! all SpecSlice-owned metadata under `.specslice/`; business docs and code
+//! are scanned as facts only.
 //!
 //! 1. Make every section optional via `#[serde(default)]`.
 //! 2. Drop `#[serde(deny_unknown_fields)]` so future keys are tolerated.
@@ -26,13 +26,31 @@ pub struct EngineConfig {
     #[serde(default)]
     pub code: CodeConfig,
     #[serde(default)]
-    pub trace: TraceConfig,
+    pub links: LinksConfig,
     #[serde(default)]
     pub slice: SliceConfig,
     #[serde(default)]
     pub impact: ImpactConfig,
     #[serde(default)]
     pub checks: ChecksConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinksConfig {
+    #[serde(default = "default_links_path")]
+    pub path: String,
+}
+
+impl Default for LinksConfig {
+    fn default() -> Self {
+        Self {
+            path: default_links_path(),
+        }
+    }
+}
+
+fn default_links_path() -> String {
+    ".specslice/links.yaml".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,55 +161,6 @@ fn default_adapter_backend() -> String {
     "lightweight".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TraceConfig {
-    #[serde(default = "default_trace_implements")]
-    #[serde(rename = "explicit_tags_implements", alias = "implements_tag")]
-    pub implements_tag: String,
-    #[serde(default = "default_trace_verifies")]
-    #[serde(rename = "explicit_tags_verifies", alias = "verifies_tag")]
-    pub verifies_tag: String,
-    #[serde(default = "default_trace_related")]
-    #[serde(rename = "explicit_tags_related", alias = "related_tag")]
-    pub related_tag: String,
-    /// Alternative nested form: `trace.explicit_tags.{implements,verifies,related}`.
-    #[serde(default)]
-    pub explicit_tags: Option<ExplicitTags>,
-}
-
-impl Default for TraceConfig {
-    fn default() -> Self {
-        Self {
-            implements_tag: default_trace_implements(),
-            verifies_tag: default_trace_verifies(),
-            related_tag: default_trace_related(),
-            explicit_tags: None,
-        }
-    }
-}
-
-fn default_trace_implements() -> String {
-    "@implements".into()
-}
-
-fn default_trace_verifies() -> String {
-    "@verifies".into()
-}
-
-fn default_trace_related() -> String {
-    "@related".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ExplicitTags {
-    #[serde(default)]
-    pub implements: Option<String>,
-    #[serde(default)]
-    pub verifies: Option<String>,
-    #[serde(default)]
-    pub related: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SliceConfig {
     #[serde(default = "default_slice_max_depth")]
@@ -268,8 +237,8 @@ fn default_missing_test_change_level() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChecksConfig {
-    #[serde(default = "default_broken_trace_level")]
-    pub broken_trace_level: String,
+    #[serde(default = "default_broken_link_level")]
+    pub broken_link_level: String,
     #[serde(default = "default_missing_linked_test_level")]
     pub missing_linked_test_level: String,
     #[serde(default = "default_orphan_requirement_level")]
@@ -279,14 +248,14 @@ pub struct ChecksConfig {
 impl Default for ChecksConfig {
     fn default() -> Self {
         Self {
-            broken_trace_level: default_broken_trace_level(),
+            broken_link_level: default_broken_link_level(),
             missing_linked_test_level: default_missing_linked_test_level(),
             orphan_requirement_level: default_orphan_requirement_level(),
         }
     }
 }
 
-fn default_broken_trace_level() -> String {
+fn default_broken_link_level() -> String {
     "error".into()
 }
 fn default_missing_linked_test_level() -> String {

@@ -12,7 +12,6 @@ pub enum EdgeKind {
     Documents,
     DeclaresImplementation,
     DeclaresVerification,
-    RelatedTo,
 }
 
 impl EdgeKind {
@@ -23,7 +22,6 @@ impl EdgeKind {
             EdgeKind::Documents => "documents",
             EdgeKind::DeclaresImplementation => "declares_implementation",
             EdgeKind::DeclaresVerification => "declares_verification",
-            EdgeKind::RelatedTo => "related_to",
         }
     }
 }
@@ -34,7 +32,7 @@ pub enum EdgeSource {
     Filesystem,
     LanguageAdapter,
     Markdown,
-    ExplicitTrace,
+    ExternalManifest,
     GitDiff,
 }
 
@@ -44,7 +42,7 @@ impl EdgeSource {
             EdgeSource::Filesystem => "filesystem",
             EdgeSource::LanguageAdapter => "language_adapter",
             EdgeSource::Markdown => "markdown",
-            EdgeSource::ExplicitTrace => "explicit_trace",
+            EdgeSource::ExternalManifest => "external_manifest",
             EdgeSource::GitDiff => "git_diff",
         }
     }
@@ -102,8 +100,7 @@ pub struct EdgeAssertion {
 }
 
 impl EdgeAssertion {
-    /// Build a `Declared / Confirmed` edge with confidence 1.0 — the default
-    /// shape used by MVP for every deterministic trace.
+    /// Build a `Declared / Confirmed` edge with confidence 1.0.
     pub fn declared(from: ArtifactId, to: ArtifactId, kind: EdgeKind, source: EdgeSource) -> Self {
         let id = ArtifactId::new(format!("edge::{}::{}::{}", kind.as_str(), from, to));
         Self {
@@ -150,12 +147,11 @@ mod tests {
             EdgeKind::DeclaresVerification.as_str(),
             "declares_verification"
         );
-        assert_eq!(EdgeKind::RelatedTo.as_str(), "related_to");
 
         assert_eq!(EdgeSource::Filesystem.as_str(), "filesystem");
         assert_eq!(EdgeSource::LanguageAdapter.as_str(), "language_adapter");
         assert_eq!(EdgeSource::Markdown.as_str(), "markdown");
-        assert_eq!(EdgeSource::ExplicitTrace.as_str(), "explicit_trace");
+        assert_eq!(EdgeSource::ExternalManifest.as_str(), "external_manifest");
         assert_eq!(EdgeSource::GitDiff.as_str(), "git_diff");
 
         assert_eq!(EdgeCertainty::Fact.as_str(), "fact");
@@ -173,7 +169,7 @@ mod tests {
             from.clone(),
             to.clone(),
             EdgeKind::DeclaresImplementation,
-            EdgeSource::ExplicitTrace,
+            EdgeSource::ExternalManifest,
         );
         assert_eq!(edge.certainty, EdgeCertainty::Declared);
         assert_eq!(edge.status, EdgeStatus::Confirmed);
@@ -182,7 +178,7 @@ mod tests {
             from,
             to,
             EdgeKind::DeclaresImplementation,
-            EdgeSource::ExplicitTrace,
+            EdgeSource::ExternalManifest,
         );
         assert_eq!(edge.id, again.id);
     }

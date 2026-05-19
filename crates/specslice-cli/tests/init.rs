@@ -17,12 +17,15 @@ fn init_creates_config_and_graph_db_in_empty_directory() {
         .assert()
         .success()
         .stdout(contains(".specslice.yaml"))
+        .stdout(contains(".specslice/links.yaml"))
         .stdout(contains(".specslice/graph.db"));
 
     repo.child(".specslice.yaml")
         .assert(predicates::path::is_file());
     repo.child(".specslice").assert(predicates::path::is_dir());
     repo.child(".specslice/graph.db")
+        .assert(predicates::path::is_file());
+    repo.child(".specslice/links.yaml")
         .assert(predicates::path::is_file());
 }
 

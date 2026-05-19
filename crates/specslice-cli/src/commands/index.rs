@@ -21,22 +21,19 @@ fn print_result(result: &IndexResult) {
         println!("  Requirements: {}", docs.requirements);
         println!("  DocSections: {}", docs.doc_sections);
         println!("  Edges: {}", docs.edges);
-        if !docs.unresolved_references.is_empty() {
-            println!(
-                "  Unresolved references: {}",
-                docs.unresolved_references.len()
-            );
-        }
     }
     if let Some(code) = &result.code {
         println!("Code index:");
         println!("  Dart files: {}", code.files);
         println!("  Symbols: {}", code.symbols);
         println!("  TestCases: {}", code.tests);
-        println!(
-            "  Declared implementations: {}",
-            code.declared_implementations
-        );
-        println!("  Declared verifications: {}", code.declared_verifications);
+    }
+    if let Some(links) = &result.links {
+        println!("Links index:");
+        println!("  Requirements: {}", links.requirements);
+        println!("  Docs: {}", links.docs);
+        println!("  Implementations: {}", links.implementations);
+        println!("  Tests: {}", links.tests);
+        println!("  Edges: {}", links.edges);
     }
 }

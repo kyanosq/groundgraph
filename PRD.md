@@ -6,13 +6,15 @@
 
 > **SpecSlice 本体不是 Dart 库，而是 Rust 构建的 CLI / Engine / Library；Dart 只是 MVP 阶段优先支持的目标语言 Adapter。**
 
-当前 MVP 不追求“自动理解整个仓库”，而是先跑通一个对 AI 编程最有价值的显式 trace 闭环：
+当前 MVP 不追求“自动理解整个仓库”，而是先跑通一个对 AI 编程最有价值的非侵入式关系闭环：
 
 ```text
 REQ / DocSection
-      ↓ explicit trace
+      ↓ AI generated candidate + human confirmation
+Confirmed external links manifest
+      ↓
 Dart Symbol
-      ↓ explicit trace
+      ↓ confirmed external links manifest
 TestCase
       ↓ git diff impact
 Affected Requirements / Docs / Tests
@@ -68,7 +70,7 @@ SCIP / Multi-language
 
 MVP 的准确定位：
 
-> **显式 trace 驱动的 AI 编程上下文治理工具。**
+> **非侵入式关系图驱动的 AI 编程上下文治理工具。**
 
 不是：
 
@@ -110,10 +112,10 @@ REQ 文档
 MVP 核心原则：
 
 ```text
-1. 显式 trace 优先。
-2. 不依赖 LLM。
+1. 非侵入式关系声明优先，业务代码/业务文档不写工具专用注解。
+2. 业务逻辑文档与代码/测试的关联由 AI 生成候选，人工确认。
 3. 不做复杂 call graph。
-4. 不做全自动文档关联。
+4. 不用规则匹配推断业务关联。
 5. 不做大图可视化。
 6. 不做复杂 Review Workflow。
 7. 不做多语言。
@@ -122,9 +124,47 @@ MVP 核心原则：
 10. PR Impact 是第一阶段 killer feature。
 ```
 
+### 2.1 非侵入式硬约束
+
+SpecSlice 对目标仓库的默认工作方式必须是只读扫描业务内容，只写 SpecSlice 自己拥有的目录。
+
+```text
+业务代码：只读扫描，不要求、不支持工具专用注解。
+业务测试：只读扫描，不要求、不支持工具专用注解。
+业务文档：只读扫描，不要求新增 frontmatter、Related 段落或工具标记。
+
+SpecSlice 可写位置：
+- .specslice.yaml
+- .specslice/links.yaml
+- .specslice/graph.db
+- .specslice/export/
+- 后续 .specslice/requirements.yaml
+- 后续 .specslice/candidates/
+```
+
+已有业务文档中的 frontmatter 可以被兼容读取，但不能成为接入前置条件。没有 frontmatter 的 Markdown 仍应能被索引为 File / DocSection，并通过 `.specslice/links.yaml` 或后续 `.specslice/requirements.yaml` 建立需求关系。
+
+任何 LLM、候选发现、用户澄清结果都不得自动写回业务代码、业务测试或业务文档；只能写入 `.specslice/` 下的外置元数据，或者作为报告输出等待用户确认。
+
+业务逻辑文档与代码/测试的关联不得由人工标注产生，也不得由文件名、类名、测试名、关键词等规则匹配直接产生。规则只能做三件事：
+
+```text
+1. 解析事实：文件、标题、符号、测试、行号、hash。
+2. 校验事实：AI 候选引用的节点是否存在、是否唯一、是否可定位。
+3. 维护已确认关系：列出、检查、删除或修正 `.specslice/` 中的外置元数据。
+```
+
+关联生成流程必须是：
+
+```text
+facts -> AI candidate links/questions -> human confirm/edit/reject -> .specslice/links.yaml
+```
+
+人工可以修改已确认的外置关系，但这属于维护和纠错，不是主要建链方式。
+
 ---
 
-## 2.1 Dart Adapter 技术边界
+## 2.2 Dart Adapter 技术边界
 
 Rust Core 不能直接像调用 Rust crate 一样调用 Dart analyzer。
 
@@ -142,7 +182,6 @@ MVP:
   - test(...)
   - group(...)
   - import
-  - doc comment trace
   - symbol_ranges
 
 Phase 3:
@@ -187,7 +226,7 @@ Dart Language Adapter:
 - Dart file scanner
 - Dart symbol extractor
 - Dart test extractor
-- Dart trace comment extractor
+- External links manifest indexer
 - Symbol range mapper
 - Parent symbol hierarchy
 ```
@@ -196,7 +235,7 @@ Dart Language Adapter:
 
 ```text
 CandidateFeature
-CandidateTraceEdge
+CandidateLinkEdge
 LLM Semantic Inference
 infer-features
 link-docs
@@ -274,12 +313,12 @@ specslice export --format jsonl
 
 ```text
 1. 扫描 docs / specs / adr。
-2. 解析 frontmatter。
-3. 识别 REQ / AC / ADR ID。
-4. 建立 Requirement 节点。
-5. 建立 DocSection 节点。
+2. 提取 Markdown File / DocSection。
+3. 兼容读取已有 frontmatter 中的 id / type / title / status。
+4. 不要求业务文档新增 frontmatter。
+5. Requirement 节点可由已有 frontmatter、`.specslice/links.yaml` 或后续 `.specslice/requirements.yaml` 创建。
 6. 建立 DocSection --documents--> Requirement。
-7. 支持 Related 中的 symbol/test 字符串，但暂时只作为 unresolved reference。
+7. 不解析业务文档中的工具专用关系标记；跨文档/代码/测试关系由 `.specslice/links.yaml` 声明。
 ```
 
 ### 文档示例
@@ -296,10 +335,19 @@ status: active
 
 用户导入图片后，系统应自动避开人脸区域放置水印。
 
-## Related
+```
 
-- symbol://lib/domain/watermark/auto_placement_service.dart#AutoPlacementService
-- test://test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region
+关系声明示例：
+
+```yaml
+requirements:
+  REQ-WATERMARK-001:
+    docs:
+      - docs/watermark.md#自动水印放置
+    implementations:
+      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService
+    tests:
+      - test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region
 ```
 
 ### 验收标准
@@ -307,8 +355,8 @@ status: active
 运行：
 
 ```bash
-specslice index docs
-specslice check --docs
+specslice index --docs-only
+specslice check
 ```
 
 应能输出：
@@ -316,16 +364,16 @@ specslice check --docs
 ```text
 Requirements: 1
 DocSections: 1
-Broken doc references: 0 / N
+Broken links: 0 / N
 ```
 
 ---
 
-## MVP-2：Dart Adapter 代码索引与显式 Trace
+## MVP-2：Dart Adapter 代码索引与外置关系声明
 
 ### 目标
 
-在 Rust Core 中通过 Dart language adapter，从 Dart/Flutter 代码中提取文件、类、方法、函数、测试，并解析 `@implements` / `@verifies`。
+在 Rust Core 中通过 Dart language adapter，从 Dart/Flutter 代码中提取文件、类、方法、函数、测试；需求关系只从 `.specslice/links.yaml` 读取。
 
 ### 重要边界
 
@@ -346,13 +394,9 @@ Dart analyzer sidecar 放到后续 Phase 3。
    - ImportDirective
    - test(...)
    - group(...)
-   - Doc comments
 3. 建立 contains / imports 边。
-4. 解析 doc comment 中的 trace 标签：
-   - @implements
-   - @verifies
-   - @related
-5. 建立 declared trace：
+4. 索引 `.specslice/links.yaml`。
+5. 建立 declared links：
    - CodeSymbol --declaresImplementation--> Requirement
    - TestCase --declaresVerification--> Requirement
 6. 建立 symbol_ranges。
@@ -370,25 +414,7 @@ Dart analyzer sidecar 放到后续 Phase 3。
 6. resolved AST。
 ```
 
-### 代码示例
-
-```dart
-/// @implements REQ-WATERMARK-001
-class AutoPlacementService {
-  PlacementResult placeWatermark(...) {
-    ...
-  }
-}
-```
-
-测试示例：
-
-```dart
-/// @verifies REQ-WATERMARK-001
-test('places watermark outside face region', () {
-  ...
-});
-```
+代码和测试示例不包含 SpecSlice 注解；关系只写在 `.specslice/links.yaml`。
 
 ### 验收标准
 
@@ -396,7 +422,7 @@ test('places watermark outside face region', () {
 
 ```bash
 specslice index .
-specslice check --broken-trace
+specslice check
 ```
 
 应能识别：
@@ -405,9 +431,9 @@ specslice check --broken-trace
 Dart files: N
 Symbols: N
 TestCases: N
-Declared implementations: N
-Declared verifications: N
-Broken trace links: 0 / N
+Linked implementations: N
+Linked verifications: N
+Broken links: 0 / N
 ```
 
 ---
@@ -515,7 +541,7 @@ specslice slice REQ-WATERMARK-001
 
 ### Impact Resolution Policy
 
-PR Impact 不能只查直接 trace。
+PR Impact 不能只查直接关系边。
 
 如果 changed symbol 没有直接关联需求，需要沿父级结构向上查找：
 
@@ -536,9 +562,9 @@ changed private helper
 MVP 最小传播规则：
 
 ```text
-1. direct symbol trace
-2. parent class trace
-3. containing file trace
+1. direct symbol link
+2. parent class link
+3. containing file link
 4. test file relation
 5. changed doc section relation
 ```
@@ -566,7 +592,7 @@ docs/watermark.md#REQ-WATERMARK-001
 Affected requirement:
 - REQ-WATERMARK-001
 
-Related implementation:
+Linked implementation:
 - AutoPlacementService
 
 Linked tests:
@@ -600,10 +626,10 @@ Linked tests:
 - test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region
 
 Warnings:
-- Affected requirement has linked test, but no related test changed in this PR.
+- Affected requirement has linked test, but no linked test changed in this PR.
 
 Info:
-- Related doc section was not changed. Review whether docs are still accurate.
+- Linked doc section was not changed. Review whether docs are still accurate.
 ```
 
 ### 验收标准
@@ -635,7 +661,7 @@ specslice impact --base origin/main
 ```text
 1. changed doc section
 2. affected requirement
-3. related implementation
+3. linked implementation
 4. linked test
 ```
 
@@ -650,16 +676,14 @@ specslice impact --base origin/main
 ### Basic Checks
 
 ```text
-1. Broken Trace Check
-   - @implements 指向不存在的 REQ
-   - @verifies 指向不存在的 REQ / AC
-   - Related 指向不存在的 symbol/test
+1. Broken Link Check
+   - `.specslice/links.yaml` 指向不存在的 Requirement / DocSection / Symbol / Test
 
 2. Missing Linked Test Check
-   - Requirement 有 declared implementation，但没有 declared verification。
+   - Requirement 有 linked implementation，但没有 linked verification。
 
 3. Orphan Requirement Check
-   - Requirement 没有 declared implementation。
+   - Requirement 没有 linked implementation。
 
 4. Impact Review Check
    - PR 改了 requirement implementation，但相关 test/doc 未变化。
@@ -669,16 +693,16 @@ specslice impact --base origin/main
 
 ```text
 Error:
-- broken trace
+- broken link
 - missing referenced requirement
 - missing referenced symbol in confirmed link
 
 Warning:
 - requirement has implementation but no linked test
-- changed implementation without related test change
+- changed implementation without linked test change
 
 Info:
-- related doc not changed
+- linked doc not changed
 - doc/code may need review
 ```
 
@@ -708,7 +732,7 @@ specslice context REQ-WATERMARK-001 --json
     "test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region"
   ],
   "risks": [
-    "Verification is declared, not proven by coverage."
+    "Verification is linked, not proven by coverage."
   ],
   "files_to_read": [
     "docs/watermark.md",
@@ -734,7 +758,50 @@ specslice context REQ-WATERMARK-001 --json
 
 ---
 
-## 5. MVP 最小数据库 Schema
+## 5. 逻辑可信度与澄清机制
+
+SpecSlice 需要区分“关系存在”和“业务逻辑可信”。`.specslice/links.yaml` 只能说明某个 Requirement、Symbol、TestCase 被外置关系连接起来，不能证明实现真的满足业务逻辑，也不能证明测试真的覆盖了行为。
+
+后续应增加一个外置的 Logic Confidence / Logic Review 层：
+
+```text
+LogicConfidence:
+- confirmed_link: 用户确认的外置关系，节点可解析。
+- stale_link: 关系仍存在，但关联文件内容 hash 已变化，建议复核。
+- missing_doc: 有实现/测试，但没有可读业务逻辑文档。
+- missing_link: 有文档或代码信号，但没有外置关系声明。
+- mismatch_candidate: 文档描述与代码/测试信号可能不一致。
+- unknown: 信息不足，不能判断。
+```
+
+可信度不是单一“真/假”判断，而是带 evidence 的评估结果：
+
+```text
+score: 0.0 - 1.0
+status: confirmed | stale | candidate | unknown | conflict
+evidence:
+  - linked docs / symbols / tests
+  - changed file hash
+  - matched names / phrases
+  - test names
+questions:
+  - 需要用户确认的问题
+```
+
+当业务逻辑文档缺失，或文档与代码表现存在误差时，系统可以生成澄清问题：
+
+```text
+1. 这个 symbol 是否属于某个现有 Requirement？
+2. 当前测试名描述的业务规则是否就是该 Requirement 的验收标准？
+3. 文档说 A，但代码/测试显示 B，哪个是期望行为？
+4. 是否需要新建一个外置 Requirement？
+```
+
+LLM 可以参与生成候选解释和问题，但输出必须是 candidate，不得进入 confirmed graph，也不得写回业务代码、业务测试或业务文档。用户确认后，结果写入 `.specslice/links.yaml` 或后续 `.specslice/requirements.yaml`。
+
+---
+
+## 6. MVP 最小数据库 Schema
 
 MVP 仍然保留 Evidence-based 架构，但只实现必要表。
 
@@ -848,7 +915,7 @@ llm_runs
 
 ---
 
-## 6. Language Adapter 契约
+## 7. Language Adapter 契约
 
 Language Adapter 是 SpecSlice 后续扩展到多语言的关键边界。
 
@@ -888,7 +955,6 @@ pub struct LanguageIndexBatch {
     pub symbols: Vec<SymbolArtifact>,
     pub tests: Vec<TestArtifact>,
     pub imports: Vec<ImportEdge>,
-    pub trace_links: Vec<DeclaredTrace>,
     pub symbol_ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
 }
@@ -902,7 +968,6 @@ Dart Adapter 输出：
 - SymbolArtifact
 - TestArtifact
 - ImportEdge
-- DeclaredTrace
 - SymbolRange
 
 Rust Core 转换为：
@@ -915,7 +980,7 @@ Rust Core 转换为：
 
 ---
 
-## 7. MVP 目录结构
+## 8. MVP 目录结构
 
 MVP 阶段不要过度拆 crate。
 
@@ -946,7 +1011,7 @@ specslice/
         lightweight_parser.rs
         dart_symbol_extractor.rs
         dart_test_extractor.rs
-        dart_trace_comment_extractor.rs
+        links_manifest_indexer.rs
         symbol_range_mapper.rs
 
     specslice-engine/
@@ -987,7 +1052,7 @@ specslice-mcp
 
 ---
 
-## 8. MVP 配置文件
+## 9. MVP 配置文件
 
 `.specslice.yaml`：
 
@@ -1027,11 +1092,8 @@ code:
     - "**/*.g.dart"
     - "**/*.freezed.dart"
 
-trace:
-  explicit_tags:
-    implements: "@implements"
-    verifies: "@verifies"
-    related: "@related"
+links:
+  path: .specslice/links.yaml
 
 slice:
   max_depth: 3
@@ -1048,7 +1110,7 @@ impact:
   missing_test_change_level: warning
 
 checks:
-  broken_trace_level: error
+  broken_link_level: error
   missing_linked_test_level: warning
   orphan_requirement_level: warning
 ```
@@ -1063,7 +1125,7 @@ analysis_server   后续：接 Dart analysis server / LSP
 
 ---
 
-## 9. MVP 数据模型收敛
+## 10. MVP 数据模型收敛
 
 以下枚举和结构体应定义在 Rust Core 中；Dart 只是 language adapter 输出这些统一模型。
 
@@ -1076,7 +1138,6 @@ pub enum EdgeKind {
     Documents,
     DeclaresImplementation,
     DeclaresVerification,
-    RelatedTo,
 }
 ```
 
@@ -1099,7 +1160,7 @@ pub enum EdgeSource {
     Filesystem,
     LanguageAdapter,
     Markdown,
-    ExplicitTrace,
+    ExternalManifest,
     GitDiff,
 }
 ```
@@ -1149,7 +1210,7 @@ Rejected
 
 ---
 
-## 10. MVP 验收用例
+## 11. MVP 验收用例
 
 ### Fixture 项目
 
@@ -1184,7 +1245,6 @@ title: Auto watermark placement
 ### auto_placement_service.dart
 
 ```dart
-/// @implements REQ-WATERMARK-001
 class AutoPlacementService {
   PlacementResult placeWatermark(...) {
     ...
@@ -1199,10 +1259,22 @@ class AutoPlacementService {
 ### auto_placement_service_test.dart
 
 ```dart
-/// @verifies REQ-WATERMARK-001
 test('places watermark outside face region', () {
   ...
 });
+```
+
+### .specslice/links.yaml
+
+```yaml
+requirements:
+  REQ-WATERMARK-001:
+    docs:
+      - docs/watermark.md#自动水印放置
+    implementations:
+      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService
+    tests:
+      - test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region
 ```
 
 ### 验收命令
@@ -1233,19 +1305,18 @@ specslice context REQ-WATERMARK-001 --json
 
 ### MVP 不覆盖的项目状态
 
-MVP 不负责自动理解无 trace 仓库。
+MVP 不负责自动理解无需求文档或无外置关系声明的仓库。
 
 ```text
 无 REQ 文档
-无 @implements
-无 @verifies
+无 .specslice/links.yaml 关系声明
 ```
 
 这种项目需要后续 Phase 1 的 Candidate Layer。
 
 ---
 
-## 11. 库调用时返回的核心产物
+## 12. 库调用时返回的核心产物
 
 SpecSlice 内部维护完整 Artifact Graph，但外部不应默认返回完整图。
 
@@ -1296,7 +1367,7 @@ ImpactReport:
   这次改动影响了哪些需求、文档、测试？
 
 CheckReport:
-  当前 trace 是否断链、缺测试、缺实现？
+  当前 links manifest 是否断链、缺测试、缺实现？
 
 AgentContextPack:
   AI Agent 修改这个功能前应该读哪些内容、跑哪些测试？
@@ -1304,24 +1375,27 @@ AgentContextPack:
 
 ---
 
-## 12. 后续演进路线
+## 13. 后续演进路线
 
 ## Phase 1：LLM Candidate Layer
 
 ### 目标
 
-解决“有文档但无显式 trace”或“老仓库无文档”的问题。
+解决“有文档但无外置关系声明”、“业务逻辑文档缺失”或“文档与代码/测试信号可能不一致”的问题。业务逻辑文档与代码/测试的关联只能由 AI 生成候选，再由人工确认；不能由人工标注或规则匹配产生。
 
 ### 新增能力
 
 ```text
 1. CandidateFeature
-2. CandidateTraceEdge
+2. CandidateLinkEdge
 3. candidate_features 表
 4. candidate_edges 表
 5. specslice link-docs
 6. specslice infer-features
 7. specslice accept-feature
+8. specslice ask
+9. .specslice/requirements.yaml
+10. .specslice/candidates/
 ```
 
 ### 原则
@@ -1331,7 +1405,25 @@ AgentContextPack:
 2. Candidate 必须有 evidence。
 3. Candidate 默认 pendingReview。
 4. CI 不信任 candidate。
+5. Candidate 不写回业务代码、业务测试或业务文档。
+6. 用户确认后只更新 `.specslice/` 下的外置元数据。
+7. 规则匹配不能生成业务关联；规则只能解析事实和校验 AI candidate。
+8. 人工可以修改已确认关系，但不是主要建链入口。
 ```
+
+### 澄清工作流
+
+```text
+1. 扫描 docs/code/tests 得到事实节点。
+2. 生成 AI evidence pack。
+3. AI 生成 candidate links / missing_doc / missing_link / mismatch_candidate / questions。
+4. 系统校验 candidate 引用的节点是否存在且唯一。
+5. 用户确认、编辑或拒绝候选。
+6. 将确认结果写入 .specslice/requirements.yaml 或 .specslice/links.yaml。
+7. 重新 index / check / impact。
+```
+
+这个流程必须把 LLM 输出视为候选。LLM 负责提出候选解释和澄清问题，不能直接决定业务真值。
 
 ---
 
@@ -1457,17 +1549,17 @@ Rust MVP 必须保留：
 
 ---
 
-## 13. 开发优先级总表
+## 14. 开发优先级总表
 
 | 阶段 | 目标 | 是否 MVP 必需 |
 |---|---|---|
 | MVP-0 | Rust CLI + SQLite | 必需 |
 | MVP-1 | 文档/REQ 索引 | 必需 |
-| MVP-2 | Dart lightweight adapter + trace | 必需 |
+| MVP-2 | Dart lightweight adapter + external links manifest | 必需 |
 | MVP-3 | Feature Slice | 必需 |
 | MVP-4 | PR Impact | 必需 |
 | MVP-5 | Checks + Context Pack | 必需 |
-| Phase 1 | LLM Candidate Layer | 后续 |
+| Phase 1 | AI Candidate + Human Confirmation | 初步可用必需 |
 | Phase 2 | Review Workflow | 后续 |
 | Phase 3 | Dart analyzer sidecar | 后续 |
 | Phase 4 | MCP / Agent 集成 | 后续 |
@@ -1476,7 +1568,7 @@ Rust MVP 必须保留：
 
 ---
 
-## 14. MVP 不变的核心架构原则
+## 15. MVP 不变的核心架构原则
 
 ```text
 1. Graph is not truth. Evidence is truth.
@@ -1487,14 +1579,15 @@ Rust MVP 必须保留：
 6. Prefer fewer high-confidence links over many noisy links.
 7. Do not build a giant graph visualization first.
 8. Do not use imports as default feature traversal.
-9. Do not claim @verifies proves behavior.
+9. Do not claim linked tests prove behavior.
 10. Keep the protocol migration-friendly.
 11. Adapter outputs facts; Core owns storage and semantics.
+12. Rules do not infer business links; AI proposes, humans confirm.
 ```
 
 ---
 
-## 15. 最终结论
+## 16. 最终结论
 
 SpecSlice 的完整愿景是：
 
@@ -1513,7 +1606,13 @@ REQ 文档
 MVP 的正确形态是：
 
 ```text
-Rust CLI + SQLite + Markdown REQ + Dart lightweight adapter + explicit trace + Feature Slice + PR Impact + Context Pack
+Rust CLI + SQLite + Markdown REQ + Dart lightweight adapter + external links manifest + Feature Slice + PR Impact + Context Pack
+```
+
+初步可用版本还必须具备：
+
+```text
+AI Candidate + Human Confirmation
 ```
 
 它不承诺：
@@ -1521,7 +1620,6 @@ Rust CLI + SQLite + Markdown REQ + Dart lightweight adapter + explicit trace + F
 ```text
 Dart semantic analyzer
 call graph
-LLM
 GraphRAG
 MCP
 无文档自动理解
@@ -1543,7 +1641,8 @@ MCP
 正确路线是：
 
 ```text
-先用 Rust Core + Dart lightweight adapter + 显式 trace 跑通 PR Impact。
+先用 Rust Core + Dart lightweight adapter + external links manifest 跑通 PR Impact 的确认后链路。
+再用 AI Candidate + Human Confirmation 生成业务文档与代码/测试的候选关联。
 再用 LLM Candidate Layer 解决老仓库和无文档问题。
 最后再演进到 MCP / GraphRAG / SCIP / 多语言。
 ```

@@ -9,8 +9,6 @@
 //! - Emit `File --contains--> DocSection` (Fact) and the first DocSection of
 //!   a requirement-typed file gets a `DocSection --documents--> Requirement`
 //!   (Declared) edge.
-//! - Collect `symbol://` / `test://` style entries from a `## Related`
-//!   section as unresolved references so later checks can flag broken trace.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use specslice_core::{
     artifact_id::{doc_section_id, file_id, requirement_id, slugify},
-    ArtifactId, EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
+    EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind,
 };
 use specslice_store::Store;
 
@@ -31,24 +29,6 @@ pub struct DocsIndexResult {
     pub requirements: usize,
     pub doc_sections: usize,
     pub edges: usize,
-    pub unresolved_references: Vec<UnresolvedReference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnresolvedReference {
-    pub from_requirement: String,
-    pub kind: UnresolvedKind,
-    pub target: String,
-    pub doc_path: String,
-    pub line: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnresolvedKind {
-    Symbol,
-    Test,
-    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,21 +52,14 @@ struct ParsedDoc {
     frontmatter: Frontmatter,
     headings: Vec<Heading>,
     total_lines: u32,
-    related: Vec<RelatedLink>,
     content_hash: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RelatedLink {
-    line: u32,
-    kind: UnresolvedKind,
-    target: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct DocsIndexOptions {
     pub repo_root: PathBuf,
     pub doc_roots: Vec<PathBuf>,
+    pub include_globs: Vec<String>,
 }
 
 /// Walk all configured doc roots and merge results into the given store.
@@ -118,6 +91,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            if !matches_include_globs(&options.include_globs, &rel)? {
+                continue;
+            }
             if visited.iter().any(|v| v == &rel) {
                 continue;
             }
@@ -127,6 +103,23 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
         }
     }
     Ok(result)
+}
+
+fn matches_include_globs(patterns: &[String], rel_path: &str) -> Result<bool> {
+    if patterns.is_empty() {
+        return Ok(true);
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            globset::Glob::new(pattern)
+                .with_context(|| format!("invalid docs.include glob `{pattern}`"))?,
+        );
+    }
+    let set = builder
+        .build()
+        .context("building docs.include glob matcher")?;
+    Ok(set.is_match(rel_path))
 }
 
 fn index_one_file(
@@ -183,14 +176,9 @@ fn index_one_file(
 
     // Build doc sections from headings. A section runs from its heading line
     // until the next heading of equal or lower level (smaller `level` value
-    // means a higher heading), or EOF. We skip the well-known `Related`
-    // sub-section so its body (a list of unresolved references) does not
-    // pollute the doc-section count.
+    // means a higher heading), or EOF.
     let mut first_section_id = None;
     for (idx, heading) in parsed.headings.iter().enumerate() {
-        if is_related_heading(heading) {
-            continue;
-        }
         let end_line = parsed
             .headings
             .iter()
@@ -236,37 +224,6 @@ fn index_one_file(
         }
     }
 
-    // Record related references both as unresolved (in-memory, for the CLI
-    // status line) and as `Requirement --RelatedTo--> <uri>` edges so the
-    // checks layer can detect broken links across re-runs.
-    if let Some(req) = &requirement_node {
-        for link in &parsed.related {
-            let scheme = match link.kind {
-                UnresolvedKind::Symbol => "symbol://",
-                UnresolvedKind::Test => "test://",
-                UnresolvedKind::Other => "ref://",
-            };
-            let target_id = ArtifactId::new(format!("{scheme}{}", link.target));
-            let mut edge = EdgeAssertion::declared(
-                req.id.clone(),
-                target_id,
-                EdgeKind::RelatedTo,
-                EdgeSource::Markdown,
-            );
-            edge.indexer = Some(DOCS_INDEXER_NAME.into());
-            store.upsert_edge(&edge)?;
-            result.edges += 1;
-
-            result.unresolved_references.push(UnresolvedReference {
-                from_requirement: req.stable_key.clone().unwrap_or_else(|| req.id.to_string()),
-                kind: link.kind,
-                target: link.target.clone(),
-                doc_path: rel_path.to_string(),
-                line: link.line,
-            });
-        }
-    }
-
     Ok(())
 }
 
@@ -275,15 +232,10 @@ fn make_indexed_edge(mut edge: EdgeAssertion) -> EdgeAssertion {
     edge
 }
 
-fn is_related_heading(heading: &Heading) -> bool {
-    heading.text.trim().eq_ignore_ascii_case("related")
-}
-
 fn parse_markdown(raw: &str) -> ParsedDoc {
     let mut total_lines = 0u32;
     let mut frontmatter_text = String::new();
     let mut headings = Vec::new();
-    let mut related = Vec::new();
     let mut content_hasher = Sha256::new();
 
     // 1. Frontmatter. Consume from the opening `---` to the closing `---`.
@@ -321,7 +273,6 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
         })
     };
 
-    let mut in_related_section = false;
     for (idx, line) in raw.lines().enumerate() {
         total_lines = (idx + 1) as u32;
         content_hasher.update(line.as_bytes());
@@ -336,17 +287,7 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
                 text: text.to_string(),
                 line: total_lines,
             });
-            in_related_section = text.trim().eq_ignore_ascii_case("related");
             continue;
-        }
-        if in_related_section {
-            if let Some((kind, target)) = parse_related_line(trimmed) {
-                related.push(RelatedLink {
-                    line: total_lines,
-                    kind,
-                    target,
-                });
-            }
         }
     }
     if total_lines == 0 {
@@ -358,7 +299,6 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
         frontmatter,
         headings,
         total_lines,
-        related,
         content_hash,
     }
 }
@@ -387,20 +327,6 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     Some((level, rest))
 }
 
-fn parse_related_line(line: &str) -> Option<(UnresolvedKind, String)> {
-    let bullet = line.trim_start_matches(['-', '*', '+']).trim();
-    if bullet.is_empty() {
-        return None;
-    }
-    if let Some(rest) = bullet.strip_prefix("symbol://") {
-        return Some((UnresolvedKind::Symbol, rest.to_string()));
-    }
-    if let Some(rest) = bullet.strip_prefix("test://") {
-        return Some((UnresolvedKind::Test, rest.to_string()));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,22 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_related_line_classifies_links() {
-        assert_eq!(
-            parse_related_line("- symbol://lib/a.dart#Foo"),
-            Some((UnresolvedKind::Symbol, "lib/a.dart#Foo".into()))
-        );
-        assert_eq!(
-            parse_related_line("* test://test/a_test.dart#x"),
-            Some((UnresolvedKind::Test, "test/a_test.dart#x".into()))
-        );
-        assert_eq!(parse_related_line("- not a link"), None);
-        assert_eq!(parse_related_line(""), None);
-    }
-
-    #[test]
     fn parse_markdown_handles_frontmatter_and_headings() {
-        let src = "---\nid: REQ-1\ntype: requirement\ntitle: T\n---\n\n# Top\n\nBody\n\n## Related\n\n- symbol://a.dart#Foo\n- test://a_test.dart#b\n";
+        let src = "---\nid: REQ-1\ntype: requirement\ntitle: T\n---\n\n# Top\n\nBody\n\n## Details\n\nMore text.\n";
         let parsed = parse_markdown(src);
         assert_eq!(parsed.frontmatter.id.as_deref(), Some("REQ-1"));
         assert_eq!(parsed.frontmatter.doc_type.as_deref(), Some("requirement"));
@@ -440,10 +352,7 @@ mod tests {
         assert_eq!(parsed.headings.len(), 2);
         assert_eq!(parsed.headings[0].level, 1);
         assert_eq!(parsed.headings[0].text, "Top");
-        assert_eq!(parsed.headings[1].text, "Related");
-        assert_eq!(parsed.related.len(), 2);
-        assert_eq!(parsed.related[0].kind, UnresolvedKind::Symbol);
-        assert_eq!(parsed.related[1].kind, UnresolvedKind::Test);
+        assert_eq!(parsed.headings[1].text, "Details");
     }
 
     #[test]

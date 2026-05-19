@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions};
 use specslice_engine::docs_indexer::{index_docs, DocsIndexOptions};
+use specslice_engine::links_indexer::{index_links, LinksIndexOptions};
 use specslice_engine::slice::slice_from_store;
 use specslice_engine::SliceItem;
 use specslice_store::Store;
@@ -28,15 +29,24 @@ fn fresh_store_with_index() -> (TempDir, Store) {
         &DocsIndexOptions {
             repo_root: fixture.clone(),
             doc_roots: vec![PathBuf::from("docs")],
+            include_globs: Vec::new(),
         },
     )
     .unwrap();
     index_dart(
         &mut store,
         &DartIndexOptions {
-            repo_root: fixture,
+            repo_root: fixture.clone(),
             code_roots: vec![PathBuf::from("lib"), PathBuf::from("test")],
             ..Default::default()
+        },
+    )
+    .unwrap();
+    index_links(
+        &mut store,
+        &LinksIndexOptions {
+            repo_root: fixture,
+            manifest_path: PathBuf::from(".specslice/links.yaml"),
         },
     )
     .unwrap();
@@ -80,8 +90,8 @@ fn slicing_watermark_requirement_returns_docs_impl_and_tests() {
         "tests: {tests:?}"
     );
 
-    // Has linked tests → risk should warn about declared-not-proven.
-    assert!(slice.risks.iter().any(|r| r.contains("declared")));
+    // Has linked tests → risk should warn that links are not coverage proof.
+    assert!(slice.risks.iter().any(|r| r.contains("linked")));
 }
 
 #[test]
@@ -116,7 +126,7 @@ fn slicing_requirement_without_tests_reports_missing_linked_test_risk() {
             cls.id.clone(),
             req.id.clone(),
             EdgeKind::DeclaresImplementation,
-            EdgeSource::ExplicitTrace,
+            EdgeSource::ExternalManifest,
         ))
         .unwrap();
 
@@ -125,5 +135,5 @@ fn slicing_requirement_without_tests_reports_missing_linked_test_risk() {
     assert!(slice
         .risks
         .iter()
-        .any(|r| r.contains("no linked tests") || r.contains("missing @verifies")));
+        .any(|r| r.contains("no linked verification tests")));
 }

@@ -55,7 +55,11 @@ fn setup_repo() -> TempDir {
     run_git(tmp.path(), &["init", "-q", "-b", "main"]);
     run_git(tmp.path(), &["config", "user.email", "t@t"]);
     run_git(tmp.path(), &["config", "user.name", "T"]);
-    std::fs::write(tmp.path().join(".gitignore"), ".specslice/\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        ".specslice/graph.db\n.specslice/export/\n",
+    )
+    .unwrap();
     run_git(tmp.path(), &["add", "."]);
     run_git(tmp.path(), &["commit", "-q", "-m", "baseline"]);
     tmp
@@ -69,12 +73,14 @@ fn init_is_idempotent_via_engine_api() {
     })
     .unwrap();
     assert!(!first.config_already_existed);
+    assert!(!first.links_already_existed);
     assert!(!first.graph_db_already_existed);
     let second = init_repository(InitOptions {
         repo_root: tmp.path().into(),
     })
     .unwrap();
     assert!(second.config_already_existed);
+    assert!(second.links_already_existed);
     assert!(second.graph_db_already_existed);
 }
 
@@ -100,8 +106,8 @@ fn index_docs_only_via_path_entrypoint() {
         impact: None,
     })
     .unwrap();
-    // We did not index code, so all dart trace edges are absent and the
-    // requirement is technically orphan in this graph.
+    // We did not index code or external links, so the requirement is
+    // technically orphan in this graph.
     assert!(checks
         .findings
         .iter()

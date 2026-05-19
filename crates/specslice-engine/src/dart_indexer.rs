@@ -6,16 +6,13 @@
 //!   - File / class / method / function / constructor / test-case nodes.
 //!   - `File --contains--> Symbol` (Fact) edges and Class -> Method `contains` edges.
 //!   - `File --imports--> File` (Fact) edges when the target file resolves locally.
-//!   - `Symbol/Test --declaresImplementation/declaresVerification--> Requirement`
-//!     (Declared) edges for `@implements` / `@verifies` tags.
 //!   - Symbol ranges and parent-child hierarchy.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use specslice_core::artifact_id::requirement_id;
-use specslice_core::language_batch::{LanguageIndexBatch, TraceTag};
+use specslice_core::language_batch::LanguageIndexBatch;
 use specslice_core::{EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind};
 use specslice_lang_dart::index_dart_paths;
 use specslice_store::Store;
@@ -60,9 +57,6 @@ pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartI
             true
         });
         batch.symbol_ranges.retain(|r| !drop_file(&r.file_path));
-        batch
-            .trace_links
-            .retain(|t| !drop_file(t.from_symbol_id.as_str()));
     }
     ingest(store, &batch)
 }
@@ -212,31 +206,6 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         );
         edge.indexer = Some(DART_INDEXER_NAME.into());
         store.upsert_edge(&edge)?;
-    }
-
-    for trace in &batch.trace_links {
-        let (edge_kind, increment_field) = match trace.tag {
-            TraceTag::Implements => (EdgeKind::DeclaresImplementation, true),
-            TraceTag::Verifies => (EdgeKind::DeclaresVerification, false),
-            TraceTag::Related => (EdgeKind::RelatedTo, false),
-        };
-        let mut edge = EdgeAssertion::declared(
-            trace.from_symbol_id.clone(),
-            requirement_id(&trace.target),
-            edge_kind,
-            EdgeSource::ExplicitTrace,
-        );
-        edge.indexer = Some(DART_INDEXER_NAME.into());
-        store.upsert_edge(&edge)?;
-        match trace.tag {
-            TraceTag::Implements => {
-                if increment_field {
-                    result.declared_implementations += 1;
-                }
-            }
-            TraceTag::Verifies => result.declared_verifications += 1,
-            TraceTag::Related => {}
-        }
     }
 
     for range in &batch.symbol_ranges {

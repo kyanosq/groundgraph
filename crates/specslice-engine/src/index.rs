@@ -8,12 +8,14 @@ use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
+use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
     pub repo_root: PathBuf,
     pub include_docs: bool,
     pub include_code: bool,
+    pub include_links: bool,
 }
 
 impl IndexOptions {
@@ -22,6 +24,7 @@ impl IndexOptions {
             repo_root: repo_root.into(),
             include_docs: true,
             include_code: true,
+            include_links: true,
         }
     }
 
@@ -30,6 +33,7 @@ impl IndexOptions {
             repo_root: repo_root.into(),
             include_docs: true,
             include_code: false,
+            include_links: false,
         }
     }
 }
@@ -38,6 +42,7 @@ impl IndexOptions {
 pub struct IndexResult {
     pub docs: Option<DocsIndexResult>,
     pub code: Option<crate::dart_indexer::DartIndexResult>,
+    pub links: Option<LinksIndexResult>,
 }
 
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
@@ -58,6 +63,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         let docs_options = DocsIndexOptions {
             repo_root: options.repo_root.clone(),
             doc_roots: config.docs.paths.iter().map(PathBuf::from).collect(),
+            include_globs: config.docs.include.clone(),
         };
         let docs = index_docs(&mut store, &docs_options).context("indexing docs")?;
         result.docs = Some(docs);
@@ -77,6 +83,21 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing Dart sources")?;
         result.code = Some(code);
+    }
+
+    if options.include_links {
+        store
+            .clear_indexer_outputs(LINKS_INDEXER_NAME)
+            .context("clearing previous links index outputs")?;
+        let links = index_links(
+            &mut store,
+            &LinksIndexOptions {
+                repo_root: options.repo_root.clone(),
+                manifest_path: PathBuf::from(&config.links.path),
+            },
+        )
+        .context("indexing external links manifest")?;
+        result.links = Some(links);
     }
 
     Ok(result)

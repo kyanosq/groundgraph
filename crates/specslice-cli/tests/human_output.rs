@@ -227,14 +227,12 @@ fn slice_human_output_handles_missing_implementation_risk() {
 fn check_human_output_includes_error_severity_marker() {
     let tmp = tempfile::TempDir::new().unwrap();
     copy_dir(&fixture_path(), tmp.path());
-    // Break the trace target.
-    let impl_path = tmp
-        .path()
-        .join("lib/domain/watermark/auto_placement_service.dart");
-    let s = std::fs::read_to_string(&impl_path).unwrap();
+    // Break the external links manifest target.
+    let links_path = tmp.path().join(".specslice/links.yaml");
+    let s = std::fs::read_to_string(&links_path).unwrap();
     std::fs::write(
-        &impl_path,
-        s.replace("@implements REQ-WATERMARK-001", "@implements REQ-NOPE"),
+        &links_path,
+        s.replace("AutoPlacementService", "MissingService"),
     )
     .unwrap();
     Command::cargo_bin("specslice")
@@ -265,13 +263,12 @@ fn check_human_output_includes_warn_severity_marker() {
     // Remove the impl + test to make REQ-WATERMARK-001 an orphan (warning).
     std::fs::remove_dir_all(tmp.path().join("lib")).unwrap();
     std::fs::remove_dir_all(tmp.path().join("test")).unwrap();
-    // Also strip the `## Related` section so the doc's `symbol://`/`test://`
-    // references do not surface as `broken_related` errors. We want this
-    // test to focus on the orphan-requirement warning path.
-    let doc = tmp.path().join("docs/watermark.md");
-    let body = std::fs::read_to_string(&doc).unwrap();
-    let trimmed = body.split("## Related").next().unwrap_or(&body).to_string();
-    std::fs::write(&doc, trimmed).unwrap();
+    // Clear links so this test focuses on the orphan-requirement warning path.
+    std::fs::write(
+        tmp.path().join(".specslice/links.yaml"),
+        "requirements: {}\n",
+    )
+    .unwrap();
 
     Command::cargo_bin("specslice")
         .unwrap()

@@ -2,7 +2,6 @@ import 'package:flutter_watermark_app/domain/watermark/auto_placement_service.da
 import 'package:flutter_watermark_app/domain/watermark/placement_candidate.dart';
 
 void main() {
-  /// @verifies REQ-WATERMARK-001
   test('places watermark outside face region', () {
     final service = AutoPlacementService();
     final best = service.placeWatermark([

@@ -62,10 +62,10 @@ fn print_human(report: &ImpactReport) {
             println!("- {} {}", r.id, r.name.clone().unwrap_or_default());
         }
     }
-    if !report.related_implementations.is_empty() {
+    if !report.linked_implementations.is_empty() {
         println!();
-        println!("Related implementation:");
-        for i in &report.related_implementations {
+        println!("Linked implementation:");
+        for i in &report.linked_implementations {
             println!(
                 "- {} ({})",
                 i.name.clone().unwrap_or_else(|| i.id.clone()),

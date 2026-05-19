@@ -1,6 +1,6 @@
 //! Schema tests for `.specslice.yaml`.
 //!
-//! PRD §8 specifies a richer config (docs / code / trace / slice / impact /
+//! PRD §8 specifies a richer config (docs / code / links / slice / impact /
 //! checks). MVP-0 shipped only `repo + storage`. These tests pin the
 //! requirements:
 //! 1. A minimal `repo + storage` config still parses.
@@ -11,8 +11,10 @@
 use std::path::PathBuf;
 
 use specslice_engine::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
+use specslice_engine::impact::{run_impact, ImpactOptions};
 use specslice_engine::index::{index_repository, IndexOptions};
 use specslice_engine::init::{init_repository, InitOptions};
+use specslice_engine::{run_checks, CheckOptions};
 use specslice_store::Store;
 use tempfile::TempDir;
 
@@ -69,11 +71,8 @@ code:
     - "**/*.g.dart"
     - "**/*.freezed.dart"
 
-trace:
-  explicit_tags:
-    implements: "@implements"
-    verifies: "@verifies"
-    related: "@related"
+links:
+  path: .specslice/links.yaml
 
 slice:
   max_depth: 3
@@ -90,7 +89,7 @@ impact:
   missing_test_change_level: warning
 
 checks:
-  broken_trace_level: error
+  broken_link_level: error
   missing_linked_test_level: warning
   orphan_requirement_level: warning
 "#;
@@ -98,8 +97,8 @@ checks:
     assert_eq!(cfg.docs.paths.len(), 3);
     assert_eq!(cfg.code.paths.len(), 2);
     assert_eq!(cfg.code.exclude.len(), 5);
-    assert_eq!(cfg.trace.implements_tag, "@implements");
-    assert_eq!(cfg.checks.broken_trace_level, "error");
+    assert_eq!(cfg.links.path, ".specslice/links.yaml");
+    assert_eq!(cfg.checks.broken_link_level, "error");
 }
 
 #[test]
@@ -182,6 +181,180 @@ fn index_repository_honours_configured_code_paths_and_exclude() {
     assert!(names.iter().any(|n| n.as_deref() == Some("Keep")));
     assert!(!names.iter().any(|n| n.as_deref() == Some("GeneratedSkip")));
     assert!(!names.iter().any(|n| n.as_deref() == Some("Ignored")));
+}
+
+#[test]
+fn index_repository_honours_configured_docs_include_globs() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\ndocs:\n  paths:\n    - docs\n  include:\n    - \"**/*.spec.md\"\ncode:\n  paths: []\n",
+    );
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(
+        root.join("docs/keep.spec.md"),
+        "---\nid: REQ-INCLUDE-1\ntype: requirement\ntitle: Keep\n---\n\n# Keep\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("docs/drop.md"),
+        "---\nid: REQ-INCLUDE-2\ntype: requirement\ntitle: Drop\n---\n\n# Drop\n",
+    )
+    .unwrap();
+
+    let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    let docs = result.docs.expect("docs result present");
+    assert_eq!(docs.requirements, 1);
+    let store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    let reqs = store
+        .list_nodes_by_kind(specslice_core::NodeKind::Requirement)
+        .unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].path.as_deref(), Some("docs/keep.spec.md"));
+}
+
+#[test]
+fn index_repository_honours_configured_links_manifest_path() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\ndocs:\n  paths:\n    - docs\ncode:\n  paths:\n    - lib\nlinks:\n  path: links/custom.yaml\n",
+    );
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(
+        root.join("docs/r.md"),
+        "---\nid: REQ-TAGS-1\ntype: requirement\ntitle: Tags\n---\n\n# Tags\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/a.dart"), "class Tagged {}\n").unwrap();
+    std::fs::create_dir_all(root.join("links")).unwrap();
+    std::fs::write(
+        root.join("links/custom.yaml"),
+        "requirements:\n  REQ-TAGS-1:\n    implementations:\n      - lib/a.dart#Tagged\n",
+    )
+    .unwrap();
+
+    let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    let code = result.code.expect("code result present");
+    assert_eq!(code.declared_implementations, 0);
+    let links = result.links.expect("links result present");
+    assert_eq!(links.implementations, 1);
+}
+
+#[test]
+fn run_checks_honours_configured_finding_levels() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\ndocs:\n  paths: []\ncode:\n  paths: []\nchecks:\n  orphan_requirement_level: info\n  missing_linked_test_level: off\n",
+    );
+    let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    let mut req = specslice_core::Node::new(
+        specslice_core::artifact_id::requirement_id("REQ-CHECK-1"),
+        specslice_core::NodeKind::Requirement,
+    );
+    req.path = Some("docs/check.md".into());
+    store.upsert_node(&req).unwrap();
+    drop(store);
+
+    let report = run_checks(CheckOptions {
+        repo_root: root.into(),
+        impact: None,
+    })
+    .unwrap();
+    let orphan = report
+        .findings
+        .iter()
+        .find(|f| f.code == "orphan_requirement")
+        .expect("orphan finding");
+    assert_eq!(
+        orphan.severity,
+        specslice_engine::checks::CheckSeverity::Info
+    );
+}
+
+#[test]
+fn run_impact_honours_configured_doc_and_warning_levels() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\ndocs:\n  paths: []\ncode:\n  paths: []\nimpact:\n  include_doc_changes: false\n  missing_test_change_level: off\n",
+    );
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "user.email", "t@t"])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "user.name", "T"])
+        .status()
+        .unwrap();
+    std::fs::write(root.join("note.md"), "one\n").unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["commit", "-q", "-m", "base"])
+        .status()
+        .unwrap();
+    std::fs::write(root.join("note.md"), "two\n").unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["add", "."])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["commit", "-q", "-m", "edit"])
+        .status()
+        .unwrap();
+
+    let report = run_impact(ImpactOptions {
+        repo_root: root.into(),
+        base_ref: "HEAD~1".into(),
+        head_ref: "HEAD".into(),
+        reindex: true,
+    })
+    .unwrap();
+    assert!(report.changed_doc_sections.is_empty());
+    assert!(report.warnings.is_empty());
 }
 
 #[test]

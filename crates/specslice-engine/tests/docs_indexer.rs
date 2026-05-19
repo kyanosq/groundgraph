@@ -6,9 +6,7 @@ use specslice_core::{
     artifact_id::{doc_section_id, file_id, requirement_id},
     EdgeKind, NodeKind,
 };
-use specslice_engine::docs_indexer::{
-    index_docs, DocsIndexOptions, UnresolvedKind, DOCS_INDEXER_NAME,
-};
+use specslice_engine::docs_indexer::{index_docs, DocsIndexOptions, DOCS_INDEXER_NAME};
 use specslice_store::Store;
 use tempfile::TempDir;
 
@@ -35,21 +33,13 @@ fn indexing_watermark_fixture_creates_requirement_and_doc_section() {
     let opts = DocsIndexOptions {
         repo_root: fixture,
         doc_roots: vec![PathBuf::from("docs")],
+        include_globs: Vec::new(),
     };
     let result = index_docs(&mut store, &opts).unwrap();
 
     assert_eq!(result.files, 1, "expected exactly 1 file");
     assert_eq!(result.requirements, 1, "expected exactly 1 requirement");
     assert!(result.doc_sections >= 1, "expected at least 1 doc section");
-    assert_eq!(result.unresolved_references.len(), 2);
-    assert!(result
-        .unresolved_references
-        .iter()
-        .any(|r| r.kind == UnresolvedKind::Symbol));
-    assert!(result
-        .unresolved_references
-        .iter()
-        .any(|r| r.kind == UnresolvedKind::Test));
 
     let req = store
         .find_node(&requirement_id("REQ-WATERMARK-001"))
@@ -93,6 +83,7 @@ fn re_indexing_is_idempotent_and_clears_previous_outputs() {
     let opts = DocsIndexOptions {
         repo_root: fixture,
         doc_roots: vec![PathBuf::from("docs")],
+        include_globs: Vec::new(),
     };
 
     let first = index_docs(&mut store, &opts).unwrap();
@@ -121,6 +112,7 @@ fn missing_doc_root_is_skipped() {
     let opts = DocsIndexOptions {
         repo_root: tmp_root.path().into(),
         doc_roots: vec![PathBuf::from("does_not_exist")],
+        include_globs: Vec::new(),
     };
     let result = index_docs(&mut store, &opts).unwrap();
     assert_eq!(result.files, 0);
@@ -133,6 +125,7 @@ fn duplicate_doc_roots_do_not_double_count_files() {
     let opts = DocsIndexOptions {
         repo_root: fixture_path(),
         doc_roots: vec![PathBuf::from("docs"), PathBuf::from("docs")],
+        include_globs: Vec::new(),
     };
     let result = index_docs(&mut store, &opts).unwrap();
     assert_eq!(result.files, 1);

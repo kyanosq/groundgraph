@@ -24,6 +24,8 @@ impl InitOptions {
 pub struct InitOutcome {
     pub config_path: PathBuf,
     pub config_already_existed: bool,
+    pub links_path: PathBuf,
+    pub links_already_existed: bool,
     pub graph_db_path: PathBuf,
     pub graph_db_already_existed: bool,
 }
@@ -35,6 +37,8 @@ pub struct InitOutcome {
 ///   files are left untouched (idempotent re-init).
 /// - Ensure `.specslice/` exists and open the SQLite database. The database
 ///   file is created if it is missing.
+/// - Ensure the external links manifest exists. This is the only place where
+///   users declare requirement-to-code/test relationships.
 pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
     let repo_root = options.repo_root;
     let config_path = repo_root.join(DEFAULT_CONFIG_FILE_NAME);
@@ -54,6 +58,17 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
     std::fs::create_dir_all(&storage_dir)
         .with_context(|| format!("creating storage directory {}", storage_dir.display()))?;
 
+    let links_path = resolve_links_path(&repo_root, &config);
+    let links_already_existed = links_path.exists();
+    if !links_already_existed {
+        if let Some(parent) = links_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating links directory {}", parent.display()))?;
+        }
+        std::fs::write(&links_path, "requirements: {}\n")
+            .with_context(|| format!("writing links manifest {}", links_path.display()))?;
+    }
+
     let graph_db_path = resolve_storage_path(&repo_root, &config);
     let graph_db_already_existed = graph_db_path.exists();
 
@@ -67,6 +82,8 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
     Ok(InitOutcome {
         config_path,
         config_already_existed,
+        links_path,
+        links_already_existed,
         graph_db_path,
         graph_db_already_existed,
     })
@@ -81,6 +98,15 @@ fn load_existing_config(path: &Path) -> Result<EngineConfig> {
 
 fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
     let raw = Path::new(&config.storage.path);
+    if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        repo_root.join(raw)
+    }
+}
+
+fn resolve_links_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
+    let raw = Path::new(&config.links.path);
     if raw.is_absolute() {
         raw.to_path_buf()
     } else {

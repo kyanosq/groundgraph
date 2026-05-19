@@ -12,7 +12,7 @@ mod commands;
 #[command(
     name = "specslice",
     version,
-    about = "Explicit trace-driven context layer for AI coding."
+    about = "Non-invasive context layer for AI coding."
 )]
 struct Cli {
     /// Repository root that hosts `.specslice.yaml` and `.specslice/`.
@@ -33,7 +33,7 @@ enum Commands {
     Slice(SliceArgs),
     /// Report which requirements, docs and tests are affected by a git diff.
     Impact(ImpactArgs),
-    /// Run consistency checks (broken trace, missing linked test, orphan REQ).
+    /// Run consistency checks (broken links, missing linked test, orphan REQ).
     Check(CheckArgs),
     /// Produce an agent-ready context pack for a requirement.
     Context(ContextArgs),

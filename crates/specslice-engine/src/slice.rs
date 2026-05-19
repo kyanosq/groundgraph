@@ -90,19 +90,18 @@ pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice
 
     if slice.linked_tests.is_empty() && !slice.implementation.is_empty() {
         slice.risks.push(
-            "Requirement has declared implementation but no linked tests (missing @verifies)."
-                .to_string(),
+            "Requirement has linked implementation but no linked verification tests.".to_string(),
         );
     }
     if !slice.linked_tests.is_empty() {
         slice
             .risks
-            .push("Verification is declared, not proven by coverage.".to_string());
+            .push("Verification is linked, not proven by coverage.".to_string());
     }
     if slice.implementation.is_empty() {
         slice
             .risks
-            .push("No declared implementation found for this requirement.".to_string());
+            .push("No linked implementation found for this requirement.".to_string());
     }
 
     Ok(slice)
@@ -215,7 +214,7 @@ mod helper_tests {
                 from.clone(),
                 requirement_id("REQ-A"),
                 EdgeKind::DeclaresImplementation,
-                EdgeSource::ExplicitTrace,
+                EdgeSource::ExternalManifest,
             ))
             .unwrap();
         store
@@ -223,15 +222,15 @@ mod helper_tests {
                 from.clone(),
                 requirement_id("REQ-B"),
                 EdgeKind::DeclaresVerification,
-                EdgeSource::ExplicitTrace,
+                EdgeSource::ExternalManifest,
             ))
             .unwrap();
         store
             .upsert_edge(&EdgeAssertion::fact(
                 from.clone(),
                 requirement_id("REQ-C"),
-                EdgeKind::RelatedTo,
-                EdgeSource::ExplicitTrace,
+                EdgeKind::Imports,
+                EdgeSource::ExternalManifest,
             ))
             .unwrap();
         let reqs = declared_requirements_for(&store, &from).unwrap();

@@ -11,6 +11,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
 
 fn print_outcome(repo_root: &Path, outcome: &InitOutcome) {
     let config_label = display_relative(repo_root, &outcome.config_path);
+    let links_label = display_relative(repo_root, &outcome.links_path);
     let db_label = display_relative(repo_root, &outcome.graph_db_path);
 
     let config_action = if outcome.config_already_existed {
@@ -23,9 +24,15 @@ fn print_outcome(repo_root: &Path, outcome: &InitOutcome) {
     } else {
         "created"
     };
+    let links_action = if outcome.links_already_existed {
+        "kept"
+    } else {
+        "created"
+    };
 
     println!("SpecSlice workspace ready.");
     println!("  {config_action}: {config_label}");
+    println!("  {links_action}: {links_label}");
     println!("  {db_action}: {db_label}");
 }
 

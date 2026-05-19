@@ -399,7 +399,6 @@ fn parse_edge_kind(raw: &str) -> Result<EdgeKind, rusqlite::Error> {
         "documents" => EdgeKind::Documents,
         "declares_implementation" => EdgeKind::DeclaresImplementation,
         "declares_verification" => EdgeKind::DeclaresVerification,
-        "related_to" => EdgeKind::RelatedTo,
         other => return Err(decode_error(3, format!("unknown edge kind {other}"))),
     })
 }
@@ -409,7 +408,7 @@ fn parse_edge_source(raw: &str) -> Result<EdgeSource, rusqlite::Error> {
         "filesystem" => EdgeSource::Filesystem,
         "language_adapter" => EdgeSource::LanguageAdapter,
         "markdown" => EdgeSource::Markdown,
-        "explicit_trace" => EdgeSource::ExplicitTrace,
+        "external_manifest" => EdgeSource::ExternalManifest,
         "git_diff" => EdgeSource::GitDiff,
         other => return Err(decode_error(4, format!("unknown edge source {other}"))),
     })

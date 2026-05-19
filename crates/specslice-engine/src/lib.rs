@@ -14,6 +14,7 @@ pub mod git_diff;
 pub mod impact;
 pub mod index;
 pub mod init;
+pub mod links_indexer;
 pub mod slice;
 
 pub use checks::{
@@ -23,11 +24,10 @@ pub use config::EngineConfig;
 pub use context_pack::{
     build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
 };
-pub use docs_indexer::{
-    DocsIndexOptions, DocsIndexResult, UnresolvedKind, UnresolvedReference, DOCS_INDEXER_NAME,
-};
+pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
 pub use impact::{run_impact, ImpactOptions, ImpactReport};
 pub use index::{index_repository, IndexOptions, IndexResult};
 pub use init::{init_repository, InitOptions, InitOutcome};
+pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};

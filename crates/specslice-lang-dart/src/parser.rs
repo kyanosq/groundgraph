@@ -4,8 +4,8 @@
 //! Goals:
 //! - Be cheap and predictable. Dart's full grammar is out of scope.
 //! - Produce stable artifact IDs and line ranges good enough for PR Impact.
-//! - Capture doc-comment trace tags exactly when they appear immediately
-//!   above a declaration.
+//! - Ignore comments completely. SpecSlice is non-invasive and must not
+//!   depend on tool-specific annotations in business code.
 //!
 //! Non-goals: typedef, mixins, enums, extension methods, type parameters,
 //! async modifiers — they are accepted but not modelled as separate kinds.
@@ -15,8 +15,7 @@ use specslice_core::artifact_id::{
     dart_test_id, file_id, slugify,
 };
 use specslice_core::language_batch::{
-    AdapterDiagnostic, DeclaredTrace, FileArtifact, ImportEdge, SymbolArtifact, SymbolRange,
-    TestArtifact, TraceTag,
+    AdapterDiagnostic, FileArtifact, ImportEdge, SymbolArtifact, SymbolRange, TestArtifact,
 };
 use specslice_core::{ArtifactId, NodeKind};
 
@@ -25,48 +24,8 @@ pub struct ParseResult {
     pub symbols: Vec<SymbolArtifact>,
     pub tests: Vec<TestArtifact>,
     pub imports: Vec<ImportEdge>,
-    pub traces: Vec<DeclaredTrace>,
     pub ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
-}
-
-struct DocBuffer {
-    lines: Vec<String>,
-    start_line: u32,
-}
-
-impl DocBuffer {
-    fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-            start_line: 0,
-        }
-    }
-
-    fn push(&mut self, raw: &str, line_no: u32) {
-        let stripped = raw.trim_start_matches('/').trim();
-        if self.lines.is_empty() {
-            self.start_line = line_no;
-        }
-        self.lines.push(stripped.to_string());
-    }
-
-    fn take(&mut self) -> Option<(String, u32)> {
-        if self.lines.is_empty() {
-            None
-        } else {
-            let joined = self.lines.join("\n");
-            let start = self.start_line;
-            self.lines.clear();
-            self.start_line = 0;
-            Some((joined, start))
-        }
-    }
-
-    fn clear(&mut self) {
-        self.lines.clear();
-        self.start_line = 0;
-    }
 }
 
 struct ClassFrame {
@@ -79,7 +38,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
     let mut symbols = Vec::new();
     let mut tests = Vec::new();
     let mut imports = Vec::new();
-    let mut traces = Vec::new();
     let mut ranges = Vec::new();
     let diagnostics = Vec::new();
 
@@ -90,7 +48,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         content_hash: content_hash.to_string(),
     };
 
-    let mut doc = DocBuffer::new();
     let mut class_stack: Vec<ClassFrame> = Vec::new();
     let mut open_symbol_starts: Vec<(ArtifactId, u32, usize)> = Vec::new();
     let mut depth = 0usize;
@@ -102,9 +59,9 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         let line = strip_inline_string_braces(raw_line);
         let trimmed = line.trim_start();
 
-        // Track doc-comment buffer.
+        // Ignore comments completely. Links are declared outside business
+        // source files in `.specslice/links.yaml`.
         if trimmed.starts_with("///") {
-            doc.push(trimmed, line_no);
             continue;
         }
         // Skip blank lines without clearing doc buffer.
@@ -130,7 +87,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 from_file: file_artifact.id.clone(),
                 to_path: target,
             });
-            doc.clear();
             update_depth(&line, &mut depth);
             close_symbols(
                 &mut open_symbol_starts,
@@ -145,7 +101,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
             continue;
         }
 
-        let current_doc = doc.take();
         let current_class = class_stack
             .last()
             .map(|c| (c.id.clone(), c.name.clone(), c.depth));
@@ -164,9 +119,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 parent_symbol_id: None,
             };
             symbols.push(sym);
-            if let Some((doc_text, doc_start)) = current_doc.as_ref() {
-                push_traces(&mut traces, &class_id, doc_text, *doc_start);
-            }
             let opens_brace = line.contains('{');
             update_depth(&line, &mut depth);
             if opens_brace {
@@ -203,9 +155,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 end_line: line_no,
                 parent_symbol_id: current_class.as_ref().map(|c| c.0.clone()),
             });
-            if let Some((doc_text, doc_start)) = current_doc.as_ref() {
-                push_traces(&mut traces, &id, doc_text, *doc_start);
-            }
             update_depth(&line, &mut depth);
             close_symbols(
                 &mut open_symbol_starts,
@@ -274,9 +223,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
                 });
-                if let Some((doc_text, doc_start)) = current_doc.as_ref() {
-                    push_traces(&mut traces, &id, doc_text, *doc_start);
-                }
                 if line.contains('{') {
                     update_depth(&line, &mut depth);
                     open_symbol_starts.push((id, line_no, depth));
@@ -307,9 +253,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
                 });
-                if let Some((doc_text, doc_start)) = current_doc.as_ref() {
-                    push_traces(&mut traces, &id, doc_text, *doc_start);
-                }
                 if line.contains('{') {
                     update_depth(&line, &mut depth);
                     open_symbol_starts.push((id, line_no, depth));
@@ -341,9 +284,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     end_line: line_no,
                     parent_symbol_id: None,
                 });
-                if let Some((doc_text, doc_start)) = current_doc.as_ref() {
-                    push_traces(&mut traces, &id, doc_text, *doc_start);
-                }
                 if line.contains('{') {
                     update_depth(&line, &mut depth);
                     open_symbol_starts.push((id, line_no, depth));
@@ -376,12 +316,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
             line_no,
             path,
         );
-        // doc buffer is consumed already by `take()` above unless we didn't
-        // hit any declaration. Reset if any meaningful code precedes the next
-        // declaration.
-        if !trimmed.is_empty() && !trimmed.starts_with("///") {
-            // already taken
-        }
     }
 
     // Anything still open closes at EOF.
@@ -403,7 +337,6 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         symbols,
         tests,
         imports,
-        traces,
         ranges,
         diagnostics,
     }
@@ -649,39 +582,6 @@ fn parse_constructor(line: &str, class_name: &str) -> Option<String> {
     }
 }
 
-fn push_traces(out: &mut Vec<DeclaredTrace>, owner: &ArtifactId, doc_text: &str, start_line: u32) {
-    for token in extract_trace_tokens(doc_text) {
-        out.push(DeclaredTrace {
-            from_symbol_id: owner.clone(),
-            tag: token.0,
-            target: token.1,
-            start_line,
-        });
-    }
-}
-
-fn extract_trace_tokens(doc_text: &str) -> Vec<(TraceTag, String)> {
-    let mut out = Vec::new();
-    for raw in doc_text.lines() {
-        let line = raw.trim();
-        for tag in [TraceTag::Implements, TraceTag::Verifies, TraceTag::Related] {
-            let needle = format!("@{}", tag.as_str());
-            if let Some(idx) = line.find(&needle) {
-                let after = &line[idx + needle.len()..];
-                let target: String = after
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| !c.is_whitespace())
-                    .collect();
-                if !target.is_empty() {
-                    out.push((tag, target));
-                }
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn extracts_class_and_methods_with_doc_trace() {
-        let src = "/// @implements REQ-1\nclass Foo {\n  Foo();\n  void bar() {}\n}\n";
+    fn extracts_class_and_methods_ignoring_comments() {
+        let src = "/// Ordinary API docs\nclass Foo {\n  Foo();\n  void bar() {}\n}\n";
         let r = parse(src);
         assert_eq!(r.symbols.len(), 3, "class + ctor + method");
         let class = r
@@ -708,9 +608,6 @@ mod tests {
             .unwrap();
         assert_eq!(method.name, "bar");
         assert_eq!(method.parent_symbol_id.as_ref().unwrap(), &class.id);
-        assert_eq!(r.traces.len(), 1);
-        assert_eq!(r.traces[0].tag, TraceTag::Implements);
-        assert_eq!(r.traces[0].target, "REQ-1");
     }
 
     #[test]
@@ -736,8 +633,8 @@ mod tests {
     }
 
     #[test]
-    fn extracts_test_and_group_with_trace() {
-        let src = "void main() {\n  group('Outer', () {\n    /// @verifies REQ-1\n    test('inside', () {});\n  });\n}\n";
+    fn extracts_test_and_group_ignoring_comments() {
+        let src = "void main() {\n  group('Outer', () {\n    /// Ordinary test docs\n    test('inside', () {});\n  });\n}\n";
         let r = parse(src);
         let test = r
             .tests
@@ -751,10 +648,6 @@ mod tests {
             .find(|t| t.kind == NodeKind::TestGroup)
             .unwrap();
         assert_eq!(group.name, "Outer");
-        assert!(r
-            .traces
-            .iter()
-            .any(|t| t.tag == TraceTag::Verifies && t.target == "REQ-1"));
     }
 
     #[test]
@@ -788,13 +681,6 @@ mod tests {
             method_range.parent_symbol_id.as_ref().unwrap(),
             &class_range.symbol_id
         );
-    }
-
-    #[test]
-    fn missing_trace_tag_is_skipped() {
-        let src = "/// just text\nclass Foo {}\n";
-        let r = parse(src);
-        assert!(r.traces.is_empty());
     }
 
     #[test]
@@ -876,34 +762,11 @@ mod tests {
     }
 
     #[test]
-    fn trace_tokens_handle_multiple_tags_per_doc_block() {
-        let toks =
-            extract_trace_tokens("@implements REQ-1\n@verifies REQ-2\n@related REQ-3\nbody text\n");
-        let tags: Vec<_> = toks.iter().map(|(t, _)| *t).collect();
-        assert!(tags.contains(&TraceTag::Implements));
-        assert!(tags.contains(&TraceTag::Verifies));
-        assert!(tags.contains(&TraceTag::Related));
-    }
-
-    #[test]
-    fn doc_comment_with_blank_line_keeps_attaching_to_next_decl() {
-        // The doc buffer should be preserved through blank lines until a
-        // declaration consumes it.
-        let src = "/// @implements REQ-1\n\nclass Foo {}\n";
-        let r = parse(src);
-        assert!(r
-            .traces
-            .iter()
-            .any(|t| t.tag == TraceTag::Implements && t.target == "REQ-1"));
-    }
-
-    #[test]
     fn empty_source_returns_only_file_artifact() {
         let r = parse("");
         assert!(r.symbols.is_empty());
         assert!(r.tests.is_empty());
         assert!(r.imports.is_empty());
-        assert!(r.traces.is_empty());
         assert!(r.ranges.is_empty());
         assert_eq!(r.file.path, "lib/a.dart");
     }

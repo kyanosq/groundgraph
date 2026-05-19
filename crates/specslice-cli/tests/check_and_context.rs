@@ -58,17 +58,13 @@ fn check_on_clean_fixture_reports_no_findings() {
 }
 
 #[test]
-fn check_breaks_trace_when_requirement_id_is_invalid_in_doc_comment() {
+fn check_reports_broken_manifest_link() {
     let tmp = tempfile::TempDir::new().unwrap();
     init_and_index(tmp.path());
-    // Now break the trace by editing the impl doc comment to reference an
-    // unknown requirement.
-    let impl_path = tmp
-        .path()
-        .join("lib/domain/watermark/auto_placement_service.dart");
-    let original = std::fs::read_to_string(&impl_path).unwrap();
-    let edited = original.replace("@implements REQ-WATERMARK-001", "@implements REQ-UNKNOWN");
-    std::fs::write(&impl_path, edited).unwrap();
+    let links_path = tmp.path().join(".specslice/links.yaml");
+    let original = std::fs::read_to_string(&links_path).unwrap();
+    let edited = original.replace("AutoPlacementService", "MissingService");
+    std::fs::write(&links_path, edited).unwrap();
     Command::cargo_bin("specslice")
         .unwrap()
         .current_dir(tmp.path())
@@ -82,8 +78,8 @@ fn check_breaks_trace_when_requirement_id_is_invalid_in_doc_comment() {
         .args(["check"])
         .assert()
         .failure()
-        .stdout(contains("broken_trace"))
-        .stdout(contains("REQ-UNKNOWN"));
+        .stdout(contains("broken_link"))
+        .stdout(contains("MissingService"));
 }
 
 #[test]

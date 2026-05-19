@@ -1,6 +1,5 @@
 import 'placement_candidate.dart';
 
-/// @implements REQ-WATERMARK-001
 class AutoPlacementService {
   AutoPlacementService();
 

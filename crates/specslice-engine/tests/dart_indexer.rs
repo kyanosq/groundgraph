@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use specslice_core::artifact_id::{dart_class_id, dart_method_id, requirement_id};
+use specslice_core::artifact_id::{dart_class_id, dart_method_id};
 use specslice_core::{EdgeKind, NodeKind};
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, DART_INDEXER_NAME};
 use specslice_store::Store;
@@ -37,18 +37,17 @@ fn indexing_dart_fixture_yields_expected_counts() {
     assert!(result.files >= 3, "files: {}", result.files);
     assert!(result.symbols >= 4, "symbols: {}", result.symbols);
     assert_eq!(result.tests, 1, "test cases");
-    assert_eq!(result.declared_implementations, 1);
-    assert_eq!(result.declared_verifications, 1);
+    assert_eq!(result.declared_implementations, 0);
+    assert_eq!(result.declared_verifications, 0);
 
-    let req = requirement_id("REQ-WATERMARK-001");
     let impl_edges = store
         .list_edges_by_kind(EdgeKind::DeclaresImplementation)
         .unwrap();
-    assert!(impl_edges.iter().any(|e| e.to_id == req));
+    assert!(impl_edges.is_empty());
     let verifies = store
         .list_edges_by_kind(EdgeKind::DeclaresVerification)
         .unwrap();
-    assert!(verifies.iter().any(|e| e.to_id == req));
+    assert!(verifies.is_empty());
 
     // Symbol ranges include the method, and the method maps to its parent class.
     let class = dart_class_id(

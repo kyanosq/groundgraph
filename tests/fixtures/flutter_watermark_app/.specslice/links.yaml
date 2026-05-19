@@ -1,0 +1,8 @@
+requirements:
+  REQ-WATERMARK-001:
+    docs:
+      - docs/watermark.md#auto-watermark-placement
+    implementations:
+      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService
+    tests:
+      - test/watermark/auto_placement_service_test.dart#places-watermark-outside-face-region

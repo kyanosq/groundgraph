@@ -3,8 +3,7 @@
 //! MVP-2 scope (PRD §2.1 / §3 / implementation plan §MVP-2):
 //! - Scan `lib/` and `test/` for `*.dart` files.
 //! - Extract file, class, method, function, constructor, import, `test(...)`,
-//!   `group(...)`, and doc-comment trace tags (`@implements`, `@verifies`,
-//!   `@related`).
+//!   and `group(...)`.
 //! - Output a [`LanguageIndexBatch`]; the engine handles SQLite ingestion.
 
 pub mod parser;
@@ -67,7 +66,6 @@ fn merge(into: &mut LanguageIndexBatch, mut from: ParseResult) {
     into.symbols.append(&mut from.symbols);
     into.tests.append(&mut from.tests);
     into.imports.append(&mut from.imports);
-    into.trace_links.append(&mut from.traces);
     into.symbol_ranges.append(&mut from.ranges);
     into.diagnostics.append(&mut from.diagnostics);
 }

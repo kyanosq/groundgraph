@@ -45,33 +45,6 @@ pub struct ImportEdge {
     pub to_path: String,
 }
 
-/// A `@implements` / `@verifies` / `@related` annotation found in a doc comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TraceTag {
-    Implements,
-    Verifies,
-    Related,
-}
-
-impl TraceTag {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TraceTag::Implements => "implements",
-            TraceTag::Verifies => "verifies",
-            TraceTag::Related => "related",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeclaredTrace {
-    pub from_symbol_id: ArtifactId,
-    pub tag: TraceTag,
-    pub target: String,
-    pub start_line: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolRange {
     pub file_path: String,
@@ -96,7 +69,6 @@ pub struct LanguageIndexBatch {
     pub symbols: Vec<SymbolArtifact>,
     pub tests: Vec<TestArtifact>,
     pub imports: Vec<ImportEdge>,
-    pub trace_links: Vec<DeclaredTrace>,
     pub symbol_ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
 }
@@ -104,13 +76,6 @@ pub struct LanguageIndexBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn trace_tag_strings() {
-        assert_eq!(TraceTag::Implements.as_str(), "implements");
-        assert_eq!(TraceTag::Verifies.as_str(), "verifies");
-        assert_eq!(TraceTag::Related.as_str(), "related");
-    }
 
     #[test]
     fn empty_batch_round_trips() {

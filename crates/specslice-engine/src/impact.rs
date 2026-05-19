@@ -3,7 +3,7 @@
 //! MVP-4 (PRD §4 / implementation plan §MVP-4):
 //! - Read `git diff --unified=0 base..head`.
 //! - Resolve changed files to changed symbols via `symbol_ranges`.
-//! - Walk declared traces (direct + parent class).
+//! - Walk manifest-declared relationships (direct + parent class).
 //! - For changed doc sections, walk `documents` → Requirement → impl/tests.
 //! - Report changed_symbols, affected_requirements, affected_docs, linked_tests
 //!   and warnings.
@@ -30,6 +30,36 @@ pub struct ImpactOptions {
     pub reindex: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactPolicy {
+    pub propagate_to_parent_symbol: bool,
+    pub include_doc_changes: bool,
+    pub stale_doc_level: String,
+    pub missing_test_change_level: String,
+}
+
+impl Default for ImpactPolicy {
+    fn default() -> Self {
+        Self {
+            propagate_to_parent_symbol: true,
+            include_doc_changes: true,
+            stale_doc_level: "info".into(),
+            missing_test_change_level: "warning".into(),
+        }
+    }
+}
+
+impl From<&crate::config::ImpactConfig> for ImpactPolicy {
+    fn from(value: &crate::config::ImpactConfig) -> Self {
+        Self {
+            propagate_to_parent_symbol: value.propagate_to_parent_symbol,
+            include_doc_changes: value.include_doc_changes,
+            stale_doc_level: value.stale_doc_level.clone(),
+            missing_test_change_level: value.missing_test_change_level.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ImpactReport {
     pub changed_files: Vec<String>,
@@ -42,28 +72,36 @@ pub struct ImpactReport {
     /// Populated regardless of whether the implementation was itself changed
     /// — this is what PRD §4.4 "Doc Impact" requires so the report stays
     /// actionable for doc-only changes.
-    pub related_implementations: Vec<SliceItem>,
+    pub linked_implementations: Vec<SliceItem>,
     pub warnings: Vec<String>,
     pub info: Vec<String>,
 }
 
 pub fn run_impact(options: ImpactOptions) -> Result<ImpactReport> {
-    if options.reindex {
+    let config = load_config(&options.repo_root)?;
+    if options.reindex && config.impact.auto_reindex_changed_files {
         index_repository(IndexOptions::all(options.repo_root.clone()))
             .context("re-indexing repository before impact")?;
     }
-    let config = load_config(&options.repo_root)?;
     let db_path = resolve_storage_path(&options.repo_root, &config);
     let store = Store::open(&db_path)
         .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
 
     let diff_text = git_diff(&options.repo_root, &options.base_ref, &options.head_ref)?;
     let changed = parse_unified_diff(&diff_text);
-    compute_impact(&store, &changed)
+    compute_impact_with_policy(&store, &changed, ImpactPolicy::from(&config.impact))
 }
 
 /// Compute an impact report from an already-parsed diff. Useful in tests.
 pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactReport> {
+    compute_impact_with_policy(store, changed, ImpactPolicy::default())
+}
+
+pub fn compute_impact_with_policy(
+    store: &Store,
+    changed: &[ChangedFile],
+    policy: ImpactPolicy,
+) -> Result<ImpactReport> {
     let mut report = ImpactReport::default();
     let mut affected_reqs: BTreeSet<ArtifactId> = BTreeSet::new();
     let mut changed_symbol_ids: BTreeSet<ArtifactId> = BTreeSet::new();
@@ -90,10 +128,9 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
                     line_range: Some((symbol.start_line, symbol.end_line)),
                 });
 
-                // Propagate from symbol → declared requirement, walking up
-                // through parent symbols until we hit one. We rely on
-                // `symbol_ranges` for the parent chain because it is the
-                // canonical source for parent_symbol_id.
+                // Propagate from symbol → declared requirement. By default we
+                // walk parent symbols; config can disable that for stricter
+                // direct-only impact.
                 let file_ranges = store.list_symbol_ranges_for_file(&symbol.file_path)?;
                 let mut visited: BTreeSet<ArtifactId> = BTreeSet::new();
                 let mut cursor: Option<ArtifactId> = Some(symbol.symbol_id.clone());
@@ -111,6 +148,9 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
                     if hit {
                         break;
                     }
+                    if !policy.propagate_to_parent_symbol {
+                        break;
+                    }
                     cursor = file_ranges
                         .iter()
                         .find(|r| r.symbol_id == id)
@@ -119,7 +159,9 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
             }
 
             // Markdown change → affected doc sections + their REQ.
-            if file.path.ends_with(".md") || file.path.ends_with(".mdx") {
+            if policy.include_doc_changes
+                && (file.path.ends_with(".md") || file.path.ends_with(".mdx"))
+            {
                 let sections = find_doc_sections_for(store, &file.path, *hunk)?;
                 for sec in sections {
                     if !changed_doc_section_ids.contains(&sec.id) {
@@ -201,7 +243,7 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
     }
     for impl_id in &impl_set {
         if let Some(node) = store.find_node(impl_id)? {
-            report.related_implementations.push(SliceItem {
+            report.linked_implementations.push(SliceItem {
                 id: node.id.to_string(),
                 kind: node.kind.as_str().to_string(),
                 path: node.path,
@@ -219,26 +261,39 @@ pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactRe
     sort_items(&mut report.affected_requirements);
     sort_items(&mut report.affected_docs);
     sort_items(&mut report.linked_tests);
-    sort_items(&mut report.related_implementations);
+    sort_items(&mut report.linked_implementations);
 
     // Warnings & info.
     if !report.affected_requirements.is_empty()
         && !report.linked_tests.is_empty()
         && !any_test_changed
     {
-        report.warnings.push(
-            "Affected requirement has linked tests, but no related test changed in this PR."
+        push_impact_message(
+            &mut report,
+            &policy.missing_test_change_level,
+            "Affected requirement has linked tests, but no linked test changed in this PR."
                 .to_string(),
         );
     }
     if !report.affected_requirements.is_empty() && report.changed_doc_sections.is_empty() {
-        report.info.push(
-            "Related doc sections were not changed. Review whether docs are still accurate."
+        push_impact_message(
+            &mut report,
+            &policy.stale_doc_level,
+            "Linked doc sections were not changed. Review whether docs are still accurate."
                 .to_string(),
         );
     }
 
     Ok(report)
+}
+
+fn push_impact_message(report: &mut ImpactReport, level: &str, message: String) {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "warning" | "warn" => report.warnings.push(message),
+        "info" => report.info.push(message),
+        "off" | "none" | "ignore" => {}
+        _ => report.info.push(message),
+    }
 }
 
 fn find_changed_symbols(
@@ -247,7 +302,25 @@ fn find_changed_symbols(
     hunk: Hunk,
 ) -> Result<Vec<specslice_core::SymbolRange>> {
     let ranges = store.find_symbols_intersecting(path, hunk.new_start, hunk.new_end)?;
-    Ok(ranges)
+    Ok(filter_most_specific_symbols(ranges))
+}
+
+fn filter_most_specific_symbols(
+    ranges: Vec<specslice_core::SymbolRange>,
+) -> Vec<specslice_core::SymbolRange> {
+    ranges
+        .iter()
+        .filter(|candidate| {
+            !ranges.iter().any(|other| {
+                other.symbol_id != candidate.symbol_id
+                    && candidate.start_line <= other.start_line
+                    && other.end_line <= candidate.end_line
+                    && (other.end_line - other.start_line)
+                        < (candidate.end_line - candidate.start_line)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn find_doc_sections_for(
