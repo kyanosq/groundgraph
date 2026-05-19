@@ -12,6 +12,7 @@ pub mod dart_indexer;
 pub mod docs_indexer;
 pub mod export;
 pub mod git_diff;
+pub mod graph;
 pub mod impact;
 pub mod index;
 pub mod init;
@@ -32,6 +33,10 @@ pub use context_pack::{
 };
 pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
+pub use graph::{
+    build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
+    GraphStats, GraphStatus, GraphViewModel, GRAPH_SCHEMA_VERSION,
+};
 pub use impact::{run_impact, ImpactOptions, ImpactReport};
 pub use index::{index_repository, IndexOptions, IndexResult};
 pub use init::{init_repository, InitOptions, InitOutcome};

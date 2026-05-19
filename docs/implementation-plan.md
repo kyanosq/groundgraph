@@ -367,24 +367,37 @@ MVP 完成时必须满足：
 - 增加 `specslice accept-candidate`，用户确认后写入 `.specslice/links.yaml` 或 `.specslice/requirements.yaml`。
 - 验收：LLM/candidate 不进入 confirmed graph；CI 默认不信任 candidate。
 
-### P6：可视化与审阅界面
+### P6：可视化与审阅界面 ✅ 落地
 
-- 先增加只读可视化导出，不直接修改业务仓库：
-  - `specslice graph --format mermaid`：输出当前 confirmed graph。
-  - `specslice graph --format html`：生成 `.specslice/export/graph.html` 静态页面。
-  - `specslice graph --include-candidates`：可选叠加 AI 候选边，用不同状态标识 proposed / accepted / rejected / stale。
-- 可视化节点分层：
-  - DocumentChunk / DocSection。
-  - BusinessLogic / Requirement。
-  - CodeSymbol。
-  - TestCase / TestGroup。
-  - Candidate / Question / Risk。
-- 可视化边分层：
-  - fact：文件包含段落、文件包含符号。
-  - confirmed：人工确认后的文档、实现、测试关系。
-  - candidate：AI 候选，默认不参与 impact/check。
-  - risk：missing_doc、missing_test、stale_link、mismatch_candidate。
-- 验收：可视化只读、可复现、能从节点跳回文件路径和行号；CI 默认只验证导出可生成，不要求浏览器环境。
+详细设计见 [`docs/visualization-design.md`](visualization-design.md)。
+
+落地内容（CLI 子命令 `specslice graph`）：
+
+- `--format json`：输出稳定契约 `GraphViewModel`（schema_version=1），含 stats/nodes/edges/findings 与 generated_at。
+- `--format mermaid`：输出 `flowchart LR`，使用 `n0/n1/…` 别名，不暴露原始 artifact id；layer→箭头/形状映射（confirmed→实线圆角、candidate→虚线、risk→菱形）。
+- `--format html`：生成 `.specslice/export/graph.html`，自包含 HTML+CSS+JSON+JS，零远程依赖（无 `https://`/`http://`/CDN）。lane 列布局 Documents/Business/Code/Tests/Risks；layer 分别用 `layer-fact`/`layer-confirmed`/`layer-candidate`/`layer-risk` CSS 类区分；支持搜索、focus、图层开关、节点/边详情面板；SVG 贝塞尔在 resize/filter 后重算。
+- 通用旗标：`--focus <id>`（支持 `REQ-*` 稳定键或完整 artifact id，单跳邻域）、`--max-nodes N`（截断时附 `graph_truncated` finding，确保保留 focus 与 confirmed 节点）、`--include-risks`（基于 `compute_checks` 注入 risk findings）、`--include-candidates`（占位，目前无候选源时返回空稳定状态）。
+
+节点分层映射：
+
+- DocSection / AcceptanceCriterion / Adr → `documents` lane, layer=`fact`。
+- Requirement → `business` lane, layer=`confirmed`。
+- File / Dart {class,method,function,constructor} → `code` lane, layer=`fact`。
+- TestCase / TestGroup → `tests` lane, layer=`fact`。
+- Findings（来自 checks）→ `risks` lane, layer=`risk`，仅在 `--include-risks` 时出现。
+
+边分层映射：
+
+- `EdgeSource::ExternalManifest` → layer=`confirmed`（来自 `.specslice/links.yaml`）。
+- `EdgeCertainty::Fact`（filesystem/parser 提供）→ layer=`fact`。
+- 候选 / risk：保留位置，等 `.specslice/candidates/` 落地后填充。
+
+验收（已通过，2026-05-19）：
+
+- 引擎层 9 个测试覆盖 view model 结构、focus 邻域、未命中 focus、max_nodes 截断、risk findings 与候选空占位。
+- CLI 层 7 个 e2e 测试覆盖 JSON/HTML/Mermaid 输出、`--out` 路径、`--focus`、`--max-nodes`，外加 5 个单元测试覆盖 mermaid 别名转义与 HTML payload 中 `</script>` 注入防御。
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --quiet`、`git diff --check` 全部通过。
+- 真实冷启动：`cargo run -- graph --format html` 在 `tests/fixtures/flutter_watermark_app` 上 30s 内产出 26KB HTML，离线 grep 无任何远程 URL。
 
 ## 后续验收方式
 

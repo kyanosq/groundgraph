@@ -41,6 +41,51 @@ enum Commands {
     Connect(ConnectArgs),
     /// Export the current graph store to a portable bundle.
     Export(ExportArgs),
+    /// Render the graph as JSON, Mermaid, or self-contained HTML.
+    Graph(GraphArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct GraphArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = GraphFormatArg::Html)]
+    format: GraphFormatArg,
+    /// Where to write the rendered output. Defaults to stdout for JSON and
+    /// Mermaid, and to `.specslice/export/graph.html` for HTML.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Focus on a single business id (`REQ-…`) or full artifact id.
+    #[arg(long)]
+    focus: Option<String>,
+    /// Hide check/risk findings from the export. Defaults to true (include).
+    #[arg(long, default_value_t = true)]
+    include_risks: bool,
+    /// Reserved for the future `.specslice/candidates/` overlay.
+    #[arg(long)]
+    include_candidates: bool,
+    /// Cap the number of nodes; emits a `graph_truncated` finding when hit.
+    #[arg(long)]
+    max_nodes: Option<usize>,
+    /// Pretty-print the JSON output.
+    #[arg(long)]
+    pretty: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum GraphFormatArg {
+    Json,
+    Html,
+    Mermaid,
+}
+
+impl From<GraphFormatArg> for commands::graph::GraphFormat {
+    fn from(value: GraphFormatArg) -> Self {
+        match value {
+            GraphFormatArg::Json => commands::graph::GraphFormat::Json,
+            GraphFormatArg::Html => commands::graph::GraphFormat::Html,
+            GraphFormatArg::Mermaid => commands::graph::GraphFormat::Mermaid,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -199,5 +244,15 @@ fn run() -> Result<()> {
             }
         },
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
+        Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
+            repo_root: cli.repo_root.clone(),
+            format: args.format.into(),
+            out: args.out,
+            focus: args.focus,
+            include_risks: args.include_risks,
+            include_candidates: args.include_candidates,
+            max_nodes: args.max_nodes,
+            pretty: args.pretty,
+        }),
     }
 }
