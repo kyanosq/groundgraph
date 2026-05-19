@@ -1,0 +1,9 @@
+target/
+.DS_Store
+
+# SpecSlice local runtime state.
+.specslice/graph.db
+.specslice/export/
+
+# Rust/editor local files.
+*.swp
