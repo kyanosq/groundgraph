@@ -20,6 +20,25 @@ pub enum EdgeKind {
     /// targets (identifier followed by `(`). Lets the UI distinguish "uses
     /// constant" from "invokes method" without inspecting evidence.
     Calls,
+    // ---- P8 framework-aware semantic edges --------------------------------
+    /// `ref.read(X)`, `ref.watch(X)`, or `ref.listen(X)` on a Riverpod
+    /// `Ref` / `WidgetRef` resolves to a provider top-level variable.
+    /// Emitted from analyzer-resolved AST only.
+    ReadsProvider,
+    /// `context.push("/route")`, `context.go(...)`, `Navigator.pushNamed(...)`
+    /// and friends. Target is a synthetic `route::<path>` node.
+    NavigatesTo,
+    /// `Hive.box(name).put/get/delete(...)` and `SharedPreferences`-style
+    /// calls. Target is a synthetic `storage::<backend>::<bucket>` node.
+    PersistsTo,
+    /// `stream.listen(callback)` on anything whose static type implements
+    /// `Stream<T>`. Target is the producer of the stream (the symbol or
+    /// member that returned it), when resolvable.
+    SubscribesStream,
+    /// P9 evidence edge: an AI-authored business candidate cites this
+    /// concrete code fact as its supporting evidence. Always travels from
+    /// a `business_candidate::*` node to a Fact-layer edge target.
+    DerivesFrom,
 }
 
 impl EdgeKind {
@@ -32,6 +51,11 @@ impl EdgeKind {
             EdgeKind::DeclaresVerification => "declares_verification",
             EdgeKind::References => "references",
             EdgeKind::Calls => "calls",
+            EdgeKind::ReadsProvider => "reads_provider",
+            EdgeKind::NavigatesTo => "navigates_to",
+            EdgeKind::PersistsTo => "persists_to",
+            EdgeKind::SubscribesStream => "subscribes_stream",
+            EdgeKind::DerivesFrom => "derives_from",
         }
     }
 }
@@ -159,6 +183,11 @@ mod tests {
         );
         assert_eq!(EdgeKind::References.as_str(), "references");
         assert_eq!(EdgeKind::Calls.as_str(), "calls");
+        assert_eq!(EdgeKind::ReadsProvider.as_str(), "reads_provider");
+        assert_eq!(EdgeKind::NavigatesTo.as_str(), "navigates_to");
+        assert_eq!(EdgeKind::PersistsTo.as_str(), "persists_to");
+        assert_eq!(EdgeKind::SubscribesStream.as_str(), "subscribes_stream");
+        assert_eq!(EdgeKind::DerivesFrom.as_str(), "derives_from");
 
         assert_eq!(EdgeSource::Filesystem.as_str(), "filesystem");
         assert_eq!(EdgeSource::LanguageAdapter.as_str(), "language_adapter");

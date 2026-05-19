@@ -46,6 +46,7 @@ use specslice_core::{EdgeAssertion, EdgeCertainty, EdgeSource, EdgeStatus, Node,
 use specslice_store::Store;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::business_candidates::{candidate_artifact_id, load_business_candidates, BusinessCandidate};
 use crate::checks::{compute_checks_with_policy, CheckFinding, CheckPolicy, CheckSeverity};
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 
@@ -206,11 +207,15 @@ impl GraphView {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GraphOptions {
     pub view: GraphView,
     pub focus: Option<String>,
     pub include_risks: bool,
+    /// When `true` (the default), P9 business candidates from
+    /// `.specslice/candidates/business_logic.yaml` are merged into the
+    /// view as `business_candidate` nodes on the Candidate layer. Set
+    /// to `false` to render the pure code-fact graph.
     pub include_candidates: bool,
     pub max_nodes: Option<usize>,
     /// When `false` (default) the view drops framework-noise edges:
@@ -219,6 +224,19 @@ pub struct GraphOptions {
     /// engine also filters defensively at view time so older `.specslice`
     /// stores stay clean.
     pub include_noise: bool,
+}
+
+impl Default for GraphOptions {
+    fn default() -> Self {
+        Self {
+            view: GraphView::default(),
+            focus: None,
+            include_risks: false,
+            include_candidates: true,
+            max_nodes: None,
+            include_noise: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,14 +281,46 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
     // 4. Compute child_count for every aggregator.
     compute_child_counts(&mut nodes);
 
-    // 5. Risk findings, candidate placeholder.
+    // 5. Risk findings.
     let mut findings: Vec<GraphFinding> = Vec::new();
     if options.include_risks {
         let report = compute_checks_with_policy(&store, None, CheckPolicy::from(&config.checks))
             .context("computing checks for graph view")?;
         findings.extend(report.findings.iter().map(map_check));
     }
-    let _ = options.include_candidates;
+
+    // 5b. P9 — merge AI-authored business candidates from
+    // `.specslice/candidates/business_logic.yaml`. Read-only: the engine
+    // never writes the YAML; if it's malformed we still produce a
+    // graph and surface the parser warnings as findings so the user can
+    // act on them.
+    if options.include_candidates {
+        match load_business_candidates(repo_root) {
+            Ok(outcome) => {
+                let node_ids: HashSet<String> =
+                    nodes.iter().map(|n| n.id.clone()).collect();
+                for c in &outcome.document.candidates {
+                    merge_business_candidate(c, &node_ids, &mut nodes, &mut edges, &mut findings);
+                }
+                for w in outcome.warnings {
+                    findings.push(GraphFinding {
+                        code: "business_candidate_warning".into(),
+                        severity: "warning".into(),
+                        message: w,
+                        target_id: None,
+                    });
+                }
+            }
+            Err(e) => {
+                findings.push(GraphFinding {
+                    code: "business_candidate_load_failed".into(),
+                    severity: "warning".into(),
+                    message: format!("failed to load business candidates: {e}"),
+                    target_id: None,
+                });
+            }
+        }
+    }
 
     // 6. Focus narrowing — applied before view filter so visibility is sane.
     if let Some(focus_raw) = options.focus.as_deref() {
@@ -656,26 +706,131 @@ fn severity_to_str(s: CheckSeverity) -> &'static str {
     }
 }
 
+/// P9 — merge one AI-authored candidate into the in-memory graph.
+///
+/// We:
+/// 1. Materialise a `business_candidate::<id>` node with `layer = Candidate`.
+/// 2. For every evidence id that resolves to a known node, materialise a
+///    `derives_from` edge from the candidate to that evidence node, with
+///    confidence = candidate.confidence (defaulting to 0.5 if missing).
+/// 3. For every evidence id we *cannot* resolve, surface a finding so
+///    the human reviewer can fix the YAML.
+fn merge_business_candidate(
+    c: &BusinessCandidate,
+    known_node_ids: &HashSet<String>,
+    nodes: &mut Vec<GraphNode>,
+    edges: &mut Vec<GraphEdge>,
+    findings: &mut Vec<GraphFinding>,
+) {
+    let candidate_id = candidate_artifact_id(&c.id);
+    let confidence = c.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+    let mut badges = Vec::new();
+    badges.push(format!("ai_candidate status={}", c.status));
+    if !c.open_questions.is_empty() {
+        badges.push(format!("{} open questions", c.open_questions.len()));
+    }
+    // Surface the human-readable description + any open questions as a
+    // badge string each, so even minimal renderers see them.
+    if !c.description.trim().is_empty() {
+        badges.push(format!("desc: {}", shorten_for_badge(c.description.trim())));
+    }
+    for q in &c.open_questions {
+        badges.push(format!("Q: {}", shorten_for_badge(q)));
+    }
+    nodes.push(GraphNode {
+        id: candidate_id.clone(),
+        kind: "business_candidate".into(),
+        column: GraphColumn::Business,
+        layer: GraphLayer::Candidate,
+        label: c.name.clone(),
+        path: None,
+        line_range: None,
+        status: GraphStatus::Proposed,
+        parent_id: None,
+        child_count: 0,
+        default_visible: false,
+        confidence: Some(confidence),
+        source: Some("ai_candidate".into()),
+        badges,
+    });
+
+    for (idx, ev) in c.evidence.iter().enumerate() {
+        if !known_node_ids.contains(ev) {
+            findings.push(GraphFinding {
+                code: "business_candidate_dangling_evidence".into(),
+                severity: "warning".into(),
+                message: format!(
+                    "candidate `{}` cites evidence `{}` but no such node exists in the graph",
+                    c.id, ev
+                ),
+                target_id: Some(candidate_id.clone()),
+            });
+            continue;
+        }
+        edges.push(GraphEdge {
+            id: format!("derives_from::{}#{idx}", c.id),
+            from: candidate_id.clone(),
+            to: ev.clone(),
+            kind: "derives_from".into(),
+            layer: GraphLayer::Candidate,
+            status: GraphStatus::Proposed,
+            confidence: Some(confidence),
+            source: Some("ai_candidate".into()),
+            rationale: None,
+            source_file: None,
+            line_range: None,
+            snippet: None,
+            resolver: Some("ai_candidate".into()),
+        });
+    }
+}
+
+/// Trim a description / open-question down to a 120-char preview so it
+/// can ride along on a node badge without blowing up the UI. Word-aware
+/// truncation falls back to a hard cut for pathological inputs.
+fn shorten_for_badge(s: &str) -> String {
+    const LIMIT: usize = 120;
+    if s.chars().count() <= LIMIT {
+        return s.replace('\n', " ");
+    }
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i >= LIMIT - 1 {
+            break;
+        }
+        if ch == '\n' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('…');
+    out
+}
+
 fn column_for(kind: NodeKind) -> GraphColumn {
     match kind {
         NodeKind::DocSection | NodeKind::AcceptanceCriterion | NodeKind::Adr => {
             GraphColumn::Documents
         }
-        NodeKind::Requirement => GraphColumn::Business,
+        NodeKind::Requirement | NodeKind::BusinessCandidate => GraphColumn::Business,
         NodeKind::File
         | NodeKind::DartClass
         | NodeKind::DartMethod
         | NodeKind::DartFunction
-        | NodeKind::DartConstructor => GraphColumn::Code,
+        | NodeKind::DartConstructor
+        | NodeKind::DartProvider
+        | NodeKind::Route
+        | NodeKind::Storage => GraphColumn::Code,
         NodeKind::TestCase | NodeKind::TestGroup => GraphColumn::Tests,
     }
 }
 
 fn layer_for_node(kind: NodeKind) -> GraphLayer {
-    if matches!(kind, NodeKind::Requirement) {
-        GraphLayer::Confirmed
-    } else {
-        GraphLayer::Fact
+    match kind {
+        NodeKind::Requirement => GraphLayer::Confirmed,
+        NodeKind::BusinessCandidate => GraphLayer::Candidate,
+        _ => GraphLayer::Fact,
     }
 }
 
@@ -723,19 +878,20 @@ fn apply_view(
             }
         }
         GraphView::Business => {
-            // Identify requirements present and visible by themselves; also
-            // make their immediate doc/impl/test neighbours visible.
-            let req_ids: HashSet<String> = nodes
+            // Identify requirements *and* P9 business candidates as the
+            // "business surface"; pull in their one-hop neighbours so the
+            // user sees the immediate code/doc evidence supporting them.
+            let business_ids: HashSet<String> = nodes
                 .iter()
-                .filter(|n| n.kind == "requirement")
+                .filter(|n| n.kind == "requirement" || n.kind == "business_candidate")
                 .map(|n| n.id.clone())
                 .collect();
-            let mut visible: HashSet<String> = req_ids.clone();
+            let mut visible: HashSet<String> = business_ids.clone();
             for edge in edges {
-                if req_ids.contains(&edge.from) {
+                if business_ids.contains(&edge.from) {
                     visible.insert(edge.to.clone());
                 }
-                if req_ids.contains(&edge.to) {
+                if business_ids.contains(&edge.to) {
                     visible.insert(edge.from.clone());
                 }
             }

@@ -88,6 +88,11 @@ struct SidecarRawResponse {
     imports: Vec<serde_json::Value>,
     #[serde(default)]
     references: Vec<serde_json::Value>,
+    /// P8 — synthetic targets (routes, storage buckets, top-level
+    /// providers we did not pick up as symbols). Optional in JSON for
+    /// forward compatibility with older sidecar builds.
+    #[serde(default)]
+    synthetic_nodes: Vec<serde_json::Value>,
     #[serde(default)]
     diagnostics: Vec<serde_json::Value>,
 }
@@ -299,6 +304,16 @@ fn parse_response(stdout: &[u8]) -> SidecarOutcome {
             Err(e) => {
                 return SidecarOutcome::Skipped {
                     reason: format!("invalid reference row: {e}"),
+                };
+            }
+        }
+    }
+    for v in response.synthetic_nodes {
+        match serde_json::from_value(v) {
+            Ok(s) => batch.synthetic_nodes.push(s),
+            Err(e) => {
+                return SidecarOutcome::Skipped {
+                    reason: format!("invalid synthetic_node row: {e}"),
                 };
             }
         }

@@ -271,11 +271,36 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         store.upsert_edge(&edge)?;
     }
 
+    // P8 — emit synthetic targets (routes, storage buckets, top-level
+    // providers we did not pick up as symbols) BEFORE the edges that point
+    // at them so the foreign-key-ish contains chain stays consistent.
+    for synth in &batch.synthetic_nodes {
+        if !matches!(
+            synth.kind,
+            NodeKind::Route | NodeKind::Storage | NodeKind::DartProvider
+        ) {
+            // Adapter contract: only these synthetic kinds are allowed.
+            continue;
+        }
+        let mut node = Node::new(synth.id.clone(), synth.kind);
+        node.name = Some(synth.label.clone());
+        node.indexer = Some(DART_INDEXER_NAME.into());
+        store.upsert_node(&node)?;
+    }
+
     for reference in &batch.references {
-        if !matches!(reference.kind, EdgeKind::References | EdgeKind::Calls) {
-            // Defensive: adapter contract restricts these to References /
-            // Calls; ignore any future kinds we do not yet understand
-            // instead of corrupting the store.
+        if !matches!(
+            reference.kind,
+            EdgeKind::References
+                | EdgeKind::Calls
+                | EdgeKind::ReadsProvider
+                | EdgeKind::NavigatesTo
+                | EdgeKind::PersistsTo
+                | EdgeKind::SubscribesStream
+        ) {
+            // Defensive: adapter contract restricts these to a fixed set;
+            // ignore any future kinds we do not yet understand instead of
+            // corrupting the store.
             continue;
         }
         let mut edge = EdgeAssertion::fact(

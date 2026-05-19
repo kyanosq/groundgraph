@@ -20,6 +20,26 @@ pub enum NodeKind {
     DartConstructor,
     TestCase,
     TestGroup,
+    // ---- P8 framework-aware synthetic targets -----------------------------
+    /// Top-level Riverpod provider variable (e.g. `final proProvider =
+    /// StateNotifierProvider(...)`). The Dart analyzer sidecar adds these
+    /// during Pass 1 so `reads_provider` edges have something to point at.
+    DartProvider,
+    /// Synthetic node for a navigation destination identified only by
+    /// its route string — `route::/paywall`, `route::/editor`. Created
+    /// on demand by the sidecar when it sees `context.push("/foo")`.
+    Route,
+    /// Synthetic node for a persistence target identified by storage
+    /// backend + bucket (`storage::hive::pro_entitlement`,
+    /// `storage::shared_prefs::onboarding_done`). Created on demand by the
+    /// sidecar.
+    Storage,
+    // ---- P9 AI-authored business candidates -------------------------------
+    /// A business-logic candidate produced by the AI layer (P9) — a
+    /// human-readable description of a flow, gated by `status` and
+    /// `confidence`. Always lives in `GraphLayer::Candidate` until a
+    /// human confirms it.
+    BusinessCandidate,
 }
 
 impl NodeKind {
@@ -36,6 +56,10 @@ impl NodeKind {
             NodeKind::DartConstructor => "dart_constructor",
             NodeKind::TestCase => "test_case",
             NodeKind::TestGroup => "test_group",
+            NodeKind::DartProvider => "dart_provider",
+            NodeKind::Route => "route",
+            NodeKind::Storage => "storage",
+            NodeKind::BusinessCandidate => "business_candidate",
         }
     }
 }
@@ -96,6 +120,10 @@ mod tests {
             NodeKind::DartConstructor,
             NodeKind::TestCase,
             NodeKind::TestGroup,
+            NodeKind::DartProvider,
+            NodeKind::Route,
+            NodeKind::Storage,
+            NodeKind::BusinessCandidate,
         ] {
             assert!(!kind.as_str().is_empty());
         }

@@ -90,6 +90,20 @@ pub struct AdapterDiagnostic {
     pub message: String,
 }
 
+/// P8 synthetic target (route/storage/etc.) that exists only because some
+/// piece of code referenced it by string. The adapter promises that the
+/// `id` is unique and that `kind` is one of:
+/// `route` / `storage` / `dart_provider`.
+///
+/// `label` is what we show in the graph (e.g. `/paywall` or
+/// `hive:pro_entitlement`). It is *not* a file path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyntheticNode {
+    pub id: ArtifactId,
+    pub kind: NodeKind,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LanguageIndexBatch {
     pub language: String,
@@ -103,6 +117,10 @@ pub struct LanguageIndexBatch {
     /// JSON for forward compatibility with older adapters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<ReferenceEdge>,
+    /// P8 synthetic targets — routes, storage buckets, etc. Optional in
+    /// JSON for forward compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synthetic_nodes: Vec<SyntheticNode>,
 }
 
 #[cfg(test)]

@@ -49,6 +49,11 @@ abstract class EdgeKindString {
   static const imports = 'imports';
   static const references = 'references';
   static const calls = 'calls';
+  // P8 — framework-aware semantic edges.
+  static const readsProvider = 'reads_provider';
+  static const navigatesTo = 'navigates_to';
+  static const persistsTo = 'persists_to';
+  static const subscribesStream = 'subscribes_stream';
 }
 
 /// Same shape as `specslice_core::NodeKind` (snake_case).
@@ -60,6 +65,10 @@ abstract class NodeKindString {
   static const dartConstructor = 'dart_constructor';
   static const testCase = 'test_case';
   static const testGroup = 'test_group';
+  // P8 — synthetic target node kinds.
+  static const dartProvider = 'dart_provider';
+  static const route = 'route';
+  static const storage = 'storage';
 }
 
 class SidecarBatchResponse {
@@ -68,6 +77,7 @@ class SidecarBatchResponse {
   final List<Map<String, dynamic>> symbolRanges;
   final List<Map<String, dynamic>> imports;
   final List<Map<String, dynamic>> references;
+  final List<Map<String, dynamic>> syntheticNodes;
   final List<Map<String, dynamic>> diagnostics;
 
   SidecarBatchResponse({
@@ -76,6 +86,7 @@ class SidecarBatchResponse {
     required this.symbolRanges,
     required this.imports,
     required this.references,
+    required this.syntheticNodes,
     required this.diagnostics,
   });
 
@@ -87,6 +98,7 @@ class SidecarBatchResponse {
         'symbol_ranges': symbolRanges,
         'imports': imports,
         'references': references,
+        'synthetic_nodes': syntheticNodes,
         'diagnostics': diagnostics,
       };
 }

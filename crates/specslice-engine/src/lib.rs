@@ -4,6 +4,7 @@
 //! - [`EngineConfig`] — workspace-level config persisted to `.specslice.yaml`.
 //! - [`init_repository`] — generate the config file and graph database.
 
+pub mod business_candidates;
 pub mod checks;
 pub mod config;
 pub mod connect;
@@ -19,6 +20,12 @@ pub mod index;
 pub mod init;
 pub mod links_indexer;
 pub mod slice;
+
+pub use business_candidates::{
+    candidate_artifact_id, load_business_candidates, BusinessCandidate, BusinessCandidatesDocument,
+    LoadOutcome as BusinessCandidatesLoadOutcome, BUSINESS_CANDIDATES_REL_PATH,
+    BUSINESS_CANDIDATES_SCHEMA_VERSION,
+};
 
 pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,

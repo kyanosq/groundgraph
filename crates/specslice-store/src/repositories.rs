@@ -324,6 +324,10 @@ fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         "dart_constructor" => NodeKind::DartConstructor,
         "test_case" => NodeKind::TestCase,
         "test_group" => NodeKind::TestGroup,
+        "dart_provider" => NodeKind::DartProvider,
+        "route" => NodeKind::Route,
+        "storage" => NodeKind::Storage,
+        "business_candidate" => NodeKind::BusinessCandidate,
         other => return Err(decode_error(1, format!("unknown node kind {other}"))),
     };
     Ok(Node {
@@ -399,6 +403,7 @@ fn symbol_range_from_row(row: &Row<'_>) -> Result<SymbolRange, rusqlite::Error> 
         "test_case" => NodeKind::TestCase,
         "test_group" => NodeKind::TestGroup,
         "doc_section" => NodeKind::DocSection,
+        "dart_provider" => NodeKind::DartProvider,
         other => return Err(decode_error(4, format!("unsupported symbol kind {other}"))),
     };
     let parent: Option<String> = row.get(6)?;
@@ -422,6 +427,11 @@ fn parse_edge_kind(raw: &str) -> Result<EdgeKind, rusqlite::Error> {
         "declares_verification" => EdgeKind::DeclaresVerification,
         "references" => EdgeKind::References,
         "calls" => EdgeKind::Calls,
+        "reads_provider" => EdgeKind::ReadsProvider,
+        "navigates_to" => EdgeKind::NavigatesTo,
+        "persists_to" => EdgeKind::PersistsTo,
+        "subscribes_stream" => EdgeKind::SubscribesStream,
+        "derives_from" => EdgeKind::DerivesFrom,
         other => return Err(decode_error(3, format!("unknown edge kind {other}"))),
     })
 }
@@ -493,6 +503,11 @@ mod decode_tests {
             "declares_verification",
             "references",
             "calls",
+            "reads_provider",
+            "navigates_to",
+            "persists_to",
+            "subscribes_stream",
+            "derives_from",
         ];
         for (i, k) in kinds.iter().enumerate() {
             store.conn.execute(
@@ -613,6 +628,10 @@ mod decode_tests {
             "dart_constructor",
             "test_case",
             "test_group",
+            "dart_provider",
+            "route",
+            "storage",
+            "business_candidate",
         ];
         for (i, k) in kinds.iter().enumerate() {
             store

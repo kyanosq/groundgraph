@@ -35,12 +35,19 @@ class WalkerStats {
 
 /// Entry point. Returns the JSON-encodable batch.
 Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
-  final repoRoot = req.repoRoot;
+  // `package:analyzer` insists on absolute, normalised paths — relative
+  // paths (e.g. `.` from `specslice --repo-root .`) throw inside the
+  // context-collection constructor. Normalise once at the entry so every
+  // downstream `p.join(...)` is happy.
+  final repoRoot = p.normalize(p.absolute(req.repoRoot));
   final files = <Map<String, dynamic>>[];
   final symbols = <Map<String, dynamic>>[];
   final symbolRanges = <Map<String, dynamic>>[];
   final imports = <Map<String, dynamic>>[];
   final references = <Map<String, dynamic>>[];
+  // P8 — synthetic target nodes (routes / storage buckets) that the body
+  // visitor materialises on demand and de-duplicates by id.
+  final syntheticNodes = <String, Map<String, dynamic>>{};
   final diagnostics = <Map<String, dynamic>>[];
 
   final absoluteRoots = <String>[];
@@ -57,6 +64,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       symbolRanges: symbolRanges,
       imports: imports,
       references: references,
+      syntheticNodes: syntheticNodes.values.toList(),
       diagnostics: diagnostics,
     );
   }
@@ -70,6 +78,11 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   // map so the second pass can resolve calls/references against the
   // batch's own symbols rather than just opaque elements.
   final byElement = <Element2, String>{};
+  // Providers also accessed via their synthetic getter element — Riverpod
+  // usage sites resolve `proProvider` to a getter, not to the variable.
+  // We keep a per-file name-based lookup so [_resolveProviderId] can fall
+  // back when the getter element isn't in [byElement].
+  final providerByFileAndName = <String, String>{};
   final dartFiles = <String>[];
   for (final ctx in collection.contexts) {
     for (final f in ctx.contextRoot.analyzedFiles()) {
@@ -146,6 +159,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       byElement: byElement,
       symbols: symbols,
       symbolRanges: symbolRanges,
+      providerByFileAndName: providerByFileAndName,
     );
     unit.unit.visitChildren(declared);
   }
@@ -171,7 +185,9 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       lineInfo: unit.lineInfo,
       source: unit.content,
       byElement: byElement,
+      providerByFileAndName: providerByFileAndName,
       references: references,
+      syntheticNodes: syntheticNodes,
     );
     unit.unit.visitChildren(body);
   }
@@ -182,6 +198,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
     symbolRanges: symbolRanges,
     imports: imports,
     references: references,
+    syntheticNodes: syntheticNodes.values.toList(),
     diagnostics: diagnostics,
   );
 }
@@ -236,6 +253,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   final Map<Element2, String> byElement;
   final List<Map<String, dynamic>> symbols;
   final List<Map<String, dynamic>> symbolRanges;
+  final Map<String, String> providerByFileAndName;
 
   String? currentClassName;
   String? currentClassId;
@@ -247,6 +265,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     required this.byElement,
     required this.symbols,
     required this.symbolRanges,
+    required this.providerByFileAndName,
   });
 
   @override
@@ -375,6 +394,79 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     super.visitFunctionDeclaration(node);
   }
 
+  /// P8 — collect top-level Riverpod-shaped providers as `dart_provider`
+  /// symbols. We detect them by initializer type name: a top-level
+  /// `final foo = Provider(...)` or `StateNotifierProvider(...)` /
+  /// `ChangeNotifierProvider(...)` / `AutoDisposeProvider(...)` /
+  /// `FutureProvider(...)` / `StreamProvider(...)` etc. We accept any
+  /// type whose name ends in `Provider` so families & auto-dispose
+  /// variants are picked up without an enumeration.
+  @override
+  void visitTopLevelVariableDeclaration(TopLevelVariableDeclaration node) {
+    if (currentClassId != null) {
+      return; // class-level fields handled elsewhere
+    }
+    for (final v in node.variables.variables) {
+      final init = v.initializer;
+      if (init == null) continue;
+      if (!_looksLikeProviderConstruction(init)) continue;
+      final name = v.name.lexeme;
+      final id = 'dart_provider::$rel#$name';
+      final lines = _lineRange(node.offset, node.end);
+      symbols.add({
+        'id': id,
+        'kind': NodeKindString.dartProvider,
+        'path': rel,
+        'name': name,
+        'qualified_name': name,
+        'start_line': lines.start,
+        'end_line': lines.end,
+      });
+      symbolRanges.add({
+        'file_path': rel,
+        'symbol_id': id,
+        'start_line': lines.start,
+        'end_line': lines.end,
+        'symbol_kind': NodeKindString.dartProvider,
+        'qualified_name': name,
+      });
+      // Register the variable element AND its synthetic getter so usages
+      // like `ref.read(proProvider)` — which resolve to the getter, not
+      // the variable — can be mapped back to the same id.
+      final el = v.declaredElement2;
+      if (el != null) {
+        byElement[el] = id;
+        try {
+          final getter = (el as dynamic).getter2;
+          if (getter is Element2) byElement[getter] = id;
+        } catch (_) {
+          // analyzer surface still in flux; fall back to name lookup.
+        }
+      }
+      // Always keep a name-based lookup so the body visitor can resolve
+      // by `(file, name)` if the analyzer hands us a different element
+      // instance for usage sites.
+      providerByFileAndName['$rel|$name'] = id;
+    }
+    super.visitTopLevelVariableDeclaration(node);
+  }
+
+  bool _looksLikeProviderConstruction(Expression init) {
+    // Riverpod providers are always built by invoking a constructor whose
+    // class name ends in "Provider" — `Provider`, `StateNotifierProvider`,
+    // `ChangeNotifierProvider`, `AutoDisposeFutureProvider`,
+    // `StateNotifierProvider.family`, etc. We restrict the textual probe
+    // to the "head" of the initializer (everything before the first `(`)
+    // so argument identifiers cannot accidentally match.
+    final text = init.toSource();
+    final paren = text.indexOf('(');
+    final head = paren < 0 ? text : text.substring(0, paren);
+    final stripped = head.split('<').first; // drop generics
+    if (stripped.endsWith('Provider')) return true;
+    if (stripped.contains('Provider.')) return true;
+    return false;
+  }
+
   ({int start, int end}) _lineRange(int offsetStart, int offsetEnd) {
     final s = lineInfo.getLocation(offsetStart).lineNumber;
     final e = lineInfo.getLocation(offsetEnd).lineNumber;
@@ -382,14 +474,17 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   }
 }
 
-/// Walks method / function bodies and emits `calls` / `references` edges
-/// against the symbol table the declaration pass built.
+/// Walks method / function bodies and emits `calls` / `references` /
+/// P8 framework-aware semantic edges against the symbol table the
+/// declaration pass built.
 class _BodyVisitor extends RecursiveAstVisitor<void> {
   final String rel;
   final dynamic lineInfo;
   final String source;
   final Map<Element2, String> byElement;
+  final Map<String, String> providerByFileAndName;
   final List<Map<String, dynamic>> references;
+  final Map<String, Map<String, dynamic>> syntheticNodes;
 
   String? _currentSymbolId;
   final Set<String> _emitted = <String>{};
@@ -399,7 +494,9 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     required this.lineInfo,
     required this.source,
     required this.byElement,
+    required this.providerByFileAndName,
     required this.references,
+    required this.syntheticNodes,
   });
 
   @override
@@ -432,6 +529,19 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitMethodInvocation(MethodInvocation node) {
     final from = _currentSymbolId;
+    if (from != null) {
+      // P8 — try framework-aware patterns *first*. They are more specific
+      // than a plain `calls` edge and the goal is to surface business
+      // semantics (which provider we read, which route we navigate to,
+      // which storage we persist to, which stream we subscribed to) over
+      // the raw call relationship. We deliberately do not emit BOTH a
+      // `calls` and a `reads_provider` for the same site — only the
+      // most-specific semantic edge wins.
+      if (_tryEmitSemanticEdge(from, node)) {
+        super.visitMethodInvocation(node);
+        return;
+      }
+    }
     final target = node.methodName.element;
     if (from != null && target != null) {
       final to = byElement[target];
@@ -440,6 +550,309 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
       }
     }
     super.visitMethodInvocation(node);
+  }
+
+  /// Tries to recognise a Flutter / Riverpod / Hive / Stream pattern and
+  /// emits the corresponding P8 semantic edge. Returns `true` when a
+  /// semantic edge was emitted (so the caller skips the plain `calls`).
+  bool _tryEmitSemanticEdge(String from, MethodInvocation node) {
+    final methodName = node.methodName.name;
+    final target = node.target;
+    final targetText = target?.toSource();
+    // ---- Riverpod ref.read / ref.watch / ref.listen ----------------------
+    if ((methodName == 'read' ||
+            methodName == 'watch' ||
+            methodName == 'listen') &&
+        target != null &&
+        _isRefLikeReceiver(targetText)) {
+      final providerExpr = node.argumentList.arguments.isNotEmpty
+          ? node.argumentList.arguments.first
+          : null;
+      if (providerExpr != null) {
+        final providerId = _resolveProviderId(providerExpr);
+        if (providerId != null) {
+          _emit(from, providerId, EdgeKindString.readsProvider, node.offset,
+              node.end);
+          return true;
+        }
+      }
+    }
+    // ---- Navigation -----------------------------------------------------
+    // context.push / context.go / context.pushNamed / context.pushReplacement
+    // Navigator.pushNamed(context, 'name') / Navigator.push(...)
+    // GoRouter.of(context).go('/foo')
+    final isContextNavigate = target != null &&
+        targetText != null &&
+        _isContextLikeReceiver(targetText) &&
+        const {
+          'push',
+          'go',
+          'pushNamed',
+          'goNamed',
+          'pushReplacement',
+          'pushReplacementNamed',
+          'replace',
+        }.contains(methodName);
+    final isNavigatorStatic = target is SimpleIdentifier &&
+        target.name == 'Navigator' &&
+        const {'push', 'pushNamed', 'pushReplacementNamed', 'pushReplacement'}
+            .contains(methodName);
+    if (isContextNavigate || isNavigatorStatic) {
+      final route = _extractRouteString(node, navigatorStyle: isNavigatorStatic);
+      if (route != null) {
+        final id = 'route::$route';
+        syntheticNodes.putIfAbsent(
+            id,
+            () => {
+                  'id': id,
+                  'kind': NodeKindString.route,
+                  'label': route,
+                });
+        _emit(from, id, EdgeKindString.navigatesTo, node.offset, node.end);
+        return true;
+      }
+    }
+    // ---- Hive persistence ------------------------------------------------
+    // Two shapes:
+    //   1) Hive.box('name').put/get/delete/clear(...)
+    //   2) someBoxVar.put/get/delete(...)   (after a previous Hive.box call)
+    // We capture shape (1) directly because the box name is right there.
+    final hiveCall = _matchHiveCall(node, target, methodName);
+    if (hiveCall != null) {
+      final id = 'storage::hive::${hiveCall.boxName}';
+      syntheticNodes.putIfAbsent(
+          id,
+          () => {
+                'id': id,
+                'kind': NodeKindString.storage,
+                'label': 'hive:${hiveCall.boxName}',
+              });
+      _emit(from, id, EdgeKindString.persistsTo, node.offset, node.end);
+      return true;
+    }
+    // ---- SharedPreferences ---------------------------------------------
+    // prefs.setBool('key', ...) / prefs.setString(...) / prefs.getBool(...)
+    if (target != null && _isSharedPrefsReceiver(target) && _isPrefsMethod(methodName)) {
+      final keyExpr = node.argumentList.arguments.isNotEmpty
+          ? node.argumentList.arguments.first
+          : null;
+      final keyLit = _stringLiteralValue(keyExpr);
+      if (keyLit != null) {
+        final id = 'storage::shared_prefs::$keyLit';
+        syntheticNodes.putIfAbsent(
+            id,
+            () => {
+                  'id': id,
+                  'kind': NodeKindString.storage,
+                  'label': 'shared_prefs:$keyLit',
+                });
+        _emit(from, id, EdgeKindString.persistsTo, node.offset, node.end);
+        return true;
+      }
+    }
+    // ---- Stream subscription -------------------------------------------
+    // foo.listen(callback) where foo is a Stream<T>.
+    if (methodName == 'listen' && target != null) {
+      final t = target.staticType;
+      if (t != null && _staticTypeIsStream(t)) {
+        // Target node = the producer of the stream. If the receiver
+        // resolves to a known element in our symbol table, point at it;
+        // otherwise synthesise a storage-style node from the receiver
+        // expression so the edge is still visible.
+        String? producerId;
+        if (target is Identifier) {
+          final el = target.element;
+          if (el != null) producerId = byElement[el];
+        }
+        if (producerId == null) {
+          final label = targetText ?? 'stream';
+          producerId = 'storage::stream::$label';
+          syntheticNodes.putIfAbsent(
+              producerId,
+              () => {
+                    'id': producerId!,
+                    'kind': NodeKindString.storage,
+                    'label': 'stream:$label',
+                  });
+        }
+        _emit(from, producerId, EdgeKindString.subscribesStream, node.offset,
+            node.end);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isRefLikeReceiver(String? text) {
+    if (text == null) return false;
+    // `ref` (Riverpod Ref / WidgetRef inside a ConsumerWidget), or any
+    // identifier ending in `ref` (e.g. `_ref`, `widgetRef`). Restrictive
+    // enough to avoid false positives like `instance.read` while still
+    // accepting common Riverpod naming.
+    if (text == 'ref') return true;
+    if (text.endsWith('.ref')) return true;
+    return false;
+  }
+
+  bool _isContextLikeReceiver(String text) {
+    // Accept `context`, `this.context`, `widget.context`, or
+    // `GoRouter.of(context)` / `Navigator.of(context)` invocations.
+    if (text == 'context') return true;
+    if (text.endsWith('.context')) return true;
+    if (text.contains('GoRouter.of(') || text.contains('Navigator.of(')) {
+      return true;
+    }
+    return false;
+  }
+
+  String? _extractRouteString(MethodInvocation node,
+      {required bool navigatorStyle}) {
+    final args = node.argumentList.arguments;
+    if (args.isEmpty) return null;
+    // Navigator.pushNamed(context, '/foo') — the route string is arg[1].
+    final routeArg = navigatorStyle && args.length >= 2 ? args[1] : args.first;
+    return _stringLiteralValue(routeArg);
+  }
+
+  String? _stringLiteralValue(AstNode? n) {
+    if (n is SimpleStringLiteral) return n.value;
+    if (n is AdjacentStrings) {
+      // Concat all parts if they are all simple literals.
+      final buf = StringBuffer();
+      for (final s in n.strings) {
+        if (s is SimpleStringLiteral) {
+          buf.write(s.value);
+        } else {
+          return null;
+        }
+      }
+      return buf.toString();
+    }
+    return null;
+  }
+
+  _HiveCall? _matchHiveCall(
+      MethodInvocation node, Expression? target, String methodName) {
+    // Recognise `Hive.box('name').put/get/delete(...)` — the receiver of
+    // our MethodInvocation is itself a MethodInvocation of `Hive.box`.
+    if (target is MethodInvocation) {
+      final inner = target;
+      final innerReceiver = inner.target;
+      if (innerReceiver is SimpleIdentifier &&
+          innerReceiver.name == 'Hive' &&
+          (inner.methodName.name == 'box' ||
+              inner.methodName.name == 'openBox')) {
+        final boxNameArg = inner.argumentList.arguments.isNotEmpty
+            ? inner.argumentList.arguments.first
+            : null;
+        final boxName = _stringLiteralValue(boxNameArg);
+        if (boxName != null && _isHiveOperation(methodName)) {
+          return _HiveCall(boxName: boxName);
+        }
+      }
+    }
+    return null;
+  }
+
+  bool _isHiveOperation(String methodName) {
+    return const {
+      'put',
+      'putAll',
+      'get',
+      'delete',
+      'deleteAll',
+      'clear',
+      'add',
+      'addAll',
+      'putAt',
+      'getAt',
+    }.contains(methodName);
+  }
+
+  bool _isSharedPrefsReceiver(Expression target) {
+    final t = target.staticType;
+    if (t != null) {
+      final name = t.element3?.name3 ?? '';
+      if (name == 'SharedPreferences') return true;
+    }
+    // Fallback to textual probe — naming convention is universal.
+    final src = target.toSource();
+    return src == 'prefs' || src == '_prefs' || src.endsWith('.prefs');
+  }
+
+  bool _isPrefsMethod(String name) {
+    return name.startsWith('set') ||
+        name.startsWith('get') ||
+        name == 'remove' ||
+        name == 'clear';
+  }
+
+  bool _staticTypeIsStream(dynamic t) {
+    // `t` is a `DartType`. The simplest correct probe is to follow its
+    // supertypes looking for `Stream`. We use the textual rendering of
+    // the type as a safe fallback if the analyzer surface shifts.
+    try {
+      final name = t.element3?.name3 ?? '';
+      if (name == 'Stream') return true;
+    } catch (_) {
+      // Fall through.
+    }
+    final disp = t.toString();
+    return disp.startsWith('Stream<') || disp == 'Stream';
+  }
+
+  String? _resolveProviderId(Expression providerExpr) {
+    // `proProvider` → dart_provider::file#proProvider when that variable
+    // is in our symbol table. `proProvider.notifier` collapses to the
+    // base provider. `myFamily('id')` (Riverpod family) collapses to the
+    // family's base provider symbol.
+    Expression base = providerExpr;
+    if (base is PrefixedIdentifier) {
+      base = base.prefix;
+    } else if (base is PropertyAccess) {
+      base = base.target ?? base;
+    } else if (base is MethodInvocation) {
+      final t = base.target;
+      if (t != null) base = t;
+    }
+    String? identifierName;
+    if (base is SimpleIdentifier) {
+      identifierName = base.name;
+      // First try the element-direct map (most accurate).
+      final el = base.element;
+      if (el != null) {
+        final mapped = byElement[el];
+        if (mapped != null && mapped.startsWith('dart_provider::')) {
+          return mapped;
+        }
+      }
+    } else if (base is PrefixedIdentifier) {
+      identifierName = base.prefix.name;
+    } else if (base is Identifier) {
+      identifierName = base.toSource();
+      final el = base.element;
+      if (el != null) {
+        final mapped = byElement[el];
+        if (mapped != null && mapped.startsWith('dart_provider::')) {
+          return mapped;
+        }
+      }
+    }
+    // Element-direct lookup missed (e.g. usage site resolves to a
+    // synthetic getter, not the variable). Fall back to file+name —
+    // imports are repo-relative so we can scan every registered
+    // provider name in any file and pick the first match.
+    if (identifierName != null) {
+      // 1. Same file first.
+      final sameFile = providerByFileAndName['$rel|$identifierName'];
+      if (sameFile != null) return sameFile;
+      // 2. Any file. Identical names across files are rare for Riverpod
+      // providers (they tend to be globally unique by convention).
+      for (final entry in providerByFileAndName.entries) {
+        if (entry.key.endsWith('|$identifierName')) return entry.value;
+      }
+    }
+    return null;
   }
 
   @override
@@ -530,4 +943,9 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     if (raw.length <= 200) return raw;
     return '${raw.substring(0, 200)}…';
   }
+}
+
+class _HiveCall {
+  final String boxName;
+  _HiveCall({required this.boxName});
 }
