@@ -1,4 +1,5 @@
 target/
+dist/
 .DS_Store
 
 # SpecSlice local runtime state.
@@ -13,4 +14,3 @@ target/
 tool/specslice_dart_analyzer/.dart_tool/
 tool/specslice_dart_analyzer/build/
 tool/specslice_dart_analyzer/pubspec.lock
-

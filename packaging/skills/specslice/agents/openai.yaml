@@ -1,0 +1,6 @@
+interface:
+  display_name: "SpecSlice"
+  short_description: "Non-invasive repo graph and logic analysis"
+  default_prompt: "Use $specslice to index this repository, generate a graph, and summarize candidate business logic for review."
+policy:
+  allow_implicit_invocation: true
