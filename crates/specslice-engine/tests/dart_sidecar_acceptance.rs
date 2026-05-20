@@ -194,6 +194,16 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
         "sidecar graph view must retain test nodes, got stats={:?}",
         view.stats
     );
+    let iap_class = view
+        .nodes
+        .iter()
+        .find(|n| n.id == "dart_class::lib/core/iap/iap_constants.dart#IapProductIds")
+        .expect("sidecar graph view should contain IapProductIds class");
+    assert_eq!(
+        iap_class.source.as_deref(),
+        Some("dart_analyzer"),
+        "code nodes emitted by the analyzer sidecar should surface source=dart_analyzer"
+    );
     assert!(
         resolvers.contains("dart_analyzer"),
         "expected at least one resolver=dart_analyzer edge, got {resolvers:?}"

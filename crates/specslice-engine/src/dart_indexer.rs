@@ -94,7 +94,7 @@ pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartI
         });
         batch.symbol_ranges.retain(|r| !drop_file(&r.file_path));
     }
-    let mut result = ingest(store, &batch)?;
+    let mut result = ingest(store, &batch, &resolver_used)?;
     result.resolver_used = resolver_used;
     result.sidecar_skip_reason = skip_reason;
     Ok(result)
@@ -190,7 +190,16 @@ fn matches_regex_like(escaped: &str, path: &str) -> bool {
     }
 }
 
-fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResult> {
+fn ingest(
+    store: &mut Store,
+    batch: &LanguageIndexBatch,
+    resolver_used: &str,
+) -> Result<DartIndexResult> {
+    let indexer_name = if resolver_used.is_empty() {
+        DART_INDEXER_NAME
+    } else {
+        resolver_used
+    };
     let mut result = DartIndexResult {
         files: batch.files.len(),
         ..Default::default()
@@ -203,7 +212,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
             .file_name()
             .map(|s| s.to_string_lossy().into_owned());
         node.content_hash = Some(file.content_hash.clone());
-        node.indexer = Some(DART_INDEXER_NAME.into());
+        node.indexer = Some(indexer_name.into());
         store.upsert_node(&node)?;
     }
 
@@ -214,7 +223,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         node.stable_key = Some(symbol.qualified_name.clone());
         node.start_line = Some(symbol.start_line);
         node.end_line = Some(symbol.end_line);
-        node.indexer = Some(DART_INDEXER_NAME.into());
+        node.indexer = Some(indexer_name.into());
         store.upsert_node(&node)?;
         result.symbols += 1;
 
@@ -233,7 +242,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
                 EdgeSource::LanguageAdapter,
             )
         };
-        contains.indexer = Some(DART_INDEXER_NAME.into());
+        contains.indexer = Some(indexer_name.into());
         store.upsert_edge(&contains)?;
     }
 
@@ -243,7 +252,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         node.name = Some(test.name.clone());
         node.start_line = Some(test.start_line);
         node.end_line = Some(test.end_line);
-        node.indexer = Some(DART_INDEXER_NAME.into());
+        node.indexer = Some(indexer_name.into());
         store.upsert_node(&node)?;
         if test.kind == NodeKind::TestCase {
             result.tests += 1;
@@ -258,7 +267,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
             EdgeKind::Contains,
             EdgeSource::LanguageAdapter,
         );
-        contains.indexer = Some(DART_INDEXER_NAME.into());
+        contains.indexer = Some(indexer_name.into());
         store.upsert_edge(&contains)?;
     }
 
@@ -269,7 +278,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
             EdgeKind::Imports,
             EdgeSource::LanguageAdapter,
         );
-        edge.indexer = Some(DART_INDEXER_NAME.into());
+        edge.indexer = Some(indexer_name.into());
         store.upsert_edge(&edge)?;
     }
 
@@ -286,7 +295,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
         }
         let mut node = Node::new(synth.id.clone(), synth.kind);
         node.name = Some(synth.label.clone());
-        node.indexer = Some(DART_INDEXER_NAME.into());
+        node.indexer = Some(indexer_name.into());
         store.upsert_node(&node)?;
     }
 
@@ -311,7 +320,7 @@ fn ingest(store: &mut Store, batch: &LanguageIndexBatch) -> Result<DartIndexResu
             reference.kind,
             EdgeSource::LanguageAdapter,
         );
-        edge.indexer = Some(DART_INDEXER_NAME.into());
+        edge.indexer = Some(indexer_name.into());
         // P6.3 — propagate evidence so the UI can show file:line + snippet
         // and the user can judge how trustworthy a heuristic edge is.
         if !reference.source_file.is_empty() {
@@ -450,7 +459,7 @@ mod ingest_tests {
             resolver: "dart_lightweight".into(),
         });
 
-        let result = ingest(&mut store, &batch).unwrap();
+        let result = ingest(&mut store, &batch, RESOLVER_DART_LIGHTWEIGHT).unwrap();
         assert_eq!(result.files, 1);
 
         // No Calls/References edge should have been inserted because the
@@ -497,7 +506,7 @@ mod ingest_tests {
             snippet: "C().method();".into(),
             resolver: "dart_lightweight".into(),
         });
-        ingest(&mut store, &batch).unwrap();
+        ingest(&mut store, &batch, RESOLVER_DART_LIGHTWEIGHT).unwrap();
         assert_eq!(store.list_edges_by_kind(EdgeKind::Calls).unwrap().len(), 1);
         assert_eq!(
             store
@@ -505,6 +514,44 @@ mod ingest_tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn ingest_uses_analyzer_resolver_as_node_indexer_when_batch_came_from_sidecar() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = specslice_store::Store::open(tmp.path().join("g.db")).unwrap();
+        store.migrate().unwrap();
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.files.push(FileArtifact {
+            id: file_id("x.dart"),
+            path: "x.dart".into(),
+            language: "dart".into(),
+            content_hash: "h".into(),
+        });
+        batch.references.push(ReferenceEdge {
+            from_symbol_id: dart_method_id("x.dart", "A", "a"),
+            to_symbol_id: dart_method_id("x.dart", "B", "b"),
+            kind: EdgeKind::Calls,
+            source_file: "x.dart".into(),
+            line: 4,
+            snippet: "b();".into(),
+            resolver: RESOLVER_DART_ANALYZER.into(),
+        });
+
+        ingest(&mut store, &batch, RESOLVER_DART_ANALYZER).unwrap();
+
+        let file = store
+            .find_node(&file_id("x.dart"))
+            .unwrap()
+            .expect("file node should be indexed");
+        assert_eq!(
+            file.indexer.as_deref(),
+            Some(RESOLVER_DART_ANALYZER),
+            "graph node source should show the analyzer resolver, not the fallback parser"
         );
     }
 
@@ -537,7 +584,7 @@ mod ingest_tests {
             end_line: 5,
             parent_symbol_id: None,
         });
-        ingest(&mut store, &batch).unwrap();
+        ingest(&mut store, &batch, RESOLVER_DART_LIGHTWEIGHT).unwrap();
         let contains = store.list_edges_by_kind(EdgeKind::Contains).unwrap();
         assert!(
             contains
@@ -625,7 +672,7 @@ mod ingest_tests {
             snippet: "C.constant;".into(),
             resolver: "dart_lightweight".into(),
         });
-        ingest(&mut store, &batch).unwrap();
+        ingest(&mut store, &batch, RESOLVER_DART_LIGHTWEIGHT).unwrap();
         let edges = store.list_edges_by_kind(EdgeKind::References).unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_file.as_deref(), Some("lib/x.dart"));

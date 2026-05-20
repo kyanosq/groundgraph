@@ -74,7 +74,13 @@ struct GraphArgs {
     /// graph) on top of the structural view. Defaults to true so the
     /// confirmed loop is visible by default; pass `--include-candidates=false`
     /// to hide the AI overlay.
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     include_candidates: bool,
     /// Cap the number of nodes; emits a `graph_truncated` finding when hit.
     #[arg(long)]

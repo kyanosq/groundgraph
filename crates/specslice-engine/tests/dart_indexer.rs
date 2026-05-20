@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use specslice_core::artifact_id::{dart_class_id, dart_method_id};
 use specslice_core::{EdgeKind, NodeKind};
-use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, DART_INDEXER_NAME};
+use specslice_engine::dart_indexer::{
+    index_dart, DartIndexOptions, DART_INDEXER_NAME, RESOLVER_DART_ANALYZER,
+};
 use specslice_store::Store;
 use tempfile::TempDir;
 
@@ -106,6 +108,7 @@ fn re_indexing_is_idempotent() {
     };
     let first = index_dart(&mut store, &opts).unwrap();
     store.clear_indexer_outputs(DART_INDEXER_NAME).unwrap();
+    store.clear_indexer_outputs(RESOLVER_DART_ANALYZER).unwrap();
     let second = index_dart(&mut store, &opts).unwrap();
     assert_eq!(first, second);
 }

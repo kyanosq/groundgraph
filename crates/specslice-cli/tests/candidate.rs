@@ -272,3 +272,32 @@ fn logic_only_risks_filters_out_confirmed_link() {
         );
     }
 }
+
+#[test]
+fn graph_accepts_include_candidates_false_and_hides_candidates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args([
+            "graph",
+            "--format",
+            "json",
+            "--view",
+            "business",
+            "--include-candidates=false",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let view: serde_json::Value = serde_json::from_str(&stdout).expect("graph json should parse");
+    let nodes = view["nodes"].as_array().expect("nodes should be an array");
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node["kind"].as_str() != Some("business_candidate")),
+        "--include-candidates=false should hide every business_candidate node: {stdout}",
+    );
+}

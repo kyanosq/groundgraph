@@ -73,6 +73,9 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         store
             .clear_indexer_outputs(crate::dart_indexer::DART_INDEXER_NAME)
             .context("clearing previous dart index outputs")?;
+        store
+            .clear_indexer_outputs(crate::dart_indexer::RESOLVER_DART_ANALYZER)
+            .context("clearing previous dart analyzer index outputs")?;
         let code = crate::dart_indexer::index_dart(
             &mut store,
             &crate::dart_indexer::DartIndexOptions {
