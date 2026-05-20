@@ -585,12 +585,16 @@ specslice graph --format html --view business
 - 新 CLI：`specslice dead-code [--json] [--min-confidence high|medium|low] [--include-tests]`。
 - 引擎模块 `dead_code`：基于 store 做三层判断 —— 可达性 BFS（入口点 = `main()` / Route / DartProvider / TestCase / TestGroup / Flutter lifecycle / `public_api_roots`）；按入边 usage（calls / references / declares_verification / reads_provider / persists_to / navigates_to / subscribes_stream）+ 公共可见性 + 路径 ignore glob 分到 high / medium / low；low 专门对应「dead island」。
 - 中文 reasons：每条候选都解释「为什么被标可能死」、入边为什么不足以让它活着，以及是否落入 `public_api_roots` / 公共名 / lifecycle 名等减分项。
-- `.specslice.yaml` 新增 `dead_code` 配置（默认 `lib/main.dart` 入口、`**/*.g.dart` / `**/*.freezed.dart` / `**/generated/**` 等 ignore、可选 `public_api_roots`）。
-- 测试：engine 单元测全部 7 项覆盖 high/medium/low/ignore/include-tests/min-confidence 过滤；CLI 集成测覆盖 json schema + 排序 + 文本头；PixCraft golden 验证真实 sidecar 索引下的 schema_version、stats、排序，并断言 `*.g.dart` 被默认 ignore 过滤、`public_api_roots = lib/**` 会把 high 降到 medium 或更低。
+- `.specslice.yaml` 新增 `dead_code` 配置（默认 `lib/main.dart` 入口、`**/*.g.dart` / `**/*.freezed.dart` / `**/generated/**` / Flutter `app_localizations*.dart` 等 ignore、可选 `public_api_roots`）。
+- `--include-tests` 只把无 `declares_verification` 的 `TestCase` / `TestGroup` 作为低可信孤儿测试候选；`test/` 下的普通 Dart helper 函数不作为生产死代码候选。
+- `test/**#main` 被视为测试入口点，它调用到的生产符号会参与可达性，避免把“有测试覆盖的生产方法”误报为 dead island。
+- Dart 构造器默认不进入 high 置信桶；即使轻量/sidecar 索引把默认构造器命名成 `_default`，也按 medium 处理，因为构造器可能经由类实例化、const 构造或框架创建触发。
+- 测试：engine 单元测覆盖 high/medium/low/ignore/include-tests/min-confidence、测试 helper 噪声过滤、测试入口可达性；CLI 集成测覆盖 json schema + 排序 + 文本头；PixCraft golden 验证真实 sidecar 索引下的 schema_version、stats、排序，并断言 `*.g.dart` 被默认 ignore 过滤、`public_api_roots = lib/**` 会把 high 降到 medium 或更低。
 
 **非侵入式约束：**
 
 - 不要求代码或文档加 `@used` / `@business` 注解。
+- 不要求用户为了压低误报而在测试里加标记；测试可达性来自代码图与测试事实。
 - 任何分析边界（入口点、ignore、public API）都只通过 `.specslice.yaml` 表达。
 - 输出可信度而非删除指令，并在文末显式提示运营要先用 `graph --focus` / `search` 复核。
 

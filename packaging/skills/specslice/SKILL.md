@@ -66,9 +66,59 @@ specslice --repo-root /path/to/repo logic --only-risks
 ```bash
 specslice --repo-root /path/to/repo graph --format html --view code
 specslice --repo-root /path/to/repo graph --format html --view business
+specslice --repo-root /path/to/repo search "purchase pro" --format html
 ```
 
 Default HTML output is `.specslice/export/graph.html` unless `--out` is passed.
+Search HTML output defaults to `.specslice/export/search-<query>.html` unless
+`--output` is passed. Prefer search HTML for large repositories because it opens
+on a ranked result list plus a small focus graph instead of a full graph dump.
+
+## Dead-Code Candidate Workflow
+
+Use `dead-code` only as a candidate report. It is not an automatic deletion
+tool and it must not be presented as proof that a symbol is removable.
+
+```bash
+specslice --repo-root /path/to/repo dead-code
+specslice --repo-root /path/to/repo dead-code --json --min-confidence low
+specslice --repo-root /path/to/repo dead-code --json --min-confidence high
+specslice --repo-root /path/to/repo dead-code --include-tests
+```
+
+Interpretation:
+
+- `high`: private, unreachable, no inbound usage edges; still needs manual review.
+- `medium`: public, lifecycle-like, constructor/class, or otherwise externally reachable.
+- `low`: weak evidence such as a dead island or orphan test; use for triage, not deletion.
+- `--include-tests` reports orphan `TestCase` / `TestGroup` nodes with no
+  verification target. Test-file helper functions such as `test/**#main`,
+  `expect`, or matcher helpers are intentionally filtered from the report.
+
+Before recommending deletion, inspect the symbol with:
+
+```bash
+specslice --repo-root /path/to/repo search --code "<symbol-or-call>" --json
+specslice --repo-root /path/to/repo graph --format html --view focus --focus "<artifact-id>"
+```
+
+If the report looks noisy, adjust only SpecSlice-owned config:
+
+```yaml
+dead_code:
+  entrypoints:
+    - lib/main.dart
+  ignore:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - "**/generated/**"
+    - "**/l10n/app_localizations*.dart"
+  public_api_roots:
+    - lib/public/**
+```
+
+Never ask the user to add `@used`, `@business`, comments, or other annotations
+to production code, tests, or docs just to satisfy dead-code analysis.
 
 ## AI Candidate Workflow
 

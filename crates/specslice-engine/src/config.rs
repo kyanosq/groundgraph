@@ -273,7 +273,7 @@ fn default_orphan_requirement_level() -> String {
 /// experience on a Flutter app: `lib/main.dart` is the entry, common
 /// codegen suffixes are ignored, and no path is treated as "public
 /// API" unless the operator explicitly enumerates one.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeadCodeConfig {
     /// File paths whose top-level `main()` (and any other exported
     /// symbol) is considered an entry point. Relative to the repo
@@ -293,6 +293,16 @@ pub struct DeadCodeConfig {
     pub public_api_roots: Vec<String>,
 }
 
+impl Default for DeadCodeConfig {
+    fn default() -> Self {
+        Self {
+            entrypoints: default_dead_code_entrypoints(),
+            ignore: default_dead_code_ignore(),
+            public_api_roots: Vec::new(),
+        }
+    }
+}
+
 fn default_dead_code_entrypoints() -> Vec<String> {
     vec!["lib/main.dart".into()]
 }
@@ -303,6 +313,7 @@ fn default_dead_code_ignore() -> Vec<String> {
         "**/*.freezed.dart".into(),
         "**/*.gr.dart".into(),
         "**/generated/**".into(),
+        "**/l10n/app_localizations*.dart".into(),
         "**/.dart_tool/**".into(),
     ]
 }

@@ -31,6 +31,16 @@ fn minimal_config_still_parses() {
     // Sections that were not provided fall back to defaults.
     assert!(!cfg.docs.paths.is_empty());
     assert!(!cfg.code.paths.is_empty());
+    assert_eq!(cfg.dead_code.entrypoints, vec!["lib/main.dart"]);
+    assert!(cfg.dead_code.ignore.contains(&"**/*.g.dart".to_string()));
+    assert!(cfg
+        .dead_code
+        .ignore
+        .contains(&"**/*.freezed.dart".to_string()));
+    assert!(cfg
+        .dead_code
+        .ignore
+        .contains(&"**/l10n/app_localizations*.dart".to_string()));
 }
 
 #[test]

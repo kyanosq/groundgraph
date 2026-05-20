@@ -60,6 +60,8 @@ specslice --repo-root /path/to/repo check
 specslice --repo-root /path/to/repo logic --only-risks
 specslice --repo-root /path/to/repo graph --format html --view code
 specslice --repo-root /path/to/repo graph --format html --view business
+specslice --repo-root /path/to/repo search "purchase pro" --format html
+specslice --repo-root /path/to/repo dead-code --json --min-confidence medium
 ```
 
 HTML graph output defaults to:
@@ -67,6 +69,17 @@ HTML graph output defaults to:
 ```text
 /path/to/repo/.specslice/export/graph.html
 ```
+
+Search HTML output defaults to:
+
+```text
+/path/to/repo/.specslice/export/search-<query>.html
+```
+
+`dead-code` emits possible dead-code candidates with confidence and reasons.
+It does not delete files and should not be treated as proof that code is
+removable. Use `--include-tests` only when you want orphan test facts included;
+test helper functions under `test/` are filtered from production findings.
 
 ## AI Candidate Flow
 

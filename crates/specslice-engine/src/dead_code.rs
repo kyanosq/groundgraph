@@ -549,6 +549,12 @@ fn collect_mitigating_factors(node: &specslice_core::Node, public_set: &GlobSet)
             ));
         }
     }
+    if node.kind == NodeKind::DartConstructor {
+        out.push(
+            "构造器调用可能由类实例化、const 构造或框架创建触发，默认不作为 high 置信删除候选"
+                .into(),
+        );
+    }
     if !is_private_dart_name(node.name.as_deref()) {
         out.push("公共可见符号（无 `_` 前缀），可能被反射 / 代码生成 / 框架调用".into());
     }
@@ -769,6 +775,52 @@ mod tests {
             .expect("public unused must surface");
         assert_eq!(c.confidence, DeadCodeConfidence::Medium);
         assert!(c.reasons.iter().any(|r| r.contains("公共可见符号")));
+    }
+
+    #[test]
+    fn constructors_are_demoted_from_high_confidence_even_when_synthetic_name_is_private() {
+        let (mut store, _dir) = empty_store();
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        let ctor_id = "dart_constructor::lib/widget.dart#HomeScreen._default";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(ctor_id.to_string()),
+                kind: NodeKind::DartConstructor,
+                path: Some("lib/widget.dart".into()),
+                name: Some("_default".into()),
+                start_line: Some(1),
+                end_line: Some(1),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some("lib/widget.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|c| c.id == ctor_id)
+            .expect("unreached constructor should still be surfaced");
+        assert_eq!(candidate.confidence, DeadCodeConfidence::Medium);
+        assert!(
+            candidate.reasons.iter().any(|r| r.contains("构造器调用")),
+            "constructor demotion reason must be explicit: {:?}",
+            candidate.reasons
+        );
     }
 
     #[test]
