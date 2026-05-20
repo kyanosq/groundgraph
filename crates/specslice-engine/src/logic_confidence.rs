@@ -163,10 +163,11 @@ pub fn run_logic_confidence(options: LogicConfidenceOptions) -> Result<LogicConf
 pub fn compute_logic_confidence(store: &Store, repo_root: &Path) -> Result<LogicConfidenceReport> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
+    let all_node_handles = store.list_all_nodes()?;
 
     // --- Requirements (confirmed graph) ---------------------------------
     let req_nodes = store.list_nodes_by_kind(NodeKind::Requirement)?;
-    let all_node_ids: BTreeSet<_> = store.list_all_nodes()?.into_iter().map(|n| n.id).collect();
+    let all_node_ids: BTreeSet<_> = all_node_handles.iter().map(|n| n.id.clone()).collect();
     for req in req_nodes {
         let incoming = store.list_edges_to(&req.id)?;
         let mut linked_paths: Vec<String> = Vec::new();
@@ -252,7 +253,7 @@ pub fn compute_logic_confidence(store: &Store, repo_root: &Path) -> Result<Logic
                 warnings.push(w.clone());
             }
             for c in &outcome.document.candidates {
-                items.push(candidate_item(c, &all_node_ids));
+                items.push(candidate_item(c, &all_node_ids, store, repo_root)?);
             }
         }
         Err(e) => warnings.push(format!("加载业务候选失败：{e}")),
@@ -291,15 +292,68 @@ pub fn compute_logic_confidence(store: &Store, repo_root: &Path) -> Result<Logic
 fn candidate_item(
     c: &BusinessCandidate,
     all_nodes: &BTreeSet<specslice_core::ArtifactId>,
-) -> LogicConfidenceItem {
+    store: &Store,
+    repo_root: &Path,
+) -> Result<LogicConfidenceItem> {
     let unresolved: Vec<String> = c
         .evidence
         .iter()
         .filter(|e| !all_nodes.iter().any(|id| id.as_str() == e.as_str()))
         .cloned()
         .collect();
+
+    // Stale check: walk every resolvable evidence node, collect its
+    // `source_file` (if any), and compare the stored hash against the
+    // current on-disk hash. Any drift demotes the verdict away from
+    // ConfirmedLink — code edits between `--accept` and the next
+    // `specslice index` must surface.
+    let mut stale_paths: Vec<String> = Vec::new();
+    for ev in &c.evidence {
+        if unresolved.iter().any(|u| u == ev) {
+            continue;
+        }
+        let ev_id = specslice_core::ArtifactId::new(ev.clone());
+        let Some(node) = store.find_node(&ev_id)? else {
+            continue;
+        };
+        let Some(path) = node.path.as_deref().or(node.source_file.as_deref()) else {
+            continue;
+        };
+        let abs = repo_root.join(path);
+        let on_disk = if abs.exists() {
+            file_hash(&abs).ok()
+        } else {
+            None
+        };
+        let stored = store.get_file_hash(path).ok().flatten();
+        if let (Some(d), Some(s)) = (on_disk, stored) {
+            if d != s && !stale_paths.iter().any(|p| p == path) {
+                stale_paths.push(path.to_string());
+            }
+        }
+    }
+
     let verdict = match c.review_status() {
-        Some(ReviewStatus::Accepted) if unresolved.is_empty() => LogicConfidenceKind::ConfirmedLink,
+        // Accepted only counts as `confirmed_link` when:
+        //   1. evidence is non-empty (a candidate without any code
+        //      hooks isn't really "confirmed" — it has nothing to
+        //      anchor the human verdict to),
+        //   2. every cited node still resolves in the graph, and
+        //   3. no underlying source file has drifted from the indexed
+        //      hash.
+        Some(ReviewStatus::Accepted)
+            if !c.evidence.is_empty() && unresolved.is_empty() && stale_paths.is_empty() =>
+        {
+            LogicConfidenceKind::ConfirmedLink
+        }
+        // Accepted but evidence-less → the human committed without
+        // anchoring the claim. Treat the same as an un-linked
+        // requirement: surface as MissingLink so the reviewer adds
+        // evidence and re-runs the loop.
+        Some(ReviewStatus::Accepted) if c.evidence.is_empty() => LogicConfidenceKind::MissingLink,
+        // Accepted with broken / stale evidence → StaleLink (same
+        // verdict as a requirement whose impl/doc file changed
+        // between indexes).
         Some(ReviewStatus::Accepted) => LogicConfidenceKind::StaleLink,
         Some(ReviewStatus::Rejected) => LogicConfidenceKind::Rejected,
         Some(ReviewStatus::NeedsChanges) => LogicConfidenceKind::NeedsChanges,
@@ -307,9 +361,16 @@ fn candidate_item(
         None if c.evidence.is_empty() => LogicConfidenceKind::Unknown,
         None => LogicConfidenceKind::CandidateOnly,
     };
+
     let mut issues = Vec::new();
     for u in &unresolved {
         issues.push(format!("证据未解析: {u}"));
+    }
+    for p in &stale_paths {
+        issues.push(format!("证据文件已变更 (需重新 index): {p}"));
+    }
+    if matches!(verdict, LogicConfidenceKind::MissingLink) && c.evidence.is_empty() {
+        issues.push("接受时未提供任何证据 — 请补充 evidence 后重新审阅".into());
     }
     if !c.pending_open_questions().is_empty() {
         issues.push(format!(
@@ -317,7 +378,7 @@ fn candidate_item(
             c.pending_open_questions().len()
         ));
     }
-    LogicConfidenceItem {
+    Ok(LogicConfidenceItem {
         id: candidate_artifact_id(&c.id),
         kind: LogicConfidenceSource::BusinessCandidate,
         verdict,
@@ -327,7 +388,7 @@ fn candidate_item(
         confidence: c.confidence,
         issues,
         risks: c.risks.clone(),
-    }
+    })
 }
 
 fn verdict_order(v: LogicConfidenceKind) -> u8 {
@@ -413,6 +474,13 @@ mod tests {
         );
     }
 
+    fn empty_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        (store, dir)
+    }
+
     #[test]
     fn unreviewed_candidate_classifies_candidate_only() {
         let c = BusinessCandidate {
@@ -422,7 +490,8 @@ mod tests {
             ..Default::default()
         };
         let nodes = BTreeSet::new();
-        let item = candidate_item(&c, &nodes);
+        let (store, dir) = empty_store();
+        let item = candidate_item(&c, &nodes, &store, dir.path()).unwrap();
         assert_eq!(item.verdict, LogicConfidenceKind::CandidateOnly);
         assert!(item.issues.iter().any(|i| i.contains("证据未解析")));
     }
@@ -437,7 +506,8 @@ mod tests {
             ..Default::default()
         };
         let nodes = BTreeSet::new();
-        let item = candidate_item(&c, &nodes);
+        let (store, dir) = empty_store();
+        let item = candidate_item(&c, &nodes, &store, dir.path()).unwrap();
         assert_eq!(item.verdict, LogicConfidenceKind::StaleLink);
     }
 
@@ -452,7 +522,8 @@ mod tests {
         };
         let mut nodes = BTreeSet::new();
         nodes.insert(specslice_core::ArtifactId::new("dart_method::a.dart#A.b"));
-        let item = candidate_item(&c, &nodes);
+        let (store, dir) = empty_store();
+        let item = candidate_item(&c, &nodes, &store, dir.path()).unwrap();
         assert_eq!(item.verdict, LogicConfidenceKind::ConfirmedLink);
     }
 
@@ -467,7 +538,106 @@ mod tests {
         };
         let mut nodes = BTreeSet::new();
         nodes.insert(specslice_core::ArtifactId::new("dart_method::a.dart#A.b"));
-        let item = candidate_item(&c, &nodes);
+        let (store, dir) = empty_store();
+        let item = candidate_item(&c, &nodes, &store, dir.path()).unwrap();
         assert_eq!(item.verdict, LogicConfidenceKind::Rejected);
+    }
+
+    #[test]
+    fn accepted_candidate_without_any_evidence_is_missing_link_not_confirmed() {
+        // Reviewer feedback: an accepted candidate with empty evidence
+        // got promoted to `ConfirmedLink` because `unresolved.is_empty()`
+        // was true. That is wrong: a "confirmed" verdict must be anchored
+        // to *something*. Empty evidence must classify as MissingLink so
+        // the reviewer goes back and adds anchors.
+        let c = BusinessCandidate {
+            id: "x".into(),
+            name: "n".into(),
+            evidence: vec![],
+            status: "accepted".into(),
+            ..Default::default()
+        };
+        let nodes = BTreeSet::new();
+        let (store, dir) = empty_store();
+        let item = candidate_item(&c, &nodes, &store, dir.path()).unwrap();
+        assert_eq!(
+            item.verdict,
+            LogicConfidenceKind::MissingLink,
+            "empty-evidence accepted candidate must not be ConfirmedLink"
+        );
+        assert!(
+            item.issues
+                .iter()
+                .any(|i| i.contains("接受时未提供任何证据")),
+            "expected CN guidance, got: {:?}",
+            item.issues
+        );
+    }
+
+    #[test]
+    fn accepted_candidate_with_stale_source_file_is_stale_link() {
+        // Reviewer feedback: even when every evidence id resolves,
+        // if the underlying source file changed since the last
+        // `specslice index` run (store hash ≠ disk hash) the verdict
+        // must drop from ConfirmedLink to StaleLink so the reviewer
+        // re-confirms after re-indexing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store_path = tmp.path().join("graph.db");
+        let mut store = Store::open(&store_path).unwrap();
+        store.migrate().unwrap();
+        // Index a fake file with hash H_old.
+        let rel = "lib/a.dart";
+        let abs = tmp.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, b"old contents").unwrap();
+        let h_old = file_hash(&abs).unwrap();
+        store
+            .upsert_file_index(&specslice_store::FileIndexEntry {
+                path: rel.into(),
+                hash: h_old.clone(),
+                kind: "dart".into(),
+                indexed_at: "now".into(),
+                index_generation: 1,
+            })
+            .unwrap();
+        // Persist the symbol that the candidate cites; its source file
+        // is the rel above.
+        let ev_id_str = format!("dart_method::{rel}#A.b");
+        let ev_id = specslice_core::ArtifactId::new(ev_id_str.clone());
+        let node = specslice_core::Node {
+            id: ev_id.clone(),
+            kind: NodeKind::DartMethod,
+            path: Some(rel.into()),
+            name: Some("A.b".into()),
+            start_line: Some(1),
+            end_line: Some(2),
+            content_hash: None,
+            stable_key: None,
+            source_file: Some(rel.into()),
+            source_hash: Some(h_old.clone()),
+            indexer: Some("test".into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_node(&node).unwrap();
+        // Now mutate the file on disk — the next confidence run must
+        // notice and demote the verdict.
+        std::fs::write(&abs, b"new contents").unwrap();
+        let c = BusinessCandidate {
+            id: "x".into(),
+            name: "n".into(),
+            evidence: vec![ev_id_str.clone()],
+            status: "accepted".into(),
+            ..Default::default()
+        };
+        let mut nodes = BTreeSet::new();
+        nodes.insert(ev_id);
+        let item = candidate_item(&c, &nodes, &store, tmp.path()).unwrap();
+        assert_eq!(item.verdict, LogicConfidenceKind::StaleLink);
+        assert!(
+            item.issues.iter().any(|i| i.contains("证据文件已变更")),
+            "expected stale-source CN message, got: {:?}",
+            item.issues
+        );
     }
 }

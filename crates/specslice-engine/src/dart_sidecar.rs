@@ -113,12 +113,20 @@ pub fn try_run(
             reason: format!("env {ENV_ENABLE} not set / disabled"),
         };
     }
-    let mut cmd = match resolve_command(repo_root) {
+    let probes = probe_locations(repo_root);
+    let mut cmd = match resolve_command_with(repo_root, &probes) {
         Some(cmd) => cmd,
         None => {
+            let tried = probes
+                .iter()
+                .map(|p| format!("    - {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
             return SidecarOutcome::Skipped {
                 reason: format!(
-                    "could not locate sidecar (set {ENV_BIN} or keep {DEFAULT_SIDECAR_REL})"
+                    "could not locate sidecar — high-precision Dart analyzer is OFF. \
+                     Set {ENV_BIN}=/path/to/specslice_dart_analyzer.dart, or place the \
+                     sidecar source at one of:\n{tried}"
                 ),
             };
         }
@@ -197,19 +205,64 @@ fn is_enabled() -> bool {
     }
 }
 
-fn resolve_command(repo_root: &Path) -> Option<Command> {
+/// All locations we try in order to find the sidecar, from highest to
+/// lowest priority. Exposed for diagnostics so the skip reason can
+/// quote every path we already tried.
+fn probe_locations(repo_root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    out.push(repo_root.join(DEFAULT_SIDECAR_REL));
+    // Co-located alongside the `specslice` binary — works for a
+    // pre-packaged install where the sidecar source is shipped next to
+    // the executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            out.push(parent.join(DEFAULT_SIDECAR_REL));
+            out.push(parent.join("specslice_dart_analyzer.dart"));
+            // …/target/<profile>/specslice → walk back to the workspace
+            // root so a developer running `cargo run -- index` from any
+            // subdirectory still finds the source tree.
+            if let Some(grandparent) = parent.parent() {
+                out.push(grandparent.join(DEFAULT_SIDECAR_REL));
+                if let Some(great) = grandparent.parent() {
+                    out.push(great.join(DEFAULT_SIDECAR_REL));
+                }
+            }
+        }
+    }
+    // User-scoped install location for ad-hoc setups.
+    if let Some(home) = home_dir() {
+        out.push(
+            home.join(".specslice")
+                .join("dart_analyzer")
+                .join("bin")
+                .join("specslice_dart_analyzer.dart"),
+        );
+    }
+    out
+}
+
+fn resolve_command_with(_repo_root: &Path, locations: &[PathBuf]) -> Option<Command> {
+    // 1. Explicit override always wins.
     if let Ok(custom) = std::env::var(ENV_BIN) {
         if !custom.trim().is_empty() {
             return Some(command_from_str(&custom));
         }
     }
-    let default_path = repo_root.join(DEFAULT_SIDECAR_REL);
-    if default_path.exists() {
-        let mut cmd = Command::new("dart");
-        cmd.arg("run").arg(&default_path);
-        return Some(cmd);
+    // 2. Probe known locations and use the first hit.
+    for candidate in locations {
+        if candidate.exists() {
+            let mut cmd = Command::new("dart");
+            cmd.arg("run").arg(candidate);
+            return Some(cmd);
+        }
     }
     None
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Split a shell-style command into program + args (whitespace, no
@@ -444,6 +497,70 @@ mod tests {
                 });
             });
         });
+    }
+
+    #[test]
+    fn skip_reason_lists_every_probed_path() {
+        // Reviewer asked: real target repos rarely have
+        // `tool/specslice_dart_analyzer/...` at the repo root, so the
+        // sidecar silently skips. Skip reason must now name every
+        // location we tried, so the operator knows where to drop the
+        // sidecar source (or which env var to set).
+        with_env_lock(|| {
+            with_env_var(ENV_ENABLE, Some("1"), || {
+                with_env_var(ENV_BIN, None, || {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let outcome = try_run(tmp.path(), &[PathBuf::from("lib")], &[]);
+                    match outcome {
+                        SidecarOutcome::Skipped { reason } => {
+                            assert!(reason.contains(ENV_BIN), "{reason}");
+                            assert!(
+                                reason.contains(&format!(
+                                    "{}",
+                                    tmp.path().join(DEFAULT_SIDECAR_REL).display()
+                                )),
+                                "skip reason should quote repo-root probe path:\n{reason}"
+                            );
+                            assert!(
+                                reason.contains("high-precision Dart analyzer is OFF"),
+                                "operator-facing message expected:\n{reason}"
+                            );
+                        }
+                        _ => panic!("expected Skipped, got {outcome:?}"),
+                    }
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn probe_locations_includes_repo_root_and_binary_neighbour_and_home() {
+        // Defence-in-depth: even when the repo doesn't ship the
+        // sidecar source, an operator who dropped it next to the
+        // `specslice` binary OR under `~/.specslice/dart_analyzer/...`
+        // should hit one of these probes without setting any env var.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let probes = probe_locations(tmp.path());
+        let as_str: Vec<String> = probes.iter().map(|p| p.display().to_string()).collect();
+        let joined = as_str.join("\n");
+        assert!(
+            joined.contains(&format!(
+                "{}",
+                tmp.path().join(DEFAULT_SIDECAR_REL).display()
+            )),
+            "must probe repo root:\n{joined}"
+        );
+        assert!(
+            joined.contains(".specslice/dart_analyzer"),
+            "must probe ~/.specslice/dart_analyzer:\n{joined}"
+        );
+        // current_exe() is platform-dependent in tests; instead of asserting
+        // its specific value we just require that at least one probe is rooted
+        // outside the repo path (i.e. came from current_exe / HOME chain).
+        assert!(
+            probes.iter().any(|p| !p.starts_with(tmp.path())),
+            "must probe at least one path outside repo root:\n{joined}"
+        );
     }
 
     #[test]

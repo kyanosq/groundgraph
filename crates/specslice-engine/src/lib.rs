@@ -47,7 +47,10 @@ pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
     GraphStats, GraphStatus, GraphView, GraphViewModel, GRAPH_SCHEMA_VERSION,
 };
-pub use impact::{run_impact, ImpactOptions, ImpactReport};
+pub use impact::{
+    compute_impact, compute_impact_with_policy, merge_confirmed_candidates, run_impact,
+    ImpactOptions, ImpactReport,
+};
 pub use index::{index_repository, IndexOptions, IndexResult};
 pub use init::{init_repository, InitOptions, InitOutcome};
 pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};

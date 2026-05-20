@@ -30,7 +30,8 @@ use specslice_engine::business_candidates::{
     ReviewVerdict,
 };
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
-use specslice_engine::graph::{build_graph_view, GraphOptions, GraphView};
+use specslice_engine::graph::{build_graph_view, GraphLayer, GraphOptions, GraphStatus, GraphView};
+use specslice_engine::impact::{compute_impact_with_policy, merge_confirmed_candidates};
 use specslice_engine::init::{init_repository, InitOptions};
 use specslice_engine::logic_confidence::{
     compute_logic_confidence, LogicConfidenceKind, LogicConfidenceSource,
@@ -520,4 +521,193 @@ fn p4_logic_confidence_report_reflects_review_outcomes() {
     assert!(report.summary.rejected >= 1);
     assert!(report.summary.needs_changes >= 1);
     assert!(report.summary.candidate_only >= 1);
+}
+
+#[test]
+fn p4_accepted_candidate_promotes_into_confirmed_graph_layer() {
+    // Reviewer feedback: until now `candidate review --accept` only
+    // mutated YAML state — the rendered graph still pinned the
+    // candidate node to `GraphLayer::Candidate + GraphStatus::Proposed`
+    // and the `derives_from` edges stayed proposed too, so
+    // `slice`/`context`/`impact` would not treat the human verdict as
+    // a confirmed link.
+    //
+    // After P1 closure:
+    //   * accepted candidates → GraphLayer::Fact + GraphStatus::Confirmed
+    //   * confidence = 1.0 (human override of AI's 0.x)
+    //   * source = "human_confirmed"
+    //   * default_visible = true (so the confirmed view actually shows them)
+    //   * outgoing derives_from edges inherit the same layer/status
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    apply_review(
+        tmp.path(),
+        "complete_purchase_unlocks_pro",
+        ReviewVerdict {
+            status: ReviewStatus::Accepted,
+            reviewer: Some("alice".into()),
+            note: None,
+            answered_questions: vec![],
+            reviewed_at: Some("2026-05-19T00:00:00Z".into()),
+        },
+    )
+    .unwrap();
+    apply_review(
+        tmp.path(),
+        "restore_purchases_is_incomplete",
+        ReviewVerdict {
+            status: ReviewStatus::Rejected,
+            reviewer: Some("alice".into()),
+            note: None,
+            answered_questions: vec![],
+            reviewed_at: Some("2026-05-19T00:00:00Z".into()),
+        },
+    )
+    .unwrap();
+
+    let view = build_graph_view(
+        tmp.path(),
+        GraphOptions {
+            view: GraphView::Business,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let accepted_id = candidate_artifact_id("complete_purchase_unlocks_pro").to_string();
+    let accepted_node = view
+        .nodes
+        .iter()
+        .find(|n| n.id == accepted_id)
+        .expect("accepted candidate node missing");
+    assert_eq!(
+        accepted_node.layer,
+        GraphLayer::Fact,
+        "accepted candidate must render on the Fact layer (got {:?})",
+        accepted_node.layer
+    );
+    assert_eq!(
+        accepted_node.status,
+        GraphStatus::Confirmed,
+        "accepted candidate must render Confirmed (got {:?})",
+        accepted_node.status
+    );
+    assert_eq!(
+        accepted_node.confidence,
+        Some(1.0),
+        "accepted candidate must show confidence=1.0 (human override)"
+    );
+    assert!(
+        accepted_node.default_visible,
+        "accepted candidate must be in the default visible set so confirmed view shows it"
+    );
+    assert_eq!(
+        accepted_node.source.as_deref(),
+        Some("human_confirmed"),
+        "accepted candidate must carry source=human_confirmed"
+    );
+
+    let rejected_id = candidate_artifact_id("restore_purchases_is_incomplete").to_string();
+    let rejected_node = view
+        .nodes
+        .iter()
+        .find(|n| n.id == rejected_id)
+        .expect("rejected candidate node missing");
+    assert_eq!(rejected_node.status, GraphStatus::Rejected);
+
+    // Every derives_from edge from the accepted candidate must also
+    // be confirmed (otherwise a downstream consumer that filters by
+    // edge status would still ignore the link).
+    let derives_edges: Vec<_> = view
+        .edges
+        .iter()
+        .filter(|e| e.kind == "derives_from" && e.from == accepted_id)
+        .collect();
+    assert!(
+        !derives_edges.is_empty(),
+        "accepted candidate must keep its derives_from edges"
+    );
+    for e in &derives_edges {
+        assert_eq!(
+            e.layer,
+            GraphLayer::Fact,
+            "derives_from edge {} layer",
+            e.id
+        );
+        assert_eq!(
+            e.status,
+            GraphStatus::Confirmed,
+            "derives_from edge {} status",
+            e.id
+        );
+        assert_eq!(e.confidence, Some(1.0));
+    }
+}
+
+#[test]
+fn p4_impact_surfaces_accepted_candidate_when_its_evidence_changes() {
+    // Closing the P1 loop end-to-end: after the human accepts a
+    // candidate whose evidence cites a code file, any subsequent
+    // PR diff that touches one of those evidence symbols should
+    // surface the candidate under `affected_confirmed_candidates`
+    // so the reviewer notices the drift instead of silently
+    // letting the AI claim stand.
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    apply_review(
+        tmp.path(),
+        "complete_purchase_unlocks_pro",
+        ReviewVerdict {
+            status: ReviewStatus::Accepted,
+            reviewer: Some("alice".into()),
+            note: None,
+            answered_questions: vec![],
+            reviewed_at: Some("2026-05-19T00:00:00Z".into()),
+        },
+    )
+    .unwrap();
+
+    // Synthesise a diff that touches the paywall_screen.dart file
+    // (which the accepted candidate's evidence references). We don't
+    // need git here — `compute_impact_with_policy` works on a
+    // pre-parsed `ChangedFile` list directly.
+    let changed = vec![specslice_engine::git_diff::ChangedFile {
+        path: "lib/features/paywall/paywall_screen.dart".into(),
+        status: specslice_engine::git_diff::ChangeStatus::Modified,
+        hunks: vec![specslice_engine::git_diff::Hunk {
+            new_start: 1,
+            new_end: 999,
+        }],
+    }];
+
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    let mut report = compute_impact_with_policy(
+        &store,
+        &changed,
+        specslice_engine::impact::ImpactPolicy::default(),
+    )
+    .unwrap();
+    merge_confirmed_candidates(&mut report, tmp.path()).unwrap();
+
+    let accepted_id = candidate_artifact_id("complete_purchase_unlocks_pro").to_string();
+    assert!(
+        report
+            .affected_confirmed_candidates
+            .iter()
+            .any(|c| c.id == accepted_id),
+        "impact must list accepted candidate {accepted_id} as affected; got {:?}",
+        report.affected_confirmed_candidates
+    );
+    assert!(
+        report
+            .info
+            .iter()
+            .any(|m| m.contains("re-review recommended")),
+        "operator-facing info banner expected, got: {:?}",
+        report.info
+    );
 }

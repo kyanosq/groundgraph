@@ -54,6 +54,13 @@ pub struct BusinessCandidatesDocument {
     pub schema_version: u32,
     #[serde(default)]
     pub candidates: Vec<BusinessCandidate>,
+    /// Forward-compat bucket for any top-level field newer AI revisions
+    /// may add (e.g. cross-candidate annotations, run metadata). Round
+    /// trips through the YAML untouched so an older CLI reviewing
+    /// candidates does not silently drop them. Note: YAML *comments*
+    /// are still lost on rewrite — serde-yaml is structure-only.
+    #[serde(flatten)]
+    pub extra: serde_yaml::Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -105,6 +112,13 @@ pub struct BusinessCandidate {
     /// through YAML so reviewers can see who said what when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<CandidateReview>,
+    /// Forward-compat bucket — any field the AI emits that this engine
+    /// version does not yet model survives a `--accept` round-trip.
+    /// Comments are still lost (serde-yaml limitation); document
+    /// authors are advised to embed any human-narrative explanations
+    /// inside `description` / `risks` rather than as `#` comments.
+    #[serde(flatten)]
+    pub extra: serde_yaml::Mapping,
 }
 
 fn default_status() -> String {
@@ -469,6 +483,67 @@ candidates:
         assert_eq!(c.evidence.len(), 2);
         assert!((c.confidence.unwrap() - 0.78).abs() < 1e-4);
         assert_eq!(c.open_questions.len(), 1);
+    }
+
+    #[test]
+    fn apply_review_preserves_unknown_yaml_fields_on_round_trip() {
+        // Forward-compatibility guarantee: a future AI emits a candidate
+        // with a field the current engine does not yet model. After
+        // `apply_review` the field must still be in the YAML so the
+        // newer AI keeps working when the human is using an older CLI.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".specslice/candidates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("business_logic.yaml"),
+            r#"
+schema_version: 1
+batch_id: 2026-05-19-claude-run-3
+candidates:
+  - id: hypothetical
+    name: "Hypothetical claim"
+    description: "x"
+    evidence:
+      - dart_method::lib/whatever.dart#Foo.bar
+    confidence: 0.5
+    open_questions:
+      - "?"
+    status: proposed
+    llm_model: claude-opus-4
+    related_candidates:
+      - other_id
+"#,
+        )
+        .unwrap();
+
+        super::apply_review(
+            tmp.path(),
+            "hypothetical",
+            super::ReviewVerdict {
+                status: super::ReviewStatus::Accepted,
+                reviewer: Some("alice".into()),
+                note: None,
+                answered_questions: vec![],
+                reviewed_at: Some("2026-05-19T00:00:00Z".into()),
+            },
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("business_logic.yaml")).unwrap();
+        // Top-level unknown survives.
+        assert!(
+            raw.contains("batch_id"),
+            "top-level unknown field `batch_id` got dropped:\n{raw}"
+        );
+        // Per-candidate unknowns survive.
+        assert!(
+            raw.contains("llm_model"),
+            "per-candidate unknown `llm_model` got dropped:\n{raw}"
+        );
+        assert!(
+            raw.contains("related_candidates"),
+            "per-candidate unknown `related_candidates` got dropped:\n{raw}"
+        );
     }
 
     #[test]

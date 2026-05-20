@@ -47,7 +47,7 @@ use specslice_store::Store;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::business_candidates::{
-    candidate_artifact_id, load_business_candidates, BusinessCandidate,
+    candidate_artifact_id, load_business_candidates, BusinessCandidate, ReviewStatus,
 };
 use crate::checks::{compute_checks_with_policy, CheckFinding, CheckPolicy, CheckSeverity};
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
@@ -712,13 +712,18 @@ fn severity_to_str(s: CheckSeverity) -> &'static str {
 
 /// P9 — merge one AI-authored candidate into the in-memory graph.
 ///
-/// We:
-/// 1. Materialise a `business_candidate::<id>` node with `layer = Candidate`.
-/// 2. For every evidence id that resolves to a known node, materialise a
-///    `derives_from` edge from the candidate to that evidence node, with
-///    confidence = candidate.confidence (defaulting to 0.5 if missing).
-/// 3. For every evidence id we *cannot* resolve, surface a finding so
-///    the human reviewer can fix the YAML.
+/// Layer / status is now derived from the candidate's `review_status()`:
+///
+/// | review_status        | layer    | status    | confidence | source            |
+/// |----------------------|----------|-----------|------------|-------------------|
+/// | Accepted             | Fact     | Confirmed | 1.0        | human_confirmed   |
+/// | Rejected             | Candidate| Rejected  | as-is      | ai_candidate      |
+/// | NeedsChanges/Pending | Candidate| Proposed  | as-is      | ai_candidate      |
+/// | None (un-reviewed)   | Candidate| Proposed  | as-is      | ai_candidate      |
+///
+/// Accepted candidates with broken evidence (any id in `evidence` not in
+/// the graph) get demoted to `GraphStatus::Stale` so the UI surfaces the
+/// drift instead of silently claiming confidence.
 fn merge_business_candidate(
     c: &BusinessCandidate,
     known_node_ids: &HashSet<String>,
@@ -727,34 +732,84 @@ fn merge_business_candidate(
     findings: &mut Vec<GraphFinding>,
 ) {
     let candidate_id = candidate_artifact_id(&c.id);
-    let confidence = c.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+    let review = c.review_status();
+    let unresolved_evidence: Vec<&str> = c
+        .evidence
+        .iter()
+        .filter(|ev| !known_node_ids.contains(ev.as_str()))
+        .map(String::as_str)
+        .collect();
+    // Accepted candidates inherit a special "confirmed" rendering — but
+    // only when every evidence id still resolves. Empty-evidence or
+    // dangling-evidence accepts fall back to Stale so the reviewer
+    // notices.
+    let (layer, status, confidence, source) = match review {
+        Some(ReviewStatus::Accepted)
+            if !c.evidence.is_empty() && unresolved_evidence.is_empty() =>
+        {
+            (
+                GraphLayer::Fact,
+                GraphStatus::Confirmed,
+                1.0_f32,
+                "human_confirmed",
+            )
+        }
+        Some(ReviewStatus::Accepted) => (
+            GraphLayer::Fact,
+            GraphStatus::Stale,
+            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            "human_confirmed",
+        ),
+        Some(ReviewStatus::Rejected) => (
+            GraphLayer::Candidate,
+            GraphStatus::Rejected,
+            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            "ai_candidate",
+        ),
+        Some(ReviewStatus::NeedsChanges) | Some(ReviewStatus::Pending) | None => (
+            GraphLayer::Candidate,
+            GraphStatus::Proposed,
+            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            "ai_candidate",
+        ),
+    };
+
     let mut badges = Vec::new();
-    badges.push(format!("ai_candidate status={}", c.status));
+    let review_label = match review {
+        Some(ReviewStatus::Accepted) => "accepted",
+        Some(ReviewStatus::Rejected) => "rejected",
+        Some(ReviewStatus::NeedsChanges) => "needs_changes",
+        Some(ReviewStatus::Pending) => "pending",
+        None => c.status.as_str(),
+    };
+    badges.push(format!("ai_candidate status={review_label}"));
     if !c.open_questions.is_empty() {
         badges.push(format!("{} open questions", c.open_questions.len()));
     }
-    // Surface the human-readable description + any open questions as a
-    // badge string each, so even minimal renderers see them.
     if !c.description.trim().is_empty() {
         badges.push(format!("desc: {}", shorten_for_badge(c.description.trim())));
     }
     for q in &c.open_questions {
         badges.push(format!("Q: {}", shorten_for_badge(q)));
     }
+
     nodes.push(GraphNode {
         id: candidate_id.clone(),
         kind: "business_candidate".into(),
         column: GraphColumn::Business,
-        layer: GraphLayer::Candidate,
+        layer,
         label: c.name.clone(),
         path: None,
         line_range: None,
-        status: GraphStatus::Proposed,
+        status,
         parent_id: None,
         child_count: 0,
-        default_visible: false,
+        // Accepted candidates ride into the default visible set so the
+        // confirmed graph view actually surfaces them without
+        // explicit focus.
+        default_visible: matches!(status, GraphStatus::Confirmed),
         confidence: Some(confidence),
-        source: Some("ai_candidate".into()),
+        source: Some(source.into()),
         badges,
     });
 
@@ -776,15 +831,15 @@ fn merge_business_candidate(
             from: candidate_id.clone(),
             to: ev.clone(),
             kind: "derives_from".into(),
-            layer: GraphLayer::Candidate,
-            status: GraphStatus::Proposed,
+            layer,
+            status,
             confidence: Some(confidence),
-            source: Some("ai_candidate".into()),
+            source: Some(source.into()),
             rationale: None,
             source_file: None,
             line_range: None,
             snippet: None,
-            resolver: Some("ai_candidate".into()),
+            resolver: Some(source.into()),
         });
     }
 }

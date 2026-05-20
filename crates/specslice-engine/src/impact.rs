@@ -73,6 +73,12 @@ pub struct ImpactReport {
     /// — this is what PRD §4.4 "Doc Impact" requires so the report stays
     /// actionable for doc-only changes.
     pub linked_implementations: Vec<SliceItem>,
+    /// AI-authored business candidates the human reviewer has accepted
+    /// AND whose cited evidence intersects the changed code. These
+    /// candidates have promoted into the confirmed graph and a code
+    /// change against them now warrants a re-review.
+    #[serde(default)]
+    pub affected_confirmed_candidates: Vec<SliceItem>,
     pub warnings: Vec<String>,
     pub info: Vec<String>,
 }
@@ -89,7 +95,14 @@ pub fn run_impact(options: ImpactOptions) -> Result<ImpactReport> {
 
     let diff_text = git_diff(&options.repo_root, &options.base_ref, &options.head_ref)?;
     let changed = parse_unified_diff(&diff_text);
-    compute_impact_with_policy(&store, &changed, ImpactPolicy::from(&config.impact))
+    let mut report =
+        compute_impact_with_policy(&store, &changed, ImpactPolicy::from(&config.impact))?;
+    // Surface accepted AI candidates whose evidence intersects the
+    // changed code. We do this after the core walk so the candidate
+    // YAML is loaded once per impact run and only when there's actually
+    // a confirmed graph to consult.
+    merge_confirmed_candidates(&mut report, &options.repo_root)?;
+    Ok(report)
 }
 
 /// Compute an impact report from an already-parsed diff. Useful in tests.
@@ -285,6 +298,73 @@ pub fn compute_impact_with_policy(
     }
 
     Ok(report)
+}
+
+/// Merge accepted business candidates whose evidence intersects the
+/// already-computed changed-code/doc set into
+/// `report.affected_confirmed_candidates`.
+///
+/// This is the bridge between P9 (AI-authored candidates) and P4
+/// (PR impact): once a human has accepted a candidate, that candidate
+/// is part of the confirmed graph; any subsequent change to its
+/// evidence files / symbols must surface in `impact` reports so the
+/// reviewer notices.
+pub fn merge_confirmed_candidates(report: &mut ImpactReport, repo_root: &Path) -> Result<()> {
+    use crate::business_candidates::{
+        candidate_artifact_id, load_business_candidates, ReviewStatus,
+    };
+    let outcome = match load_business_candidates(repo_root) {
+        Ok(o) => o,
+        Err(_) => return Ok(()),
+    };
+    // Build the universe of "changed" anchors that an accepted
+    // candidate's evidence might intersect: symbols, doc sections,
+    // and raw changed file paths (so a per-file evidence id matches
+    // even when no symbol survives).
+    let changed_anchors: BTreeSet<String> = report
+        .changed_symbols
+        .iter()
+        .chain(report.changed_doc_sections.iter())
+        .map(|s| s.id.clone())
+        .collect();
+    let changed_files: BTreeSet<&str> = report.changed_files.iter().map(|s| s.as_str()).collect();
+
+    for c in &outcome.document.candidates {
+        if c.review_status() != Some(ReviewStatus::Accepted) {
+            continue;
+        }
+        let touched = c.evidence.iter().any(|ev| {
+            if changed_anchors.contains(ev) {
+                return true;
+            }
+            // Best-effort path-level match: evidence ids encode the
+            // source file after `::` and before `#`, e.g.
+            // `dart_method::lib/foo.dart#Foo.bar`. If we can pluck the
+            // file out and it intersects a changed file, count it as
+            // touched.
+            let body = ev.split_once("::").map(|(_, t)| t).unwrap_or(ev);
+            let file_part = body.split_once('#').map(|(p, _)| p).unwrap_or(body);
+            changed_files.contains(file_part)
+        });
+        if !touched {
+            continue;
+        }
+        report.affected_confirmed_candidates.push(SliceItem {
+            id: candidate_artifact_id(&c.id).to_string(),
+            kind: "business_candidate".into(),
+            path: None,
+            name: Some(c.name.clone()),
+            line_range: None,
+        });
+    }
+    sort_items(&mut report.affected_confirmed_candidates);
+    if !report.affected_confirmed_candidates.is_empty() {
+        report.info.push(format!(
+            "{} accepted candidate(s) intersect this change — re-review recommended",
+            report.affected_confirmed_candidates.len()
+        ));
+    }
+    Ok(())
 }
 
 fn push_impact_message(report: &mut ImpactReport, level: &str, message: String) {

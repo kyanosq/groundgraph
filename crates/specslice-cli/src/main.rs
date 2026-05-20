@@ -69,8 +69,12 @@ struct GraphArgs {
     /// Hide check/risk findings from the export. Defaults to true (include).
     #[arg(long, default_value_t = true)]
     include_risks: bool,
-    /// Reserved for the future `.specslice/candidates/` overlay.
-    #[arg(long)]
+    /// Overlay the `.specslice/candidates/business_logic.yaml` candidates
+    /// (and any human-accepted candidates promoted into the confirmed
+    /// graph) on top of the structural view. Defaults to true so the
+    /// confirmed loop is visible by default; pass `--include-candidates=false`
+    /// to hide the AI overlay.
+    #[arg(long, default_value_t = true)]
     include_candidates: bool,
     /// Cap the number of nodes; emits a `graph_truncated` finding when hit.
     #[arg(long)]

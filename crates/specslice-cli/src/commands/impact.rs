@@ -80,6 +80,13 @@ fn print_human(report: &ImpactReport) {
             println!("- {}", t.path.clone().unwrap_or_else(|| t.id.clone()));
         }
     }
+    if !report.affected_confirmed_candidates.is_empty() {
+        println!();
+        println!("受影响的已确认业务候选 (需重新审阅):");
+        for c in &report.affected_confirmed_candidates {
+            println!("- {} {}", c.id, c.name.clone().unwrap_or_default(),);
+        }
+    }
     if !report.warnings.is_empty() {
         println!();
         println!("Warnings:");
