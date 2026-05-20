@@ -85,6 +85,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   // We keep a per-file name-based lookup so [_resolveProviderId] can fall
   // back when the getter element isn't in [byElement].
   final providerByFileAndName = <String, String>{};
+  final constStringByFileAndName = <String, String>{};
   final dartFiles = <String>[];
   for (final ctx in collection.contexts) {
     for (final f in ctx.contextRoot.analyzedFiles()) {
@@ -162,6 +163,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       symbols: symbols,
       symbolRanges: symbolRanges,
       providerByFileAndName: providerByFileAndName,
+      constStringByFileAndName: constStringByFileAndName,
     );
     unit.unit.visitChildren(declared);
 
@@ -197,6 +199,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       source: unit.content,
       byElement: byElement,
       providerByFileAndName: providerByFileAndName,
+      constStringByFileAndName: constStringByFileAndName,
       references: references,
       syntheticNodes: syntheticNodes,
     );
@@ -272,6 +275,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   final List<Map<String, dynamic>> symbols;
   final List<Map<String, dynamic>> symbolRanges;
   final Map<String, String> providerByFileAndName;
+  final Map<String, String> constStringByFileAndName;
 
   String? currentClassName;
   String? currentClassId;
@@ -284,6 +288,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     required this.symbols,
     required this.symbolRanges,
     required this.providerByFileAndName,
+    required this.constStringByFileAndName,
   });
 
   @override
@@ -412,6 +417,12 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     super.visitFunctionDeclaration(node);
   }
 
+  @override
+  void visitFieldDeclaration(FieldDeclaration node) {
+    _recordConstStringVariables(node.fields);
+    super.visitFieldDeclaration(node);
+  }
+
   /// P8 — collect top-level Riverpod-shaped providers as `dart_provider`
   /// symbols. We detect them by initializer type name: a top-level
   /// `final foo = Provider(...)` or `StateNotifierProvider(...)` /
@@ -424,6 +435,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     if (currentClassId != null) {
       return; // class-level fields handled elsewhere
     }
+    _recordConstStringVariables(node.variables);
     for (final v in node.variables.variables) {
       final init = v.initializer;
       if (init == null) continue;
@@ -467,6 +479,17 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
       providerByFileAndName['$rel|$name'] = id;
     }
     super.visitTopLevelVariableDeclaration(node);
+  }
+
+  void _recordConstStringVariables(VariableDeclarationList variables) {
+    final keyword = variables.keyword?.lexeme;
+    if (keyword != 'const' && keyword != 'final') return;
+    for (final v in variables.variables) {
+      final init = v.initializer;
+      if (init is SimpleStringLiteral) {
+        constStringByFileAndName['$rel|${v.name.lexeme}'] = init.value;
+      }
+    }
   }
 
   bool _looksLikeProviderConstruction(Expression init) {
@@ -601,6 +624,7 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
   final String source;
   final Map<Element2, String> byElement;
   final Map<String, String> providerByFileAndName;
+  final Map<String, String> constStringByFileAndName;
   final List<Map<String, dynamic>> references;
   final Map<String, Map<String, dynamic>> syntheticNodes;
 
@@ -613,6 +637,7 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     required this.source,
     required this.byElement,
     required this.providerByFileAndName,
+    required this.constStringByFileAndName,
     required this.references,
     required this.syntheticNodes,
   });
@@ -837,6 +862,9 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
 
   String? _stringLiteralValue(AstNode? n) {
     if (n is SimpleStringLiteral) return n.value;
+    if (n is SimpleIdentifier) {
+      return constStringByFileAndName['$rel|${n.name}'];
+    }
     if (n is AdjacentStrings) {
       // Concat all parts if they are all simple literals.
       final buf = StringBuffer();
@@ -854,6 +882,21 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
 
   _HiveCall? _matchHiveCall(
       MethodInvocation node, Expression? target, String methodName) {
+    // Recognise `Hive.openBox('name')` / `Hive.box('name')` itself. This
+    // matters for code that stores the box in a variable before calling
+    // `put` or `get`, because the storage boundary is still visible at
+    // the open site.
+    if (target is SimpleIdentifier &&
+        target.name == 'Hive' &&
+        (methodName == 'box' || methodName == 'openBox')) {
+      final boxNameArg = node.argumentList.arguments.isNotEmpty
+          ? node.argumentList.arguments.first
+          : null;
+      final boxName = _stringLiteralValue(boxNameArg);
+      if (boxName != null) {
+        return _HiveCall(boxName: boxName);
+      }
+    }
     // Recognise `Hive.box('name').put/get/delete(...)` — the receiver of
     // our MethodInvocation is itself a MethodInvocation of `Hive.box`.
     if (target is MethodInvocation) {

@@ -61,4 +61,55 @@ void test(String name, void Function() body) => body();
     final tests = response.toJson()['tests'] as List<dynamic>? ?? const [];
     expect(tests, isEmpty);
   });
+
+  test('walkRepository emits Hive openBox storage edge from const box name',
+      () async {
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+
+    final libDir = Directory(p.join(root.path, 'lib'));
+    libDir.createSync(recursive: true);
+    File(p.join(libDir.path, 'pro_provider.dart')).writeAsStringSync('''
+class ProNotifier {
+  static const String _boxName = 'settings';
+
+  Future<void> applyPurchase() async {
+    final box = await Hive.openBox(_boxName);
+    await box.put('pro_entitlement_type_v2', 'lifetime');
+  }
+}
+
+class Hive {
+  static Future<Box> openBox(String name) async => Box();
+}
+
+class Box {
+  Future<void> put(String key, Object value) async {}
+}
+''');
+
+    final response = await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+    final references =
+        response.toJson()['references'] as List<dynamic>? ?? const [];
+
+    expect(
+      references,
+      contains(
+        isA<Map<String, dynamic>>()
+            .having((e) => e['kind'], 'kind', EdgeKindString.persistsTo)
+            .having(
+              (e) => e['from_symbol_id'],
+              'from_symbol_id',
+              'dart_method::lib/pro_provider.dart#ProNotifier.applyPurchase',
+            )
+            .having(
+              (e) => e['to_symbol_id'],
+              'to_symbol_id',
+              'storage::hive::settings',
+            ),
+      ),
+    );
+  });
 }
