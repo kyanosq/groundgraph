@@ -2,6 +2,7 @@ pub mod candidate;
 pub mod check;
 pub mod connect;
 pub mod context;
+pub mod dead_code;
 pub mod export;
 pub mod graph;
 pub mod graph_html;

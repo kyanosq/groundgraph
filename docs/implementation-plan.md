@@ -576,6 +576,24 @@ specslice graph --format html --view business
 
 - 对真实业务仓库的“业务逻辑图”仍依赖 AI candidate 输入和人工确认；没有候选文件时只能输出代码事实图，不能声称已经理解业务需求。
 
+### P10：死代码检查 ✅ 落地
+
+**目标：** 提供独立命令 `specslice dead-code`，把代码图变成可用的“死代码可信度报告”而不是删除建议。报告必须给出置信度和理由，不替操作员决策。
+
+**已落地：**
+
+- 新 CLI：`specslice dead-code [--json] [--min-confidence high|medium|low] [--include-tests]`。
+- 引擎模块 `dead_code`：基于 store 做三层判断 —— 可达性 BFS（入口点 = `main()` / Route / DartProvider / TestCase / TestGroup / Flutter lifecycle / `public_api_roots`）；按入边 usage（calls / references / declares_verification / reads_provider / persists_to / navigates_to / subscribes_stream）+ 公共可见性 + 路径 ignore glob 分到 high / medium / low；low 专门对应「dead island」。
+- 中文 reasons：每条候选都解释「为什么被标可能死」、入边为什么不足以让它活着，以及是否落入 `public_api_roots` / 公共名 / lifecycle 名等减分项。
+- `.specslice.yaml` 新增 `dead_code` 配置（默认 `lib/main.dart` 入口、`**/*.g.dart` / `**/*.freezed.dart` / `**/generated/**` 等 ignore、可选 `public_api_roots`）。
+- 测试：engine 单元测全部 7 项覆盖 high/medium/low/ignore/include-tests/min-confidence 过滤；CLI 集成测覆盖 json schema + 排序 + 文本头；PixCraft golden 验证真实 sidecar 索引下的 schema_version、stats、排序，并断言 `*.g.dart` 被默认 ignore 过滤、`public_api_roots = lib/**` 会把 high 降到 medium 或更低。
+
+**非侵入式约束：**
+
+- 不要求代码或文档加 `@used` / `@business` 注解。
+- 任何分析边界（入口点、ignore、public API）都只通过 `.specslice.yaml` 表达。
+- 输出可信度而非删除指令，并在文末显式提示运营要先用 `graph --focus` / `search` 复核。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：

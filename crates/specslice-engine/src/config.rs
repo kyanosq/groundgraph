@@ -33,6 +33,8 @@ pub struct EngineConfig {
     pub impact: ImpactConfig,
     #[serde(default)]
     pub checks: ChecksConfig,
+    #[serde(default)]
+    pub dead_code: DeadCodeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,4 +265,44 @@ fn default_missing_linked_test_level() -> String {
 }
 fn default_orphan_requirement_level() -> String {
     "warning".into()
+}
+
+/// Configuration consumed by `specslice dead-code` (P7).
+///
+/// All sections are optional. Defaults give a useful zero-config
+/// experience on a Flutter app: `lib/main.dart` is the entry, common
+/// codegen suffixes are ignored, and no path is treated as "public
+/// API" unless the operator explicitly enumerates one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DeadCodeConfig {
+    /// File paths whose top-level `main()` (and any other exported
+    /// symbol) is considered an entry point. Relative to the repo
+    /// root.
+    #[serde(default = "default_dead_code_entrypoints")]
+    pub entrypoints: Vec<String>,
+    /// Glob patterns whose matching files are excluded from the
+    /// dead-code report (codegen, generated, vendored). Patterns are
+    /// matched against the *relative* repo-root path.
+    #[serde(default = "default_dead_code_ignore")]
+    pub ignore: Vec<String>,
+    /// Glob patterns marking a "public API surface". Symbols under
+    /// these paths can never be flagged as high-confidence dead, even
+    /// when no caller appears in the graph (consumers may live
+    /// outside the repo).
+    #[serde(default)]
+    pub public_api_roots: Vec<String>,
+}
+
+fn default_dead_code_entrypoints() -> Vec<String> {
+    vec!["lib/main.dart".into()]
+}
+
+fn default_dead_code_ignore() -> Vec<String> {
+    vec![
+        "**/*.g.dart".into(),
+        "**/*.freezed.dart".into(),
+        "**/*.gr.dart".into(),
+        "**/generated/**".into(),
+        "**/.dart_tool/**".into(),
+    ]
 }

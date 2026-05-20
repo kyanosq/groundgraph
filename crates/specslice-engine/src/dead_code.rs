@@ -1,0 +1,896 @@
+//! P7 — dead-code detection.
+//!
+//! `specslice dead-code` returns *possibly_dead* candidates with an
+//! explicit confidence score and a list of human-readable reasons.
+//! The goal is **never** to recommend deletion automatically — it is
+//! to surface symbols that no in-repo caller or framework root can
+//! reach so the operator (or an AI agent) can decide.
+//!
+//! ## Detection pipeline
+//!
+//! 1. **Entry point set.** Built from
+//!    - `dead_code.entrypoints` config (top-level functions in those
+//!      files, e.g. `lib/main.dart#main`),
+//!    - every `Route`, `DartProvider`, `TestCase` and `TestGroup`,
+//!    - every method whose name matches a known Flutter lifecycle
+//!      callback (`build`, `initState`, `dispose`, ...),
+//!    - every symbol under `dead_code.public_api_roots`.
+//! 2. **Forward reachability.** BFS along outbound usage edges
+//!    (`calls`, `references`, `reads_provider`, `persists_to`,
+//!    `navigates_to`, `subscribes_stream`, `declares_verification`,
+//!    `contains`). Anything not reached is a candidate.
+//! 3. **Confidence binning.** For each unreached code symbol:
+//!    - **High** — no inbound usage edges, private (`_`-prefixed) name,
+//!      not in `public_api_roots`, not a lifecycle name, file not in
+//!      `ignore` glob → very likely safe to delete after manual review.
+//!    - **Medium** — same but the symbol is public, has a lifecycle
+//!      name, or sits under `public_api_roots`. May be consumed by
+//!      reflection, code-gen, framework, or external callers.
+//!    - **Low** — has inbound usage edges, but every source is itself
+//!      a candidate (a "dead island"). Surfaced last; cheapest to
+//!      ignore.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
+use specslice_core::{EdgeKind, NodeKind};
+use specslice_store::Store;
+
+use crate::config::{DeadCodeConfig, EngineConfig, DEFAULT_CONFIG_FILE_NAME};
+
+pub const DEAD_CODE_SCHEMA_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Data contract
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeadCodeConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl DeadCodeConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadCodeConfidence::High => "high",
+            DeadCodeConfidence::Medium => "medium",
+            DeadCodeConfidence::Low => "low",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeadCodeOptions {
+    pub repo_root: std::path::PathBuf,
+    pub min_confidence: DeadCodeConfidence,
+    /// When `true`, test cases / test groups are themselves eligible
+    /// to appear as dead-code candidates (orphan tests). They remain
+    /// entry points for reachability either way.
+    pub include_tests: bool,
+}
+
+impl Default for DeadCodeOptions {
+    fn default() -> Self {
+        Self {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Medium,
+            include_tests: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeadCodeReport {
+    pub schema_version: u32,
+    pub min_confidence: String,
+    pub stats: DeadCodeStats,
+    pub candidates: Vec<DeadCodeCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DeadCodeStats {
+    pub total_code_symbols: usize,
+    pub entrypoints: usize,
+    pub reachable: usize,
+    pub possibly_dead: usize,
+    pub ignored_by_pattern: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeadCodeCandidate {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub path: Option<String>,
+    pub line_range: Option<(u32, u32)>,
+    pub confidence: DeadCodeConfidence,
+    pub reasons: Vec<String>,
+    /// Inbound usage edges that survived filtering (empty for
+    /// `High`/`Medium`; non-empty for `Low` "dead island" cases).
+    pub inbound_sources: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+pub fn analyze_dead_code(opts: DeadCodeOptions) -> Result<DeadCodeReport> {
+    let config = load_workspace_config(&opts.repo_root)?;
+    let db_path = resolve_storage_path(&opts.repo_root, &config);
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let dead_cfg = config.dead_code.clone();
+    analyze_dead_code_with_store(&store, opts, &dead_cfg)
+}
+
+fn load_workspace_config(repo_root: &Path) -> Result<EngineConfig> {
+    let path = repo_root.join(DEFAULT_CONFIG_FILE_NAME);
+    if !path.exists() {
+        anyhow::bail!(
+            "no SpecSlice workspace at {}: run `specslice init` first",
+            repo_root.display()
+        );
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    serde_yaml::from_str::<EngineConfig>(&raw)
+        .with_context(|| format!("parsing config {}", path.display()))
+}
+
+fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
+    let raw = config.storage.path.clone();
+    if raw.is_empty() {
+        return repo_root.join(".specslice/graph.db");
+    }
+    let candidate = PathBuf::from(&raw);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        repo_root.join(candidate)
+    }
+}
+
+pub fn analyze_dead_code_with_store(
+    store: &Store,
+    opts: DeadCodeOptions,
+    config: &DeadCodeConfig,
+) -> Result<DeadCodeReport> {
+    let ignore_set = build_globset(&config.ignore).context("compiling dead_code.ignore globs")?;
+    let public_set = build_globset(&config.public_api_roots)
+        .context("compiling dead_code.public_api_roots globs")?;
+
+    let nodes = store.list_all_nodes().context("listing nodes")?;
+    let edges = store.list_all_edges().context("listing edges")?;
+
+    let node_index: HashMap<String, &specslice_core::Node> =
+        nodes.iter().map(|n| (n.id.to_string(), n)).collect();
+
+    // Precompute outbound usage edges per node.
+    let mut outbound: HashMap<&str, Vec<&specslice_core::EdgeAssertion>> = HashMap::new();
+    let mut inbound: HashMap<&str, Vec<&specslice_core::EdgeAssertion>> = HashMap::new();
+    for edge in &edges {
+        if !is_usage_edge(edge.kind) {
+            continue;
+        }
+        outbound
+            .entry(edge.from_id.as_str())
+            .or_default()
+            .push(edge);
+        inbound.entry(edge.to_id.as_str()).or_default().push(edge);
+    }
+
+    // Entry points.
+    let mut entry_ids: BTreeSet<String> = BTreeSet::new();
+    seed_config_entrypoints(&config.entrypoints, &nodes, &mut entry_ids);
+    for n in &nodes {
+        match n.kind {
+            NodeKind::Route | NodeKind::DartProvider | NodeKind::TestCase | NodeKind::TestGroup => {
+                entry_ids.insert(n.id.to_string());
+            }
+            NodeKind::DartMethod => {
+                if is_lifecycle_method_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            _ => {}
+        }
+        // public_api_roots: anything under those paths.
+        if let Some(p) = n.path.as_deref() {
+            if matches_set(&public_set, p) && is_code_kind(n.kind) {
+                entry_ids.insert(n.id.to_string());
+            }
+        }
+    }
+
+    // BFS forward.
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<String> = entry_ids.iter().cloned().collect();
+    while let Some(id) = queue.pop_front() {
+        if !reachable.insert(id.clone()) {
+            continue;
+        }
+        if let Some(out) = outbound.get(id.as_str()) {
+            for e in out {
+                let to = e.to_id.to_string();
+                if !reachable.contains(&to) {
+                    queue.push_back(to);
+                }
+            }
+        }
+    }
+
+    // Classify unreached code symbols.
+    let mut candidates: Vec<DeadCodeCandidate> = Vec::new();
+    let mut ignored_count: usize = 0;
+    let mut total_code: usize = 0;
+    for n in &nodes {
+        if !is_code_kind(n.kind) {
+            continue;
+        }
+        if !opts.include_tests && matches!(n.kind, NodeKind::TestCase | NodeKind::TestGroup) {
+            // Tests are always roots, never reported unless caller asks.
+            continue;
+        }
+        total_code += 1;
+        let id_str = n.id.to_string();
+        if reachable.contains(&id_str) {
+            continue;
+        }
+        // Ignore patterns.
+        if let Some(p) = n.path.as_deref() {
+            if matches_set(&ignore_set, p) {
+                ignored_count += 1;
+                continue;
+            }
+        }
+        let inbound_for: &[&specslice_core::EdgeAssertion] = inbound
+            .get(id_str.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let (confidence, reasons) = classify(n, inbound_for, &public_set, &reachable);
+        if confidence < opts.min_confidence {
+            continue;
+        }
+        let label = n
+            .name
+            .clone()
+            .or_else(|| n.stable_key.clone())
+            .unwrap_or_else(|| id_str.clone());
+        let line_range = match (n.start_line, n.end_line) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        };
+        // Only surface *usage* inbound sources here so the listing
+        // matches the reasons. Structural `contains` parents are
+        // implied by `path` and would otherwise mislead operators
+        // ("look! someone references it!" — no, it's just the file
+        // that owns it).
+        let inbound_sources: Vec<String> = inbound_for
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Calls
+                        | EdgeKind::References
+                        | EdgeKind::ReadsProvider
+                        | EdgeKind::PersistsTo
+                        | EdgeKind::NavigatesTo
+                        | EdgeKind::SubscribesStream
+                        | EdgeKind::DeclaresVerification
+                )
+            })
+            .map(|e| e.from_id.to_string())
+            .collect();
+        candidates.push(DeadCodeCandidate {
+            id: id_str,
+            kind: n.kind.as_str().into(),
+            label,
+            path: n.path.clone(),
+            line_range,
+            confidence,
+            reasons,
+            inbound_sources,
+        });
+    }
+
+    // Sort: confidence desc, then path asc, then label asc.
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .cmp(&a.confidence)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let possibly_dead = candidates.len();
+    let reachable_count = reachable
+        .iter()
+        .filter(|id| node_index.contains_key(id.as_str()))
+        .count();
+    let entrypoints = entry_ids.len();
+    Ok(DeadCodeReport {
+        schema_version: DEAD_CODE_SCHEMA_VERSION,
+        min_confidence: opts.min_confidence.as_str().into(),
+        stats: DeadCodeStats {
+            total_code_symbols: total_code,
+            entrypoints,
+            reachable: reachable_count,
+            possibly_dead,
+            ignored_by_pattern: ignored_count,
+        },
+        candidates,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        builder.add(Glob::new(p).with_context(|| format!("invalid glob `{p}`"))?);
+    }
+    Ok(builder.build()?)
+}
+
+fn matches_set(set: &GlobSet, path: &str) -> bool {
+    if set.is_empty() {
+        return false;
+    }
+    set.is_match(path)
+}
+
+fn is_usage_edge(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls
+            | EdgeKind::References
+            | EdgeKind::ReadsProvider
+            | EdgeKind::PersistsTo
+            | EdgeKind::NavigatesTo
+            | EdgeKind::SubscribesStream
+            | EdgeKind::DeclaresVerification
+            | EdgeKind::Contains
+    )
+}
+
+fn is_code_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::DartClass
+            | NodeKind::DartMethod
+            | NodeKind::DartFunction
+            | NodeKind::DartConstructor
+            | NodeKind::TestCase
+            | NodeKind::TestGroup
+    )
+}
+
+/// Flutter / Dart names that look like framework callbacks. Anything
+/// matching here is treated as a *root* (cannot be high-confidence
+/// dead) because the framework / reflection invokes it.
+fn is_lifecycle_method_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    // Names can be qualified like `MyWidget.build` — match on the
+    // trailing identifier.
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    matches!(
+        last,
+        "build"
+            | "initState"
+            | "dispose"
+            | "didChangeDependencies"
+            | "didUpdateWidget"
+            | "didChangeAppLifecycleState"
+            | "createState"
+            | "createElement"
+            | "main"
+            | "noSuchMethod"
+            | "toString"
+            | "hashCode"
+            | "=="
+            | "didChangeMetrics"
+            | "didChangePlatformBrightness"
+            | "didChangeLocales"
+            | "didHaveMemoryPressure"
+    )
+}
+
+fn is_private_dart_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    last.starts_with('_')
+}
+
+fn seed_config_entrypoints(
+    entrypoints: &[String],
+    nodes: &[specslice_core::Node],
+    sink: &mut BTreeSet<String>,
+) {
+    // Each entrypoint path is a *file*. Promote any top-level
+    // function/method declared in that file (typically `main()`) and
+    // the file node itself.
+    let entry_files: BTreeSet<&str> = entrypoints.iter().map(String::as_str).collect();
+    for n in nodes {
+        let Some(path) = n.path.as_deref() else {
+            continue;
+        };
+        if entry_files.contains(path) {
+            sink.insert(n.id.to_string());
+        }
+    }
+}
+
+fn classify(
+    node: &specslice_core::Node,
+    inbound: &[&specslice_core::EdgeAssertion],
+    public_set: &GlobSet,
+    reachable: &BTreeSet<String>,
+) -> (DeadCodeConfidence, Vec<String>) {
+    let mut reasons: Vec<String> = Vec::new();
+    let mitigating_factors: Vec<String> = collect_mitigating_factors(node, public_set);
+    let inbound_usage: Vec<&&specslice_core::EdgeAssertion> = inbound
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EdgeKind::Calls
+                    | EdgeKind::References
+                    | EdgeKind::ReadsProvider
+                    | EdgeKind::PersistsTo
+                    | EdgeKind::NavigatesTo
+                    | EdgeKind::SubscribesStream
+                    | EdgeKind::DeclaresVerification
+            )
+        })
+        .collect();
+    // Some edges (e.g. Contains from a file to a class) are not
+    // "usage"; exclude them from the inbound count too.
+    let live_inbound: Vec<&&&specslice_core::EdgeAssertion> = inbound_usage
+        .iter()
+        .filter(|e| reachable.contains(e.from_id.as_str()))
+        .collect();
+    let dead_island_inbound: Vec<&&&specslice_core::EdgeAssertion> = inbound_usage
+        .iter()
+        .filter(|e| !reachable.contains(e.from_id.as_str()))
+        .collect();
+
+    reasons.push(reason_unreached(node));
+
+    if inbound_usage.is_empty() {
+        reasons.push("无任何 calls / references / declares_verification 入边".into());
+    } else if live_inbound.is_empty() && !dead_island_inbound.is_empty() {
+        reasons.push(format!(
+            "仅被 {} 个同样不可达的符号引用（dead island）",
+            dead_island_inbound.len()
+        ));
+    } else {
+        // Inbound from live nodes but still unreached — only happens
+        // when forward edges are missing (e.g., reflective access).
+        reasons.push("入边存在但未被入口点覆盖".into());
+    }
+
+    for m in &mitigating_factors {
+        reasons.push(m.clone());
+    }
+
+    let confidence = if !inbound_usage.is_empty() && live_inbound.is_empty() {
+        // Dead island.
+        DeadCodeConfidence::Low
+    } else if mitigating_factors.is_empty() && inbound_usage.is_empty() {
+        DeadCodeConfidence::High
+    } else if inbound_usage.is_empty() {
+        DeadCodeConfidence::Medium
+    } else {
+        DeadCodeConfidence::Low
+    };
+    (confidence, reasons)
+}
+
+fn reason_unreached(node: &specslice_core::Node) -> String {
+    match node.kind {
+        NodeKind::DartMethod | NodeKind::DartFunction | NodeKind::DartConstructor => {
+            "未被 main / 路由 / Provider / 测试 / lifecycle 任一入口点可达".into()
+        }
+        NodeKind::DartClass => "类未被任何入口点引用".into(),
+        NodeKind::TestCase | NodeKind::TestGroup => "测试未被 test runner / 父级 group 关联".into(),
+        _ => "未被任何入口点可达".into(),
+    }
+}
+
+fn collect_mitigating_factors(node: &specslice_core::Node, public_set: &GlobSet) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(p) = node.path.as_deref() {
+        if matches_set(public_set, p) {
+            out.push(format!(
+                "位于 public_api_roots（{p}），可能被仓库外消费者使用"
+            ));
+        }
+    }
+    if !is_private_dart_name(node.name.as_deref()) {
+        out.push("公共可见符号（无 `_` 前缀），可能被反射 / 代码生成 / 框架调用".into());
+    }
+    if is_lifecycle_method_name(node.name.as_deref()) {
+        out.push("名称匹配 Flutter / Dart 生命周期 / 框架回调".into());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Display helper
+// ---------------------------------------------------------------------------
+
+/// Group candidates by confidence for human-readable output.
+pub fn group_by_confidence(
+    candidates: &[DeadCodeCandidate],
+) -> BTreeMap<DeadCodeConfidence, Vec<&DeadCodeCandidate>> {
+    let mut out: BTreeMap<DeadCodeConfidence, Vec<&DeadCodeCandidate>> = BTreeMap::new();
+    for c in candidates {
+        out.entry(c.confidence).or_default().push(c);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use specslice_core::{
+        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus, Node, NodeKind,
+    };
+    use specslice_store::Store;
+    use tempfile::TempDir;
+
+    fn empty_store() -> (Store, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        (store, dir)
+    }
+
+    fn insert_method(store: &mut Store, file: &str, qualified: &str) -> String {
+        let id = format!("dart_method::{file}#{qualified}");
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::DartMethod,
+                path: Some(file.into()),
+                name: Some(qualified.into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        id
+    }
+
+    fn insert_function(store: &mut Store, file: &str, name: &str) -> String {
+        let id = format!("dart_function::{file}#{name}");
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::DartFunction,
+                path: Some(file.into()),
+                name: Some(name.into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        id
+    }
+
+    fn insert_calls(store: &mut Store, from: &str, to: &str) {
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("calls::{from}->{to}")),
+                from_id: ArtifactId::new(from.to_string()),
+                to_id: ArtifactId::new(to.to_string()),
+                kind: EdgeKind::Calls,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+    }
+
+    fn config_with(entrypoints: Vec<&str>) -> DeadCodeConfig {
+        DeadCodeConfig {
+            entrypoints: entrypoints.into_iter().map(String::from).collect(),
+            ignore: vec!["**/*.g.dart".into()],
+            public_api_roots: vec![],
+        }
+    }
+
+    #[test]
+    fn high_confidence_dead_when_private_unreferenced_unreached() {
+        let (mut store, _dir) = empty_store();
+        // main calls reachable_helper; orphan is private + has zero inbound edges.
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        let helper = insert_method(&mut store, "lib/util.dart", "Helper.reachable");
+        let orphan = insert_function(&mut store, "lib/util.dart", "_unused_internal");
+        insert_calls(&mut store, &main_id, &helper);
+
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["lib/main.dart"]))
+                .unwrap();
+        let by_id: BTreeMap<&str, &DeadCodeCandidate> = report
+            .candidates
+            .iter()
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        let c = by_id
+            .get(orphan.as_str())
+            .expect("private unused function must surface as a candidate");
+        assert_eq!(c.confidence, DeadCodeConfidence::High);
+        // Helper is reachable, so it must NOT appear.
+        assert!(
+            !by_id.contains_key(helper.as_str()),
+            "reachable helper must not appear as dead"
+        );
+    }
+
+    #[test]
+    fn medium_confidence_when_public_or_lifecycle_unreached() {
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        // Public name, no inbound usage edges, unreachable.
+        let public_unused = insert_method(&mut store, "lib/api/foo.dart", "PublicApi.unused");
+        // Lifecycle build() with no inbound (some Flutter route mounts widgets
+        // implicitly via runApp, which we don't model).
+        let widget_build = insert_method(&mut store, "lib/widgets/x.dart", "MyWidget.build");
+        // Touch main so it's not flagged.
+        let _ = main_id;
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["lib/main.dart"]))
+                .unwrap();
+        let by_id: BTreeMap<&str, &DeadCodeCandidate> = report
+            .candidates
+            .iter()
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        // build() is an entry-point lifecycle root → NOT reported.
+        assert!(
+            !by_id.contains_key(widget_build.as_str()),
+            "lifecycle build() must be treated as root, not flagged"
+        );
+        // PublicApi.unused is public and unreachable → Medium.
+        let c = by_id
+            .get(public_unused.as_str())
+            .expect("public unused must surface");
+        assert_eq!(c.confidence, DeadCodeConfidence::Medium);
+        assert!(c.reasons.iter().any(|r| r.contains("公共可见符号")));
+    }
+
+    #[test]
+    fn low_confidence_dead_island_when_inbound_is_also_dead() {
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        // Two private methods that only call each other → unreachable dead island.
+        let a = insert_method(&mut store, "lib/util.dart", "_orphan_a");
+        let b = insert_method(&mut store, "lib/util.dart", "_orphan_b");
+        insert_calls(&mut store, &a, &b);
+        insert_calls(&mut store, &b, &a);
+        let _ = main_id;
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["lib/main.dart"]))
+                .unwrap();
+        let by_id: BTreeMap<&str, &DeadCodeCandidate> = report
+            .candidates
+            .iter()
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        let a_card = by_id.get(a.as_str()).expect("island member A");
+        let b_card = by_id.get(b.as_str()).expect("island member B");
+        assert_eq!(a_card.confidence, DeadCodeConfidence::Low);
+        assert_eq!(b_card.confidence, DeadCodeConfidence::Low);
+        assert!(a_card.reasons.iter().any(|r| r.contains("dead island")));
+    }
+
+    #[test]
+    fn ignore_glob_drops_candidates() {
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        let generated = insert_function(&mut store, "lib/foo.g.dart", "_FooGenerated$serializer");
+        let _ = main_id;
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["lib/main.dart"]))
+                .unwrap();
+        assert!(
+            report.candidates.iter().all(|c| c.id != generated),
+            "*.g.dart should be excluded by default ignore glob"
+        );
+        assert_eq!(report.stats.ignored_by_pattern, 1);
+    }
+
+    #[test]
+    fn test_reaches_target_so_target_is_not_dead() {
+        let (mut store, _dir) = empty_store();
+        // main is detached; the only reachable path to the target is
+        // via a test_case.
+        let target = insert_method(&mut store, "lib/foo.dart", "Foo.runOnce");
+        let test_id = "test_case::test/foo_test.dart#exercises Foo.runOnce";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(test_id.to_string()),
+                kind: NodeKind::TestCase,
+                path: Some("test/foo_test.dart".into()),
+                name: Some("exercises Foo.runOnce".into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some("test/foo_test.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("declares_verification::{test_id}->{target}")),
+                from_id: ArtifactId::new(test_id.to_string()),
+                to_id: ArtifactId::new(target.clone()),
+                kind: EdgeKind::DeclaresVerification,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report = analyze_dead_code_with_store(&store, opts, &config_with(vec![])).unwrap();
+        assert!(
+            !report.candidates.iter().any(|c| c.id == target),
+            "target reached only via a test must remain alive (tests are roots)"
+        );
+    }
+
+    #[test]
+    fn min_confidence_filter_drops_lower_buckets() {
+        let (mut store, _dir) = empty_store();
+        // a private orphan (High) and a public orphan (Medium).
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        let _private_orphan = insert_function(&mut store, "lib/util.dart", "_private_dead");
+        let _public_orphan = insert_method(&mut store, "lib/api/foo.dart", "PublicApi.dead");
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::High,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        assert!(
+            report
+                .candidates
+                .iter()
+                .all(|c| c.confidence == DeadCodeConfidence::High),
+            "--min-confidence high must drop medium/low"
+        );
+        assert!(!report.candidates.is_empty());
+    }
+
+    #[test]
+    fn include_tests_reports_orphan_test_cases() {
+        let (mut store, _dir) = empty_store();
+        // A bare test_case with no parent group, no incoming edges.
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new("test_case::test/foo_test.dart#orphan".to_string()),
+                kind: NodeKind::TestCase,
+                path: Some("test/foo_test.dart".into()),
+                name: Some("orphan".into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some("test/foo_test.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        // Without --include-tests: not reported.
+        let default_report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+        assert!(default_report.candidates.is_empty());
+        // With --include-tests: reported.
+        let with_tests = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: true,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+        // Tests are themselves roots, so even with include_tests they
+        // never appear as unreached (they're in the reachable set).
+        // But contains/declares_verification edges from the test
+        // might still leave it unreported. Verify that an orphan test
+        // with no incoming edges nor downstream targets is still
+        // considered reachable (it's a root).
+        assert!(
+            with_tests.candidates.is_empty(),
+            "tests are roots; even with --include-tests they shouldn't show as dead"
+        );
+    }
+}

@@ -11,6 +11,7 @@ pub mod connect;
 pub mod context_pack;
 pub mod dart_indexer;
 pub mod dart_sidecar;
+pub mod dead_code;
 pub mod docs_indexer;
 pub mod export;
 pub mod git_diff;
@@ -41,6 +42,10 @@ pub use connect::{
 };
 pub use context_pack::{
     build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
+};
+pub use dead_code::{
+    analyze_dead_code, analyze_dead_code_with_store, DeadCodeCandidate, DeadCodeConfidence,
+    DeadCodeOptions, DeadCodeReport, DeadCodeStats, DEAD_CODE_SCHEMA_VERSION,
 };
 pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};

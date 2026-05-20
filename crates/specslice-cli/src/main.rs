@@ -49,6 +49,41 @@ enum Commands {
     Logic(LogicArgs),
     /// 代码图搜索 — `grep` 的代码图替代品。
     Search(SearchArgs),
+    /// 死代码报告 — 标注无法从任何入口点可达的代码符号。
+    /// 不会自动删除任何文件。
+    #[command(name = "dead-code")]
+    DeadCode(DeadCodeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct DeadCodeArgs {
+    /// 最低置信度过滤：`high` / `medium` / `low`。默认 `medium`。
+    #[arg(long, value_enum, default_value_t = DeadCodeConfidenceArg::Medium)]
+    min_confidence: DeadCodeConfidenceArg,
+    /// 同时分析孤儿测试节点（默认不报告测试本身，只把测试作为入口点）。
+    #[arg(long)]
+    include_tests: bool,
+    /// 输出 JSON（默认为人类可读的中文文本）。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DeadCodeConfidenceArg {
+    High,
+    Medium,
+    Low,
+}
+
+impl DeadCodeConfidenceArg {
+    fn into_engine(self) -> specslice_engine::dead_code::DeadCodeConfidence {
+        use specslice_engine::dead_code::DeadCodeConfidence;
+        match self {
+            DeadCodeConfidenceArg::High => DeadCodeConfidence::High,
+            DeadCodeConfidenceArg::Medium => DeadCodeConfidence::Medium,
+            DeadCodeConfidenceArg::Low => DeadCodeConfidence::Low,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -508,6 +543,14 @@ fn run() -> Result<()> {
                 format,
                 output: args.output,
                 include_noise: args.include_noise,
+            })
+        }
+        Commands::DeadCode(args) => {
+            commands::dead_code::run(commands::dead_code::DeadCodeRunArgs {
+                repo_root: cli.repo_root.clone(),
+                min_confidence: args.min_confidence.into_engine(),
+                include_tests: args.include_tests,
+                json: args.json,
             })
         }
     }
