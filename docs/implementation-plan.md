@@ -14,6 +14,46 @@ MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart
 - 人工确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询、反查和审阅。
 - 图浏览能否帮助用户快速理解目标仓库的真实代码逻辑，并明确区分事实、候选、确认关系和风险。
 
+## 产品工作流
+
+SpecSlice 的产品体验不是让用户手写业务逻辑与代码的映射，也不是用规则从文件名、标题、注释或命名约定里猜业务含义。产品闭环应当是：
+
+1. **代码图生成事实。** SpecSlice 只用确定性索引器生成文档段落、Dart 符号、测试、调用、Provider、路由、持久化、Stream 等事实节点和事实边。
+2. **AI 生成业务候选。** AI 读取代码图、文档事实和测试事实，把多个事实组织成中文自然语言业务逻辑描述，并附上 evidence、可信度和未能证明的问题。
+3. **人工确认业务含义。** 用户看到的是自然语言确认稿，而不是原始 artifact id 或 YAML。用户可以逐条选择确认、拒绝、补充或暂缓。
+4. **确认后进入 confirmed graph。** 只有人工确认后的候选才会写入 `.specslice/requirements.yaml` 或 `.specslice/links.yaml`，并进入 confirmed graph。AI 候选默认不参与 `slice`、`context`、`impact` 的可信链路。
+5. **问题转为测试或澄清。** 如果候选缺少测试、缺少业务文档、无法判断产品意图，系统应以“需要补充的问题”呈现，而不是把候选当作错误或事实。
+
+确认界面的核心输出必须是中文自然语言，例如：
+
+```text
+编辑器会从项目库加载项目，编辑像素或图层后进入防抖保存；撤销/重做使用最多 100 条历史快照。
+建议：可以确认。真实 App 生命周期暂停/恢复仍建议补测试。
+```
+
+原始 evidence 只作为可展开的依据展示，用于审计 AI 为什么得出这条业务描述；它不应成为用户确认业务含义的主要交互方式。
+
+### 人工确认结果的产品语义
+
+人工确认不是“用户手写链接”，而是用户对 AI 根据代码图生成的业务描述做产品判断。确认结果应支持四类闭环：
+
+- `accepted`：业务描述符合产品意图，可以进入 confirmed graph。
+- `rejected`：业务描述不符合产品意图，保留为被拒绝候选，避免下次重复提出。
+- `needs_changes`：业务方向成立，但需要补测试、补产品边界或补实现；不能进入 confirmed graph。
+- `pending`：用户需要更多解释，或还有外部配置、商店后台、设备行为等代码图无法证明的信息。
+
+AI candidate 代理可以做的事：
+
+- 根据代码图和测试图生成中文业务描述、证据、可信度、风险和待确认问题。
+- 根据用户自然语言反馈更新候选审阅状态，例如“这项没问题”“需要补测试”“这里不是三类而是两类”。
+- 把“需要补测试”的项转成 TDD 任务，测试通过后再建议用户确认。
+
+AI candidate 代理不能做的事：
+
+- 不能把 `proposed` 候选直接标成 confirmed business rule。
+- 不能要求用户在业务代码、业务文档或测试中加入 SpecSlice 注解。
+- 不能把文件名、标题、注释或命名相似度当作业务关联真相；这些只能作为 AI 解释候选时的弱信号。
+
 ## 非侵入式约束
 
 - 业务代码、业务测试、业务文档默认只读扫描。
@@ -502,7 +542,7 @@ specslice graph --format html --view business
 
 ### P9：AI 业务候选层 ✅ 落地
 
-**目标：** AI 可以把文档/代码/测试事实组织成业务逻辑候选，但必须保持候选态。
+**目标：** AI 可以把文档/代码/测试事实组织成中文自然语言业务逻辑候选，但必须保持候选态，等待人工确认。
 
 **已落地：**
 
@@ -510,11 +550,20 @@ specslice graph --format html --view business
 - Graph 将候选节点和 `derives_from` evidence 边渲染为 Candidate layer。
 - 候选引用不存在时输出 warning finding。
 
+**产品确认流：**
+
+- 输入：代码图中的事实节点和事实边，包括 `calls`、`references`、`reads_provider`、`persists_to`、`navigates_to`、`subscribes_stream`、测试节点和 DocSection。
+- AI 输出：面向用户的中文业务描述、建议动作（确认 / 拒绝 / 补充 / 暂缓）、可信度、open questions、evidence。
+- 用户确认：用户只需要判断自然语言描述是否符合真实产品设计，不需要手写 `.specslice/links.yaml`，也不需要人工初始标注代码关系。
+- 系统写入：被用户确认的候选才能转成外置 confirmed requirement/link；未确认候选继续停留在 `.specslice/candidates/`。
+- 风险呈现：测试不足、产品边界不清、外部配置不可见、设备/商店行为不可证明等，应进入补充问题或风险提示，而不是自动失败。
+
 **边界：**
 
 - 候选不进入 confirmed graph。
 - `slice` / `context` / `impact` 默认不信任 candidate。
 - 人工确认后才写入 `.specslice/links.yaml` 或 `.specslice/requirements.yaml`。
+- `status: proposed` 表示 AI 生成且 evidence 可解析；`status: confirmed` 只能表示人工已确认，不允许用“AI/Codex 已审阅”冒充人工确认。
 
 ## 当前收口状态
 

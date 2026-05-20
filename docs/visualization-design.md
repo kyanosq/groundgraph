@@ -45,6 +45,15 @@ Required interactions:
 - For method/handler focus, preserve immediate code facts and important semantic context such as provider reads, stream subscriptions, navigation, and persistence.
 - Show empty states clearly, especially “No confirmed business logic yet”.
 
+Candidate confirmation UX:
+
+- Candidate nodes must show a concise natural-language business description first; evidence ids are secondary and expandable.
+- For Chinese users, the review surface should be able to present Chinese confirmation copy such as “建议确认 / 建议暂缓 / 需要补充问题”.
+- The UI should separate four states: AI-proposed candidate, product-owner accepted business logic, rejected candidate, and needs-changes candidate.
+- Needs-changes items should show the requested closure action first, for example “补首页项目生命周期测试” or “列出并确认 Pro 付费项目”.
+- Accept/reject actions are future interactive workflow; until then, generated HTML remains read-only and should point users to the review decision artifact.
+- A candidate with resolvable evidence is not a confirmed business rule. Visual wording must not imply product correctness until a human accepts it.
+
 Visual encoding:
 
 | Type | Shape | Color | Edge Style |
