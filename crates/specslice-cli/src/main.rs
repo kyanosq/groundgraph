@@ -47,6 +47,8 @@ enum Commands {
     Candidate(CandidateArgs),
     /// 输出业务逻辑可信度报告（confirmed / candidate / stale / missing 等）。
     Logic(LogicArgs),
+    /// 代码图搜索 — `grep` 的代码图替代品。
+    Search(SearchArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -203,6 +205,40 @@ struct LogicArgs {
     /// 仅列出存在风险 (非 confirmed_link) 的条目。
     #[arg(long)]
     only_risks: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SearchArgs {
+    /// 自由文本查询（关键词）。与 `--code` / `--file` 互斥。
+    query: Option<String>,
+    /// 代码片段输入：从中确定性地提取 identifier / 字符串 / 路径段
+    /// 作为关键词（CLI 不做 AI 扩词）。
+    #[arg(long)]
+    code: Option<String>,
+    /// 精确位置入口：文件路径（配合 `--line`）。
+    #[arg(long)]
+    file: Option<String>,
+    /// 精确位置入口：行号。
+    #[arg(long)]
+    line: Option<u32>,
+    /// 子图扩展跳数（默认 1）。0 表示只返回命中节点。
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
+    /// 直接命中数上限（不影响 1-hop 邻居数量）。
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+    /// 按节点种类过滤命中。可重复或逗号分隔：
+    /// `--kind method,class,test`。同时接受 `dart_method` / `method`
+    /// 等别名。
+    #[arg(long, value_delimiter = ',')]
+    kind: Vec<String>,
+    /// 输出 JSON（默认为人类可读的中文文本）。
+    #[arg(long)]
+    json: bool,
+    /// 保留 framework 噪声 calls（toString / build / dispose / …）。
+    /// 默认过滤。
+    #[arg(long)]
+    include_noise: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -426,6 +462,18 @@ fn run() -> Result<()> {
             include_candidates: args.include_candidates,
             max_nodes: args.max_nodes,
             pretty: args.pretty,
+            include_noise: args.include_noise,
+        }),
+        Commands::Search(args) => commands::search::run(commands::search::SearchRunArgs {
+            repo_root: cli.repo_root.clone(),
+            query: args.query,
+            code: args.code,
+            file: args.file,
+            line: args.line,
+            depth: args.depth,
+            limit: args.limit,
+            kinds: args.kind,
+            json: args.json,
             include_noise: args.include_noise,
         }),
     }

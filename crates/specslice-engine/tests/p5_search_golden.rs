@@ -1,0 +1,362 @@
+//! P5 — `specslice search` golden regression against PixCraft fixture.
+//!
+//! Three high-value smoke surfaces:
+//!   1. Keyword search `purchase` must find paywall / pro / candidate
+//!      nodes and produce match_reasons.
+//!   2. `--code` snippet input extracts deterministic tokens and finds
+//!      the same surface without the operator having to know the
+//!      identifier exactly.
+//!   3. `--file --line` resolves to the enclosing symbol and the
+//!      result includes a `graph_commands` follow-up.
+//!
+//! Skips when the Dart SDK or the sidecar source isn't available — the
+//! search results depend on the index produced by the sidecar.
+
+use std::path::PathBuf;
+
+use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
+use specslice_engine::init::{init_repository, InitOptions};
+use specslice_engine::search::{
+    run_search_with_store, SearchOptions, SearchQuery, SCORE_EXACT_ID, SCORE_NAME_TOKEN,
+    SCORE_PATH_SEGMENT,
+};
+
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests/fixtures/pixcraft_iap")
+}
+
+fn workspace_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn copy_fixture_into(dst: &std::path::Path) {
+    let src = fixture_path();
+    for entry in walkdir::WalkDir::new(&src) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&src).unwrap();
+        let target = dst.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(entry.path(), &target).unwrap();
+    }
+}
+
+fn dart_available() -> bool {
+    std::process::Command::new("dart")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn sidecar_source_present() -> bool {
+    workspace_dir()
+        .join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart")
+        .exists()
+}
+
+struct EnvGuard {
+    key: String,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &str, value: Option<&str>) -> Self {
+        let prev = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        Self {
+            key: key.into(),
+            prev,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(p) => std::env::set_var(&self.key, p),
+            None => std::env::remove_var(&self.key),
+        }
+    }
+}
+
+fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
+    if !sidecar_source_present() || !dart_available() {
+        eprintln!("skipping: dart sidecar unavailable");
+        return None;
+    }
+    let on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
+    let sidecar_abs =
+        workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
+    let bin = EnvGuard::set(
+        "SPECSLICE_DART_ANALYZER_BIN",
+        Some(&format!("dart run {}", sidecar_abs.display())),
+    );
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repository(InitOptions {
+        repo_root: tmp.path().into(),
+    })
+    .unwrap();
+    copy_fixture_into(tmp.path());
+
+    let mut store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    store.migrate().unwrap();
+    let result = index_dart(
+        &mut store,
+        &DartIndexOptions {
+            repo_root: tmp.path().into(),
+            code_roots: vec!["lib".into(), "test".into()],
+            exclude_globs: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result.resolver_used, RESOLVER_DART_ANALYZER,
+        "P5 search golden requires sidecar resolver"
+    );
+    Some((tmp, on, bin))
+}
+
+#[test]
+fn p5_keyword_search_purchase_surfaces_paywall_and_pro_with_reasons() {
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    let result = run_search_with_store(
+        &store,
+        SearchOptions {
+            repo_root: tmp.path().into(),
+            query: SearchQuery::Keywords("purchase".into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        },
+    )
+    .unwrap();
+
+    // Tokenisation: `purchase` deduped to a single token.
+    assert_eq!(result.tokens, vec!["purchase"]);
+
+    // Direct matches must include at least one paywall/pro symbol and
+    // a business_candidate node mentioning purchases.
+    let ids: Vec<&str> = result.matches.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.iter()
+            .any(|id| id.contains("PaywallScreen") && id.contains("listenToPurchaseUpdates")),
+        "expected PaywallScreen.listenToPurchaseUpdates hit; got {ids:?}"
+    );
+    assert!(
+        ids.iter()
+            .any(|id| id.contains("ProNotifier") && id.contains("applyPurchase")),
+        "expected ProNotifier.applyPurchase hit; got {ids:?}"
+    );
+    assert!(
+        ids.iter()
+            .any(|id| id.contains("business_candidate::complete_purchase_unlocks_pro")),
+        "expected the accepted candidate to be searchable too; got {ids:?}"
+    );
+
+    // Every hit must come with explanation.
+    for m in &result.matches {
+        assert!(
+            !m.match_reasons.is_empty(),
+            "every match must carry match_reasons, got empty for {}",
+            m.id
+        );
+    }
+
+    // The top hit scores must be at least one full name-token bucket
+    // — otherwise the search ranking is mis-tuned.
+    let top_score = result.matches.first().map(|m| m.score).unwrap_or(0);
+    assert!(
+        top_score >= SCORE_NAME_TOKEN,
+        "top score too weak: {top_score}"
+    );
+
+    // graph_commands must focus on the top hit so the agent / human
+    // has a paste-ready follow-up.
+    assert!(
+        !result.graph_commands.is_empty(),
+        "graph_commands must include a focus suggestion"
+    );
+    let top_id = &result.matches[0].id;
+    assert!(
+        result.graph_commands[0].contains(top_id),
+        "graph_commands should focus on top hit {top_id}; got {:?}",
+        result.graph_commands
+    );
+
+    // Subgraph must include at least one calls / persists_to / reads_provider
+    // edge for the PaywallScreen.listenToPurchaseUpdates anchor — that's
+    // the whole reason the search is graph-aware.
+    let edge_kinds: std::collections::BTreeSet<&str> = result
+        .subgraph
+        .edges
+        .iter()
+        .map(|e| e.kind.as_str())
+        .collect();
+    assert!(
+        edge_kinds.contains("calls")
+            || edge_kinds.contains("persists_to")
+            || edge_kinds.contains("reads_provider"),
+        "subgraph must expose at least one semantic edge; got {edge_kinds:?}"
+    );
+}
+
+#[test]
+fn p5_code_snippet_input_finds_targets_via_deterministic_token_extraction() {
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    let snippet = r#"
+        // Imagine the operator pasted this fragment from a code review:
+        proNotifier.applyPurchase(productId);
+        Hive.box("pro_entitlement").put("entitled", true);
+    "#;
+    let result = run_search_with_store(
+        &store,
+        SearchOptions {
+            repo_root: tmp.path().into(),
+            query: SearchQuery::Code(snippet.into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        },
+    )
+    .unwrap();
+
+    // Deterministic tokens — must contain identifier + sub-tokens AND
+    // the string-literal contents (storage bucket key).
+    assert!(
+        result.tokens.iter().any(|t| t == "applypurchase"),
+        "code tokeniser must keep `applyPurchase`; got {:?}",
+        result.tokens
+    );
+    assert!(
+        result.tokens.iter().any(|t| t == "pro_entitlement"),
+        "code tokeniser must extract string-literal bucket name; got {:?}",
+        result.tokens
+    );
+
+    let ids: Vec<&str> = result.matches.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.iter()
+            .any(|id| id.contains("ProNotifier") && id.contains("applyPurchase")),
+        "code-snippet input must locate ProNotifier.applyPurchase; got {ids:?}"
+    );
+    // Storage bucket synthetic node should be findable via string-literal.
+    assert!(
+        ids.contains(&"storage::hive::pro_entitlement"),
+        "code-snippet input must find the synthetic storage bucket; got {ids:?}"
+    );
+}
+
+#[test]
+fn p5_file_line_input_resolves_to_enclosing_symbol() {
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    // Find the actual line range of PaywallScreen.listenToPurchaseUpdates
+    // in the index so the test stays robust against fixture line drift.
+    let ranges = store
+        .list_symbol_ranges_for_file("lib/features/paywall/paywall_screen.dart")
+        .unwrap();
+    let target = ranges
+        .iter()
+        .find(|r| r.qualified_name.contains("listenToPurchaseUpdates"))
+        .expect("fixture must define PaywallScreen.listenToPurchaseUpdates");
+    let probe_line = target.start_line + 1;
+
+    let result = run_search_with_store(
+        &store,
+        SearchOptions {
+            repo_root: tmp.path().into(),
+            query: SearchQuery::Position {
+                path: "lib/features/paywall/paywall_screen.dart".into(),
+                line: probe_line,
+            },
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        },
+    )
+    .unwrap();
+
+    let top = &result.matches[0];
+    assert_eq!(top.score, SCORE_EXACT_ID);
+    assert!(
+        top.id.contains("listenToPurchaseUpdates"),
+        "position search must resolve to enclosing symbol; got {}",
+        top.id
+    );
+    assert!(
+        top.match_reasons.iter().any(|r| r.starts_with("symbol at")),
+        "must explain how the symbol was resolved; got {:?}",
+        top.match_reasons
+    );
+    assert!(
+        !result.graph_commands.is_empty(),
+        "must seed a graph_commands focus on the enclosing symbol"
+    );
+}
+
+#[test]
+fn p5_path_segment_match_scores_above_weak_substring() {
+    // Sanity for the scoring contract: a path-segment hit must
+    // out-rank a weak substring hit so operators searching for a
+    // module name go to the module first.
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    let result = run_search_with_store(
+        &store,
+        SearchOptions {
+            repo_root: tmp.path().into(),
+            query: SearchQuery::Keywords("paywall".into()),
+            depth: 0,
+            kinds: Vec::new(),
+            limit: 50,
+            include_noise: false,
+        },
+    )
+    .unwrap();
+    // Highest-scoring match must have a path-segment reason.
+    let top = result.matches.first().expect("paywall must have hits");
+    assert!(
+        top.match_reasons
+            .iter()
+            .any(|r| r.contains("path contains segment `paywall`")),
+        "top paywall hit must come from a path-segment match; got {:?}",
+        top.match_reasons
+    );
+    assert!(top.score >= SCORE_PATH_SEGMENT);
+}

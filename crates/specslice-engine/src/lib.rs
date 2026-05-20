@@ -20,6 +20,7 @@ pub mod index;
 pub mod init;
 pub mod links_indexer;
 pub mod logic_confidence;
+pub mod search;
 pub mod slice;
 
 pub use business_candidates::{
@@ -57,5 +58,11 @@ pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_
 pub use logic_confidence::{
     compute_logic_confidence, run_logic_confidence, LogicConfidenceItem, LogicConfidenceKind,
     LogicConfidenceOptions, LogicConfidenceReport, LogicConfidenceSource, LogicConfidenceSummary,
+};
+pub use search::{
+    default_search_kinds, run_search, run_search_with_store, tokenise_code, tokenise_keywords,
+    SearchEdge, SearchMatch, SearchNode, SearchOptions, SearchQuery, SearchResult, SearchSubgraph,
+    DEFAULT_DEPTH as SEARCH_DEFAULT_DEPTH, DEFAULT_LIMIT as SEARCH_DEFAULT_LIMIT,
+    EXPANSION_EDGE_KINDS as SEARCH_EXPANSION_EDGE_KINDS,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
