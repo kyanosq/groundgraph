@@ -11,4 +11,5 @@ pub mod index;
 pub mod init;
 pub mod logic;
 pub mod search;
+pub mod search_html;
 pub mod slice;

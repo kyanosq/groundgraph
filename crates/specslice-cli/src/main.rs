@@ -232,13 +232,38 @@ struct SearchArgs {
     /// 等别名。
     #[arg(long, value_delimiter = ',')]
     kind: Vec<String>,
-    /// 输出 JSON（默认为人类可读的中文文本）。
+    /// 输出格式：`text`（默认）/ `json` / `html`。
+    /// HTML 是搜索驱动的单文件阅读器。
+    #[arg(long, value_enum, default_value_t = SearchFormatArg::Text)]
+    format: SearchFormatArg,
+    /// 兼容别名 — 等价于 `--format json`。
     #[arg(long)]
     json: bool,
+    /// `--format html` 的输出文件路径。默认写到
+    /// `<repo_root>/.specslice/export/search-<slug>.html`。
+    #[arg(long)]
+    output: Option<PathBuf>,
     /// 保留 framework 噪声 calls（toString / build / dispose / …）。
     /// 默认过滤。
     #[arg(long)]
     include_noise: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SearchFormatArg {
+    Text,
+    Json,
+    Html,
+}
+
+impl SearchFormatArg {
+    fn into_command_format(self) -> commands::search::SearchFormat {
+        match self {
+            SearchFormatArg::Text => commands::search::SearchFormat::Text,
+            SearchFormatArg::Json => commands::search::SearchFormat::Json,
+            SearchFormatArg::Html => commands::search::SearchFormat::Html,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -464,17 +489,26 @@ fn run() -> Result<()> {
             pretty: args.pretty,
             include_noise: args.include_noise,
         }),
-        Commands::Search(args) => commands::search::run(commands::search::SearchRunArgs {
-            repo_root: cli.repo_root.clone(),
-            query: args.query,
-            code: args.code,
-            file: args.file,
-            line: args.line,
-            depth: args.depth,
-            limit: args.limit,
-            kinds: args.kind,
-            json: args.json,
-            include_noise: args.include_noise,
-        }),
+        Commands::Search(args) => {
+            // `--json` legacy flag wins when explicit; otherwise honour `--format`.
+            let format = if args.json {
+                commands::search::SearchFormat::Json
+            } else {
+                args.format.into_command_format()
+            };
+            commands::search::run(commands::search::SearchRunArgs {
+                repo_root: cli.repo_root.clone(),
+                query: args.query,
+                code: args.code,
+                file: args.file,
+                line: args.line,
+                depth: args.depth,
+                limit: args.limit,
+                kinds: args.kind,
+                format,
+                output: args.output,
+                include_noise: args.include_noise,
+            })
+        }
     }
 }

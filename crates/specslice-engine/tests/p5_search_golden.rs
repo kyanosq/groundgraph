@@ -14,11 +14,12 @@
 
 use std::path::PathBuf;
 
+use specslice_engine::business_candidates::{apply_review, ReviewStatus, ReviewVerdict};
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::init::{init_repository, InitOptions};
 use specslice_engine::search::{
-    run_search_with_store, SearchOptions, SearchQuery, SCORE_EXACT_ID, SCORE_NAME_TOKEN,
-    SCORE_PATH_SEGMENT,
+    compute_search_html_payload, run_search_with_store, SearchOptions, SearchQuery, SCORE_EXACT_ID,
+    SCORE_NAME_TOKEN, SCORE_PATH_SEGMENT,
 };
 
 fn fixture_path() -> PathBuf {
@@ -359,4 +360,113 @@ fn p5_path_segment_match_scores_above_weak_substring() {
         top.match_reasons
     );
     assert!(top.score >= SCORE_PATH_SEGMENT);
+}
+
+#[test]
+fn p6_html_payload_for_purchase_keeps_canvas_readable_and_carries_business_signals() {
+    // P6.5 验收：搜 "purchase" 后，HTML payload 必须满足：
+    //   1. 至少给出 PaywallScreen.listenToPurchaseUpdates 的焦点卡片
+    //   2. 焦点画布 ≤25 节点（与设计约束一致），可读性能在 30 秒内被人理解
+    //   3. 焦点卡里能看到 calls / persists_to / declares_verification 等业务边
+    //   4. 已 accepted 的 complete_purchase_unlocks_pro 候选作为卡片直接渲染
+    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+        return;
+    };
+
+    // 真实场景：人工已经在 candidate review 里把
+    // complete_purchase_unlocks_pro 标为 accepted，HTML 阅读器要能
+    // 把这条事实展示为「已确认业务候选」。
+    apply_review(
+        tmp.path(),
+        "complete_purchase_unlocks_pro",
+        ReviewVerdict {
+            status: ReviewStatus::Accepted,
+            reviewer: Some("p6-golden".into()),
+            note: Some("HTML reader golden — accepted at test time".into()),
+            answered_questions: vec![],
+            reviewed_at: None,
+        },
+    )
+    .unwrap();
+
+    let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
+    let result = run_search_with_store(
+        &store,
+        SearchOptions {
+            repo_root: tmp.path().into(),
+            query: SearchQuery::Keywords("purchase".into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        },
+    )
+    .unwrap();
+    let payload = compute_search_html_payload(&result, tmp.path(), 25);
+    assert_eq!(payload.schema_version, 1);
+    assert!(
+        !payload.focus_cards.is_empty(),
+        "payload must contain focus cards"
+    );
+
+    // (1) 找到 listenToPurchaseUpdates 的焦点卡片。
+    let paywall_card = payload
+        .focus_cards
+        .iter()
+        .find(|c| c.match_id.contains("PaywallScreen.listenToPurchaseUpdates"))
+        .expect("listenToPurchaseUpdates focus card must exist");
+    // (2) 画布严守 ≤25 节点。
+    assert!(
+        paywall_card.focused.nodes.len() <= 25,
+        "P6 budget: focused canvas must be ≤25 nodes, got {}",
+        paywall_card.focused.nodes.len()
+    );
+    // (3) 必须能直接读到关键业务边：calls + (persists_to or navigates_to + reads_provider 至少一种)
+    let edge_kinds: std::collections::BTreeSet<&str> = paywall_card
+        .edge_groups
+        .keys()
+        .map(|s| s.as_str())
+        .collect();
+    assert!(
+        edge_kinds.contains("calls"),
+        "PaywallScreen focus card must surface at least one calls edge; got {edge_kinds:?}"
+    );
+    assert!(
+        edge_kinds.contains("persists_to")
+            || edge_kinds.contains("reads_provider")
+            || edge_kinds.contains("navigates_to")
+            || edge_kinds.contains("subscribes_stream"),
+        "PaywallScreen focus card must surface a business-semantic edge; got {edge_kinds:?}"
+    );
+    // (3') 候选证据边 derives_from 不能因为 noise filter 被吞掉。
+    assert!(
+        payload
+            .focus_cards
+            .iter()
+            .any(|c| c.edge_groups.contains_key("derives_from")),
+        "至少一个焦点卡片应当展示 candidate derives_from 证据边"
+    );
+
+    // (4) 已 accepted 的业务候选卡片要被独立 render。
+    let candidate_card = payload
+        .focus_cards
+        .iter()
+        .find(|c| c.match_id == "business_candidate::complete_purchase_unlocks_pro")
+        .expect("accepted candidate must appear as a focus card");
+    let details = candidate_card
+        .candidate
+        .as_ref()
+        .expect("candidate card must carry description payload");
+    assert_eq!(details.status, "accepted");
+    assert!(
+        candidate_card.badge.contains("已确认"),
+        "accepted candidate badge must be Chinese-readable: {}",
+        candidate_card.badge
+    );
+    // 候选卡片画布也应当 ≤25 节点。
+    assert!(
+        candidate_card.focused.nodes.len() <= 25,
+        "candidate focus card canvas must respect the budget, got {}",
+        candidate_card.focused.nodes.len()
+    );
 }

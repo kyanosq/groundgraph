@@ -12,12 +12,28 @@
 //! Output mode: `--json` for machine consumption (default is a
 //! human-friendly text rendering).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use specslice_core::NodeKind;
-use specslice_engine::search::{run_search, SearchOptions, SearchQuery, SearchResult};
+use specslice_engine::search::{
+    compute_search_html_payload, run_search, SearchOptions, SearchQuery, SearchResult,
+    HTML_DEFAULT_FOCUS_BUDGET,
+};
 use specslice_engine::{default_search_kinds, SEARCH_DEFAULT_DEPTH, SEARCH_DEFAULT_LIMIT};
+
+use crate::commands::search_html;
+
+/// Output mode selected on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFormat {
+    /// Human-readable Chinese text (default).
+    Text,
+    /// JSON for agents / scripts.
+    Json,
+    /// Self-contained search-driven HTML reader.
+    Html,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchRunArgs {
@@ -29,7 +45,11 @@ pub struct SearchRunArgs {
     pub depth: usize,
     pub limit: usize,
     pub kinds: Vec<String>,
-    pub json: bool,
+    pub format: SearchFormat,
+    /// File to write `Html` output to. When `None`, HTML lands in
+    /// `<repo_root>/.specslice/export/search-<slug>.html`. JSON / Text
+    /// always go to stdout.
+    pub output: Option<PathBuf>,
     pub include_noise: bool,
 }
 
@@ -45,15 +65,70 @@ pub fn run(args: SearchRunArgs) -> Result<()> {
         include_noise: args.include_noise,
     };
     let result = run_search(options).context("running search")?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).context("serialising search result")?
-        );
-    } else {
-        print_human(&result);
+    match args.format {
+        SearchFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).context("serialising search result")?
+            );
+        }
+        SearchFormat::Text => print_human(&result),
+        SearchFormat::Html => {
+            let payload =
+                compute_search_html_payload(&result, &args.repo_root, HTML_DEFAULT_FOCUS_BUDGET);
+            let html = search_html::render_html(&payload).context("rendering search HTML")?;
+            let out_path = resolve_html_output(&args.repo_root, &args.output, &result)?;
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating output directory {}", parent.display()))?;
+            }
+            std::fs::write(&out_path, html)
+                .with_context(|| format!("writing HTML to {}", out_path.display()))?;
+            println!("HTML 已生成: {}", out_path.display());
+        }
     }
     Ok(())
+}
+
+fn resolve_html_output(
+    repo_root: &Path,
+    requested: &Option<PathBuf>,
+    result: &SearchResult,
+) -> Result<PathBuf> {
+    if let Some(p) = requested {
+        if p.is_absolute() {
+            return Ok(p.clone());
+        }
+        return Ok(repo_root.join(p));
+    }
+    let slug = slugify(&result.query);
+    let name = if slug.is_empty() {
+        "search.html".to_string()
+    } else {
+        format!("search-{slug}.html")
+    };
+    Ok(repo_root.join(".specslice/export").join(name))
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > 40 {
+        out.truncate(40);
+    }
+    out
 }
 
 fn pick_query(args: &SearchRunArgs) -> Result<SearchQuery> {

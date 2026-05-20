@@ -167,6 +167,97 @@ pub struct SearchEdge {
 }
 
 // ---------------------------------------------------------------------------
+// HTML payload — search-driven reader view (P6.1–P6.5)
+// ---------------------------------------------------------------------------
+
+/// Default canvas budget per focus card. The user explicitly asked for
+/// "≤ 25 visible nodes" so an operator can read the local subgraph in
+/// 30 seconds.
+pub const HTML_DEFAULT_FOCUS_BUDGET: usize = 25;
+
+/// Bundle that drives `specslice search --format html`. Schema is
+/// versioned so the HTML JS payload contract is explicit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHtmlPayload {
+    pub schema_version: u32,
+    pub query: String,
+    pub tokens: Vec<String>,
+    pub matches_total: usize,
+    pub focus_cards: Vec<SearchFocusCard>,
+    pub graph_commands: Vec<String>,
+}
+
+/// One focus card per match (sorted by score). The HTML left rail
+/// shows these as a ranked list; selecting one swaps the centre canvas
+/// to the card's `focused` subgraph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchFocusCard {
+    pub match_id: String,
+    pub label: String,
+    pub kind: String,
+    pub path: Option<String>,
+    pub line_range: Option<(u32, u32)>,
+    pub score: i32,
+    pub source: Option<String>,
+    pub match_reasons: Vec<String>,
+    /// Human label shown on the card chip — e.g. `代码方法`,
+    /// `已确认业务候选`, `测试`.
+    pub badge: String,
+    /// For business_candidate matches only: the AI-authored
+    /// description so the right rail can render it as a card.
+    pub candidate: Option<SearchCandidateDetails>,
+    /// Edges where the match is the *destination*.
+    pub upstream: Vec<SearchEdgeInspector>,
+    /// Edges where the match is the *origin*.
+    pub downstream: Vec<SearchEdgeInspector>,
+    /// Tests pointing at the match (via `declares_verification`).
+    pub tests: Vec<SearchTestRef>,
+    /// Subgraph rendered on the canvas when this card is selected.
+    /// Capped at `HTML_DEFAULT_FOCUS_BUDGET` nodes.
+    pub focused: SearchSubgraph,
+    /// Histogram of edges by `kind` so the inspector can show
+    /// "calls: 3 · references: 2 · persists_to: 1".
+    pub edge_groups: BTreeMap<String, usize>,
+    /// `true` when the focus subgraph was trimmed to fit the budget.
+    pub focus_truncated: bool,
+    /// How many neighbours were dropped from the canvas (always
+    /// `0` when `focus_truncated` is false).
+    pub focus_hidden_count: usize,
+}
+
+/// Inspector row: one neighbour reached via one edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchEdgeInspector {
+    pub edge_id: String,
+    pub edge_kind: String,
+    pub neighbor_id: String,
+    pub neighbor_label: String,
+    pub neighbor_kind: String,
+    pub neighbor_path: Option<String>,
+    pub source_file: Option<String>,
+    pub line_range: Option<(u32, u32)>,
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTestRef {
+    pub id: String,
+    pub label: String,
+    pub path: Option<String>,
+    pub line_range: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchCandidateDetails {
+    pub status: String,
+    pub confidence: Option<f32>,
+    pub description: String,
+    pub risks: Vec<String>,
+    pub recommendation: Option<String>,
+    pub open_questions: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Default kind set + edge kinds for expansion
 // ---------------------------------------------------------------------------
 
@@ -256,7 +347,8 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
         matches.truncate(limit);
     }
 
-    let subgraph = expand_subgraph(store, &matches, options.depth, options.include_noise)?;
+    let mut subgraph = expand_subgraph(store, &matches, options.depth, options.include_noise)?;
+    merge_candidate_evidence_edges(&mut subgraph, &options.repo_root);
     let graph_commands = build_graph_commands(&matches, &options.repo_root);
 
     Ok(SearchResult {
@@ -266,6 +358,352 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
         subgraph,
         graph_commands,
     })
+}
+
+/// Business candidates live in `business_logic.yaml` and emit
+/// `derives_from` edges only at graph-view time. The search store
+/// never sees those edges, so the focus subgraph would be missing the
+/// link "this code symbol is the evidence for candidate X" or
+/// vice-versa. We synthesise them here from the YAML so search /
+/// search-html / agents can see candidate evidence the same way the
+/// graph view does.
+fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Path) {
+    let candidates = match load_business_candidates(repo_root) {
+        Ok(o) => o.document.candidates,
+        Err(_) => return,
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let mut existing_node_ids: BTreeSet<String> =
+        subgraph.nodes.iter().map(|n| n.id.clone()).collect();
+    let mut existing_edge_ids: HashSet<String> =
+        subgraph.edges.iter().map(|e| e.id.clone()).collect();
+    for c in &candidates {
+        let candidate_id = crate::business_candidates::candidate_artifact_id(&c.id).to_string();
+        let candidate_in_subgraph = existing_node_ids.contains(&candidate_id);
+        // Find which evidence entries touch the current subgraph.
+        let touching_evidence: Vec<&String> = c
+            .evidence
+            .iter()
+            .filter(|ev| existing_node_ids.contains(ev.as_str()))
+            .collect();
+        if !candidate_in_subgraph && touching_evidence.is_empty() {
+            continue;
+        }
+        if !candidate_in_subgraph {
+            // Add a synthetic candidate node so focus cards for any
+            // code symbol can show "this is referenced by candidate X".
+            subgraph.nodes.push(SearchNode {
+                id: candidate_id.clone(),
+                kind: NodeKind::BusinessCandidate.as_str().into(),
+                label: c.name.clone(),
+                path: None,
+                line_range: None,
+            });
+            existing_node_ids.insert(candidate_id.clone());
+        }
+        let evidence_to_link: Vec<&String> = if candidate_in_subgraph {
+            c.evidence
+                .iter()
+                .filter(|ev| existing_node_ids.contains(ev.as_str()))
+                .collect()
+        } else {
+            touching_evidence
+        };
+        for ev in evidence_to_link {
+            let edge_id = format!("derives_from::{candidate_id}->{ev}");
+            if !existing_edge_ids.insert(edge_id.clone()) {
+                continue;
+            }
+            subgraph.edges.push(SearchEdge {
+                id: edge_id,
+                from: candidate_id.clone(),
+                to: ev.to_string(),
+                kind: "derives_from".into(),
+                source_file: None,
+                line_range: None,
+                snippet: None,
+            });
+        }
+    }
+    // Keep deterministic ordering for goldens.
+    subgraph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    subgraph.edges.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
+/// Build the search-driven HTML payload: a per-match focus card with
+/// trimmed canvas (≤ `focus_budget` nodes), edge inspectors, tests and
+/// candidate descriptions. Drives `specslice search --format html`.
+pub fn run_search_html(options: SearchOptions) -> Result<SearchHtmlPayload> {
+    let config = load_config(&options.repo_root)?;
+    let db_path = resolve_storage_path(&options.repo_root, &config);
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let repo_root = options.repo_root.clone();
+    let result = run_search_with_store(&store, options)?;
+    Ok(compute_search_html_payload(
+        &result,
+        &repo_root,
+        HTML_DEFAULT_FOCUS_BUDGET,
+    ))
+}
+
+/// Pure transform from a [`SearchResult`] (plus the repo root, for
+/// looking up business candidates) into the [`SearchHtmlPayload`] the
+/// HTML renderer consumes. Pulled out so unit tests can construct
+/// `SearchResult` fixtures directly without touching disk.
+pub fn compute_search_html_payload(
+    result: &SearchResult,
+    repo_root: &Path,
+    focus_budget: usize,
+) -> SearchHtmlPayload {
+    let budget = focus_budget.max(1);
+    let node_lookup: BTreeMap<&str, &SearchNode> = result
+        .subgraph
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n))
+        .collect();
+    let candidates_by_id: BTreeMap<String, crate::business_candidates::BusinessCandidate> =
+        load_business_candidates(repo_root)
+            .ok()
+            .map(|o| o.document.candidates)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                (
+                    crate::business_candidates::candidate_artifact_id(&c.id).to_string(),
+                    c,
+                )
+            })
+            .collect();
+
+    let mut focus_cards: Vec<SearchFocusCard> = Vec::with_capacity(result.matches.len());
+    for m in &result.matches {
+        focus_cards.push(build_focus_card(
+            m,
+            &result.subgraph,
+            &node_lookup,
+            &candidates_by_id,
+            budget,
+        ));
+    }
+    SearchHtmlPayload {
+        schema_version: 1,
+        query: result.query.clone(),
+        tokens: result.tokens.clone(),
+        matches_total: result.matches.len(),
+        focus_cards,
+        graph_commands: result.graph_commands.clone(),
+    }
+}
+
+fn build_focus_card(
+    m: &SearchMatch,
+    subgraph: &SearchSubgraph,
+    node_lookup: &BTreeMap<&str, &SearchNode>,
+    candidates: &BTreeMap<String, crate::business_candidates::BusinessCandidate>,
+    budget: usize,
+) -> SearchFocusCard {
+    // 1-hop edges where this match is one endpoint.
+    let mut upstream: Vec<SearchEdgeInspector> = Vec::new();
+    let mut downstream: Vec<SearchEdgeInspector> = Vec::new();
+    let mut tests: Vec<SearchTestRef> = Vec::new();
+
+    for e in &subgraph.edges {
+        if e.from == m.id {
+            if let Some(n) = node_lookup.get(e.to.as_str()) {
+                downstream.push(make_edge_inspector(e, n));
+            }
+        } else if e.to == m.id {
+            if let Some(n) = node_lookup.get(e.from.as_str()) {
+                if e.kind == "declares_verification"
+                    && (n.kind == "test_case" || n.kind == "test_group")
+                {
+                    tests.push(SearchTestRef {
+                        id: n.id.clone(),
+                        label: n.label.clone(),
+                        path: n.path.clone(),
+                        line_range: n.line_range,
+                    });
+                }
+                upstream.push(make_edge_inspector(e, n));
+            }
+        }
+    }
+    upstream.sort_by(|a, b| {
+        edge_priority(&b.edge_kind)
+            .cmp(&edge_priority(&a.edge_kind))
+            .then_with(|| a.neighbor_id.cmp(&b.neighbor_id))
+    });
+    downstream.sort_by(|a, b| {
+        edge_priority(&b.edge_kind)
+            .cmp(&edge_priority(&a.edge_kind))
+            .then_with(|| a.neighbor_id.cmp(&b.neighbor_id))
+    });
+    tests.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Cap canvas to `budget` nodes: anchor + highest-priority neighbours.
+    let mut neighbour_scores: BTreeMap<String, i32> = BTreeMap::new();
+    for e in &subgraph.edges {
+        let (anchor_side, other) = if e.from == m.id {
+            (true, &e.to)
+        } else if e.to == m.id {
+            (true, &e.from)
+        } else {
+            (false, &e.from)
+        };
+        if !anchor_side {
+            continue;
+        }
+        let p = edge_priority(&e.kind);
+        neighbour_scores
+            .entry(other.clone())
+            .and_modify(|cur| {
+                if p > *cur {
+                    *cur = p;
+                }
+            })
+            .or_insert(p);
+    }
+    let mut ranked: Vec<(String, i32)> = neighbour_scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let total_neighbours = ranked.len();
+    let keep = budget.saturating_sub(1); // anchor occupies one slot.
+    let truncated = ranked.len() > keep;
+    let hidden = ranked.len().saturating_sub(keep);
+    ranked.truncate(keep);
+    let mut keep_ids: BTreeSet<String> = ranked.into_iter().map(|(id, _)| id).collect();
+    keep_ids.insert(m.id.clone());
+
+    let mut focused_nodes: Vec<SearchNode> = Vec::new();
+    for id in &keep_ids {
+        if let Some(n) = node_lookup.get(id.as_str()) {
+            focused_nodes.push((*n).clone());
+        }
+    }
+    let mut focused_edges: Vec<SearchEdge> = subgraph
+        .edges
+        .iter()
+        .filter(|e| keep_ids.contains(&e.from) && keep_ids.contains(&e.to))
+        .cloned()
+        .collect();
+    focused_edges.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut edge_groups: BTreeMap<String, usize> = BTreeMap::new();
+    for e in &focused_edges {
+        *edge_groups.entry(e.kind.clone()).or_insert(0) += 1;
+    }
+
+    let candidate = candidates
+        .get(m.id.as_str())
+        .map(|c| SearchCandidateDetails {
+            status: c
+                .review_status()
+                .map(|s| match s {
+                    crate::business_candidates::ReviewStatus::Accepted => "accepted",
+                    crate::business_candidates::ReviewStatus::Rejected => "rejected",
+                    crate::business_candidates::ReviewStatus::NeedsChanges => "needs_changes",
+                    crate::business_candidates::ReviewStatus::Pending => "pending",
+                })
+                .unwrap_or("unreviewed")
+                .into(),
+            confidence: c.confidence,
+            description: c.description.clone(),
+            risks: c.risks.clone(),
+            recommendation: c.recommendation.clone(),
+            open_questions: c.open_questions.clone(),
+        });
+
+    let badge = badge_for(m, candidate.as_ref());
+
+    SearchFocusCard {
+        match_id: m.id.clone(),
+        label: m.label.clone(),
+        kind: m.kind.clone(),
+        path: m.path.clone(),
+        line_range: m.line_range,
+        score: m.score,
+        source: m.source.clone(),
+        match_reasons: m.match_reasons.clone(),
+        badge,
+        candidate,
+        upstream,
+        downstream,
+        tests,
+        focused: SearchSubgraph {
+            nodes: focused_nodes,
+            edges: focused_edges,
+        },
+        edge_groups,
+        focus_truncated: truncated,
+        focus_hidden_count: if truncated { hidden } else { 0 },
+    }
+    .with_total_neighbours_hint(total_neighbours)
+}
+
+fn make_edge_inspector(edge: &SearchEdge, neighbor: &SearchNode) -> SearchEdgeInspector {
+    SearchEdgeInspector {
+        edge_id: edge.id.clone(),
+        edge_kind: edge.kind.clone(),
+        neighbor_id: neighbor.id.clone(),
+        neighbor_label: neighbor.label.clone(),
+        neighbor_kind: neighbor.kind.clone(),
+        neighbor_path: neighbor.path.clone(),
+        source_file: edge.source_file.clone(),
+        line_range: edge.line_range,
+        snippet: edge.snippet.clone(),
+    }
+}
+
+/// Higher = more interesting for canvas selection. Mirrors the user's
+/// readability priorities ("tests > business semantic > calls/refs >
+/// contains > misc").
+fn edge_priority(kind: &str) -> i32 {
+    match kind {
+        "declares_verification" => 5,
+        "reads_provider" | "persists_to" | "navigates_to" | "subscribes_stream" => 4,
+        "derives_from" => 4,
+        "calls" | "references" => 3,
+        "contains" => 2,
+        _ => 1,
+    }
+}
+
+fn badge_for(m: &SearchMatch, candidate: Option<&SearchCandidateDetails>) -> String {
+    if let Some(c) = candidate {
+        return match c.status.as_str() {
+            "accepted" => "已确认业务候选".into(),
+            "rejected" => "已拒绝业务候选".into(),
+            "needs_changes" => "需修改的业务候选".into(),
+            "pending" => "待审业务候选".into(),
+            _ => "业务候选".into(),
+        };
+    }
+    match m.kind.as_str() {
+        "dart_method" => "代码方法".into(),
+        "dart_class" => "代码类".into(),
+        "dart_function" => "代码函数".into(),
+        "dart_constructor" => "构造器".into(),
+        "test_case" => "测试用例".into(),
+        "test_group" => "测试分组".into(),
+        "dart_provider" => "Riverpod Provider".into(),
+        "route" => "路由".into(),
+        "storage" => "存储".into(),
+        "doc_section" => "文档段".into(),
+        "file" => "文件".into(),
+        "business_candidate" => "业务候选".into(),
+        other => other.to_string(),
+    }
+}
+
+impl SearchFocusCard {
+    fn with_total_neighbours_hint(self, _total: usize) -> Self {
+        // Reserved for future telemetry; total currently expressed via
+        // `focus_hidden_count` only.
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,6 +1764,283 @@ candidates:
                 .any(|r| r.starts_with("symbol at")),
             "reason should call out the source location, got {:?}",
             result.matches[0].match_reasons
+        );
+    }
+
+    // ----- P6.1 HTML payload ------------------------------------------------
+
+    fn insert_test_case_edge(store: &mut Store, from_test: &str, to_target: &str) {
+        let edge = EdgeAssertion {
+            id: ArtifactId::new(format!("declares_verification::{from_test}->{to_target}")),
+            from_id: ArtifactId::new(from_test.to_string()),
+            to_id: ArtifactId::new(to_target.to_string()),
+            kind: EdgeKind::DeclaresVerification,
+            source: EdgeSource::LanguageAdapter,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: Some("dart_analyzer".into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_edge(&edge).unwrap();
+    }
+
+    fn insert_test_case(store: &mut Store, file: &str, name: &str, line: (u32, u32)) -> String {
+        let id = format!("test_case::{file}#{name}");
+        let node = Node {
+            id: ArtifactId::new(id.clone()),
+            kind: NodeKind::TestCase,
+            path: Some(file.into()),
+            name: Some(name.into()),
+            start_line: Some(line.0),
+            end_line: Some(line.1),
+            content_hash: None,
+            stable_key: None,
+            source_file: Some(file.into()),
+            source_hash: None,
+            indexer: Some("dart_analyzer".into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_node(&node).unwrap();
+        id
+    }
+
+    fn write_workspace(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join(".specslice.yaml"),
+            "schema_version: 1\nstorage:\n  backend: sqlite\n  path: \".specslice/graph.db\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn html_payload_includes_one_focus_card_per_match_with_canvas_under_budget() {
+        let (mut store, dir) = empty_store();
+        write_workspace(dir.path());
+        // Build a tiny graph: caller --calls--> hub --persists_to--> storage,
+        // hub also has a test pointing at it.
+        let hub = insert_method(
+            &mut store,
+            "lib/iap/pro_notifier.dart",
+            "ProNotifier.applyPurchase",
+            (10, 30),
+        );
+        let caller = insert_method(
+            &mut store,
+            "lib/iap/paywall_screen.dart",
+            "PaywallScreen.listenToPurchaseUpdates",
+            (50, 80),
+        );
+        insert_calls_edge(&mut store, &caller, &hub);
+        let storage_id = "storage::hive::pro_entitlement";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(storage_id.to_string()),
+                kind: NodeKind::Storage,
+                path: None,
+                name: Some("pro_entitlement".into()),
+                start_line: None,
+                end_line: None,
+                content_hash: None,
+                stable_key: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("persists_to::{hub}->{storage_id}")),
+                from_id: ArtifactId::new(hub.clone()),
+                to_id: ArtifactId::new(storage_id.to_string()),
+                kind: EdgeKind::PersistsTo,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        let test_id = insert_test_case(
+            &mut store,
+            "test/iap/pro_notifier_test.dart",
+            "applies purchase",
+            (3, 9),
+        );
+        insert_test_case_edge(&mut store, &test_id, &hub);
+
+        let opts = SearchOptions {
+            repo_root: dir.path().into(),
+            query: SearchQuery::Keywords("purchase".into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        };
+        let result = run_search_with_store(&store, opts).unwrap();
+        let payload = compute_search_html_payload(&result, dir.path(), 25);
+
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.query, "purchase");
+        assert_eq!(payload.matches_total, result.matches.len());
+        assert!(
+            !payload.focus_cards.is_empty(),
+            "must emit at least one focus card"
+        );
+
+        // Find the hub focus card and assert the canvas is small but useful.
+        let hub_card = payload
+            .focus_cards
+            .iter()
+            .find(|c| c.match_id == hub)
+            .expect("hub focus card must exist");
+        assert!(
+            hub_card.focused.nodes.len() <= 25,
+            "canvas must stay under the 25-node budget, got {}",
+            hub_card.focused.nodes.len()
+        );
+        let ids: BTreeSet<&str> = hub_card
+            .focused
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(ids.contains(hub.as_str()), "hub must be on its own canvas");
+        assert!(
+            ids.contains(caller.as_str()) && ids.contains(storage_id),
+            "1-hop business neighbours must appear on the focused canvas; got {ids:?}"
+        );
+        // Tests carry the highest priority — must be present.
+        assert!(
+            hub_card.tests.iter().any(|t| t.id == test_id),
+            "tests must surface in the inspector; got {:?}",
+            hub_card.tests
+        );
+        // Edges grouped by kind for the inspector.
+        assert!(hub_card.edge_groups.get("calls").copied().unwrap_or(0) >= 1);
+        assert!(
+            hub_card
+                .edge_groups
+                .get("persists_to")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+        // Badge readable.
+        assert_eq!(hub_card.badge, "代码方法");
+    }
+
+    #[test]
+    fn html_payload_attaches_candidate_card_for_accepted_business_candidate() {
+        let (mut store, dir) = empty_store();
+        write_workspace(dir.path());
+        std::fs::create_dir_all(dir.path().join(".specslice/candidates")).unwrap();
+        std::fs::write(
+            dir.path().join(".specslice/candidates/business_logic.yaml"),
+            r#"
+schema_version: 1
+candidates:
+  - id: complete_purchase_unlocks_pro
+    name: "Completes an in-app purchase and unlocks Pro for the user"
+    description: "After the user taps purchase, applyPurchase writes pro_entitlement."
+    evidence:
+      - dart_method::lib/pro_notifier.dart#ProNotifier.applyPurchase
+    confidence: 0.72
+    risks:
+      - "Pro entitlement is granted without server-side receipt validation."
+    review:
+      status: accepted
+      reviewer: "ops"
+      note: "verified"
+"#,
+        )
+        .unwrap();
+        insert_method(
+            &mut store,
+            "lib/pro_notifier.dart",
+            "ProNotifier.applyPurchase",
+            (1, 10),
+        );
+
+        let opts = SearchOptions {
+            repo_root: dir.path().into(),
+            query: SearchQuery::Keywords("purchase".into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 25,
+            include_noise: false,
+        };
+        let result = run_search_with_store(&store, opts).unwrap();
+        let payload = compute_search_html_payload(&result, dir.path(), 25);
+
+        let candidate_card = payload
+            .focus_cards
+            .iter()
+            .find(|c| c.match_id == "business_candidate::complete_purchase_unlocks_pro")
+            .expect("candidate match must produce a focus card");
+        let details = candidate_card
+            .candidate
+            .as_ref()
+            .expect("candidate focus card must include description payload");
+        assert_eq!(details.status, "accepted");
+        assert!(details.description.contains("applyPurchase"));
+        assert_eq!(details.risks.len(), 1);
+        assert_eq!(candidate_card.badge, "已确认业务候选");
+    }
+
+    #[test]
+    fn html_payload_marks_focus_truncated_when_neighbours_exceed_budget() {
+        let (mut store, dir) = empty_store();
+        write_workspace(dir.path());
+        let hub = insert_method(&mut store, "lib/hub.dart", "Hub.run", (1, 5));
+        // Add 30 callee methods, all reached via `calls`.
+        for i in 0..30 {
+            let id = insert_method(
+                &mut store,
+                &format!("lib/m{i}.dart"),
+                &format!("Mod{i}.run"),
+                (1, 2),
+            );
+            insert_calls_edge(&mut store, &hub, &id);
+        }
+        let opts = SearchOptions {
+            repo_root: dir.path().into(),
+            query: SearchQuery::Keywords("Hub".into()),
+            depth: 1,
+            kinds: Vec::new(),
+            limit: 5,
+            include_noise: false,
+        };
+        let result = run_search_with_store(&store, opts).unwrap();
+        let payload = compute_search_html_payload(&result, dir.path(), 5);
+        let hub_card = payload
+            .focus_cards
+            .iter()
+            .find(|c| c.match_id == hub)
+            .expect("hub card must exist");
+        assert!(
+            hub_card.focus_truncated,
+            "30 callees > budget=5 must trip the truncation flag"
+        );
+        assert!(
+            hub_card.focused.nodes.len() <= 5,
+            "must respect the budget cap of 5"
+        );
+        assert!(
+            hub_card.focus_hidden_count > 0,
+            "hidden count must be >0 when truncated"
         );
     }
 }

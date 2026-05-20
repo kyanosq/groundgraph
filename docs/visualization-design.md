@@ -6,6 +6,16 @@
 
 **Architecture:** The engine exports a stable `GraphViewModel` JSON from `.specslice/graph.db`. The CLI can render that model as JSON, Mermaid, or a self-contained HTML file under `.specslice/export/graph.html`. P6 shipped a deterministic lane layout; P6.1 replaced the default HTML experience with a module tree + SVG graph + detail panel browser so large real repos do not collapse into thousands of flat nodes.
 
+**P6.x — Search-driven Reader (current default for HTML):** A real-world repo's full graph is too noisy to read by eye. The user-facing entrypoint is now `specslice search <query> --format html`, which renders a search-centric **code-graph reader** instead of a full graph dump:
+
+- **No default global graph.** The HTML opens directly to the search result. The operator picks the entry (keyword, code snippet via `--code`, or `file:line` via `--file/--line`) and the canvas focuses on what they asked about.
+- **Per-match focus card.** Each ranked match owns its own canvas of ≤ 25 nodes — anchor in the centre, neighbours arranged in a ring sorted by edge-readability priority (tests > business-semantic > calls/references > misc).
+- **Inspector explains, not enumerates.** Right rail shows *why* the node matched (`match_reasons`), upstream/downstream edges grouped by kind, related tests, and — for business-candidate matches — the AI-authored description as a card with status, confidence, risks and open questions.
+- **Edge click is first-class.** Clicking an edge row or an edge label in the canvas reveals `from`, `to`, `kind`, `source_file`, `line_range`, and `snippet` so the line "X calls Y" becomes navigable.
+- **Synthetic candidate evidence.** `derives_from` edges live in `business_logic.yaml`, not in `graph.db`. The search engine synthesises them into the focus subgraph so HTML can show "this code symbol is the evidence for candidate Z" without re-indexing.
+
+Generated to `<repo>/.specslice/export/search-<slug>.html` by default; pass `--output` to override. Same self-containment contract as `graph --format html` (no remote URLs, no CDN, one HTML file).
+
 **Tech Stack:** Rust engine/CLI, `serde` data contracts, self-contained HTML/CSS/vanilla JS, optional Mermaid text export.
 
 ---
