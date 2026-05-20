@@ -205,6 +205,23 @@ pub fn analyze_dead_code_with_store(
                     entry_ids.insert(n.id.to_string());
                 }
             }
+            // Go: `main` and `init` are the language's hard entry points.
+            // Treat `Test*` / `Benchmark*` / `Example*` exported functions as
+            // entry points too because the `go test` runner resolves them by
+            // name via reflection.
+            NodeKind::GoFunction | NodeKind::GoMethod => {
+                if is_go_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            // Swift: top-level `main()` (Swift Argument Parser / `@main`)
+            // and XCTest's `test*` instance methods are reflection-driven
+            // entries. Tag them so reachability does not flag them as dead.
+            NodeKind::SwiftFunction | NodeKind::SwiftMethod => {
+                if is_swift_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
             _ => {}
         }
         // public_api_roots: anything under those paths.
@@ -397,6 +414,17 @@ fn is_code_kind(kind: NodeKind) -> bool {
             | NodeKind::DartConstructor
             | NodeKind::TestCase
             | NodeKind::TestGroup
+            | NodeKind::SwiftClass
+            | NodeKind::SwiftStruct
+            | NodeKind::SwiftEnum
+            | NodeKind::SwiftProtocol
+            | NodeKind::SwiftMethod
+            | NodeKind::SwiftFunction
+            | NodeKind::SwiftInitializer
+            | NodeKind::GoStruct
+            | NodeKind::GoInterface
+            | NodeKind::GoMethod
+            | NodeKind::GoFunction
     )
 }
 
@@ -430,6 +458,56 @@ fn is_lifecycle_method_name(name: Option<&str>) -> bool {
             | "didChangeLocales"
             | "didHaveMemoryPressure"
     )
+}
+
+fn is_go_entry_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    if last == "main" || last == "init" {
+        return true;
+    }
+    // `go test` invokes any `TestXxx(*testing.T)` / `BenchmarkXxx` /
+    // `ExampleXxx` via reflection — they have no callers in the graph
+    // but must not be reported as dead. Same convention for the
+    // `TestMain` hook.
+    if let Some(rest) = last
+        .strip_prefix("Test")
+        .or_else(|| last.strip_prefix("Benchmark"))
+        .or_else(|| last.strip_prefix("Example"))
+    {
+        return rest
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_uppercase() || !c.is_alphabetic());
+    }
+    false
+}
+
+fn is_swift_entry_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    if last == "main" {
+        return true;
+    }
+    // XCTest discovers `test*` instance methods by reflection, and
+    // SwiftUI / UIKit lifecycle callbacks are likewise framework-invoked.
+    matches!(
+        last,
+        "viewDidLoad"
+            | "viewWillAppear"
+            | "viewDidAppear"
+            | "viewWillDisappear"
+            | "viewDidDisappear"
+            | "applicationDidFinishLaunching"
+            | "applicationDidBecomeActive"
+            | "applicationWillResignActive"
+            | "scene"
+            | "body"
+    ) || last.starts_with("test")
 }
 
 fn is_private_dart_name(name: Option<&str>) -> bool {
@@ -536,6 +614,17 @@ fn reason_unreached(node: &specslice_core::Node) -> String {
         }
         NodeKind::DartClass => "类未被任何入口点引用".into(),
         NodeKind::TestCase | NodeKind::TestGroup => "测试未被 test runner / 父级 group 关联".into(),
+        NodeKind::SwiftMethod | NodeKind::SwiftFunction | NodeKind::SwiftInitializer => {
+            "未被 Swift 入口（@main / 公开 API / 测试）任一入口点可达".into()
+        }
+        NodeKind::SwiftClass
+        | NodeKind::SwiftStruct
+        | NodeKind::SwiftEnum
+        | NodeKind::SwiftProtocol => "类型未被任何 Swift 入口点引用".into(),
+        NodeKind::GoMethod | NodeKind::GoFunction => {
+            "未被 Go 入口（main / init / 公开 API / 测试）任一入口点可达".into()
+        }
+        NodeKind::GoStruct | NodeKind::GoInterface => "类型未被任何 Go 入口点引用".into(),
         _ => "未被任何入口点可达".into(),
     }
 }

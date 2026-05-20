@@ -8,7 +8,13 @@ use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
+use crate::go_indexer::{
+    index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
+};
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
+use crate::swift_indexer::{
+    index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+};
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -43,6 +49,14 @@ pub struct IndexResult {
     pub docs: Option<DocsIndexResult>,
     pub code: Option<crate::dart_indexer::DartIndexResult>,
     pub links: Option<LinksIndexResult>,
+    /// P11 — when the Swift adapter is enabled in `.specslice.yaml`,
+    /// this holds the stats from the LSP-driven indexer. `None` when
+    /// the adapter is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swift: Option<SwiftIndexResult>,
+    /// P11 — Go adapter counterpart. Same semantics as `swift`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go: Option<GoIndexResult>,
 }
 
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
@@ -86,6 +100,46 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing Dart sources")?;
         result.code = Some(code);
+
+        // P11 — opt-in Swift / Go adapters. Both are gated behind the
+        // `swift.enabled` / `go.enabled` keys so existing Dart-only
+        // workspaces keep their current behaviour. The adapters also
+        // honour `SPECSLICE_SWIFT_LSP_BIN` / `SPECSLICE_GO_LSP_BIN`
+        // env vars for ad-hoc binary overrides.
+        if config.swift.enabled {
+            store
+                .clear_indexer_outputs(SWIFT_INDEXER_NAME)
+                .context("clearing previous Swift LSP outputs")?;
+            let swift_paths = config.swift.paths_or(&["Sources", "Tests"]);
+            let swift_options = SwiftIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: swift_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.swift.exclude.clone(),
+                lsp_command: std::env::var(SWIFT_LSP_COMMAND_ENV)
+                    .ok()
+                    .or_else(|| config.swift.lsp_command.clone()),
+            };
+            let swift =
+                index_swift(&mut store, &swift_options).context("indexing Swift sources")?;
+            result.swift = Some(swift);
+        }
+
+        if config.go.enabled {
+            store
+                .clear_indexer_outputs(GO_INDEXER_NAME)
+                .context("clearing previous Go LSP outputs")?;
+            let go_paths = config.go.paths_or(&["."]);
+            let go_options = GoIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: go_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.go.exclude.clone(),
+                lsp_command: std::env::var(GO_LSP_COMMAND_ENV)
+                    .ok()
+                    .or_else(|| config.go.lsp_command.clone()),
+            };
+            let go = index_go(&mut store, &go_options).context("indexing Go sources")?;
+            result.go = Some(go);
+        }
     }
 
     if options.include_links {

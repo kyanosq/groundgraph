@@ -40,6 +40,27 @@ pub enum NodeKind {
     /// `confidence`. Always lives in `GraphLayer::Candidate` until a
     /// human confirms it.
     BusinessCandidate,
+    // ---- P11 multi-language sidecars (Swift / Go via LSP) -----------------
+    // Each new language reuses the Dart-style language-prefixed
+    // convention so existing graph view / search code paths keep their
+    // explicit `match kind` arms. Names map to Swift declarations
+    // surfaced by `sourcekit-lsp` via `textDocument/documentSymbol`.
+    SwiftClass,
+    SwiftStruct,
+    SwiftEnum,
+    SwiftProtocol,
+    SwiftMethod,
+    SwiftFunction,
+    SwiftInitializer,
+    // Go declarations surfaced by `gopls` via the same LSP request.
+    // `gopls` reports Go structs as `SymbolKind::Struct` and Go
+    // interfaces as `SymbolKind::Interface`; we keep the distinction
+    // explicit because they have very different ownership semantics in
+    // a code graph.
+    GoStruct,
+    GoInterface,
+    GoMethod,
+    GoFunction,
 }
 
 impl NodeKind {
@@ -60,6 +81,17 @@ impl NodeKind {
             NodeKind::Route => "route",
             NodeKind::Storage => "storage",
             NodeKind::BusinessCandidate => "business_candidate",
+            NodeKind::SwiftClass => "swift_class",
+            NodeKind::SwiftStruct => "swift_struct",
+            NodeKind::SwiftEnum => "swift_enum",
+            NodeKind::SwiftProtocol => "swift_protocol",
+            NodeKind::SwiftMethod => "swift_method",
+            NodeKind::SwiftFunction => "swift_function",
+            NodeKind::SwiftInitializer => "swift_initializer",
+            NodeKind::GoStruct => "go_struct",
+            NodeKind::GoInterface => "go_interface",
+            NodeKind::GoMethod => "go_method",
+            NodeKind::GoFunction => "go_function",
         }
     }
 }
@@ -124,8 +156,43 @@ mod tests {
             NodeKind::Route,
             NodeKind::Storage,
             NodeKind::BusinessCandidate,
+            NodeKind::SwiftClass,
+            NodeKind::SwiftStruct,
+            NodeKind::SwiftEnum,
+            NodeKind::SwiftProtocol,
+            NodeKind::SwiftMethod,
+            NodeKind::SwiftFunction,
+            NodeKind::SwiftInitializer,
+            NodeKind::GoStruct,
+            NodeKind::GoInterface,
+            NodeKind::GoMethod,
+            NodeKind::GoFunction,
         ] {
             assert!(!kind.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn swift_and_go_kinds_serialise_with_language_prefix() {
+        let cases = [
+            (NodeKind::SwiftClass, "swift_class"),
+            (NodeKind::SwiftStruct, "swift_struct"),
+            (NodeKind::SwiftEnum, "swift_enum"),
+            (NodeKind::SwiftProtocol, "swift_protocol"),
+            (NodeKind::SwiftMethod, "swift_method"),
+            (NodeKind::SwiftFunction, "swift_function"),
+            (NodeKind::SwiftInitializer, "swift_initializer"),
+            (NodeKind::GoStruct, "go_struct"),
+            (NodeKind::GoInterface, "go_interface"),
+            (NodeKind::GoMethod, "go_method"),
+            (NodeKind::GoFunction, "go_function"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            let json = serde_json::to_string(&kind).expect("serialise");
+            assert_eq!(json, format!("\"{}\"", expected));
+            let back: NodeKind = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(back, kind);
         }
     }
 

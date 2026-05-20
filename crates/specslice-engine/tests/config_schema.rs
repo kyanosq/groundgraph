@@ -380,6 +380,102 @@ fn default_config_serialises_with_new_sections_for_round_trip() {
     assert_eq!(round_trip, cfg);
 }
 
+#[test]
+fn p11_swift_and_go_sections_parse_with_paths_and_lsp_command() {
+    let yaml = r#"
+repo:
+  root: .
+  default_branch: main
+
+storage:
+  path: .specslice/graph.db
+
+docs:
+  paths: []
+code:
+  paths: []
+
+swift:
+  enabled: true
+  paths:
+    - Sources
+    - Tests
+  exclude:
+    - "**/.build/**"
+  lsp_command: /opt/swift/usr/bin/sourcekit-lsp
+
+go:
+  enabled: true
+  paths:
+    - .
+    - cmd
+  exclude:
+    - "**/vendor/**"
+"#;
+    let cfg: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+    assert!(cfg.swift.enabled, "swift.enabled must round-trip");
+    assert_eq!(cfg.swift.paths_or(&["Sources"]), vec!["Sources", "Tests"]);
+    assert_eq!(
+        cfg.swift.lsp_command.as_deref(),
+        Some("/opt/swift/usr/bin/sourcekit-lsp")
+    );
+    assert!(cfg.go.enabled);
+    assert_eq!(cfg.go.paths_or(&["."]), vec![".", "cmd"]);
+    assert_eq!(cfg.go.exclude, vec!["**/vendor/**".to_string()]);
+    // Sections default to disabled when omitted.
+    let minimal: EngineConfig = serde_yaml::from_str(
+        "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\n",
+    )
+    .unwrap();
+    assert!(!minimal.swift.enabled);
+    assert!(!minimal.go.enabled);
+}
+
+#[test]
+fn index_repository_skips_swift_adapter_when_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    // Default config does not enable swift / go.
+    let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    assert!(
+        result.swift.is_none(),
+        "swift result must be None when disabled"
+    );
+    assert!(result.go.is_none(), "go result must be None when disabled");
+}
+
+#[test]
+fn index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        concat!(
+            "repo:\n  root: .\n  default_branch: main\n",
+            "storage:\n  path: .specslice/graph.db\n",
+            "docs:\n  paths: []\n",
+            "code:\n  paths: []\n",
+            "swift:\n  enabled: true\n  paths: [Sources]\n  lsp_command: specslice_missing_sourcekit_lsp\n",
+            "go:\n  enabled: true\n  paths: ['.']\n  lsp_command: specslice_missing_gopls\n",
+        ),
+    );
+    let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    let swift = result.swift.expect("swift section present when enabled");
+    assert_eq!(swift.files, 0);
+    assert!(swift.sidecar_skip_reason.contains("PATH"));
+    let go = result.go.expect("go section present when enabled");
+    assert_eq!(go.files, 0);
+    assert!(go.sidecar_skip_reason.contains("PATH"));
+}
+
 #[allow(dead_code)]
 fn make_pathbuf(s: &str) -> PathBuf {
     PathBuf::from(s)

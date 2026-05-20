@@ -148,8 +148,11 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
     }
 }
 
-/// True for nodes whose kind matches "implementation" (Dart class, method,
-/// function, constructor). Useful for downstream Impact and Context modules.
+/// True for nodes whose kind represents an "implementation" symbol that
+/// can carry behaviour — Dart classes/methods/functions/constructors plus
+/// the Swift and Go equivalents emitted by the LSP-backed adapters in P11.
+/// Routes / providers / storage are deliberately excluded because they
+/// are synthetic anchors, not bodies of code.
 pub fn is_implementation_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -157,6 +160,17 @@ pub fn is_implementation_kind(kind: NodeKind) -> bool {
             | NodeKind::DartMethod
             | NodeKind::DartFunction
             | NodeKind::DartConstructor
+            | NodeKind::SwiftClass
+            | NodeKind::SwiftStruct
+            | NodeKind::SwiftEnum
+            | NodeKind::SwiftProtocol
+            | NodeKind::SwiftMethod
+            | NodeKind::SwiftFunction
+            | NodeKind::SwiftInitializer
+            | NodeKind::GoStruct
+            | NodeKind::GoInterface
+            | NodeKind::GoMethod
+            | NodeKind::GoFunction
     )
 }
 

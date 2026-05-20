@@ -303,6 +303,17 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         NodeKind::DartProvider,
         NodeKind::DocSection,
         NodeKind::BusinessCandidate,
+        NodeKind::SwiftClass,
+        NodeKind::SwiftStruct,
+        NodeKind::SwiftEnum,
+        NodeKind::SwiftProtocol,
+        NodeKind::SwiftMethod,
+        NodeKind::SwiftFunction,
+        NodeKind::SwiftInitializer,
+        NodeKind::GoStruct,
+        NodeKind::GoInterface,
+        NodeKind::GoMethod,
+        NodeKind::GoFunction,
     ]
 }
 
@@ -776,6 +787,17 @@ fn badge_for(m: &SearchMatch, candidate: Option<&SearchCandidateDetails>) -> Str
         "doc_section" => "文档段".into(),
         "file" => "文件".into(),
         "business_candidate" => "业务候选".into(),
+        "swift_class" => "Swift 类".into(),
+        "swift_struct" => "Swift 结构体".into(),
+        "swift_enum" => "Swift 枚举".into(),
+        "swift_protocol" => "Swift 协议".into(),
+        "swift_method" => "Swift 方法".into(),
+        "swift_function" => "Swift 函数".into(),
+        "swift_initializer" => "Swift 构造器".into(),
+        "go_struct" => "Go 结构体".into(),
+        "go_interface" => "Go 接口".into(),
+        "go_method" => "Go 方法".into(),
+        "go_function" => "Go 函数".into(),
         other => other.to_string(),
     }
 }

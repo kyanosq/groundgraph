@@ -880,7 +880,18 @@ fn column_for(kind: NodeKind) -> GraphColumn {
         | NodeKind::DartConstructor
         | NodeKind::DartProvider
         | NodeKind::Route
-        | NodeKind::Storage => GraphColumn::Code,
+        | NodeKind::Storage
+        | NodeKind::SwiftClass
+        | NodeKind::SwiftStruct
+        | NodeKind::SwiftEnum
+        | NodeKind::SwiftProtocol
+        | NodeKind::SwiftMethod
+        | NodeKind::SwiftFunction
+        | NodeKind::SwiftInitializer
+        | NodeKind::GoStruct
+        | NodeKind::GoInterface
+        | NodeKind::GoMethod
+        | NodeKind::GoFunction => GraphColumn::Code,
         NodeKind::TestCase | NodeKind::TestGroup => GraphColumn::Tests,
     }
 }
@@ -1210,8 +1221,19 @@ fn compare_business_priority(a: &GraphNode, b: &GraphNode) -> std::cmp::Ordering
 
 fn business_rank(node: &GraphNode) -> u8 {
     // Noise demotion runs first: a method named `dispose` should sink to
-    // the tail even when it lives in a business-named file.
-    if matches!(node.kind.as_str(), "dart_method" | "dart_function") {
+    // the tail even when it lives in a business-named file. The noise
+    // list is Dart-centric but the same names (`build` / `dispose` /
+    // `toString`) recur in Swift / Go heuristics; sharing the rank
+    // across languages keeps the graph readable.
+    if matches!(
+        node.kind.as_str(),
+        "dart_method"
+            | "dart_function"
+            | "swift_method"
+            | "swift_function"
+            | "go_method"
+            | "go_function"
+    ) {
         let method_name = node.label.as_str();
         if NOISE_TARGET_METHODS.contains(&method_name) {
             return 2;
@@ -1283,10 +1305,14 @@ fn kind_rank(kind: &str) -> u8 {
         "requirement" => 1,
         "file" => 2,
         "doc_section" | "acceptance_criterion" | "adr" => 3,
-        "dart_class" => 4,
-        "dart_function" => 5,
-        "dart_method" => 6,
-        "dart_constructor" => 7,
+        // Container-shaped declarations sort with `dart_class` so the
+        // graph reader keeps "container first, members later" order
+        // regardless of language.
+        "dart_class" | "swift_class" | "swift_struct" | "swift_enum" | "swift_protocol"
+        | "go_struct" | "go_interface" => 4,
+        "dart_function" | "swift_function" | "go_function" => 5,
+        "dart_method" | "swift_method" | "go_method" => 6,
+        "dart_constructor" | "swift_initializer" => 7,
         "test_group" => 8,
         "test_case" => 9,
         _ => 10,

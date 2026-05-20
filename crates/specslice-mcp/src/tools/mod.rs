@@ -143,6 +143,21 @@ pub(crate) fn parse_node_kind(raw: &str) -> Result<NodeKind> {
         "storage" => NodeKind::Storage,
         "candidate" | "business_candidate" => NodeKind::BusinessCandidate,
         "requirement" => NodeKind::Requirement,
+        // P11 — Swift / Go kinds (full names + short aliases). Short
+        // aliases let agents say `swift_method` *or* `swift.method`;
+        // the bare `class` / `method` aliases above remain bound to
+        // Dart for backward compatibility with existing skills.
+        "swift_class" => NodeKind::SwiftClass,
+        "swift_struct" => NodeKind::SwiftStruct,
+        "swift_enum" => NodeKind::SwiftEnum,
+        "swift_protocol" => NodeKind::SwiftProtocol,
+        "swift_method" => NodeKind::SwiftMethod,
+        "swift_function" => NodeKind::SwiftFunction,
+        "swift_initializer" | "swift_init" => NodeKind::SwiftInitializer,
+        "go_struct" | "gostruct" => NodeKind::GoStruct,
+        "go_interface" | "gointerface" => NodeKind::GoInterface,
+        "go_method" => NodeKind::GoMethod,
+        "go_function" | "gofunc" => NodeKind::GoFunction,
         other => bail!(
             "unknown node kind `{other}`. valid: {}",
             default_search_kinds()

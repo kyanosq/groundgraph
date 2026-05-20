@@ -15,14 +15,18 @@ pub mod dead_code;
 pub mod docs_indexer;
 pub mod export;
 pub mod git_diff;
+pub mod go_indexer;
 pub mod graph;
 pub mod impact;
 pub mod index;
 pub mod init;
 pub mod links_indexer;
 pub mod logic_confidence;
+pub mod lsp_client;
+pub mod lsp_indexer;
 pub mod search;
 pub mod slice;
+pub mod swift_indexer;
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,
@@ -71,3 +75,12 @@ pub use search::{
     EXPANSION_EDGE_KINDS as SEARCH_EXPANSION_EDGE_KINDS,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
+
+pub use go_indexer::{
+    build_go_batch, go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME,
+    GO_LSP_COMMAND_ENV,
+};
+pub use swift_indexer::{
+    build_swift_batch, index_swift, swift_lsp_available, SwiftIndexOptions, SwiftIndexResult,
+    SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+};

@@ -35,6 +35,16 @@ pub struct EngineConfig {
     pub checks: ChecksConfig,
     #[serde(default)]
     pub dead_code: DeadCodeConfig,
+    /// P11 — opt-in Swift language adapter driven by `sourcekit-lsp`.
+    /// Disabled by default so existing Dart-only workspaces are not
+    /// affected. Operators flip `enabled: true` and (optionally) point
+    /// `lsp_command` at a specific binary.
+    #[serde(default)]
+    pub swift: LanguageAdapterConfig,
+    /// P11 — opt-in Go language adapter driven by `gopls`. Same
+    /// semantics as `swift`.
+    #[serde(default)]
+    pub go: LanguageAdapterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -316,4 +326,42 @@ fn default_dead_code_ignore() -> Vec<String> {
         "**/l10n/app_localizations*.dart".into(),
         "**/.dart_tool/**".into(),
     ]
+}
+
+/// Shared shape for the per-language LSP adapter sections (Swift, Go,
+/// and future Python / TypeScript / Java entries). `enabled` opts the
+/// language in; the engine silently does nothing when it is `false`.
+/// `paths` mirrors `code.paths` but is per-language so a single repo
+/// can index multiple languages with non-overlapping roots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LanguageAdapterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directories under `repo.root` that hold this language's
+    /// sources. Empty defaults to the language-specific suggestion
+    /// (Swift: `Sources test Tests`; Go: `.` and `cmd`). The engine
+    /// resolves the actual fallback at run-time so the YAML keeps a
+    /// minimal opt-in shape.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Glob patterns to skip even when they live under `paths`. Same
+    /// matcher as `code.exclude`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Optional LSP binary override. Defaults to `sourcekit-lsp` for
+    /// Swift / `gopls` for Go, looked up on `PATH`. The corresponding
+    /// `SPECSLICE_SWIFT_LSP_BIN` / `SPECSLICE_GO_LSP_BIN` env vars take
+    /// precedence at runtime.
+    #[serde(default)]
+    pub lsp_command: Option<String>,
+}
+
+impl LanguageAdapterConfig {
+    pub fn paths_or(&self, fallback: &[&str]) -> Vec<String> {
+        if self.paths.is_empty() {
+            fallback.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            self.paths.clone()
+        }
+    }
 }

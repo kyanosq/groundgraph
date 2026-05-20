@@ -249,6 +249,17 @@ fn collect_orphan_symbols(store: &Store) -> Result<Vec<EvidenceSymbol>> {
         NodeKind::DartMethod,
         NodeKind::DartFunction,
         NodeKind::DartConstructor,
+        NodeKind::SwiftClass,
+        NodeKind::SwiftStruct,
+        NodeKind::SwiftEnum,
+        NodeKind::SwiftProtocol,
+        NodeKind::SwiftMethod,
+        NodeKind::SwiftFunction,
+        NodeKind::SwiftInitializer,
+        NodeKind::GoStruct,
+        NodeKind::GoInterface,
+        NodeKind::GoMethod,
+        NodeKind::GoFunction,
     ] {
         for node in store.list_nodes_by_kind(kind)? {
             let edges_out = store.list_edges_from(&node.id)?;

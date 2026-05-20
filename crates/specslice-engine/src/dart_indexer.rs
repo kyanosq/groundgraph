@@ -365,6 +365,166 @@ fn ingest(
     Ok(result)
 }
 
+/// Language-agnostic ingestion helper used by the P11 LSP adapters
+/// (Swift / Go). Mirrors the structural subset of [`ingest`] without
+/// the Dart-specific bookkeeping (analyzer-vs-lightweight resolver
+/// tags, `declared_implementations` counts, etc.). The caller passes
+/// its own indexer label so per-language facts can be cleared
+/// independently before the next index run.
+///
+/// Specifically, this writes:
+/// - `file` nodes (one per [`LanguageIndexBatch::files`] entry)
+/// - symbol nodes plus `File → Symbol` (or `Parent → Symbol`)
+///   `contains` edges
+/// - test nodes plus their `contains` edges
+/// - `imports` edges
+/// - `symbol_ranges`
+/// - `references` edges, but only when the adapter sets the same
+///   restricted set of [`EdgeKind`] values the Dart adapter is
+///   allowed to emit (so a buggy adapter cannot corrupt the store
+///   with arbitrary edge kinds)
+///
+/// Synthetic nodes (routes / storage / Dart providers) are
+/// **not** ingested here — they are Dart-only and live in the
+/// per-language Dart path.
+pub fn ingest_language_batch_minimal(
+    store: &mut Store,
+    batch: &LanguageIndexBatch,
+    indexer_name: &str,
+) -> Result<()> {
+    for file in &batch.files {
+        let mut node = Node::new(file.id.clone(), NodeKind::File);
+        node.path = Some(file.path.clone());
+        node.name = std::path::Path::new(&file.path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned());
+        node.content_hash = Some(file.content_hash.clone());
+        node.indexer = Some(indexer_name.into());
+        store.upsert_node(&node)?;
+    }
+
+    for symbol in &batch.symbols {
+        let mut node = Node::new(symbol.id.clone(), symbol.kind);
+        node.path = Some(symbol.path.clone());
+        node.name = Some(symbol.name.clone());
+        node.stable_key = Some(symbol.qualified_name.clone());
+        node.start_line = Some(symbol.start_line);
+        node.end_line = Some(symbol.end_line);
+        node.indexer = Some(indexer_name.into());
+        store.upsert_node(&node)?;
+
+        let mut contains = if let Some(parent) = &symbol.parent_symbol_id {
+            EdgeAssertion::fact(
+                parent.clone(),
+                symbol.id.clone(),
+                EdgeKind::Contains,
+                EdgeSource::LanguageAdapter,
+            )
+        } else {
+            EdgeAssertion::fact(
+                specslice_core::artifact_id::file_id(&symbol.path),
+                symbol.id.clone(),
+                EdgeKind::Contains,
+                EdgeSource::LanguageAdapter,
+            )
+        };
+        contains.indexer = Some(indexer_name.into());
+        store.upsert_edge(&contains)?;
+    }
+
+    for test in &batch.tests {
+        let mut node = Node::new(test.id.clone(), test.kind);
+        node.path = Some(test.path.clone());
+        node.name = Some(test.name.clone());
+        node.start_line = Some(test.start_line);
+        node.end_line = Some(test.end_line);
+        node.indexer = Some(indexer_name.into());
+        store.upsert_node(&node)?;
+        let parent_id = test
+            .parent_symbol_id
+            .clone()
+            .unwrap_or_else(|| specslice_core::artifact_id::file_id(&test.path));
+        let mut contains = EdgeAssertion::fact(
+            parent_id,
+            test.id.clone(),
+            EdgeKind::Contains,
+            EdgeSource::LanguageAdapter,
+        );
+        contains.indexer = Some(indexer_name.into());
+        store.upsert_edge(&contains)?;
+    }
+
+    for import in &batch.imports {
+        let mut edge = EdgeAssertion::fact(
+            import.from_file.clone(),
+            specslice_core::artifact_id::file_id(&import.to_path),
+            EdgeKind::Imports,
+            EdgeSource::LanguageAdapter,
+        );
+        edge.indexer = Some(indexer_name.into());
+        store.upsert_edge(&edge)?;
+    }
+
+    for reference in &batch.references {
+        if !matches!(
+            reference.kind,
+            EdgeKind::References
+                | EdgeKind::Calls
+                | EdgeKind::ReadsProvider
+                | EdgeKind::NavigatesTo
+                | EdgeKind::PersistsTo
+                | EdgeKind::SubscribesStream
+        ) {
+            continue;
+        }
+        let mut edge = EdgeAssertion::fact(
+            reference.from_symbol_id.clone(),
+            reference.to_symbol_id.clone(),
+            reference.kind,
+            EdgeSource::LanguageAdapter,
+        );
+        edge.indexer = Some(indexer_name.into());
+        if !reference.source_file.is_empty() {
+            edge.source_file = Some(reference.source_file.clone());
+        }
+        if reference.line > 0 || !reference.snippet.is_empty() || !reference.resolver.is_empty() {
+            edge.evidence_json = Some(build_reference_evidence_json(
+                reference.line,
+                &reference.snippet,
+                &reference.resolver,
+            ));
+        }
+        store.upsert_edge(&edge)?;
+    }
+
+    for range in &batch.symbol_ranges {
+        store.upsert_symbol_range(range)?;
+    }
+    for symbol in &batch.symbols {
+        store.upsert_symbol_range(&specslice_core::SymbolRange {
+            file_path: symbol.path.clone(),
+            symbol_id: symbol.id.clone(),
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            symbol_kind: symbol.kind,
+            qualified_name: symbol.qualified_name.clone(),
+            parent_symbol_id: symbol.parent_symbol_id.clone(),
+        })?;
+    }
+    for test in &batch.tests {
+        store.upsert_symbol_range(&specslice_core::SymbolRange {
+            file_path: test.path.clone(),
+            symbol_id: test.id.clone(),
+            start_line: test.start_line,
+            end_line: test.end_line,
+            symbol_kind: test.kind,
+            qualified_name: test.name.clone(),
+            parent_symbol_id: test.parent_symbol_id.clone(),
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod glob_tests {
     use super::path_matches_glob;

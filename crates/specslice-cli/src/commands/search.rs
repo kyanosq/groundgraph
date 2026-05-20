@@ -194,6 +194,18 @@ fn match_kind(name: &str) -> Result<NodeKind> {
         "storage" => NodeKind::Storage,
         "candidate" | "business_candidate" => NodeKind::BusinessCandidate,
         "requirement" => NodeKind::Requirement,
+        // P11 — Swift / Go kinds.
+        "swift_class" => NodeKind::SwiftClass,
+        "swift_struct" => NodeKind::SwiftStruct,
+        "swift_enum" => NodeKind::SwiftEnum,
+        "swift_protocol" => NodeKind::SwiftProtocol,
+        "swift_method" => NodeKind::SwiftMethod,
+        "swift_function" => NodeKind::SwiftFunction,
+        "swift_initializer" | "swift_init" => NodeKind::SwiftInitializer,
+        "go_struct" | "gostruct" => NodeKind::GoStruct,
+        "go_interface" | "gointerface" => NodeKind::GoInterface,
+        "go_method" => NodeKind::GoMethod,
+        "go_function" | "gofunc" => NodeKind::GoFunction,
         other => {
             bail!(
                 "unknown --kind `{other}`. valid: {}",

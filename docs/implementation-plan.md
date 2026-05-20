@@ -625,6 +625,32 @@ specslice graph --format html --view business
 - 不主动联网、不依赖任何外部 LLM；Agent 端拿到结构化 JSON 后自由扩词，CLI 保持确定性。
 - 阅读器 HTML 单文件可离线打开，不引入 CDN / WebFont / WebGL。
 
+### P12：Swift / Go 多语言 sidecar（LSP 驱动）✅ 落地
+
+**目标：** 把 SpecSlice 的事实图从 Dart 扩出 Swift / Go 两条边，按规划用上游 LSP（`sourcekit-lsp`、`gopls`）当 sidecar，不自己写 parser，统一图模型由语言侧 Adapter 产出节点和边。
+
+**已落地：**
+
+- `specslice-core` 新增 11 个语言节点：`SwiftClass / SwiftStruct / SwiftEnum / SwiftProtocol / SwiftMethod / SwiftFunction / SwiftInitializer` 和 `GoStruct / GoInterface / GoMethod / GoFunction`，全部沿用 `language_prefix_kind` 约定，`as_str` / serde 序列化与 store 解码同步扩。
+- 新增通用 `lsp_client`：同步 stdio LSP 客户端，自实现 `Content-Length` 帧、`initialize → initialized → request → exit` 生命周期、`request id` 关联与服务器侧请求自答（避免 gopls 阻塞），并兼容旧 `SymbolInformation[]` 平铺响应通过 `containerName` 重建层级。
+- 新增通用 `lsp_indexer`：根据 `LspProfile { language, language_id, file_extensions, skip_dirs, default_command, command_env_var, map_kind, qualify }` 走 `discover_files → didOpen → documentSymbol → didClose → shutdown`，把符号树映射进 `LanguageIndexBatch`；缺二进制 / 无源文件 / 进程异常都返回 `Skipped { reason, language }`，永不让 `index_repository` 失败。
+- 新增 `swift_indexer` + `go_indexer`：分别映射 sourcekit-lsp / gopls 的 `documentSymbol` 到 SpecSlice 节点类型；qualified name 采用 `<file>::Type.Member` 形式，跨语言保持稳定。`SPECSLICE_SWIFT_LSP_BIN` / `SPECSLICE_GO_LSP_BIN` 可覆盖二进制路径，`.specslice.yaml` 的 `swift / go.lsp_command` 同样生效。
+- `dart_indexer` 抽出 `ingest_language_batch_minimal`（files + symbols + tests + imports + references + symbol_ranges 的通用子集），Swift / Go 全部复用同一入仓路径，不需要为新语言改 store 代码。
+- 配置面：`EngineConfig` 新增 `swift / go: LanguageAdapterConfig { enabled, paths, exclude, lsp_command }`，两者默认关闭。`index_repository` 仅在 `enabled == true` 时调度对应 indexer，并在二进制缺失时把跳过原因写进结果，不让现有 Dart-only 仓库感知到任何变化。
+- CLI / MCP 适配：`specslice search --kind swift_method,go_struct,...` 直接生效；MCP `search_graph` / `get_subgraph` 的 `kinds` 数组支持全部新 kind 别名；`graph` 列分组与「业务噪声排序」也同步把 swift/go 的方法纳入降权名单（`build / dispose / toString` 等）。
+- Dead-code 入口点：Go 自动把 `main / init / Test*/Benchmark*/Example*` 视作入口；Swift 自动把 `main / test* / UIKit/SwiftUI 生命周期回调` 视作入口；`reason_unreached` 针对新 NodeKind 输出对应语言的解释，避免误判反射调用。
+- 测试覆盖：
+  - 单测：LSP 帧读写 / `SymbolInformation` 重建层级 / `path_to_file_uri` UTF-8 / `simple_glob_match` 的 `*` vs `**` 语义 / Swift & Go `map_kind` & `qualify` / `LspIndexOutcome::Skipped` 路径。
+  - 集成测：`tests/fixtures/swift_hello`（含 `Package.swift` / `Sources/Greeter` / `Tests/GreeterTests`）与 `tests/fixtures/go_hello`（含 `go.mod` / `internal/api` / `cmd/server`）。`lsp_indexers.rs` 在无 LSP 二进制时仅验证 `Skipped` 文案；当 `sourcekit-lsp` / `gopls` 真在 PATH 上时，会启服务器、跑 `documentSymbol`、断言节点名与 NodeKind 与 fixture 对得上。
+  - 配置 schema：`p11_swift_and_go_sections_parse_with_paths_and_lsp_command` / `index_repository_skips_swift_adapter_when_disabled` / `index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing` 锁住默认关闭与 enabled-but-LSP-missing 两种行为。
+
+**非侵入式约束（与 P11 一致）：**
+
+- 不写自家 parser；语言事实由上游官方 LSP 服务器（`sourcekit-lsp` / `gopls`）产出，SpecSlice 只做结构化吸纳。
+- 不在 Swift / Go 代码中加注解、不依赖运行时反射 / 字符串约定；缺少 `Package.swift` 或 `go.mod` 时优雅退化为「跳过」并保留可读原因。
+- 不联网；LSP 完全本地 stdio 通信，CLI / MCP 的搜索 / 死代码 / Context Pack 路径在 Swift / Go 启用后保持同一可信链路。
+- 不引入新的事实通路：Swift / Go 沿用 `EdgeKind::Contains`（File → Symbol → Symbol），后续 `callHierarchy` / `references` 会作为新 PR 单独跟进，不会回头改既有 Dart 路径。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：
