@@ -46,7 +46,9 @@ use specslice_core::{EdgeAssertion, EdgeCertainty, EdgeSource, EdgeStatus, Node,
 use specslice_store::Store;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::business_candidates::{candidate_artifact_id, load_business_candidates, BusinessCandidate};
+use crate::business_candidates::{
+    candidate_artifact_id, load_business_candidates, BusinessCandidate,
+};
 use crate::checks::{compute_checks_with_policy, CheckFinding, CheckPolicy, CheckSeverity};
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 
@@ -297,8 +299,7 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
     if options.include_candidates {
         match load_business_candidates(repo_root) {
             Ok(outcome) => {
-                let node_ids: HashSet<String> =
-                    nodes.iter().map(|n| n.id.clone()).collect();
+                let node_ids: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
                 for c in &outcome.document.candidates {
                     merge_business_candidate(c, &node_ids, &mut nodes, &mut edges, &mut findings);
                 }
