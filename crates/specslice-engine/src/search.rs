@@ -348,7 +348,8 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
     }
 
     let mut subgraph = expand_subgraph(store, &matches, options.depth, options.include_noise)?;
-    merge_candidate_evidence_edges(&mut subgraph, &options.repo_root);
+    let direct_match_ids: BTreeSet<String> = matches.iter().map(|m| m.id.clone()).collect();
+    merge_candidate_evidence_edges(store, &mut subgraph, &options.repo_root, &direct_match_ids)?;
     let graph_commands = build_graph_commands(&matches, &options.repo_root);
 
     Ok(SearchResult {
@@ -367,13 +368,18 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
 /// vice-versa. We synthesise them here from the YAML so search /
 /// search-html / agents can see candidate evidence the same way the
 /// graph view does.
-fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Path) {
+fn merge_candidate_evidence_edges(
+    store: &Store,
+    subgraph: &mut SearchSubgraph,
+    repo_root: &Path,
+    direct_match_ids: &BTreeSet<String>,
+) -> Result<()> {
     let candidates = match load_business_candidates(repo_root) {
         Ok(o) => o.document.candidates,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     if candidates.is_empty() {
-        return;
+        return Ok(());
     }
     let mut existing_node_ids: BTreeSet<String> =
         subgraph.nodes.iter().map(|n| n.id.clone()).collect();
@@ -381,7 +387,8 @@ fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Pat
         subgraph.edges.iter().map(|e| e.id.clone()).collect();
     for c in &candidates {
         let candidate_id = crate::business_candidates::candidate_artifact_id(&c.id).to_string();
-        let candidate_in_subgraph = existing_node_ids.contains(&candidate_id);
+        let candidate_in_subgraph =
+            existing_node_ids.contains(&candidate_id) || direct_match_ids.contains(&candidate_id);
         // Find which evidence entries touch the current subgraph.
         let touching_evidence: Vec<&String> = c
             .evidence
@@ -391,7 +398,7 @@ fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Pat
         if !candidate_in_subgraph && touching_evidence.is_empty() {
             continue;
         }
-        if !candidate_in_subgraph {
+        if !existing_node_ids.contains(&candidate_id) {
             // Add a synthetic candidate node so focus cards for any
             // code symbol can show "this is referenced by candidate X".
             subgraph.nodes.push(SearchNode {
@@ -404,14 +411,35 @@ fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Pat
             existing_node_ids.insert(candidate_id.clone());
         }
         let evidence_to_link: Vec<&String> = if candidate_in_subgraph {
-            c.evidence
-                .iter()
-                .filter(|ev| existing_node_ids.contains(ev.as_str()))
-                .collect()
+            c.evidence.iter().collect()
         } else {
             touching_evidence
         };
         for ev in evidence_to_link {
+            if !existing_node_ids.contains(ev.as_str()) {
+                if let Some(node) = store
+                    .find_node(&ArtifactId::new(ev.clone()))
+                    .with_context(|| format!("resolving candidate evidence node `{ev}`"))?
+                {
+                    subgraph.nodes.push(SearchNode {
+                        id: node.id.to_string(),
+                        kind: node.kind.as_str().into(),
+                        label: node
+                            .name
+                            .clone()
+                            .or_else(|| node.stable_key.clone())
+                            .unwrap_or_else(|| node.id.to_string()),
+                        path: node.path.clone(),
+                        line_range: match (node.start_line, node.end_line) {
+                            (Some(s), Some(e)) => Some((s, e)),
+                            _ => None,
+                        },
+                    });
+                    existing_node_ids.insert(ev.clone());
+                } else {
+                    continue;
+                }
+            }
             let edge_id = format!("derives_from::{candidate_id}->{ev}");
             if !existing_edge_ids.insert(edge_id.clone()) {
                 continue;
@@ -430,6 +458,7 @@ fn merge_candidate_evidence_edges(subgraph: &mut SearchSubgraph, repo_root: &Pat
     // Keep deterministic ordering for goldens.
     subgraph.nodes.sort_by(|a, b| a.id.cmp(&b.id));
     subgraph.edges.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(())
 }
 
 /// Build the search-driven HTML payload: a per-match focus card with
@@ -1976,7 +2005,7 @@ candidates:
 
         let opts = SearchOptions {
             repo_root: dir.path().into(),
-            query: SearchQuery::Keywords("purchase".into()),
+            query: SearchQuery::Keywords("entitlement".into()),
             depth: 1,
             kinds: Vec::new(),
             limit: 25,
@@ -1998,6 +2027,28 @@ candidates:
         assert!(details.description.contains("applyPurchase"));
         assert_eq!(details.risks.len(), 1);
         assert_eq!(candidate_card.badge, "已确认业务候选");
+        let focused_ids: BTreeSet<&str> = candidate_card
+            .focused
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(
+            focused_ids.contains("business_candidate::complete_purchase_unlocks_pro"),
+            "candidate focus canvas must include the candidate anchor; got {focused_ids:?}"
+        );
+        assert!(
+            focused_ids.contains("dart_method::lib/pro_notifier.dart#ProNotifier.applyPurchase"),
+            "candidate focus canvas must include resolved evidence nodes; got {focused_ids:?}"
+        );
+        assert!(
+            candidate_card.focused.edges.iter().any(|e| {
+                e.kind == "derives_from"
+                    && e.from == "business_candidate::complete_purchase_unlocks_pro"
+                    && e.to == "dart_method::lib/pro_notifier.dart#ProNotifier.applyPurchase"
+            }),
+            "candidate focus canvas must show derives_from evidence edge"
+        );
     }
 
     #[test]

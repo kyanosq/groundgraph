@@ -198,6 +198,13 @@ pub fn analyze_dead_code_with_store(
                     entry_ids.insert(n.id.to_string());
                 }
             }
+            NodeKind::DartFunction => {
+                if n.path.as_deref().is_some_and(is_test_path)
+                    && is_lifecycle_method_name(n.name.as_deref())
+                {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
             _ => {}
         }
         // public_api_roots: anything under those paths.
@@ -233,12 +240,32 @@ pub fn analyze_dead_code_with_store(
         if !is_code_kind(n.kind) {
             continue;
         }
-        if !opts.include_tests && matches!(n.kind, NodeKind::TestCase | NodeKind::TestGroup) {
-            // Tests are always roots, never reported unless caller asks.
+        let id_str = n.id.to_string();
+        if matches!(n.kind, NodeKind::TestCase | NodeKind::TestGroup) {
+            if !opts.include_tests {
+                // Tests are always roots for production reachability, but are
+                // not reported as dead-code candidates unless explicitly asked.
+                continue;
+            }
+            total_code += 1;
+            let outbound_for: &[&specslice_core::EdgeAssertion] = outbound
+                .get(id_str.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if let Some(candidate) = orphan_test_candidate(n, outbound_for) {
+                if candidate.confidence >= opts.min_confidence {
+                    candidates.push(candidate);
+                }
+            }
+            continue;
+        }
+        if n.path.as_deref().is_some_and(is_test_path) {
+            // Test-file helper functions are execution scaffolding, not
+            // production dead-code candidates. `--include-tests` reports the
+            // semantic TestCase/TestGroup nodes above instead.
             continue;
         }
         total_code += 1;
-        let id_str = n.id.to_string();
         if reachable.contains(&id_str) {
             continue;
         }
@@ -413,6 +440,10 @@ fn is_private_dart_name(name: Option<&str>) -> bool {
     last.starts_with('_')
 }
 
+fn is_test_path(path: &str) -> bool {
+    path.starts_with("test/") || path.contains("/test/")
+}
+
 fn seed_config_entrypoints(
     entrypoints: &[String],
     nodes: &[specslice_core::Node],
@@ -525,6 +556,41 @@ fn collect_mitigating_factors(node: &specslice_core::Node, public_set: &GlobSet)
         out.push("名称匹配 Flutter / Dart 生命周期 / 框架回调".into());
     }
     out
+}
+
+fn orphan_test_candidate(
+    node: &specslice_core::Node,
+    outbound: &[&specslice_core::EdgeAssertion],
+) -> Option<DeadCodeCandidate> {
+    if outbound
+        .iter()
+        .any(|e| e.kind == EdgeKind::DeclaresVerification)
+    {
+        return None;
+    }
+    let id = node.id.to_string();
+    let label = node
+        .name
+        .clone()
+        .or_else(|| node.stable_key.clone())
+        .unwrap_or_else(|| id.clone());
+    let line_range = match (node.start_line, node.end_line) {
+        (Some(s), Some(e)) => Some((s, e)),
+        _ => None,
+    };
+    Some(DeadCodeCandidate {
+        id,
+        kind: node.kind.as_str().into(),
+        label,
+        path: node.path.clone(),
+        line_range,
+        confidence: DeadCodeConfidence::Low,
+        reasons: vec![
+            "测试没有解析到验证目标（无 declares_verification 边）".into(),
+            "测试仍可能被 test runner 执行；这是孤儿测试提示，不是删除建议".into(),
+        ],
+        inbound_sources: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +937,8 @@ mod tests {
         )
         .unwrap();
         assert!(default_report.candidates.is_empty());
-        // With --include-tests: reported.
+        // With --include-tests: orphan tests are reported even though
+        // tests remain reachability roots for production code.
         let with_tests = analyze_dead_code_with_store(
             &store,
             DeadCodeOptions {
@@ -882,15 +949,70 @@ mod tests {
             &config_with(vec![]),
         )
         .unwrap();
-        // Tests are themselves roots, so even with include_tests they
-        // never appear as unreached (they're in the reachable set).
-        // But contains/declares_verification edges from the test
-        // might still leave it unreported. Verify that an orphan test
-        // with no incoming edges nor downstream targets is still
-        // considered reachable (it's a root).
+        let test_candidate = with_tests
+            .candidates
+            .iter()
+            .find(|c| c.id == "test_case::test/foo_test.dart#orphan")
+            .expect("--include-tests must surface orphan test cases");
+        assert_eq!(test_candidate.kind, "test_case");
+        assert_eq!(test_candidate.confidence, DeadCodeConfidence::Low);
         assert!(
-            with_tests.candidates.is_empty(),
-            "tests are roots; even with --include-tests they shouldn't show as dead"
+            test_candidate
+                .reasons
+                .iter()
+                .any(|r| r.contains("没有解析到验证目标")),
+            "orphan test reason must explain the missing verification edge: {:?}",
+            test_candidate.reasons
+        );
+    }
+
+    #[test]
+    fn test_file_helper_functions_are_not_reported_as_dead_code_candidates() {
+        let (mut store, _dir) = empty_store();
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        let test_main = insert_function(&mut store, "test/foo_test.dart", "main");
+        let test_expect = insert_function(&mut store, "test/foo_test.dart", "expect");
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: true,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+
+        let ids: BTreeSet<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(test_main.as_str()) && !ids.contains(test_expect.as_str()),
+            "test-file helper functions must not pollute dead-code output: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_main_keeps_called_production_symbol_reachable() {
+        let (mut store, _dir) = empty_store();
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        let test_main = insert_function(&mut store, "test/foo_test.dart", "main");
+        let target = insert_method(&mut store, "lib/foo.dart", "Foo.runOnce");
+        insert_calls(&mut store, &test_main, &target);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+
+        assert!(
+            !report.candidates.iter().any(|c| c.id == target),
+            "production symbol exercised by test main must remain reachable"
         );
     }
 }
