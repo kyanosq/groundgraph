@@ -32,8 +32,9 @@ class SidecarRequest {
   factory SidecarRequest.fromJson(Map<String, dynamic> json) {
     return SidecarRequest(
       repoRoot: json['repo_root'] as String,
-      codeRoots:
-          (json['code_roots'] as List<dynamic>).map((e) => e as String).toList(),
+      codeRoots: (json['code_roots'] as List<dynamic>)
+          .map((e) => e as String)
+          .toList(),
       excludeGlobs: (json['exclude_globs'] as List<dynamic>?)
               ?.map((e) => e as String)
               .toList() ??
@@ -74,6 +75,7 @@ abstract class NodeKindString {
 class SidecarBatchResponse {
   final List<Map<String, dynamic>> files;
   final List<Map<String, dynamic>> symbols;
+  final List<Map<String, dynamic>> tests;
   final List<Map<String, dynamic>> symbolRanges;
   final List<Map<String, dynamic>> imports;
   final List<Map<String, dynamic>> references;
@@ -83,6 +85,7 @@ class SidecarBatchResponse {
   SidecarBatchResponse({
     required this.files,
     required this.symbols,
+    required this.tests,
     required this.symbolRanges,
     required this.imports,
     required this.references,
@@ -95,6 +98,7 @@ class SidecarBatchResponse {
         'resolver': resolverDartAnalyzer,
         'files': files,
         'symbols': symbols,
+        'tests': tests,
         'symbol_ranges': symbolRanges,
         'imports': imports,
         'references': references,

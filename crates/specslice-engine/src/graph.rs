@@ -1036,8 +1036,34 @@ fn focus_subgraph(nodes: &[GraphNode], edges: &[GraphEdge], target_id: &str) -> 
         kept.insert(id);
     }
 
+    // Pull one extra hop of high-signal semantic context from the already
+    // included neighbourhood. This keeps handler/listener focus useful in
+    // Flutter apps: the focused callback may be referenced by `initState`,
+    // while the actual stream/provider/storage/route edge is attached to that
+    // one-hop caller. We intentionally do not follow generic calls/references
+    // here; otherwise method focus can balloon into a whole module graph.
+    let semantic_context_sources = kept.clone();
+    for e in edges {
+        if !is_focus_semantic_context_edge(&e.kind) {
+            continue;
+        }
+        if semantic_context_sources.contains(&e.from) {
+            kept.insert(e.to.clone());
+        }
+        if semantic_context_sources.contains(&e.to) {
+            kept.insert(e.from.clone());
+        }
+    }
+
     kept.retain(|id| valid.contains(id));
     kept
+}
+
+fn is_focus_semantic_context_edge(kind: &str) -> bool {
+    matches!(
+        kind,
+        "reads_provider" | "navigates_to" | "persists_to" | "subscribes_stream"
+    )
 }
 
 fn priority_order(nodes: &[GraphNode], edges: &[GraphEdge], focus: Option<&str>) -> Vec<String> {
@@ -1420,6 +1446,44 @@ mod tests {
         // After `kept.retain(|id| valid.contains(id))`, the inserted bogus
         // target is dropped because it does not exist in `nodes`.
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn focus_subgraph_keeps_semantic_context_from_one_hop_callers() {
+        let nodes = vec![
+            fake_node(
+                "dart_method::lib/paywall.dart#Screen.initState",
+                "dart_method",
+                None,
+            ),
+            fake_node(
+                "dart_method::lib/paywall.dart#Screen.listenToPurchaseUpdates",
+                "dart_method",
+                None,
+            ),
+            fake_node("storage::stream::purchaseStream", "storage", None),
+        ];
+        let edges = vec![
+            fake_edge(
+                "dart_method::lib/paywall.dart#Screen.initState",
+                "dart_method::lib/paywall.dart#Screen.listenToPurchaseUpdates",
+                "references",
+            ),
+            fake_edge(
+                "dart_method::lib/paywall.dart#Screen.initState",
+                "storage::stream::purchaseStream",
+                "subscribes_stream",
+            ),
+        ];
+        let kept = focus_subgraph(
+            &nodes,
+            &edges,
+            "dart_method::lib/paywall.dart#Screen.listenToPurchaseUpdates",
+        );
+        assert!(
+            kept.contains("storage::stream::purchaseStream"),
+            "focusing listener must keep the caller's stream subscription context: {kept:?}"
+        );
     }
 
     #[test]

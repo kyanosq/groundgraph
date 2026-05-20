@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a browser-viewable, read-only visualization for SpecSlice graphs so users can inspect document facts, confirmed business logic links, AI candidates and risks without modifying the target repository.
+**Goal:** Build a browser-viewable, read-only visualization for SpecSlice graphs so users can inspect document facts, code facts, semantic code edges, confirmed business logic links, AI candidates and risks without modifying the target repository.
 
-**Architecture:** The engine exports a stable `GraphViewModel` JSON from `.specslice/graph.db`. The CLI can render that model as JSON, Mermaid, or a self-contained HTML file under `.specslice/export/graph.html`. The first version uses a deterministic lane layout rather than a force-directed graph, so it is easy to test, works offline, and can show paths/line ranges clearly.
+**Architecture:** The engine exports a stable `GraphViewModel` JSON from `.specslice/graph.db`. The CLI can render that model as JSON, Mermaid, or a self-contained HTML file under `.specslice/export/graph.html`. P6 shipped a deterministic lane layout; P6.1 replaced the default HTML experience with a module tree + SVG graph + detail panel browser so large real repos do not collapse into thousands of flat nodes.
 
 **Tech Stack:** Rust engine/CLI, `serde` data contracts, self-contained HTML/CSS/vanilla JS, optional Mermaid text export.
 
@@ -23,16 +23,15 @@
 
 The first screen should be a working graph viewer, not a landing page.
 
-Layout:
+Current layout:
 
 ```text
 ┌────────────────────────────────────────────────────────────────────┐
-│ Toolbar: search, focus id, layer toggles, candidate/risk toggles    │
-├──────────────┬──────────────┬──────────────┬──────────────┬────────┤
-│ Documents    │ Business     │ Code         │ Tests        │ Risks  │
-│ DocSection   │ Requirement  │ Dart symbols │ Test cases   │ Issues │
-│ nodes        │ nodes        │ nodes        │ nodes        │ nodes  │
-└──────────────┴──────────────┴──────────────┴──────────────┴────────┘
+│ Toolbar: view, search, focus id, layer toggles, candidate/risk       │
+├───────────────┬──────────────────────────────────────┬───────────────┤
+│ Tree          │ SVG graph canvas                      │ Detail panel  │
+│ modules/files │ visible nodes + aggregated edges      │ node/edge data│
+└───────────────┴──────────────────────────────────────┴───────────────┘
 ```
 
 Required interactions:
@@ -41,7 +40,9 @@ Required interactions:
 - Toggle `fact`, `confirmed`, `candidate`, and `risk` layers.
 - Click a node to open a right-side detail panel.
 - Click an edge to show kind, confidence, status, source, and rationale if present.
-- Focus a business logic id to show only its docs, implementations, tests, candidates, and risks.
+- Focus a business logic id, module path, file id, symbol id, test id, or candidate id.
+- For module/file/class focus, expand descendants plus their direct graph neighbourhood.
+- For method/handler focus, preserve immediate code facts and important semantic context such as provider reads, stream subscriptions, navigation, and persistence.
 - Show empty states clearly, especially “No confirmed business logic yet”.
 
 Visual encoding:
@@ -71,10 +72,10 @@ Flags:
 
 ```bash
 --out <path>              # default .specslice/export/graph.html for html
---focus <id>              # requirement/business logic id or artifact id
---include-candidates      # include .specslice/candidates once that store exists
+--focus <id>              # requirement id, module path, artifact id, stable key
+--include-candidates      # include .specslice/candidates/business_logic.yaml
 --include-risks           # include check/confidence findings, default true
---max-nodes <n>           # default 250 for html, unlimited for json
+--max-nodes <n>           # default 80 for html, unlimited for json
 --open                    # optional later; not required for CI
 ```
 
@@ -87,7 +88,7 @@ Initial behavior:
 
 ## Data Contract
 
-Create an engine-level view model that is independent of SQLite row shape:
+The engine-level view model is independent of SQLite row shape. Current schema version is `2`; schema version `1` below is the historical P6 starting point. New readers must accept the extra P6.1+ fields (`view`, `column`, `parent_id`, `child_count`, `default_visible`, evidence fields, resolver).
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -174,10 +175,11 @@ Mapping rules:
 - `NodeKind::DocSection` -> `GraphLayer::Fact`, column `Documents`.
 - `NodeKind::Requirement` -> `GraphLayer::Confirmed`, column `Business`.
 - Dart classes, methods, functions, constructors -> `GraphLayer::Fact`, column `Code`.
+- Dart providers, routes and storage nodes -> `GraphLayer::Fact`, column `Code`.
 - Test cases and groups -> `GraphLayer::Fact`, column `Tests`.
 - `EdgeCertainty::Fact` -> `GraphLayer::Fact`.
 - `EdgeSource::ExternalManifest` + `Confirmed` -> `GraphLayer::Confirmed`.
-- Future `.specslice/candidates/` entries -> `GraphLayer::Candidate`.
+- `.specslice/candidates/business_logic.yaml` entries -> `GraphLayer::Candidate`.
 - Checks and LogicConfidence findings -> `GraphLayer::Risk`.
 
 Important: Do not create business logic nodes from Markdown frontmatter or heading patterns. Business nodes come only from confirmed external graph data or future accepted AI requirement registry entries.
@@ -206,26 +208,22 @@ Generated HTML structure:
 Renderer responsibilities:
 
 - Parse `#specslice-data`.
-- Build lane columns using CSS grid.
+- Build the module/file/symbol tree from `parent_id`.
 - Render nodes as buttons for keyboard accessibility.
 - Render edges in an absolute-positioned SVG overlay after layout.
 - Recompute edge paths on resize and filter changes.
 - Populate detail panel from selected node/edge.
 - Never fetch remote resources.
 
-Suggested layout algorithm:
+Current layout algorithm:
 
-1. Split nodes into lanes: `documents`, `business`, `code`, `tests`, `risks`.
-2. Within each lane, sort by:
-   - confirmed business nodes first,
-   - path,
-   - start line,
-   - label.
-3. Render each lane as a vertical list.
-4. Draw cubic bezier edges between node center points.
-5. Hide edges whose endpoints are filtered out.
+1. Split nodes by `parent_id` into a tree.
+2. Render only `default_visible` nodes plus user-expanded descendants.
+3. When an edge endpoint is hidden, walk up `parent_id` to the nearest visible ancestor and render a deduplicated aggregate edge.
+4. Draw cubic bezier edges between visible node centers.
+5. Hide edges whose endpoints cannot be represented by a visible node.
 
-This deterministic layout is less flashy than a force graph, but easier to inspect and much easier to validate in tests.
+This deterministic layout is less flashy than a force graph, but easier to inspect, easier to test, and better suited to large codebases where folder hierarchy matters.
 
 ## Mermaid Output
 

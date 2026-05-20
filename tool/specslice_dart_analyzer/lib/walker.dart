@@ -42,6 +42,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   final repoRoot = p.normalize(p.absolute(req.repoRoot));
   final files = <Map<String, dynamic>>[];
   final symbols = <Map<String, dynamic>>[];
+  final tests = <Map<String, dynamic>>[];
   final symbolRanges = <Map<String, dynamic>>[];
   final imports = <Map<String, dynamic>>[];
   final references = <Map<String, dynamic>>[];
@@ -61,6 +62,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
     return SidecarBatchResponse(
       files: files,
       symbols: symbols,
+      tests: tests,
       symbolRanges: symbolRanges,
       imports: imports,
       references: references,
@@ -162,6 +164,15 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
       providerByFileAndName: providerByFileAndName,
     );
     unit.unit.visitChildren(declared);
+
+    if (_isTestSourcePath(rel)) {
+      final testDeclarations = _TestDeclarationVisitor(
+        rel: rel,
+        lineInfo: unit.lineInfo,
+        tests: tests,
+      );
+      unit.unit.visitChildren(testDeclarations);
+    }
   }
 
   // Second pass: bodies. Walk every method/function/constructor body for
@@ -195,6 +206,7 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   return SidecarBatchResponse(
     files: files,
     symbols: symbols,
+    tests: tests,
     symbolRanges: symbolRanges,
     imports: imports,
     references: references,
@@ -243,6 +255,12 @@ bool _matchesGlob(String pattern, String path) {
   }
   regex.write(r'$');
   return RegExp(regex.toString()).hasMatch(path);
+}
+
+bool _isTestSourcePath(String rel) {
+  return rel.startsWith('test/') ||
+      rel.startsWith('integration_test/') ||
+      rel.endsWith('_test.dart');
 }
 
 /// Walks declarations and builds the symbol table + element → id map.
@@ -474,6 +492,106 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   }
 }
 
+/// Collects `test('name', ...)` and `group('name', ...)` calls as test
+/// artifacts. This is intentionally syntax-level: the target repo may use
+/// package:test, flutter_test, or local wrappers, and SpecSlice only needs a
+/// stable fact that a named test/group exists at a source location.
+class _TestDeclarationVisitor extends RecursiveAstVisitor<void> {
+  final String rel;
+  final dynamic lineInfo;
+  final List<Map<String, dynamic>> tests;
+  final Set<String> _seenIds = <String>{};
+
+  _TestDeclarationVisitor({
+    required this.rel,
+    required this.lineInfo,
+    required this.tests,
+  });
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    _tryAdd(node.methodName.name, node.argumentList.arguments, node.offset,
+        node.end);
+    super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitFunctionExpressionInvocation(FunctionExpressionInvocation node) {
+    final fn = node.function;
+    if (fn is SimpleIdentifier) {
+      _tryAdd(fn.name, node.argumentList.arguments, node.offset, node.end);
+    }
+    super.visitFunctionExpressionInvocation(node);
+  }
+
+  void _tryAdd(String callee, NodeList<Expression> args, int offsetStart,
+      int offsetEnd) {
+    if (callee != 'test' && callee != 'group') return;
+    if (args.isEmpty) return;
+    final name = _stringLiteralValue(args.first);
+    if (name == null || name.trim().isEmpty) return;
+    final lines = _lineRange(offsetStart, offsetEnd);
+    final slug = _slugify(name);
+    final prefix = callee == 'group' ? 'dart_group' : 'dart_test';
+    final kind =
+        callee == 'group' ? NodeKindString.testGroup : NodeKindString.testCase;
+    var id = '$prefix::$rel#$slug';
+    if (!_seenIds.add(id)) {
+      id = '$prefix::$rel#$slug-line-${lines.start}';
+      _seenIds.add(id);
+    }
+    tests.add({
+      'id': id,
+      'kind': kind,
+      'path': rel,
+      'name': name,
+      'start_line': lines.start,
+      'end_line': lines.end,
+      'parent_symbol_id': null,
+    });
+  }
+
+  String? _stringLiteralValue(AstNode? n) {
+    if (n is SimpleStringLiteral) return n.value;
+    if (n is AdjacentStrings) {
+      final buf = StringBuffer();
+      for (final s in n.strings) {
+        if (s is SimpleStringLiteral) {
+          buf.write(s.value);
+        } else {
+          return null;
+        }
+      }
+      return buf.toString();
+    }
+    return null;
+  }
+
+  String _slugify(String value) {
+    final buf = StringBuffer();
+    var lastWasDash = false;
+    for (final codeUnit in value.toLowerCase().codeUnits) {
+      final isAsciiLetter = codeUnit >= 97 && codeUnit <= 122;
+      final isDigit = codeUnit >= 48 && codeUnit <= 57;
+      if (isAsciiLetter || isDigit) {
+        buf.writeCharCode(codeUnit);
+        lastWasDash = false;
+      } else if (!lastWasDash) {
+        buf.write('-');
+        lastWasDash = true;
+      }
+    }
+    final slug = buf.toString().replaceAll(RegExp(r'^-+|-+$'), '');
+    return slug.isEmpty ? 'unnamed' : slug;
+  }
+
+  ({int start, int end}) _lineRange(int offsetStart, int offsetEnd) {
+    final s = lineInfo.getLocation(offsetStart).lineNumber;
+    final e = lineInfo.getLocation(offsetEnd).lineNumber;
+    return (start: s, end: e);
+  }
+}
+
 /// Walks method / function bodies and emits `calls` / `references` /
 /// P8 framework-aware semantic edges against the symbol table the
 /// declaration pass built.
@@ -598,7 +716,8 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
         const {'push', 'pushNamed', 'pushReplacementNamed', 'pushReplacement'}
             .contains(methodName);
     if (isContextNavigate || isNavigatorStatic) {
-      final route = _extractRouteString(node, navigatorStyle: isNavigatorStatic);
+      final route =
+          _extractRouteString(node, navigatorStyle: isNavigatorStatic);
       if (route != null) {
         final id = 'route::$route';
         syntheticNodes.putIfAbsent(
@@ -632,7 +751,9 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     }
     // ---- SharedPreferences ---------------------------------------------
     // prefs.setBool('key', ...) / prefs.setString(...) / prefs.getBool(...)
-    if (target != null && _isSharedPrefsReceiver(target) && _isPrefsMethod(methodName)) {
+    if (target != null &&
+        _isSharedPrefsReceiver(target) &&
+        _isPrefsMethod(methodName)) {
       final keyExpr = node.argumentList.arguments.isNotEmpty
           ? node.argumentList.arguments.first
           : null;
@@ -867,12 +988,10 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
         // Constructor wasn't itself a tracked symbol — fall back to its
         // enclosing class so the edge still appears in the graph.
         final enclosing = ctor.enclosingElement2;
-        if (enclosing != null) {
-          final classId = byElement[enclosing];
-          if (classId != null) {
-            _emit(from, classId, EdgeKindString.references, node.offset,
-                node.end);
-          }
+        final classId = byElement[enclosing];
+        if (classId != null) {
+          _emit(
+              from, classId, EdgeKindString.references, node.offset, node.end);
         }
       }
     }

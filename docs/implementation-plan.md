@@ -1,14 +1,18 @@
-# SpecSlice MVP 落地方案、测试体系与验收指标
+# SpecSlice 落地方案、测试体系与验收指标
 
 ## 目标
 
-SpecSlice MVP 先证明一个非侵入式闭环：
+SpecSlice 的核心目标是证明一个非侵入式闭环：
 
 ```text
-文档事实 / Dart 事实 / 测试事实 -> AI 业务逻辑候选与关联候选 -> 人工确认 -> confirmed graph -> PR Impact -> Agent Context Pack
+文档事实 / Dart 事实 / 测试事实 -> AI 业务逻辑候选与关联候选 -> 人工确认 -> confirmed graph -> PR Impact / Agent Context Pack / Graph 浏览
 ```
 
-第一阶段不做 Dart analyzer sidecar、不做 GraphRAG、不做 MCP。MVP 的价值判断看两件事：AI 能否基于事实生成高质量业务逻辑候选和候选关联；确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询和反查。
+MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart analyzer sidecar、Flutter/Riverpod 语义边和 AI 业务候选层落到主线。当前阶段仍不做 GraphRAG、不做 MCP、不把 LLM 输出直接写进 confirmed graph。价值判断看三件事：
+
+- AI 能否基于文档/代码/测试事实生成高质量业务逻辑候选和候选关联。
+- 人工确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询、反查和审阅。
+- 图浏览能否帮助用户快速理解目标仓库的真实代码逻辑，并明确区分事实、候选、确认关系和风险。
 
 ## 非侵入式约束
 
@@ -62,14 +66,15 @@ SpecSlice MVP 先证明一个非侵入式闭环：
 - 再断言数据库里只有 file/doc section 和 contains edge，没有 requirement node 和 documents edge。
 - 再写 frontmatter 文档回归测试，确认规则不会从 frontmatter 推导业务语义。
 
-### MVP-2：Dart Lightweight Adapter 与外置关系声明
+### MVP-2：Dart Adapter 与外置关系声明
 
-**目标：** 不依赖 Dart analyzer，只用 Rust lightweight scanner 提取 Dart 文件、符号和测试；关系声明只来自 `.specslice/links.yaml`。
+**目标：** 用统一 `LanguageIndexBatch` 提取 Dart 文件、符号和测试；关系声明只来自 `.specslice/links.yaml`。Rust lightweight scanner 是默认 fallback；P7 之后可通过 Dart analyzer sidecar 获得 resolved AST 精度。
 
 **实现范围：**
 
-- 扫描 `lib / test`。
+- 扫描配置中的 code paths，默认覆盖 `lib / test`。
 - 提取 file、class、method、function、constructor、import、`test(...)`、`group(...)`。
+- 可选 sidecar 通过 `SPECSLICE_DART_ANALYZER=1` 启用，输出同一批量协议；失败时回退到 lightweight，不阻断索引。
 - 输出 `LanguageIndexBatch`，由 Core 统一入库。
 - 建立 symbol range 和 parent-child hierarchy。
 - 索引 `.specslice/links.yaml`，建立 `Documents`、`DeclaresImplementation`、`DeclaresVerification` 边。
@@ -89,7 +94,7 @@ SpecSlice MVP 先证明一个非侵入式闭环：
 
 - `specslice slice <confirmed-business-logic-id>`。
 - 只走 confirmed/declared 高可信边。
-- 默认不走 imports、calls、references、candidate edges。
+- 默认不走 imports、calls、references、semantic code facts、candidate edges。代码事实边用于图浏览、候选生成和解释，不自动提升为 confirmed slice。
 - 输出 Docs、Linked Implementation、Linked Tests、Risks。
 
 **TDD 起点：**
@@ -373,10 +378,10 @@ MVP 完成时必须满足：
 
 落地内容（CLI 子命令 `specslice graph`）：
 
-- `--format json`：输出稳定契约 `GraphViewModel`（schema_version=1），含 stats/nodes/edges/findings 与 generated_at。
+- `--format json`：输出稳定契约 `GraphViewModel`（当前 schema_version=2），含 view/stats/nodes/edges/findings 与 generated_at。
 - `--format mermaid`：输出 `flowchart LR`，使用 `n0/n1/…` 别名，不暴露原始 artifact id；layer→箭头/形状映射（confirmed→实线圆角、candidate→虚线、risk→菱形）。
 - `--format html`：生成 `.specslice/export/graph.html`，自包含 HTML+CSS+JSON+JS，零远程依赖（无 `https://`/`http://`/CDN）。lane 列布局 Documents/Business/Code/Tests/Risks；layer 分别用 `layer-fact`/`layer-confirmed`/`layer-candidate`/`layer-risk` CSS 类区分；支持搜索、focus、图层开关、节点/边详情面板；SVG 贝塞尔在 resize/filter 后重算。
-- 通用旗标：`--focus <id>`（支持 `REQ-*` 稳定键或完整 artifact id，单跳邻域）、`--max-nodes N`（截断时附 `graph_truncated` finding，确保保留 focus 与 confirmed 节点）、`--include-risks`（基于 `compute_checks` 注入 risk findings）、`--include-candidates`（占位，目前无候选源时返回空稳定状态）。
+- 通用旗标：`--focus <id>`（支持 `REQ-*` 稳定键、module path 或完整 artifact id）、`--max-nodes N`（截断时附 `graph_truncated` finding，确保保留 focus 与 confirmed 节点）、`--include-risks`（基于 `compute_checks` 注入 risk findings）、`--include-candidates`（读取 `.specslice/candidates/business_logic.yaml` 的候选层）。
 
 节点分层映射：
 
@@ -390,7 +395,8 @@ MVP 完成时必须满足：
 
 - `EdgeSource::ExternalManifest` → layer=`confirmed`（来自 `.specslice/links.yaml`）。
 - `EdgeCertainty::Fact`（filesystem/parser 提供）→ layer=`fact`。
-- 候选 / risk：保留位置，等 `.specslice/candidates/` 落地后填充。
+- 候选：来自 `.specslice/candidates/business_logic.yaml`，作为 `GraphLayer::Candidate` 展示，不参与 confirmed slice。
+- risk：来自 checks / candidate 解析问题 / 后续 LogicConfidence。
 
 验收（已通过，2026-05-19）：
 
@@ -446,6 +452,80 @@ specslice graph --format html --view business
 - 业务视图在 pixcraft 上显式空状态（"no business logic yet"），不退化成代码堆。
 - `cargo fmt`/`clippy -D warnings`/`cargo test --workspace` 全绿。
 - HTML 自包含、零远程 URL（沿用 P6 离线断言）。
+
+### P6.2 / P6.3：代码事实图与证据 ✅ 落地
+
+**目标：** 让图浏览不只是目录树，而能看到真实代码事实。
+
+**已落地：**
+
+- Dart `calls` / `references` 事实边入库并在 graph JSON/HTML 中可见。
+- 每条代码事实边携带 source file、line、snippet、resolver。
+- 默认降噪：过滤常见 framework noise calls，保留 references 和语义边。
+- 无 confirmed business 时，graph 仍可用于代码理解，但不声称业务逻辑已确认。
+
+**边界：**
+
+- `calls` / `references` 是 deterministic code facts，不是业务确认关系。
+- 它们可以作为 AI candidate evidence，但不能直接进入 confirmed graph。
+
+### P7：Dart analyzer sidecar ✅ 落地
+
+**目标：** 在可用时用 `package:analyzer` resolved AST 替代 lightweight 启发式解析，提高调用、引用和语义边准确率。
+
+**已落地：**
+
+- `SPECSLICE_DART_ANALYZER=1` 启用 sidecar；`SPECSLICE_DART_ANALYZER_BIN` 可指定入口。
+- sidecar 输出 `LanguageIndexBatch` 兼容结构；失败时 fallback 到 lightweight。
+- 代码事实边 resolver 标记为 `dart_analyzer`。
+
+**必须持续满足：**
+
+- sidecar 必须与 lightweight 输出同等类别的数据：files、symbols、tests、imports、ranges、references、synthetic nodes。
+- sidecar 不执行目标代码、不改目标仓库、不依赖业务注解。
+
+### P8：Flutter / Riverpod 语义边 ✅ 落地
+
+**目标：** 在不依赖业务标注的前提下，把常见 Flutter 业务路径提升成可读事实边。
+
+**已落地语义边：**
+
+- `reads_provider`：Riverpod `ref.read/watch/listen(provider)`。
+- `navigates_to`：Flutter / GoRouter / Navigator 路由跳转。
+- `persists_to`：Hive / SharedPreferences 持久化目标。
+- `subscribes_stream`：Stream subscription。
+
+**边界：**
+
+- 语义边仍然是代码事实，不是 confirmed business link。
+- 语义边可用于图浏览、AI 候选证据和澄清问题。
+
+### P9：AI 业务候选层 ✅ 落地
+
+**目标：** AI 可以把文档/代码/测试事实组织成业务逻辑候选，但必须保持候选态。
+
+**已落地：**
+
+- `.specslice/candidates/business_logic.yaml` 作为候选输入。
+- Graph 将候选节点和 `derives_from` evidence 边渲染为 Candidate layer。
+- 候选引用不存在时输出 warning finding。
+
+**边界：**
+
+- 候选不进入 confirmed graph。
+- `slice` / `context` / `impact` 默认不信任 candidate。
+- 人工确认后才写入 `.specslice/links.yaml` 或 `.specslice/requirements.yaml`。
+
+## 当前收口状态
+
+本轮已补齐：
+
+- analyzer sidecar 输出 `test(...)` / `group(...)` 测试事实，避免启用 P7 后测试节点从图里消失。
+- focused graph 对 listener / handler 补一跳高信号语义上下文，能保留 caller 上的 stream/provider/storage/route 事实边。
+
+仍然是重大产品边界：
+
+- 对真实业务仓库的“业务逻辑图”仍依赖 AI candidate 输入和人工确认；没有候选文件时只能输出代码事实图，不能声称已经理解业务需求。
 
 ## 后续验收方式
 

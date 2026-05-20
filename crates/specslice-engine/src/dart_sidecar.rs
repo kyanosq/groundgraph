@@ -83,6 +83,8 @@ struct SidecarRawResponse {
     #[serde(default)]
     symbols: Vec<serde_json::Value>,
     #[serde(default)]
+    tests: Vec<serde_json::Value>,
+    #[serde(default)]
     symbol_ranges: Vec<serde_json::Value>,
     #[serde(default)]
     imports: Vec<serde_json::Value>,
@@ -278,6 +280,16 @@ fn parse_response(stdout: &[u8]) -> SidecarOutcome {
             }
         }
     }
+    for v in response.tests {
+        match serde_json::from_value(v) {
+            Ok(t) => batch.tests.push(t),
+            Err(e) => {
+                return SidecarOutcome::Skipped {
+                    reason: format!("invalid test row: {e}"),
+                };
+            }
+        }
+    }
     for v in response.symbol_ranges {
         match serde_json::from_value(v) {
             Ok(r) => batch.symbol_ranges.push(r),
@@ -328,6 +340,14 @@ fn parse_response(stdout: &[u8]) -> SidecarOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_lock<F: FnOnce()>(f: F) {
+        let _guard = ENV_LOCK.lock().expect("env test mutex poisoned");
+        f();
+    }
 
     fn with_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
         let prev = std::env::var(key).ok();
@@ -347,48 +367,54 @@ mod tests {
 
     #[test]
     fn is_enabled_recognises_truthy_values() {
-        for v in ["1", "true", "TRUE", "yes", "on"] {
-            with_env_var(ENV_ENABLE, Some(v), || {
-                assert!(is_enabled(), "{v} should enable the sidecar");
-            });
-        }
-        for v in ["0", "false", "off", "no", ""] {
-            with_env_var(ENV_ENABLE, Some(v), || {
-                assert!(!is_enabled(), "{v} should disable the sidecar");
-            });
-        }
-    }
-
-    #[test]
-    fn try_run_returns_skipped_when_env_not_set() {
-        with_env_var(ENV_ENABLE, None, || {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let outcome = try_run(tmp.path(), &[PathBuf::from("lib")], &[]);
-            match outcome {
-                SidecarOutcome::Skipped { reason } => {
-                    assert!(reason.contains(ENV_ENABLE), "{reason}");
-                }
-                _ => panic!("expected Skipped, got {outcome:?}"),
+        with_env_lock(|| {
+            for v in ["1", "true", "TRUE", "yes", "on"] {
+                with_env_var(ENV_ENABLE, Some(v), || {
+                    assert!(is_enabled(), "{v} should enable the sidecar");
+                });
+            }
+            for v in ["0", "false", "off", "no", ""] {
+                with_env_var(ENV_ENABLE, Some(v), || {
+                    assert!(!is_enabled(), "{v} should disable the sidecar");
+                });
             }
         });
     }
 
     #[test]
-    fn try_run_returns_skipped_when_sidecar_path_missing() {
-        with_env_var(ENV_ENABLE, Some("1"), || {
-            with_env_var(ENV_BIN, None, || {
+    fn try_run_returns_skipped_when_env_not_set() {
+        with_env_lock(|| {
+            with_env_var(ENV_ENABLE, None, || {
                 let tmp = tempfile::TempDir::new().unwrap();
-                // No tool/ directory inside `tmp`, so default path lookup fails.
                 let outcome = try_run(tmp.path(), &[PathBuf::from("lib")], &[]);
                 match outcome {
                     SidecarOutcome::Skipped { reason } => {
-                        assert!(
-                            reason.contains("could not locate sidecar"),
-                            "expected locate error, got {reason}"
-                        );
+                        assert!(reason.contains(ENV_ENABLE), "{reason}");
                     }
                     _ => panic!("expected Skipped, got {outcome:?}"),
                 }
+            });
+        });
+    }
+
+    #[test]
+    fn try_run_returns_skipped_when_sidecar_path_missing() {
+        with_env_lock(|| {
+            with_env_var(ENV_ENABLE, Some("1"), || {
+                with_env_var(ENV_BIN, None, || {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    // No tool/ directory inside `tmp`, so default path lookup fails.
+                    let outcome = try_run(tmp.path(), &[PathBuf::from("lib")], &[]);
+                    match outcome {
+                        SidecarOutcome::Skipped { reason } => {
+                            assert!(
+                                reason.contains("could not locate sidecar"),
+                                "expected locate error, got {reason}"
+                            );
+                        }
+                        _ => panic!("expected Skipped, got {outcome:?}"),
+                    }
+                });
             });
         });
     }
@@ -424,6 +450,31 @@ mod tests {
             SidecarOutcome::Used(batch) => {
                 assert!(batch.files.is_empty());
                 assert!(batch.symbols.is_empty());
+            }
+            other => panic!("expected Used, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_accepts_test_rows() {
+        let raw = br#"{
+          "ok": true,
+          "tests": [
+            {
+              "id": "dart_test::test/iap/iap_constants_test.dart#exposes-monthly-yearly-lifetime-ids",
+              "kind": "test_case",
+              "path": "test/iap/iap_constants_test.dart",
+              "name": "exposes monthly/yearly/lifetime ids",
+              "start_line": 2,
+              "end_line": 2,
+              "parent_symbol_id": null
+            }
+          ]
+        }"#;
+        match parse_response(raw) {
+            SidecarOutcome::Used(batch) => {
+                assert_eq!(batch.tests.len(), 1);
+                assert_eq!(batch.tests[0].name, "exposes monthly/yearly/lifetime ids");
             }
             other => panic!("expected Used, got {other:?}"),
         }

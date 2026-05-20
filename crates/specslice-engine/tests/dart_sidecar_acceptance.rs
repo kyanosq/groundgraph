@@ -168,6 +168,11 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
         "sidecar must surface fixture symbols, got {}",
         result.symbols
     );
+    assert!(
+        result.tests >= 1,
+        "sidecar must surface fixture tests, got {}",
+        result.tests
+    );
 
     let view = build_graph_view(
         tmp.path(),
@@ -184,6 +189,11 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
         .filter(|e| e.kind == "calls" || e.kind == "references")
         .filter_map(|e| e.resolver.clone())
         .collect();
+    assert!(
+        view.stats.tests >= 1,
+        "sidecar graph view must retain test nodes, got stats={:?}",
+        view.stats
+    );
     assert!(
         resolvers.contains("dart_analyzer"),
         "expected at least one resolver=dart_analyzer edge, got {resolvers:?}"
