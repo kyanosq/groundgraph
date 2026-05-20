@@ -257,7 +257,7 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
     }
 
     let subgraph = expand_subgraph(store, &matches, options.depth, options.include_noise)?;
-    let graph_commands = build_graph_commands(&matches);
+    let graph_commands = build_graph_commands(&matches, &options.repo_root);
 
     Ok(SearchResult {
         query: query_text,
@@ -542,6 +542,7 @@ fn score_candidate(
     let name_lower = c.name.to_ascii_lowercase();
     let name_compact = compact_segments(&c.name).join("");
     let name_subtokens = split_identifier(&c.name);
+    let mut candidate_text_counted = false;
     let mut blob = String::new();
     blob.push_str(&c.description);
     for r in &c.risks {
@@ -570,9 +571,10 @@ fn score_candidate(
             reasons.push(format!("name token `{tok}` matches"));
             continue;
         }
-        if blob_lower.contains(tok) {
+        if blob_lower.contains(tok) && !candidate_text_counted {
             score += SCORE_CANDIDATE_TEXT;
             reasons.push(format!("candidate description mentions `{tok}`"));
+            candidate_text_counted = true;
             continue;
         }
         if id_lower.contains(tok) || name_lower.contains(tok) {
@@ -623,6 +625,7 @@ fn score_node(
         .as_deref()
         .map(compact_segments)
         .unwrap_or_default();
+    let mut candidate_text_counted = false;
 
     for tok in tokens {
         // Exact id (case insensitive).
@@ -658,9 +661,10 @@ fn score_node(
         // Candidate description / risks / recommendation.
         if node.kind == NodeKind::BusinessCandidate {
             if let Some(blob) = candidate_text.get(id) {
-                if blob.contains(tok) {
+                if blob.contains(tok) && !candidate_text_counted {
                     score += SCORE_CANDIDATE_TEXT;
                     reasons.push(format!("candidate description mentions `{tok}`"));
+                    candidate_text_counted = true;
                     continue;
                 }
             }
@@ -889,15 +893,29 @@ fn parse_evidence(raw: Option<&str>) -> (Option<(u32, u32)>, Option<String>) {
 // `graph_commands` — follow-up CLI suggestions
 // ---------------------------------------------------------------------------
 
-fn build_graph_commands(matches: &[SearchMatch]) -> Vec<String> {
+fn build_graph_commands(matches: &[SearchMatch], repo_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(top) = matches.first() {
         out.push(format!(
-            "specslice graph --view focus --focus {} --format html",
-            top.id
+            "specslice --repo-root {} graph --view focus --focus {} --format html",
+            shell_quote(&repo_root.to_string_lossy()),
+            shell_quote(&top.id)
         ));
     }
     out
+}
+
+fn shell_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".into();
+    }
+    if raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '@' | '+'))
+    {
+        return raw.into();
+    }
+    format!("'{}'", raw.replace('\'', r"'\''"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1184,79 @@ mod tests {
             result.graph_commands[0].contains(a.as_str()),
             "graph_commands should focus on top match, got {:?}",
             result.graph_commands
+        );
+        assert!(
+            result.graph_commands[0].contains("--repo-root"),
+            "graph_commands must be paste-ready outside the target repo: {:?}",
+            result.graph_commands
+        );
+        assert!(
+            result.graph_commands[0].contains(&dir.path().display().to_string()),
+            "graph_commands must include the searched repo root: {:?}",
+            result.graph_commands
+        );
+    }
+
+    #[test]
+    fn code_search_prefers_direct_code_symbols_over_candidate_text_mentions() {
+        let (mut store, dir) = empty_store();
+        std::fs::create_dir_all(dir.path().join(".specslice/candidates")).unwrap();
+        std::fs::write(
+            dir.path().join(".specslice/candidates/business_logic.yaml"),
+            r#"
+schema_version: 1
+candidates:
+  - id: complete_purchase_unlocks_pro
+    name: "Completes an in-app purchase and unlocks Pro for the user"
+    description: |
+      proNotifier applyPurchase productId pro_entitlement entitled hive box
+      pro notifier apply purchase product id entitlement true
+    evidence:
+      - dart_method::lib/core/settings/pro_provider.dart#ProNotifier.applyPurchase
+    confidence: 0.72
+    status: proposed
+"#,
+        )
+        .unwrap();
+        let method = insert_method(
+            &mut store,
+            "lib/core/settings/pro_provider.dart",
+            "ProNotifier.applyPurchase",
+            (7, 11),
+        );
+
+        let opts = SearchOptions {
+            repo_root: dir.path().into(),
+            query: SearchQuery::Code(
+                r#"proNotifier.applyPurchase(productId); Hive.box("pro_entitlement").put("entitled", true);"#
+                    .into(),
+            ),
+            depth: 0,
+            kinds: Vec::new(),
+            limit: 10,
+            include_noise: false,
+        };
+
+        let result = run_search_with_store(&store, opts).unwrap();
+        let top = result.matches.first().expect("search must return hits");
+        assert_eq!(
+            top.id,
+            method,
+            "direct code-symbol matches must outrank candidate prose matches: {:?}",
+            result
+                .matches
+                .iter()
+                .map(|m| (&m.id, m.score, &m.match_reasons))
+                .collect::<Vec<_>>()
+        );
+        let candidate = result
+            .matches
+            .iter()
+            .find(|m| m.id == "business_candidate::complete_purchase_unlocks_pro")
+            .expect("candidate should still be searchable");
+        assert!(
+            top.score > candidate.score,
+            "candidate text should not swamp a direct code symbol hit"
         );
     }
 
