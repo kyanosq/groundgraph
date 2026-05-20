@@ -403,7 +403,33 @@ fn p6_html_payload_for_purchase_keeps_canvas_readable_and_carries_business_signa
     )
     .unwrap();
     let payload = compute_search_html_payload(&result, tmp.path(), 25);
-    assert_eq!(payload.schema_version, 1);
+    assert_eq!(
+        payload.schema_version, 2,
+        "schema must bump when full_subgraph / edge_kinds appear"
+    );
+    // P0b — the reader needs the full union subgraph + edge-kind
+    // catalogue so it can render filter chips and expand neighbours
+    // without re-running search.
+    assert!(
+        !payload.full_subgraph.nodes.is_empty(),
+        "schema 2 payload must carry the full union subgraph"
+    );
+    assert!(
+        payload.full_subgraph.nodes.len() >= payload.focus_cards[0].focused.nodes.len(),
+        "full_subgraph must be a superset of any focus card's canvas"
+    );
+    assert!(
+        !payload.edge_kinds.is_empty(),
+        "edge_kinds catalogue powers the filter chip toolbar"
+    );
+    // Catalogue must be sorted by priority high→low, deterministic.
+    let priorities: Vec<u8> = payload.edge_kinds.iter().map(|m| m.priority).collect();
+    for w in priorities.windows(2) {
+        assert!(
+            w[0] >= w[1],
+            "edge_kinds must be sorted by priority desc, got {priorities:?}"
+        );
+    }
     assert!(
         !payload.focus_cards.is_empty(),
         "payload must contain focus cards"

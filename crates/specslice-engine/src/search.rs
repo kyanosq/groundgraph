@@ -177,6 +177,14 @@ pub const HTML_DEFAULT_FOCUS_BUDGET: usize = 25;
 
 /// Bundle that drives `specslice search --format html`. Schema is
 /// versioned so the HTML JS payload contract is explicit.
+///
+/// **Schema 2 additions** (search-driven reader, expand/collapse):
+/// - `full_subgraph` — union of every match's 1-hop subgraph. The HTML
+///   reader uses this as the pool from which the operator can expand
+///   additional neighbours on the canvas without re-running search.
+/// - `edge_kinds` — every edge kind present in `full_subgraph`,
+///   sorted by display priority (tests > storage/route/provider >
+///   calls/refs > contains). Drives the toolbar's filter chips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchHtmlPayload {
     pub schema_version: u32,
@@ -185,6 +193,24 @@ pub struct SearchHtmlPayload {
     pub matches_total: usize,
     pub focus_cards: Vec<SearchFocusCard>,
     pub graph_commands: Vec<String>,
+    /// Union of all matches' 1-hop subgraphs. Schema 2+.
+    #[serde(default)]
+    pub full_subgraph: SearchSubgraph,
+    /// Edge kinds that appear in `full_subgraph`, ordered by display
+    /// priority (highest first). Schema 2+.
+    #[serde(default)]
+    pub edge_kinds: Vec<SearchEdgeKindMeta>,
+}
+
+/// Metadata for one edge kind shown in the toolbar's filter chips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchEdgeKindMeta {
+    /// Stable edge kind string (`calls`, `persists_to`, ...).
+    pub kind: String,
+    /// Number of edges of this kind in `full_subgraph`.
+    pub count: usize,
+    /// Display priority bucket (5..=1, higher = more prominent).
+    pub priority: u8,
 }
 
 /// One focus card per match (sorted by score). The HTML left rail
@@ -518,13 +544,40 @@ pub fn compute_search_html_payload(
             budget,
         ));
     }
+
+    // Edge-kind metadata for the toolbar filter chips. Sorted by
+    // display priority high→low; ties broken alphabetically so the
+    // chip order is deterministic between runs.
+    let mut edge_kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for e in &result.subgraph.edges {
+        *edge_kind_counts.entry(e.kind.clone()).or_insert(0) += 1;
+    }
+    let mut edge_kinds: Vec<SearchEdgeKindMeta> = edge_kind_counts
+        .into_iter()
+        .map(|(kind, count)| {
+            let priority = u8::try_from(edge_priority(&kind).max(0)).unwrap_or(0);
+            SearchEdgeKindMeta {
+                kind,
+                count,
+                priority,
+            }
+        })
+        .collect();
+    edge_kinds.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+
     SearchHtmlPayload {
-        schema_version: 1,
+        schema_version: 2,
         query: result.query.clone(),
         tokens: result.tokens.clone(),
         matches_total: result.matches.len(),
         focus_cards,
         graph_commands: result.graph_commands.clone(),
+        full_subgraph: result.subgraph.clone(),
+        edge_kinds,
     }
 }
 
@@ -1921,12 +1974,23 @@ candidates:
         let result = run_search_with_store(&store, opts).unwrap();
         let payload = compute_search_html_payload(&result, dir.path(), 25);
 
-        assert_eq!(payload.schema_version, 1);
+        assert_eq!(
+            payload.schema_version, 2,
+            "schema bumps when full_subgraph + edge_kinds appear"
+        );
         assert_eq!(payload.query, "purchase");
         assert_eq!(payload.matches_total, result.matches.len());
         assert!(
             !payload.focus_cards.is_empty(),
             "must emit at least one focus card"
+        );
+        assert!(
+            !payload.full_subgraph.nodes.is_empty(),
+            "full_subgraph must be populated for the reader's expansion pool"
+        );
+        assert!(
+            !payload.edge_kinds.is_empty(),
+            "edge_kinds catalogue powers the filter chip toolbar"
         );
 
         // Find the hub focus card and assert the canvas is small but useful.

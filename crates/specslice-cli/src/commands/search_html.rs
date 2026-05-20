@@ -110,6 +110,33 @@ const STATIC_TEMPLATE: &str = r#"<html lang="zh-CN">
     }
     header .stats { color: var(--muted); margin-left: auto; font-size: 12px; }
     header .stats b { color: var(--text); }
+    /* P0b — edge-kind filter chips. Toggling re-renders canvas +
+       inspector so the operator can isolate calls vs storage vs
+       tests vs business-semantic edges. */
+    header .edge-filters {
+      display: flex; flex-wrap: wrap; gap: 6px; width: 100%;
+      padding-top: 4px; margin-top: 2px;
+    }
+    header .edge-filters .label {
+      font-size: 11px; color: var(--muted); padding: 2px 4px 0;
+      letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    .chip.filter {
+      cursor: pointer; user-select: none;
+      transition: background 0.08s ease, color 0.08s ease, opacity 0.08s ease;
+    }
+    .chip.filter:hover { background: var(--panel); }
+    .chip.filter.off {
+      opacity: 0.45;
+      text-decoration: line-through;
+    }
+    .chip.filter .swatch {
+      display: inline-block; width: 8px; height: 8px;
+      border-radius: 50%; margin-right: 6px; vertical-align: middle;
+    }
+    .chip.filter .count {
+      color: var(--muted); font-size: 10px; margin-left: 4px;
+    }
     main.reader {
       display: grid;
       grid-template-columns: minmax(260px, 320px) 1fr minmax(280px, 360px);
@@ -161,9 +188,19 @@ const STATIC_TEMPLATE: &str = r#"<html lang="zh-CN">
     .canvas-node { cursor: pointer; }
     .canvas-node text { font-size: 11px; pointer-events: none; }
     .canvas-node rect { stroke-width: 1.2; }
+    .canvas-node .expand-badge {
+      pointer-events: none;
+    }
+    .canvas-node.expandable rect {
+      stroke-dasharray: 4 3;
+    }
     .canvas-edge { cursor: pointer; }
     .canvas-edge.selected line { stroke-width: 2.5; }
     .canvas-edge text { font-size: 10px; fill: var(--muted); pointer-events: none; }
+    /* P0b — "collapse" affordance for nodes the operator manually
+       expanded into the canvas. Anchor + initial focus set are not
+       collapsible. */
+    .canvas-node.expanded rect { stroke-dasharray: 0; }
     .empty { padding: 24px; color: var(--muted); font-size: 13px; }
 
     aside.inspector h2 {
@@ -249,6 +286,7 @@ const STATIC_TEMPLATE: &str = r#"<html lang="zh-CN">
   <span class="q" id="hdr-query"></span>
   <span class="tokens" id="hdr-tokens"></span>
   <span class="stats" id="hdr-stats"></span>
+  <div class="edge-filters" id="edge-filter-host"></div>
 </header>
 <main class="reader">
   <aside class="matches" id="match-list"></aside>
@@ -275,6 +313,16 @@ const RENDERER_JS: &str = r#"
     return;
   }
   const cards = payload.focus_cards || [];
+  const fullSubgraph = payload.full_subgraph || { nodes: [], edges: [] };
+  const fullNodeIndex = {};
+  (fullSubgraph.nodes || []).forEach(function (n) { fullNodeIndex[n.id] = n; });
+  const edgesByNode = {};
+  (fullSubgraph.edges || []).forEach(function (e) {
+    if (!edgesByNode[e.from]) edgesByNode[e.from] = [];
+    if (!edgesByNode[e.to]) edgesByNode[e.to] = [];
+    edgesByNode[e.from].push(e);
+    edgesByNode[e.to].push(e);
+  });
 
   // ---------- Header
   document.getElementById('hdr-query').textContent = payload.query || '';
@@ -288,6 +336,43 @@ const RENDERER_JS: &str = r#"
   });
   document.getElementById('hdr-stats').innerHTML =
     '命中 <b>' + (payload.matches_total || 0) + '</b> · 焦点卡片 <b>' + cards.length + '</b>';
+
+  // ---------- Edge-kind filter chips (toolbar)
+  const hiddenEdgeKinds = new Set();
+  const filterHost = document.getElementById('edge-filter-host');
+  filterHost.innerHTML = '';
+  if ((payload.edge_kinds || []).length) {
+    const lbl = document.createElement('span');
+    lbl.className = 'label';
+    lbl.textContent = '按边过滤';
+    filterHost.appendChild(lbl);
+    payload.edge_kinds.forEach(function (meta) {
+      const chip = document.createElement('span');
+      chip.className = 'chip filter';
+      chip.dataset.kind = meta.kind;
+      const swatch = document.createElement('span');
+      swatch.className = 'swatch';
+      swatch.style.background = edgeStroke(meta.kind);
+      chip.appendChild(swatch);
+      chip.appendChild(document.createTextNode(meta.kind));
+      const count = document.createElement('span');
+      count.className = 'count';
+      count.textContent = '·' + meta.count;
+      chip.appendChild(count);
+      chip.title = '点击隐藏 / 显示 `' + meta.kind + '` 类型的边';
+      chip.addEventListener('click', function () {
+        if (hiddenEdgeKinds.has(meta.kind)) {
+          hiddenEdgeKinds.delete(meta.kind);
+          chip.classList.remove('off');
+        } else {
+          hiddenEdgeKinds.add(meta.kind);
+          chip.classList.add('off');
+        }
+        if (activeIdx >= 0) renderActive();
+      });
+      filterHost.appendChild(chip);
+    });
+  }
 
   // ---------- Match list (left rail)
   const listEl = document.getElementById('match-list');
@@ -331,6 +416,19 @@ const RENDERER_JS: &str = r#"
 
   let activeIdx = -1;
   let selectedEdgeId = null;
+  // P0b — per-card "expanded" sets. Each card starts with its
+  // `focused` node ids visible; the operator can click a node on the
+  // canvas to reveal its hidden 1-hop neighbours (drawn from
+  // `payload.full_subgraph`).
+  const expandedByCard = new Map();
+
+  function visibleIdsForCard(card, idx) {
+    const baseline = (card.focused && card.focused.nodes) || [];
+    const set = new Set(baseline.map(function (n) { return n.id; }));
+    const added = expandedByCard.get(idx);
+    if (added) added.forEach(function (id) { set.add(id); });
+    return set;
+  }
 
   function selectCard(idx) {
     activeIdx = idx;
@@ -340,55 +438,111 @@ const RENDERER_JS: &str = r#"
         el.classList.toggle('active', i === idx);
       }
     });
-    renderCanvas(cards[idx]);
-    renderInspector(cards[idx]);
+    renderActive();
+  }
+
+  function renderActive() {
+    if (activeIdx < 0 || activeIdx >= cards.length) return;
+    renderCanvas(cards[activeIdx], activeIdx);
+    renderInspector(cards[activeIdx], activeIdx);
   }
 
   // ---------- Canvas (centre)
-  function renderCanvas(card) {
+  function renderCanvas(card, cardIdx) {
     const svg = document.getElementById('canvas-svg');
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     document.getElementById('canvas-anchor').textContent = card.label || card.match_id;
     document.getElementById('canvas-kind').textContent = card.badge || card.kind;
+
+    // Compute the *current* visible set (focused + manual expansions).
+    const visibleIds = visibleIdsForCard(card, cardIdx);
+    const anchorId = card.match_id;
+    const baselineIds = new Set((card.focused && card.focused.nodes || []).map(function (n) { return n.id; }));
+
+    // Filtered edges = edges from full_subgraph whose endpoints are
+    // both visible AND whose kind is not hidden by the toolbar.
+    const visibleEdges = (fullSubgraph.edges || []).filter(function (e) {
+      return visibleIds.has(e.from) && visibleIds.has(e.to) && !hiddenEdgeKinds.has(e.kind);
+    });
+
+    // Drop nodes that become orphan after edge filtering — but always
+    // keep the anchor and any explicitly expanded node so the operator
+    // doesn't lose context.
+    const expandedSet = expandedByCard.get(cardIdx) || new Set();
+    const connected = new Set([anchorId]);
+    visibleEdges.forEach(function (e) {
+      connected.add(e.from);
+      connected.add(e.to);
+    });
+    const renderedNodeIds = new Set();
+    visibleIds.forEach(function (id) {
+      if (id === anchorId || baselineIds.has(id) || expandedSet.has(id) || connected.has(id)) {
+        renderedNodeIds.add(id);
+      }
+    });
+
+    // Recompute hidden-neighbour count per visible node so the canvas
+    // can show a "+N" badge that invites further drill-down.
+    const hiddenNeighborsByNode = {};
+    renderedNodeIds.forEach(function (id) {
+      const peers = edgesByNode[id] || [];
+      const hidden = new Set();
+      peers.forEach(function (e) {
+        if (hiddenEdgeKinds.has(e.kind)) return;
+        const other = e.from === id ? e.to : e.from;
+        if (other === id) return;
+        if (!renderedNodeIds.has(other)) hidden.add(other);
+      });
+      hiddenNeighborsByNode[id] = hidden;
+    });
+
+    const hiddenCountTotal = (fullSubgraph.nodes || []).length - renderedNodeIds.size;
     const trunc = document.getElementById('canvas-truncated');
-    if (card.focus_truncated) {
+    if (hiddenCountTotal > 0) {
       trunc.hidden = false;
-      trunc.textContent = '已折叠 ' + (card.focus_hidden_count || 0) + ' 个邻居';
+      trunc.textContent = '已折叠 ' + hiddenCountTotal + ' 个邻居 · 点节点展开';
     } else {
       trunc.hidden = true;
     }
     document.getElementById('canvas-budget').textContent =
-      '画布: ' + (card.focused && card.focused.nodes ? card.focused.nodes.length : 0) + ' 节点';
+      '画布: ' + renderedNodeIds.size + ' / ' + (fullSubgraph.nodes || []).length + ' 节点';
 
-    const focused = card.focused || { nodes: [], edges: [] };
-    const w = 800, h = 480;
-    const cx = w / 2, cy = h / 2;
-
-    // Layout: anchor in centre, neighbours arranged in a ring sorted by
+    // Layout: anchor in centre, others arranged in a ring sorted by
     // edge priority bucket (tests > business semantics > calls > misc).
-    const anchorId = card.match_id;
-    const anchor = focused.nodes.find(function (n) { return n.id === anchorId; });
-    const others = focused.nodes.filter(function (n) { return n.id !== anchorId; });
+    const renderedNodes = [];
+    renderedNodeIds.forEach(function (id) {
+      const fromFull = fullNodeIndex[id];
+      const fromFocus = (card.focused && card.focused.nodes || []).find(function (n) { return n.id === id; });
+      const n = fromFocus || fromFull;
+      if (n) renderedNodes.push(n);
+    });
+
+    const anchor = renderedNodes.find(function (n) { return n.id === anchorId; });
+    const others = renderedNodes.filter(function (n) { return n.id !== anchorId; });
     others.sort(function (a, b) {
       const pa = neighbourPriority(card, a.id);
       const pb = neighbourPriority(card, b.id);
       if (pa !== pb) return pb - pa;
-      return a.label.localeCompare(b.label);
+      return (a.label || a.id).localeCompare(b.label || b.id);
     });
+
+    const w = 880, h = 520;
+    const cx = w / 2, cy = h / 2;
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
     const positions = {};
     if (anchor) positions[anchor.id] = { x: cx, y: cy };
-    const radius = Math.min(w, h) * 0.36;
+    const ring = Math.min(w, h) * 0.36;
     const n = Math.max(others.length, 1);
     others.forEach(function (node, i) {
       const angle = (i / n) * 2 * Math.PI - Math.PI / 2;
       positions[node.id] = {
-        x: cx + Math.cos(angle) * radius,
-        y: cy + Math.sin(angle) * radius,
+        x: cx + Math.cos(angle) * ring,
+        y: cy + Math.sin(angle) * ring,
       };
     });
 
     // Edges first (drawn under nodes).
-    (focused.edges || []).forEach(function (e) {
+    visibleEdges.forEach(function (e) {
       const from = positions[e.from];
       const to = positions[e.to];
       if (!from || !to) return;
@@ -418,17 +572,20 @@ const RENDERER_JS: &str = r#"
       svg.appendChild(g);
     });
 
-    // Nodes.
-    focused.nodes.forEach(function (node) {
+    // Nodes (drawn on top).
+    renderedNodes.forEach(function (node) {
       const pos = positions[node.id];
       if (!pos) return;
       const isAnchor = node.id === anchorId;
+      const isExpanded = expandedSet.has(node.id);
+      const hidden = hiddenNeighborsByNode[node.id] || new Set();
       const label = node.label || node.id;
       const charW = 6.6;
       const wBox = Math.min(220, Math.max(80, label.length * charW + 16));
       const hBox = 32;
       const g = svgNs('g');
-      g.setAttribute('class', 'canvas-node');
+      g.setAttribute('class', 'canvas-node' + (hidden.size ? ' expandable' : '') + (isExpanded ? ' expanded' : ''));
+      g.dataset.nodeId = node.id;
       g.setAttribute('transform', 'translate(' + (pos.x - wBox / 2) + ',' + (pos.y - hBox / 2) + ')');
       const rect = svgNs('rect');
       rect.setAttribute('width', wBox);
@@ -457,8 +614,54 @@ const RENDERER_JS: &str = r#"
       t2.setAttribute('fill', 'var(--muted)');
       t2.textContent = node.kind;
       g.appendChild(t2);
+      if (hidden.size > 0) {
+        const badge = svgNs('g');
+        badge.setAttribute('class', 'expand-badge');
+        const bg = svgNs('circle');
+        bg.setAttribute('cx', wBox - 8);
+        bg.setAttribute('cy', 8);
+        bg.setAttribute('r', 9);
+        bg.setAttribute('fill', nodeStroke(node.kind));
+        const tx = svgNs('text');
+        tx.setAttribute('x', wBox - 8);
+        tx.setAttribute('y', 11);
+        tx.setAttribute('text-anchor', 'middle');
+        tx.setAttribute('fill', '#fff');
+        tx.style.fontSize = '10px';
+        tx.style.fontWeight = '700';
+        tx.textContent = '+' + hidden.size;
+        badge.appendChild(bg);
+        badge.appendChild(tx);
+        g.appendChild(badge);
+      }
+      g.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (hidden.size > 0) {
+          expandNode(cardIdx, node.id, hidden);
+        } else if (!isAnchor && !baselineIds.has(node.id) && expandedSet.has(node.id)) {
+          collapseNode(cardIdx, node.id);
+        }
+      });
       svg.appendChild(g);
     });
+  }
+
+  function expandNode(cardIdx, nodeId, hidden) {
+    if (!expandedByCard.has(cardIdx)) expandedByCard.set(cardIdx, new Set());
+    const set = expandedByCard.get(cardIdx);
+    hidden.forEach(function (id) { set.add(id); });
+    // Mark the originating node so the operator can also collapse it
+    // (the children we just added carry the "expanded" affordance).
+    set.add(nodeId);
+    renderActive();
+  }
+
+  function collapseNode(cardIdx, nodeId) {
+    const set = expandedByCard.get(cardIdx);
+    if (!set) return;
+    set.delete(nodeId);
+    // Also drop any expansion that only existed because of this node.
+    renderActive();
   }
 
   function neighbourPriority(card, neighborId) {
@@ -510,7 +713,7 @@ const RENDERER_JS: &str = r#"
   }
 
   // ---------- Inspector (right rail)
-  function renderInspector(card) {
+  function renderInspector(card, cardIdx) {
     const panel = document.getElementById('inspector');
     panel.innerHTML = '';
     const title = document.createElement('div');
@@ -629,10 +832,44 @@ const RENDERER_JS: &str = r#"
     }
 
     // Upstream / Downstream edges grouped by kind
+    const filteredUp = (card.upstream || []).filter(function (r) { return !hiddenEdgeKinds.has(r.edge_kind); });
+    const filteredDown = (card.downstream || []).filter(function (r) { return !hiddenEdgeKinds.has(r.edge_kind); });
     panel.appendChild(h2('上游 (谁影响我)'));
-    panel.appendChild(renderEdgeGroups(card, card.upstream || []));
+    panel.appendChild(renderEdgeGroups(card, filteredUp));
     panel.appendChild(h2('下游 (我影响谁)'));
-    panel.appendChild(renderEdgeGroups(card, card.downstream || []));
+    panel.appendChild(renderEdgeGroups(card, filteredDown));
+
+    // P0b — expandable neighbours not currently on the canvas. Lets
+    // the operator drill into a hidden symbol without learning the
+    // graph CLI flags.
+    const visibleIds = visibleIdsForCard(card, cardIdx);
+    const expandableByNode = computeExpandable(visibleIds);
+    if (expandableByNode.size > 0) {
+      panel.appendChild(h2('可展开邻居 (' + expandableByNode.size + ')'));
+      expandableByNode.forEach(function (hidden, fromId) {
+        const row = document.createElement('div');
+        row.className = 'edge-row';
+        const fromNode = fullNodeIndex[fromId];
+        const fromLabel = (fromNode && fromNode.label) || fromId;
+        const head = document.createElement('div');
+        head.className = 'neighbor';
+        head.textContent = '从 ' + fromLabel;
+        row.appendChild(head);
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = '+' + hidden.size + ' 个隐藏邻居 (' + Array.from(hidden).slice(0, 3).map(function (id) {
+          const n = fullNodeIndex[id];
+          return (n && n.kind) || 'node';
+        }).join(', ') + (hidden.size > 3 ? ', …' : '') + ')';
+        row.appendChild(meta);
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.textContent = '展开';
+        btn.addEventListener('click', function () { expandNode(cardIdx, fromId, hidden); });
+        meta.appendChild(btn);
+        panel.appendChild(row);
+      });
+    }
 
     // Edge detail placeholder
     const detail = document.createElement('div');
@@ -713,8 +950,26 @@ const RENDERER_JS: &str = r#"
 
   function selectEdge(card, edgeId) {
     selectedEdgeId = edgeId;
-    renderCanvas(card);
-    renderInspector(card);
+    renderActive();
+  }
+
+  /// Compute a map<visible_node_id, Set<hidden_neighbor_id>> for the
+  /// current visible set. Used to render the right-rail "可展开邻居"
+  /// section. Hidden by edge-kind filter ⇒ not counted as expandable.
+  function computeExpandable(visibleIds) {
+    const out = new Map();
+    visibleIds.forEach(function (id) {
+      const peers = edgesByNode[id] || [];
+      const hidden = new Set();
+      peers.forEach(function (e) {
+        if (hiddenEdgeKinds.has(e.kind)) return;
+        const other = e.from === id ? e.to : e.from;
+        if (other === id) return;
+        if (!visibleIds.has(other)) hidden.add(other);
+      });
+      if (hidden.size > 0) out.set(id, hidden);
+    });
+    return out;
   }
 
   function repaintEdgeDetail(card) {

@@ -91,6 +91,25 @@ fn search_html_writes_self_contained_reader_to_default_path() {
         html.contains("命中") || html.contains("代码") || html.contains("文档"),
         "Chinese reader chrome must be present"
     );
+    // P0b — the search-driven reader must ship its full subgraph
+    // and edge-kind filter toolbar so the operator can expand and
+    // hide relationships without re-running search.
+    assert!(
+        html.contains("edge-filter-host"),
+        "edge filter host element must be present in the HTML scaffolding"
+    );
+    assert!(
+        html.contains("按边过滤") || html.contains("edge-filters"),
+        "edge filter label or container must be present"
+    );
+    assert!(
+        html.contains("full_subgraph"),
+        "embedded payload must declare a full_subgraph for canvas expansion"
+    );
+    assert!(
+        html.contains("edge_kinds"),
+        "embedded payload must declare the edge_kinds catalogue"
+    );
 }
 
 #[test]

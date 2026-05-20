@@ -598,6 +598,33 @@ specslice graph --format html --view business
 - 任何分析边界（入口点、ignore、public API）都只通过 `.specslice.yaml` 表达。
 - 输出可信度而非删除指令，并在文末显式提示运营要先用 `graph --focus` / `search` 复核。
 
+### P11：Agent 工具层与画布交互（MCP + 阅读器升级）✅ 落地
+
+**目标：** 让 AI Agent 不再解析 CLI 文本，让人能围绕搜索目标在画布上展开 / 收起 / 过滤局部业务图。
+
+**已落地（A — MCP 工具化）：**
+
+- 新 crate `specslice-mcp`，提供 `specslice-mcp` 二进制：stdio 上的换行分隔 JSON-RPC 2.0，MCP 协议版本 `2024-11-05`。
+- 启动顺序：`--repo-root <path>` → `SPECSLICE_REPO_ROOT` → 当前目录；每条 `tools/call` 还可在 `arguments` 里覆写 `repo_root`，便于 Agent 在多仓库间复用同一进程。
+- 协议面：`initialize` 返回 `protocolVersion / serverInfo / capabilities.tools`；`notifications/initialized` 静默接受；`tools/list` 返回带 JSON Schema 的工具清单；`tools/call` 把工具结果包成单个 `text` content block，结构化 JSON 在 `text` 字段内。
+- 6 个一线工具：`search_graph(query/code/file+line)` · `get_subgraph(node_id, depth, edge_kinds)` · `explain_symbol(symbol_id)` · `impact(base, head)` · `dead_code(min_confidence, include_tests)` · `context_pack(requirement_id|candidate_id|symbol_id)`，全部复用 engine 现成 API、不引入新的事实通路。
+- 工具错误（缺工作区、参数缺失、引擎抛错）走 MCP 约定的 `isError: true` content，传输级错误（未知方法 / 未知工具 / 缺 `name`）才回 JSON-RPC error envelope，不会让 Agent 误把业务失败当成协议崩溃。
+- 测试：`dispatcher_*` 直接覆盖 `initialize / tools.list / 未知方法 / 未知工具 / 工具失败`；`end_to_end_initialize_list_search_against_watermark_fixture` 通过真实 `specslice-mcp` 二进制 + watermark fixture 走通 `initialize → tools/list → tools/call(search_graph) → tools/call(dead_code)`，断言每一步的 JSON-RPC 信封、tool 内嵌 JSON 与 `isError` 标志。
+
+**已落地（B — 搜索阅读器再迭代）：**
+
+- `SearchHtmlPayload` schema bump 到 2：新增 `full_subgraph`（所有命中 1-hop 并集）与 `edge_kinds`（按显示优先级排序的边类型目录 `{ kind, count, priority }`）。Schema 2 同时向后兼容：缺字段时通过 `#[serde(default)]` 视为 0 节点 / 空目录。
+- HTML 阅读器顶栏新增「按边过滤」chip 行（calls / persists_to / navigates_to / reads_provider / declares_verification / derives_from / contains 等），点击即时隐藏 / 显示对应边并连带过滤右侧上下游列表。
+- 画布支持「点击节点展开 1-hop 邻居」：节点右上角实时显示 `+N` badge，点击即从 `full_subgraph` 抽出该节点未上画布的邻居加入视野；展开过的节点画虚框，点一下回收。
+- 右侧 Inspector 增加「可展开邻居」段，按起点节点列出隐藏邻居数与类型枚举，配「展开」按钮供没有命中 badge 的场景直接操作。
+- 测试：engine `html_payload_includes_one_focus_card_per_match_with_canvas_under_budget` 与 P5 golden 都断言 `schema_version == 2`、`full_subgraph` 非空、`edge_kinds` 按 priority 严格下降；CLI `search_html_writes_self_contained_reader_to_default_path` 额外断言 HTML 中存在 `edge-filter-host` 容器、`按边过滤` 中文标签、`full_subgraph` / `edge_kinds` payload。
+
+**非侵入式约束（同 P10 一致）：**
+
+- 不在代码中加任何注解；MCP 工具与 HTML 阅读器都只读 `.specslice.yaml` + graph.db + `business_logic.yaml`。
+- 不主动联网、不依赖任何外部 LLM；Agent 端拿到结构化 JSON 后自由扩词，CLI 保持确定性。
+- 阅读器 HTML 单文件可离线打开，不引入 CDN / WebFont / WebGL。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：

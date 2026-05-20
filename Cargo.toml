@@ -6,6 +6,7 @@ members = [
     "crates/specslice-lang-dart",
     "crates/specslice-engine",
     "crates/specslice-cli",
+    "crates/specslice-mcp",
 ]
 
 [workspace.package]
