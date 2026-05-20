@@ -233,6 +233,10 @@ fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
         candidate_node_count += 1;
     }
     assert_eq!(candidate_node_count, 5);
+    assert!(
+        !view.findings.iter().any(|f| f.code == "no_business_logic"),
+        "business view with loaded candidates must not tell the user to seed candidates"
+    );
 
     // (b) derives_from edges fan out from each candidate to the cited code facts.
     let derives = view

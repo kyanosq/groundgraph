@@ -371,10 +371,7 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
 
     // 8. Apply view-specific default_visible.
     apply_view(&mut nodes, &edges, options.view, options.focus.as_deref());
-    if matches!(options.view, GraphView::Business)
-        && !nodes
-            .iter()
-            .any(|n| n.kind == "requirement" && n.default_visible)
+    if matches!(options.view, GraphView::Business) && should_emit_no_business_logic_finding(&nodes)
     {
         findings.push(GraphFinding {
             code: "no_business_logic".into(),
@@ -405,6 +402,12 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
         nodes,
         edges,
         findings,
+    })
+}
+
+fn should_emit_no_business_logic_finding(nodes: &[GraphNode]) -> bool {
+    !nodes.iter().any(|n| {
+        n.default_visible && matches!(n.kind.as_str(), "requirement" | "business_candidate")
     })
 }
 
@@ -1542,6 +1545,18 @@ mod tests {
         ];
         apply_view(&mut nodes, &edges, GraphView::Business, None);
         assert!(nodes.iter().all(|n| n.default_visible));
+    }
+
+    #[test]
+    fn business_view_no_logic_finding_is_suppressed_when_candidates_exist() {
+        let mut candidate = fake_node("business_candidate::a", "business_candidate", None);
+        candidate.column = GraphColumn::Business;
+        candidate.layer = GraphLayer::Candidate;
+        candidate.default_visible = true;
+        assert!(
+            !should_emit_no_business_logic_finding(&[candidate]),
+            "loaded candidates are a business surface; the UI should not ask users to seed candidates"
+        );
     }
 
     #[test]
