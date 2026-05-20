@@ -780,6 +780,7 @@ dependencies = [
  "assert_fs",
  "clap",
  "predicates",
+ "serde",
  "serde_json",
  "specslice-core",
  "specslice-engine",

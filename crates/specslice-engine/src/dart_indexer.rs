@@ -60,10 +60,12 @@ pub struct DartIndexResult {
 }
 
 pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartIndexResult> {
-    // P7: try the analyzer sidecar first (opt-in via SPECSLICE_DART_ANALYZER=1).
-    // When the sidecar is enabled and succeeds, we use its resolved-AST output;
-    // otherwise we silently fall back to the heuristic adapter so existing
-    // workflows keep working without a Dart SDK.
+    // P7+P2: the Dart analyzer sidecar is now the default high-precision
+    // path. It runs whenever a `dart` binary is on PATH and the
+    // workspace ships `tool/specslice_dart_analyzer/`. Users without a
+    // Dart SDK silently fall back to the lightweight heuristic adapter
+    // (resolver_used = "dart_lightweight"). Opt out with
+    // `SPECSLICE_DART_ANALYZER=0`.
     let (mut batch, resolver_used, skip_reason) = match dart_sidecar::try_run(
         &options.repo_root,
         &options.code_roots,

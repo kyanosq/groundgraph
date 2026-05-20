@@ -100,3 +100,79 @@ candidates:
       - "Should this be gated on `purchaseUpdate.status == PurchaseStatus.purchased` (not modelled in this fixture)?"
       - "Does /paywall_thanks have an idempotency mechanism upstream?"
     status: proposed
+
+  - id: editor_persists_last_tool_to_hive
+    name: "Editor remembers the last selected tool across launches"
+    description: |
+      EditorController.applyTool opens the Hive box `editor_state` and
+      writes the active EditorTool to the `lastTool` key. The same key
+      is the source of truth read on next launch (caller-side, not in
+      this fixture) so the user resumes editing with their previous
+      brush/eraser selection.
+    evidence:
+      - dart_method::lib/features/editor/editor_controller.dart#EditorController.applyTool
+      - storage::hive::editor_state
+    confidence: 0.78
+    risks:
+      - "If applyTool throws between writing to Hive and pushing the new state, the persisted tool can drift from the in-memory one."
+    recommendation: "Wrap the persistence and state mutation in a single try/catch so the Hive write only happens after the in-memory swap succeeds."
+    open_questions:
+      - "Is the EditorTool enum string format stable across versions, or could a rename invalidate persisted values?"
+    status: proposed
+
+  - id: layer_repository_persists_count_only
+    name: "Layer repository only persists the layer count, not individual layers"
+    description: |
+      LayerRepository._persist writes `count` to the `project_layers`
+      Hive box but never serialises layer ids, names or visibility.
+      Effectively the persisted state is "how many layers existed",
+      which means a restart can't actually restore the layer list.
+    evidence:
+      - dart_method::lib/features/layers/layer_repository.dart#LayerRepository._persist
+      - storage::hive::project_layers
+    confidence: 0.86
+    risks:
+      - "User loses all layer metadata between sessions despite UI implying persistence."
+    recommendation: "Persist a list of layer dictionaries instead of just the count, and add a hydrate() method on app start."
+    open_questions:
+      - "Is layer data persisted elsewhere (e.g. inside the project file itself)?"
+    status: proposed
+
+  - id: project_autosave_subscription_leak
+    name: "Project autosave listener is never cancelled"
+    description: |
+      ProjectLifecycle.subscribeAutosave attaches a listener to
+      ProjectEventBus.events but discards the StreamSubscription.
+      Combined with closeProject not unsubscribing, repeated
+      open/close cycles leak listeners and cause duplicate saveProject
+      calls per event.
+    evidence:
+      - dart_method::lib/features/project/project_lifecycle.dart#ProjectLifecycle.subscribeAutosave
+      - dart_method::lib/features/project/project_lifecycle.dart#ProjectLifecycle.closeProject
+    confidence: 0.71
+    risks:
+      - "Multiple concurrent saves for the same event amplify Hive I/O and may corrupt last-write-wins state."
+    recommendation: "Store the StreamSubscription and cancel it inside closeProject (or expose a disposeAutosave hook)."
+    open_questions:
+      - "How many times can subscribeAutosave be called for a single ProjectLifecycle instance?"
+    status: proposed
+
+  - id: project_lifecycle_persistence_layout
+    name: "Projects + last-closed marker share the same Hive box"
+    description: |
+      createProject, saveProject and closeProject all open the same
+      `projects` Hive box. closeProject writes a `lastClosed`
+      meta-key alongside the project entries, so a future scan that
+      iterates project ids will surface 'lastClosed' as if it were a
+      project name.
+    evidence:
+      - dart_method::lib/features/project/project_lifecycle.dart#ProjectLifecycle.createProject
+      - dart_method::lib/features/project/project_lifecycle.dart#ProjectLifecycle.closeProject
+      - storage::hive::projects
+    confidence: 0.69
+    risks:
+      - "Meta-keys mixed with data keys produce surprises for any later iteration / migration."
+    recommendation: "Move `lastClosed` to a dedicated `projects_meta` box or namespace the key (e.g. `__lastClosed__`)."
+    open_questions:
+      - "Is there an existing convention for meta-keys (prefix? separate box?) elsewhere in the app?"
+    status: proposed

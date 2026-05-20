@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// Schema version embedded in every YAML file. Bump only on incompatible
 /// changes — readers must accept older minor versions.
@@ -75,14 +77,131 @@ pub struct BusinessCandidate {
     pub confidence: Option<f32>,
     #[serde(default)]
     pub open_questions: Vec<String>,
-    /// `proposed` (AI), `confirmed` (human), `rejected` (human). Other
-    /// values are treated as `proposed`.
+    /// Optional AI-authored risk warnings — short sentences describing
+    /// things that look broken / fragile based on the code facts. They
+    /// surface in the CLI review UI and on the graph node as badges so
+    /// reviewers can make a quick judgement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<String>,
+    /// Optional AI-authored "what should the reviewer do" suggestion,
+    /// e.g. "建议接受 — 与产品意图一致" or "建议补测试后再确认".
+    /// One sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+    /// AI lifecycle:
+    /// - `proposed` — fresh AI candidate; default.
+    /// - `accepted` — human reviewer accepted the description.
+    /// - `rejected` — human reviewer rejected; description is wrong.
+    /// - `needs_changes` — description is on the right track but
+    ///   needs edits before it can be accepted.
+    /// - `pending` — reviewer needs more info / external context.
+    ///
+    /// Historical fixtures may carry `status: confirmed`; the engine
+    /// normalises that to `accepted` on load.
     #[serde(default = "default_status")]
     pub status: String,
+    /// Audit trail for the last human review. AI never writes this;
+    /// only the `specslice candidate review` command does. Round-trips
+    /// through YAML so reviewers can see who said what when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<CandidateReview>,
 }
 
 fn default_status() -> String {
     "proposed".into()
+}
+
+/// Reviewer verdict + audit trail. Stored under `review:` in the YAML.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CandidateReview {
+    /// One of `accepted` / `rejected` / `needs_changes` / `pending`.
+    /// Stored as a string (not an enum tag) so old YAMLs with custom
+    /// values still parse — invalid values are mapped to `pending`.
+    pub status: String,
+    /// Free-form reviewer identity. CLI defaults to the value of the
+    /// `--reviewer` flag, otherwise `$USER`, otherwise `"local"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    /// Human-written 1-3 sentence note explaining the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// RFC3339 timestamp of when the review was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+    /// Open questions the reviewer has already answered. Lets the CLI
+    /// avoid re-prompting on the next `candidate list` run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answered_questions: Vec<String>,
+}
+
+/// Canonical review status — keeps callers safe from typos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    Accepted,
+    Rejected,
+    NeedsChanges,
+    Pending,
+}
+
+impl ReviewStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewStatus::Accepted => "accepted",
+            ReviewStatus::Rejected => "rejected",
+            ReviewStatus::NeedsChanges => "needs_changes",
+            ReviewStatus::Pending => "pending",
+        }
+    }
+
+    /// Parse string from CLI / YAML. Treats unknown values as `pending`
+    /// so legacy `confirmed`/empty fields land in a safe bucket. Returns
+    /// `None` only for the empty string so callers can distinguish
+    /// "never reviewed" from "reviewed = pending".
+    pub fn parse(s: &str) -> Option<ReviewStatus> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "accepted" | "accept" | "confirmed" => Some(ReviewStatus::Accepted),
+            "rejected" | "reject" => Some(ReviewStatus::Rejected),
+            "needs_changes" | "needs-changes" | "changes" => Some(ReviewStatus::NeedsChanges),
+            "pending" | "wait" | "later" => Some(ReviewStatus::Pending),
+            _ => Some(ReviewStatus::Pending),
+        }
+    }
+}
+
+impl BusinessCandidate {
+    /// Effective review status, merging the (legacy) `status` field and
+    /// the (P1) `review.status` field. Order of precedence:
+    /// 1. `review.status` if present and parseable;
+    /// 2. `status` if it parses;
+    /// 3. `None` (i.e. AI-proposed, no human verdict yet).
+    pub fn review_status(&self) -> Option<ReviewStatus> {
+        if let Some(r) = self.review.as_ref() {
+            if let Some(parsed) = ReviewStatus::parse(&r.status) {
+                return Some(parsed);
+            }
+        }
+        match self.status.trim().to_ascii_lowercase().as_str() {
+            "proposed" | "" => None,
+            other => ReviewStatus::parse(other),
+        }
+    }
+
+    /// Open questions filtered to those the reviewer has not yet
+    /// answered. Used by the CLI to avoid re-prompting on the next pass.
+    pub fn pending_open_questions(&self) -> Vec<&str> {
+        let answered: std::collections::HashSet<&str> = self
+            .review
+            .as_ref()
+            .map(|r| r.answered_questions.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        self.open_questions
+            .iter()
+            .map(String::as_str)
+            .filter(|q| !answered.contains(q))
+            .collect()
+    }
 }
 
 /// Outcome of trying to load business candidates from a repository.
@@ -94,6 +213,34 @@ pub struct LoadOutcome {
     /// Soft warnings: invalid IDs, missing required fields, etc. The
     /// engine never panics on bad candidates — it drops them and keeps
     /// going.
+    pub warnings: Vec<String>,
+}
+
+/// Verdict the CLI / agent provides when applying a review. Mirrors
+/// [`ReviewStatus`] but also carries the surrounding metadata (reviewer,
+/// note, answered questions). Kept separate from the on-disk type so
+/// future fields can be added without breaking the YAML schema.
+#[derive(Debug, Clone)]
+pub struct ReviewVerdict {
+    pub status: ReviewStatus,
+    pub reviewer: Option<String>,
+    pub note: Option<String>,
+    /// Open-question texts the reviewer answered or wants to silence.
+    pub answered_questions: Vec<String>,
+    /// Override timestamp; if `None`, the engine uses the current UTC.
+    pub reviewed_at: Option<String>,
+}
+
+/// Outcome of applying a single review to disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewApplyOutcome {
+    /// Candidate id the verdict targeted.
+    pub candidate_id: String,
+    /// Final status after the write.
+    pub status: String,
+    /// Path that was rewritten.
+    pub path: PathBuf,
+    /// Soft warnings (none today, reserved for future schema migrations).
     pub warnings: Vec<String>,
 }
 
@@ -164,6 +311,116 @@ fn is_valid_slug(s: &str) -> bool {
 /// differently in different paths.
 pub fn candidate_artifact_id(id: &str) -> String {
     format!("business_candidate::{id}")
+}
+
+/// Convenience: filter the loaded document down to the candidates a
+/// reviewer should still look at. Returns a tuple of `(needs_review,
+/// already_reviewed, warnings)`:
+///
+/// - `needs_review`: candidates with no review block yet, or with a
+///   review status of `pending` / `needs_changes`.
+/// - `already_reviewed`: candidates already accepted or rejected. Kept
+///   for `specslice candidate list --all` use cases.
+/// - `warnings`: parser warnings forwarded from [`load_business_candidates`].
+pub fn list_for_review(repo_root: &Path) -> Result<CandidateListSnapshot> {
+    let outcome = load_business_candidates(repo_root)?;
+    let mut needs = Vec::new();
+    let mut done = Vec::new();
+    for c in outcome.document.candidates {
+        match c.review_status() {
+            Some(ReviewStatus::Accepted) | Some(ReviewStatus::Rejected) => done.push(c),
+            _ => needs.push(c),
+        }
+    }
+    Ok(CandidateListSnapshot {
+        needs_review: needs,
+        already_reviewed: done,
+        warnings: outcome.warnings,
+        path: outcome.path,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateListSnapshot {
+    pub needs_review: Vec<BusinessCandidate>,
+    pub already_reviewed: Vec<BusinessCandidate>,
+    pub warnings: Vec<String>,
+    pub path: PathBuf,
+}
+
+/// Record a reviewer verdict against a candidate and rewrite the YAML
+/// in place. The function is intentionally narrow: it loads the
+/// current document (preserving anything we don't recognise), mutates
+/// the matching candidate's `status` + `review` block, then writes
+/// back. It never touches `id`, `name`, `description`, `evidence`,
+/// `confidence`, `open_questions`, `risks` or `recommendation`.
+///
+/// Returns the new effective status so callers can confirm what landed.
+pub fn apply_review(
+    repo_root: &Path,
+    candidate_id: &str,
+    verdict: ReviewVerdict,
+) -> Result<ReviewApplyOutcome> {
+    let path = repo_root.join(BUSINESS_CANDIDATES_REL_PATH);
+    if !path.exists() {
+        anyhow::bail!(
+            "no candidates file at {} — run `specslice connect propose` (or hand-author one) first",
+            path.display()
+        );
+    }
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut document: BusinessCandidatesDocument =
+        serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let Some(target) = document
+        .candidates
+        .iter_mut()
+        .find(|c| c.id == candidate_id)
+    else {
+        anyhow::bail!(
+            "candidate `{}` not found in {}",
+            candidate_id,
+            path.display()
+        );
+    };
+    let reviewed_at = match verdict.reviewed_at.clone() {
+        Some(t) => t,
+        None => OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| String::new()),
+    };
+    let mut answered = if let Some(prev) = target.review.as_ref() {
+        prev.answered_questions.clone()
+    } else {
+        Vec::new()
+    };
+    for q in &verdict.answered_questions {
+        if !answered.iter().any(|existing| existing == q) {
+            answered.push(q.clone());
+        }
+    }
+    target.review = Some(CandidateReview {
+        status: verdict.status.as_str().to_string(),
+        reviewer: verdict.reviewer.clone(),
+        note: verdict.note.clone(),
+        reviewed_at: if reviewed_at.is_empty() {
+            None
+        } else {
+            Some(reviewed_at)
+        },
+        answered_questions: answered,
+    });
+    target.status = verdict.status.as_str().to_string();
+    let final_status = target.status.clone();
+    let serialised = serde_yaml::to_string(&document)
+        .with_context(|| format!("re-serialising {}", path.display()))?;
+    std::fs::write(&path, serialised).with_context(|| format!("writing {}", path.display()))?;
+    Ok(ReviewApplyOutcome {
+        candidate_id: candidate_id.into(),
+        status: final_status,
+        path,
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +548,307 @@ candidates:
         assert_eq!(
             candidate_artifact_id("foo"),
             "business_candidate::foo".to_string()
+        );
+    }
+
+    #[test]
+    fn review_status_parses_aliases() {
+        assert_eq!(ReviewStatus::parse(""), None);
+        assert_eq!(
+            ReviewStatus::parse("accepted"),
+            Some(ReviewStatus::Accepted)
+        );
+        assert_eq!(
+            ReviewStatus::parse("Confirmed"),
+            Some(ReviewStatus::Accepted),
+            "legacy `confirmed` should map to accepted",
+        );
+        assert_eq!(
+            ReviewStatus::parse("rejected"),
+            Some(ReviewStatus::Rejected)
+        );
+        assert_eq!(
+            ReviewStatus::parse("needs-changes"),
+            Some(ReviewStatus::NeedsChanges),
+        );
+        assert_eq!(ReviewStatus::parse("pending"), Some(ReviewStatus::Pending));
+        assert_eq!(
+            ReviewStatus::parse("garbage"),
+            Some(ReviewStatus::Pending),
+            "unknown values land in the safe pending bucket",
+        );
+    }
+
+    #[test]
+    fn review_block_round_trips_through_yaml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".specslice/candidates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("business_logic.yaml"),
+            r#"
+schema_version: 1
+candidates:
+  - id: cand_one
+    name: "完成购买并解锁 Pro"
+    description: |
+      监听购买流，调用 applyPurchase，写入 Hive。
+    evidence:
+      - dart_method::lib/a.dart#A.b
+    confidence: 0.8
+    risks:
+      - "没有收据校验"
+    recommendation: "建议补完收据校验后再确认"
+    open_questions:
+      - "是否服务端校验？"
+      - "Hive 写入是否原子？"
+    status: needs_changes
+    review:
+      status: needs_changes
+      reviewer: "qjs"
+      note: "先补一个 unit test"
+      reviewed_at: "2026-05-20T03:21:09Z"
+      answered_questions:
+        - "Hive 写入是否原子？"
+"#,
+        )
+        .unwrap();
+
+        let outcome = load_business_candidates(tmp.path()).unwrap();
+        assert_eq!(outcome.warnings, Vec::<String>::new());
+        assert_eq!(outcome.document.candidates.len(), 1);
+        let c = &outcome.document.candidates[0];
+        assert_eq!(c.risks, vec!["没有收据校验".to_string()]);
+        assert_eq!(
+            c.recommendation.as_deref(),
+            Some("建议补完收据校验后再确认")
+        );
+        let review = c.review.as_ref().expect("review block parsed");
+        assert_eq!(review.status, "needs_changes");
+        assert_eq!(review.reviewer.as_deref(), Some("qjs"));
+        assert_eq!(review.note.as_deref(), Some("先补一个 unit test"));
+        assert_eq!(review.reviewed_at.as_deref(), Some("2026-05-20T03:21:09Z"));
+        assert_eq!(
+            review.answered_questions,
+            vec!["Hive 写入是否原子？".to_string()]
+        );
+        assert_eq!(c.review_status(), Some(ReviewStatus::NeedsChanges));
+        let pending = c.pending_open_questions();
+        assert_eq!(pending, vec!["是否服务端校验？"]);
+    }
+
+    #[test]
+    fn review_status_falls_back_to_outer_status_when_no_review_block() {
+        let c = BusinessCandidate {
+            id: "x".into(),
+            name: "x".into(),
+            status: "accepted".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.review_status(), Some(ReviewStatus::Accepted));
+        let c = BusinessCandidate {
+            id: "y".into(),
+            name: "y".into(),
+            status: "proposed".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.review_status(), None);
+    }
+
+    #[test]
+    fn legacy_confirmed_maps_to_accepted() {
+        let c = BusinessCandidate {
+            id: "z".into(),
+            name: "z".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.review_status(), Some(ReviewStatus::Accepted));
+    }
+
+    #[test]
+    fn pending_open_questions_drops_already_answered() {
+        let c = BusinessCandidate {
+            id: "q".into(),
+            name: "q".into(),
+            open_questions: vec!["a".into(), "b".into(), "c".into()],
+            review: Some(CandidateReview {
+                status: "pending".into(),
+                answered_questions: vec!["b".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(c.pending_open_questions(), vec!["a", "c"]);
+    }
+
+    fn write_minimal_candidates_yaml(tmp: &tempfile::TempDir) {
+        let dir = tmp.path().join(".specslice/candidates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("business_logic.yaml"),
+            r#"
+schema_version: 1
+candidates:
+  - id: cand_a
+    name: "案例 A"
+    description: "A 的业务描述"
+    evidence:
+      - dart_method::lib/a.dart#A.b
+    confidence: 0.7
+    open_questions:
+      - "Q1"
+      - "Q2"
+    status: proposed
+  - id: cand_b
+    name: "案例 B"
+    description: "B 的业务描述"
+    evidence: []
+    confidence: 0.4
+    open_questions: []
+    status: proposed
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apply_review_writes_review_block_and_updates_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_minimal_candidates_yaml(&tmp);
+
+        let outcome = apply_review(
+            tmp.path(),
+            "cand_a",
+            ReviewVerdict {
+                status: ReviewStatus::Accepted,
+                reviewer: Some("qjs".into()),
+                note: Some("符合产品意图".into()),
+                answered_questions: vec!["Q1".into()],
+                reviewed_at: Some("2026-05-20T03:21:09Z".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.candidate_id, "cand_a");
+        assert_eq!(outcome.status, "accepted");
+
+        let reloaded = load_business_candidates(tmp.path()).unwrap();
+        let a = reloaded
+            .document
+            .candidates
+            .iter()
+            .find(|c| c.id == "cand_a")
+            .unwrap();
+        assert_eq!(a.status, "accepted");
+        let r = a.review.as_ref().unwrap();
+        assert_eq!(r.status, "accepted");
+        assert_eq!(r.reviewer.as_deref(), Some("qjs"));
+        assert_eq!(r.note.as_deref(), Some("符合产品意图"));
+        assert_eq!(r.reviewed_at.as_deref(), Some("2026-05-20T03:21:09Z"));
+        assert_eq!(r.answered_questions, vec!["Q1".to_string()]);
+        assert_eq!(a.pending_open_questions(), vec!["Q2"]);
+
+        let b = reloaded
+            .document
+            .candidates
+            .iter()
+            .find(|c| c.id == "cand_b")
+            .unwrap();
+        assert_eq!(b.status, "proposed", "other candidates untouched");
+        assert!(b.review.is_none());
+    }
+
+    #[test]
+    fn apply_review_appends_answered_questions_across_calls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_minimal_candidates_yaml(&tmp);
+
+        apply_review(
+            tmp.path(),
+            "cand_a",
+            ReviewVerdict {
+                status: ReviewStatus::NeedsChanges,
+                reviewer: Some("qjs".into()),
+                note: Some("先补一个 unit test".into()),
+                answered_questions: vec!["Q1".into()],
+                reviewed_at: None,
+            },
+        )
+        .unwrap();
+
+        apply_review(
+            tmp.path(),
+            "cand_a",
+            ReviewVerdict {
+                status: ReviewStatus::Accepted,
+                reviewer: Some("qjs".into()),
+                note: Some("测试已补".into()),
+                answered_questions: vec!["Q2".into()],
+                reviewed_at: None,
+            },
+        )
+        .unwrap();
+
+        let reloaded = load_business_candidates(tmp.path()).unwrap();
+        let a = reloaded
+            .document
+            .candidates
+            .iter()
+            .find(|c| c.id == "cand_a")
+            .unwrap();
+        let r = a.review.as_ref().unwrap();
+        assert_eq!(r.status, "accepted");
+        assert_eq!(
+            r.answered_questions,
+            vec!["Q1".to_string(), "Q2".to_string()],
+            "second review should accumulate answered questions",
+        );
+        assert_eq!(a.pending_open_questions(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn apply_review_errors_on_unknown_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_minimal_candidates_yaml(&tmp);
+        let err = apply_review(
+            tmp.path(),
+            "no_such_candidate",
+            ReviewVerdict {
+                status: ReviewStatus::Pending,
+                reviewer: None,
+                note: None,
+                answered_questions: vec![],
+                reviewed_at: None,
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_candidate"),
+            "error should mention the missing id: {msg}",
+        );
+    }
+
+    #[test]
+    fn apply_review_errors_when_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = apply_review(
+            tmp.path(),
+            "anything",
+            ReviewVerdict {
+                status: ReviewStatus::Accepted,
+                reviewer: None,
+                note: None,
+                answered_questions: vec![],
+                reviewed_at: None,
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no candidates file"),
+            "error should explain the missing file: {msg}",
         );
     }
 }

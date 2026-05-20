@@ -179,11 +179,22 @@ pub fn try_run(
 }
 
 fn is_enabled() -> bool {
-    let raw = std::env::var(ENV_ENABLE).unwrap_or_default();
-    matches!(
-        raw.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    // P2 — sidecar is now the default high-precision path. The opt-out
+    // ladder is:
+    // - `SPECSLICE_DART_ANALYZER=0` / `false` / `off` / `no` -> disabled.
+    // - `SPECSLICE_DART_ANALYZER=1` / `true` / `yes` / `on`  -> enabled.
+    // - unset                                                -> enabled
+    //   (callers without a Dart SDK still get a silent fallback because
+    //    [`resolve_command`] returns `None` and [`try_run`] reports a
+    //    skip reason instead of crashing).
+    match std::env::var(ENV_ENABLE) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => false,
+            "" => true,
+            _ => true,
+        },
+        Err(_) => true,
+    }
 }
 
 fn resolve_command(repo_root: &Path) -> Option<Command> {
@@ -366,14 +377,30 @@ mod tests {
     }
 
     #[test]
-    fn is_enabled_recognises_truthy_values() {
+    fn is_enabled_recognises_truthy_values_and_defaults_to_on() {
         with_env_lock(|| {
             for v in ["1", "true", "TRUE", "yes", "on"] {
                 with_env_var(ENV_ENABLE, Some(v), || {
                     assert!(is_enabled(), "{v} should enable the sidecar");
                 });
             }
-            for v in ["0", "false", "off", "no", ""] {
+            // P2 — empty / unset values now mean "use the sidecar".
+            for v in ["", " "] {
+                with_env_var(ENV_ENABLE, Some(v), || {
+                    assert!(
+                        is_enabled(),
+                        "{v:?} should default to the sidecar (P2 default-on)",
+                    );
+                });
+            }
+            with_env_var(ENV_ENABLE, None, || {
+                assert!(
+                    is_enabled(),
+                    "unset env var should default to the sidecar (P2 default-on)",
+                );
+            });
+            // Opt-outs still work — power users can disable explicitly.
+            for v in ["0", "false", "off", "no"] {
                 with_env_var(ENV_ENABLE, Some(v), || {
                     assert!(!is_enabled(), "{v} should disable the sidecar");
                 });
@@ -382,9 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn try_run_returns_skipped_when_env_not_set() {
+    fn try_run_returns_skipped_when_env_explicitly_disabled() {
         with_env_lock(|| {
-            with_env_var(ENV_ENABLE, None, || {
+            with_env_var(ENV_ENABLE, Some("0"), || {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let outcome = try_run(tmp.path(), &[PathBuf::from("lib")], &[]);
                 match outcome {

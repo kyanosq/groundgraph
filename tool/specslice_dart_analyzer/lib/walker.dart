@@ -71,8 +71,16 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
     );
   }
 
+  // P2 — pass the repo root as a single included path so the analyzer
+  // treats the whole repo as one context. Otherwise (without a
+  // pubspec.yaml) it spawns a separate context per directory, and
+  // cross-directory element identity (e.g. `IapProductIds` referenced
+  // from `test/` and declared in `lib/`) breaks: the byElement lookup
+  // returns null because the analyzer resynthesises the class under a
+  // different Element2 instance per context. We still honour the
+  // requested code roots when *enumerating* files to index.
   final collection = AnalysisContextCollection(
-    includedPaths: absoluteRoots,
+    includedPaths: [repoRoot],
     resourceProvider: null,
   );
 
@@ -90,6 +98,13 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   for (final ctx in collection.contexts) {
     for (final f in ctx.contextRoot.analyzedFiles()) {
       if (!f.endsWith('.dart')) continue;
+      // Restrict to files under one of the requested code roots — the
+      // analysis context covers the whole repo (for element identity),
+      // but we only want to *emit* nodes/edges for the user-selected
+      // roots.
+      final inRoot = absoluteRoots
+          .any((root) => p.isWithin(root, f) || p.equals(root, f));
+      if (!inRoot) continue;
       // Honour exclude globs (very simple matcher: substring on relative path).
       final relCheck = p.relative(f, from: repoRoot).replaceAll(r'\\', '/');
       if (req.excludeGlobs.any((g) => _matchesGlob(g, relCheck))) {
@@ -264,6 +279,29 @@ bool _isTestSourcePath(String rel) {
   return rel.startsWith('test/') ||
       rel.startsWith('integration_test/') ||
       rel.endsWith('_test.dart');
+}
+
+/// Slugify mirrors the test-declaration formula: lowercase ascii
+/// letters & digits, every other character collapses to a single
+/// dash; leading/trailing dashes are trimmed. Kept as a single
+/// top-level helper so the declaration pass and the body pass produce
+/// identical synthetic ids for the same `test('name', ...)`.
+String _slugifyTestName(String value) {
+  final buf = StringBuffer();
+  var lastWasDash = false;
+  for (final codeUnit in value.toLowerCase().codeUnits) {
+    final isAsciiLetter = codeUnit >= 97 && codeUnit <= 122;
+    final isDigit = codeUnit >= 48 && codeUnit <= 57;
+    if (isAsciiLetter || isDigit) {
+      buf.writeCharCode(codeUnit);
+      lastWasDash = false;
+    } else if (!lastWasDash) {
+      buf.write('-');
+      lastWasDash = true;
+    }
+  }
+  final slug = buf.toString().replaceAll(RegExp(r'^-+|-+$'), '');
+  return slug.isEmpty ? 'unnamed' : slug;
 }
 
 /// Walks declarations and builds the symbol table + element → id map.
@@ -590,23 +628,7 @@ class _TestDeclarationVisitor extends RecursiveAstVisitor<void> {
     return null;
   }
 
-  String _slugify(String value) {
-    final buf = StringBuffer();
-    var lastWasDash = false;
-    for (final codeUnit in value.toLowerCase().codeUnits) {
-      final isAsciiLetter = codeUnit >= 97 && codeUnit <= 122;
-      final isDigit = codeUnit >= 48 && codeUnit <= 57;
-      if (isAsciiLetter || isDigit) {
-        buf.writeCharCode(codeUnit);
-        lastWasDash = false;
-      } else if (!lastWasDash) {
-        buf.write('-');
-        lastWasDash = true;
-      }
-    }
-    final slug = buf.toString().replaceAll(RegExp(r'^-+|-+$'), '');
-    return slug.isEmpty ? 'unnamed' : slug;
-  }
+  String _slugify(String value) => _slugifyTestName(value);
 
   ({int start, int end}) _lineRange(int offsetStart, int offsetEnd) {
     final s = lineInfo.getLocation(offsetStart).lineNumber;
@@ -630,6 +652,15 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
 
   String? _currentSymbolId;
   final Set<String> _emitted = <String>{};
+  // P2 — local-variable Hive box tracking. After `final box =
+  // Hive.openBox('pro_entitlement');` we remember `box` → `pro_entitlement`,
+  // so any later `box.put/get/delete/clear(...)` site can still emit
+  // `persists_to storage::hive::pro_entitlement`. We index by both
+  // resolved [Element2] (for accurate scope handling) and by per-method
+  // variable name (as a fallback when the analyzer's local-element id
+  // doesn't match the SimpleIdentifier's resolved element).
+  final Map<Element2, String> _hiveBoxByVariable = <Element2, String>{};
+  final Map<String, String> _hiveBoxByName = <String, String>{};
 
   _BodyVisitor({
     required this.rel,
@@ -641,6 +672,48 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     required this.references,
     required this.syntheticNodes,
   });
+
+  @override
+  void visitVariableDeclaration(VariableDeclaration node) {
+    // Identify `var foo = Hive.openBox('name')` / `... = Hive.box('name')`,
+    // optionally wrapped in `await`. We don't need to know the variable's
+    // type — the surface call shape is enough.
+    final initializer = node.initializer;
+    final boxName = _hiveBoxNameFromExpression(initializer);
+    if (boxName != null) {
+      final el = node.declaredElement2;
+      if (el != null) {
+        _hiveBoxByVariable[el] = boxName;
+      }
+      // Name-based fallback: the analyzer sometimes binds variable
+      // *uses* to a different element id than the declaration (esp.
+      // around inference / `final` / `await`). The combination of the
+      // current method symbol and the variable's lexeme keeps the
+      // fallback scoped tightly enough to be safe.
+      final name = node.name.lexeme;
+      final scope = _currentSymbolId ?? rel;
+      _hiveBoxByName['$scope|$name'] = boxName;
+    }
+    super.visitVariableDeclaration(node);
+  }
+
+  String? _hiveBoxNameFromExpression(Expression? expr) {
+    if (expr == null) return null;
+    Expression e = expr;
+    if (e is AwaitExpression) e = e.expression;
+    if (e is MethodInvocation) {
+      final target = e.target;
+      if (target is SimpleIdentifier &&
+          target.name == 'Hive' &&
+          (e.methodName.name == 'box' || e.methodName.name == 'openBox')) {
+        final args = e.argumentList.arguments;
+        if (args.isNotEmpty) {
+          return _stringLiteralValue(args.first);
+        }
+      }
+    }
+    return null;
+  }
 
   @override
   void visitMethodDeclaration(MethodDeclaration node) {
@@ -671,6 +744,33 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitMethodInvocation(MethodInvocation node) {
+    // P2 — `test('name', () { ... })` / `group('name', () { ... })`:
+    // attribute references inside the closure to the synthetic
+    // `dart_test::` / `dart_group::` symbol so test files don't drop
+    // their references on the floor. We only enter this branch in test
+    // sources to avoid mis-attributing arbitrary `test('x', ...)`-shaped
+    // calls in production code.
+    final methodName = node.methodName.name;
+    if ((methodName == 'test' || methodName == 'group') &&
+        _isTestSourcePath(rel) &&
+        node.argumentList.arguments.length >= 2) {
+      final nameArg = node.argumentList.arguments.first;
+      final nameLit = _testNameLiteral(nameArg);
+      if (nameLit != null) {
+        final slug = _slugify(nameLit);
+        final prefix = methodName == 'group' ? 'dart_group' : 'dart_test';
+        final synthetic = '$prefix::$rel#$slug';
+        final prev = _currentSymbolId;
+        _currentSymbolId = synthetic;
+        // Visit the closure body specifically; skip the literal name
+        // and other arguments to avoid mis-attributing them.
+        node.argumentList.arguments.skip(1).forEach((arg) {
+          arg.accept(this);
+        });
+        _currentSymbolId = prev;
+        return; // do not super-visit; we already walked the args.
+      }
+    }
     final from = _currentSymbolId;
     if (from != null) {
       // P8 — try framework-aware patterns *first*. They are more specific
@@ -694,6 +794,24 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     }
     super.visitMethodInvocation(node);
   }
+
+  String? _testNameLiteral(Expression e) {
+    if (e is SimpleStringLiteral) return e.value;
+    if (e is AdjacentStrings) {
+      final buf = StringBuffer();
+      for (final s in e.strings) {
+        if (s is SimpleStringLiteral) {
+          buf.write(s.value);
+        } else {
+          return null;
+        }
+      }
+      return buf.toString();
+    }
+    return null;
+  }
+
+  String _slugify(String s) => _slugifyTestName(s);
 
   /// Tries to recognise a Flutter / Riverpod / Hive / Stream pattern and
   /// emits the corresponding P8 semantic edge. Returns `true` when a
@@ -913,6 +1031,25 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
         if (boxName != null && _isHiveOperation(methodName)) {
           return _HiveCall(boxName: boxName);
         }
+      }
+    }
+    // P2 — local-variable Hive box tracking. `final box = Hive.box('x');
+    // box.put('k', v);` — the second site has a SimpleIdentifier
+    // receiver that resolves to a variable we previously tagged with a
+    // box name in [visitVariableDeclaration].
+    if (target is SimpleIdentifier && _isHiveOperation(methodName)) {
+      final el = target.element;
+      if (el != null) {
+        final boxName = _hiveBoxByVariable[el];
+        if (boxName != null) {
+          return _HiveCall(boxName: boxName);
+        }
+      }
+      // Fallback: name-based lookup scoped to the current method.
+      final scope = _currentSymbolId ?? rel;
+      final byName = _hiveBoxByName['$scope|${target.name}'];
+      if (byName != null) {
+        return _HiveCall(boxName: byName);
       }
     }
     return null;

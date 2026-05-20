@@ -43,6 +43,10 @@ enum Commands {
     Export(ExportArgs),
     /// Render the graph as JSON, Mermaid, or self-contained HTML.
     Graph(GraphArgs),
+    /// 审阅 AI 业务候选：list / show / review。
+    Candidate(CandidateArgs),
+    /// 输出业务逻辑可信度报告（confirmed / candidate / stale / missing 等）。
+    Logic(LogicArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -114,6 +118,81 @@ impl From<GraphViewArg> for specslice_engine::graph::GraphView {
             GraphViewArg::Focus => specslice_engine::graph::GraphView::Focus,
         }
     }
+}
+
+#[derive(Debug, clap::Args)]
+struct CandidateArgs {
+    #[command(subcommand)]
+    sub: CandidateSub,
+}
+
+#[derive(Debug, Subcommand)]
+enum CandidateSub {
+    /// 列出所有待审 (或全部) 业务候选。
+    List(CandidateListArgs),
+    /// 查看单个候选的完整业务描述、证据、风险。
+    Show(CandidateShowArgs),
+    /// 写回审阅结果到 `.specslice/candidates/business_logic.yaml`。
+    Review(CandidateReviewArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CandidateListArgs {
+    /// 包含已接受 / 已拒绝的候选。
+    #[arg(long)]
+    all: bool,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct CandidateShowArgs {
+    /// 候选 id。
+    id: String,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct CandidateReviewArgs {
+    /// 候选 id。
+    id: String,
+    /// 接受 (accepted)。
+    #[arg(long, group = "verdict")]
+    accept: bool,
+    /// 拒绝 (rejected)。
+    #[arg(long, group = "verdict")]
+    reject: bool,
+    /// 需要补充 (needs_changes)。
+    #[arg(long = "needs-changes", group = "verdict")]
+    needs_changes: bool,
+    /// 待定 (pending)。
+    #[arg(long, group = "verdict")]
+    pending: bool,
+    /// 审阅人 (默认读取 $USER)。
+    #[arg(long)]
+    reviewer: Option<String>,
+    /// 审阅备注。
+    #[arg(long)]
+    note: Option<String>,
+    /// 标记为「已回答」的 open question 文本；可重复传入多次以累积。
+    #[arg(long = "answer")]
+    answers: Vec<String>,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct LogicArgs {
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+    /// 仅列出存在风险 (非 confirmed_link) 的条目。
+    #[arg(long)]
+    only_risks: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -272,6 +351,61 @@ fn run() -> Result<()> {
             }
         },
         Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
+        Commands::Candidate(args) => match args.sub {
+            CandidateSub::List(a) => {
+                let mode = if a.all {
+                    commands::candidate::ListMode::All
+                } else {
+                    commands::candidate::ListMode::Pending
+                };
+                commands::candidate::run_list(&cli.repo_root, mode, a.json)
+            }
+            CandidateSub::Show(a) => {
+                let exit = commands::candidate::run_show(&cli.repo_root, &a.id, a.json)?;
+                if exit != 0 {
+                    std::process::exit(exit);
+                }
+                Ok(())
+            }
+            CandidateSub::Review(a) => {
+                let status = if a.accept {
+                    specslice_engine::ReviewStatus::Accepted
+                } else if a.reject {
+                    specslice_engine::ReviewStatus::Rejected
+                } else if a.needs_changes {
+                    specslice_engine::ReviewStatus::NeedsChanges
+                } else if a.pending {
+                    specslice_engine::ReviewStatus::Pending
+                } else {
+                    anyhow::bail!(
+                        "必须给出 --accept / --reject / --needs-changes / --pending 之一"
+                    );
+                };
+                let reviewer = a.reviewer.clone().or_else(|| std::env::var("USER").ok());
+                let exit = commands::candidate::run_review(
+                    &cli.repo_root,
+                    &a.id,
+                    commands::candidate::ReviewArgs {
+                        status,
+                        reviewer: reviewer.as_deref(),
+                        note: a.note.as_deref(),
+                        answered: a.answers.clone(),
+                        json: a.json,
+                    },
+                )?;
+                if exit != 0 {
+                    std::process::exit(exit);
+                }
+                Ok(())
+            }
+        },
+        Commands::Logic(args) => {
+            let exit = commands::logic::run(&cli.repo_root, args.json, args.only_risks)?;
+            if exit != 0 {
+                std::process::exit(exit);
+            }
+            Ok(())
+        }
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
             format: args.format.into(),

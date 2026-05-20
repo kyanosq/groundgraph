@@ -1,3 +1,4 @@
+pub mod candidate;
 pub mod check;
 pub mod connect;
 pub mod context;
@@ -8,4 +9,5 @@ pub mod graph_mermaid;
 pub mod impact;
 pub mod index;
 pub mod init;
+pub mod logic;
 pub mod slice;
