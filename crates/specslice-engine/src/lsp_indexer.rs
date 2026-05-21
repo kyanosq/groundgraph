@@ -147,11 +147,38 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
     }
 
     let arg_strs: Vec<&str> = profile.default_args.to_vec();
-    let mut client = LspClient::spawn(&command, &arg_strs, &options.repo_root)?;
+    // P12 复核 [P1]: any runtime LSP failure must surface as a graceful
+    // `Skipped` (or partial `Indexed`) so `specslice index` keeps
+    // working even when sourcekit-lsp / gopls can't reach their cache,
+    // crash mid-handshake, etc. The only thing that still propagates is
+    // logic-bug-style errors from us (e.g. file extension on PATH check
+    // changed mid-call) — none of those are reachable today.
+    let mut client = match LspClient::spawn(&command, &arg_strs, &options.repo_root) {
+        Ok(c) => c,
+        Err(err) => {
+            return Ok(LspIndexOutcome::Skipped {
+                reason: format!(
+                    "无法启动 {} LSP `{}`：{}",
+                    profile.language,
+                    command,
+                    flatten_error_message(&err)
+                ),
+                language: profile.language,
+            });
+        }
+    };
     let root_uri = path_to_file_uri(&options.repo_root);
-    client
-        .initialize(&root_uri)
-        .with_context(|| format!("initialising {} via `{}`", profile.language, command))?;
+    if let Err(err) = client.initialize(&root_uri) {
+        return Ok(LspIndexOutcome::Skipped {
+            reason: format!(
+                "{} LSP `{}` initialize 失败：{}",
+                profile.language,
+                command,
+                flatten_error_message(&err)
+            ),
+            language: profile.language,
+        });
+    }
 
     let mut batch = LanguageIndexBatch {
         language: profile.language.into(),
@@ -170,13 +197,43 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
         batch.files.push(file_artifact.clone());
         stats.files += 1;
 
-        let text = std::fs::read_to_string(&file.absolute)
-            .with_context(|| format!("reading {}", file.absolute.display()))?;
+        let text = match std::fs::read_to_string(&file.absolute) {
+            Ok(t) => t,
+            Err(err) => {
+                push_partial_warning(&mut stats, &format!("读取 {} 失败：{err}", file.relative));
+                continue;
+            }
+        };
         let uri = path_to_file_uri(&file.absolute);
-        client.did_open(&uri, profile.language_id, &text)?;
-        let symbols = client
-            .document_symbol(&uri)
-            .with_context(|| format!("documentSymbol for {}", file.relative))?;
+        if let Err(err) = client.did_open(&uri, profile.language_id, &text) {
+            push_partial_warning(
+                &mut stats,
+                &format!(
+                    "{} LSP didOpen({}) 失败：{}",
+                    profile.language,
+                    file.relative,
+                    flatten_error_message(&err)
+                ),
+            );
+            // If notify fails, the LSP transport is wedged — abort
+            // the rest of the run, but keep what we have already.
+            break;
+        }
+        let symbols = match client.document_symbol(&uri) {
+            Ok(s) => s,
+            Err(err) => {
+                push_partial_warning(
+                    &mut stats,
+                    &format!(
+                        "{} LSP documentSymbol({}) 失败：{}",
+                        profile.language,
+                        file.relative,
+                        flatten_error_message(&err)
+                    ),
+                );
+                break;
+            }
+        };
         let _ = client.did_close(&uri);
         let symbol_count = ingest_symbols(profile, &file.relative, &symbols, &mut batch);
         stats.symbols += symbol_count;
@@ -189,10 +246,42 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
         tracing_skip_reason_into(&mut stats, &err);
     }
 
+    // If we got nothing useful out, surface a `Skipped` so the CLI
+    // does not present an empty Swift / Go section as success.
+    if batch.symbols.is_empty() && !stats.skip_reason.is_empty() {
+        return Ok(LspIndexOutcome::Skipped {
+            reason: stats.skip_reason,
+            language: profile.language,
+        });
+    }
+
     Ok(LspIndexOutcome::Indexed(Box::new(LspIndexedBatch {
         batch,
         stats,
     })))
+}
+
+/// Format an anyhow error chain into a single sentence suitable for
+/// the operator-facing `skip_reason` field. Mirrors the helper the
+/// Dart sidecar uses.
+fn flatten_error_message(err: &anyhow::Error) -> String {
+    let mut out = err.to_string();
+    for cause in err.chain().skip(1) {
+        out.push('：');
+        out.push_str(&cause.to_string());
+    }
+    out
+}
+
+/// Append a partial-run warning into `stats.skip_reason`, joining
+/// existing entries with `；` so the CLI can print them on one line.
+fn push_partial_warning(stats: &mut LspIndexStats, msg: &str) {
+    if stats.skip_reason.is_empty() {
+        stats.skip_reason = msg.to_string();
+    } else {
+        stats.skip_reason.push('；');
+        stats.skip_reason.push_str(msg);
+    }
 }
 
 fn tracing_skip_reason_into(stats: &mut LspIndexStats, err: &anyhow::Error) {
@@ -664,6 +753,44 @@ mod tests {
                 assert!(reason.contains("PATH"), "expected PATH hint: {reason}");
             }
             LspIndexOutcome::Indexed(_) => panic!("expected skip"),
+        }
+    }
+
+    /// Regression for P12 复核 [P1]: a runtime LSP failure (binary
+    /// resolves on PATH but exits without speaking LSP) must surface as
+    /// [`LspIndexOutcome::Skipped`], never an `Err`. Otherwise
+    /// `specslice index` of a workspace with `swift.enabled = true` will
+    /// abort whenever sourcekit-lsp can't access its cache, etc.
+    #[test]
+    #[cfg(unix)]
+    fn run_profile_downgrades_runtime_lsp_failure_to_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Sources/App")).unwrap();
+        std::fs::write(tmp.path().join("Sources/App/A.swift"), "// a\n").unwrap();
+
+        let p = profile();
+        let opts = LspIndexOptions {
+            repo_root: tmp.path().to_path_buf(),
+            code_roots: vec![PathBuf::from("Sources")],
+            exclude_globs: Vec::new(),
+            // `true(1)` is on PATH everywhere on Unix and exits 0 without
+            // writing any LSP frames — perfectly impersonates a misbehaving
+            // language server.
+            lsp_command: Some("true".into()),
+        };
+
+        let outcome = run_profile(&p, &opts).expect("runtime LSP failures must not propagate Err");
+        match outcome {
+            LspIndexOutcome::Skipped { reason, language } => {
+                assert_eq!(language, "swift");
+                assert!(
+                    reason.contains("LSP")
+                        || reason.contains("initialize")
+                        || reason.contains("closed"),
+                    "expected LSP-related skip reason, got: {reason}"
+                );
+            }
+            LspIndexOutcome::Indexed(_) => panic!("expected runtime failure to be skipped"),
         }
     }
 }

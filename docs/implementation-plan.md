@@ -8,7 +8,7 @@ SpecSlice 的核心目标是证明一个非侵入式闭环：
 文档事实 / Dart 事实 / 测试事实 -> AI 业务逻辑候选与关联候选 -> 人工确认 -> confirmed graph -> PR Impact / Agent Context Pack / Graph 浏览
 ```
 
-MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart analyzer sidecar、Flutter/Riverpod 语义边和 AI 业务候选层落到主线。当前阶段仍不做 GraphRAG、不做 MCP、不把 LLM 输出直接写进 confirmed graph。价值判断看三件事：
+MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart analyzer sidecar、Flutter/Riverpod 语义边和 AI 业务候选层落到主线。P10 落地 `specslice dead-code`，P11 把 MCP 工具层与可展开/可过滤的搜索阅读器并入主线，P12 通过 LSP sidecar 加入 Swift / Go 的结构事实图。当前阶段仍不做 GraphRAG、不把 LLM 输出直接写进 confirmed graph，也不在 Swift / Go 代码里加任何注解。价值判断看三件事：
 
 - AI 能否基于文档/代码/测试事实生成高质量业务逻辑候选和候选关联。
 - 人工确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询、反查和审阅。
@@ -650,6 +650,13 @@ specslice graph --format html --view business
 - 不在 Swift / Go 代码中加注解、不依赖运行时反射 / 字符串约定；缺少 `Package.swift` 或 `go.mod` 时优雅退化为「跳过」并保留可读原因。
 - 不联网；LSP 完全本地 stdio 通信，CLI / MCP 的搜索 / 死代码 / Context Pack 路径在 Swift / Go 启用后保持同一可信链路。
 - 不引入新的事实通路：Swift / Go 沿用 `EdgeKind::Contains`（File → Symbol → Symbol），后续 `callHierarchy` / `references` 会作为新 PR 单独跟进，不会回头改既有 Dart 路径。
+
+**P12 复核修复（已落地）：**
+
+- **LSP 运行期失败一律降级**：`run_profile` 现在把 `spawn / initialize / didOpen / documentSymbol` 的所有错误捕获并写入 `LspIndexOutcome::Skipped` 或 `Indexed { stats.skip_reason }`，不再让 `index_repository` 因 sourcekit-lsp 沙箱权限、`gopls` cache 缺失等环境问题整体失败。`run_profile_downgrades_runtime_lsp_failure_to_skipped` 用 `/usr/bin/true` 冒充 LSP 复现这条契约。
+- **read 超时真正生效**：`LspClient` 把 stdout 读取放到后台线程并通过 `mpsc::Receiver::recv_timeout` 等待应答，`set_response_timeout` 到期会立刻 `force_kill` 子进程；新增 `request_times_out_when_lsp_server_never_writes` 用 `sleep 30` 复现「LSP 吃掉请求但不回包」的死锁场景，断言 150ms 超时内 bail。
+- **CLI 输出 Swift / Go 段**：`specslice index` 的 `print_result` 拆出 `format_result`，在配置启用 `swift.enabled` / `go.enabled` 时分别打印 files / symbols / resolver_used / skip_reason；五条新 `format_result` 单测同时覆盖「未启用」「Indexed」「Skipped 含 PATH 提示」三种渲染分支。
+- 现阶段 Swift / Go 仍只覆盖结构事实（files + symbols + contains），调用/引用边会作为后续 PR 通过 `callHierarchy` / `references` 单独引入。
 
 ## 后续验收方式
 

@@ -29,8 +29,9 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -109,11 +110,22 @@ pub struct LspDocumentSymbol {
     pub children: Vec<LspDocumentSymbol>,
 }
 
-/// Spawned LSP server we can talk to synchronously.
+/// Result delivered by the background reader thread for one stdout
+/// frame. We send a single terminal `Err` and then close the channel
+/// so blocking receivers wake up on EOF / I/O failure.
+type ReaderMessage = Result<Value>;
+
+/// Spawned LSP server we can talk to synchronously. Stdout is drained
+/// by a background thread so that [`Self::set_response_timeout`] can
+/// fire even when the server holds stdin open without writing — the
+/// blocking [`BufRead::read_line`] used by [`read_message`] would
+/// otherwise sit on a futex forever and trump the deadline check.
 pub struct LspClient {
     child: Option<Child>,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// `None` once we drop the receiver during shutdown so the reader
+    /// thread observes the disconnect and exits cleanly.
+    rx: Option<Receiver<ReaderMessage>>,
     next_id: AtomicI64,
     server_name: String,
     response_timeout: Duration,
@@ -140,14 +152,43 @@ impl LspClient {
         let stdout = child
             .stdout
             .take()
-            .map(BufReader::new)
             .context("LSP server did not expose stdout")?;
+
+        let (tx, rx) = mpsc::channel::<ReaderMessage>();
+        let server_name = command.to_string();
+        // Reader thread: drain stdout into the channel one frame at a
+        // time. Returns silently when the receiver is dropped (we lose
+        // interest) or when stdout EOFs / errors (server died).
+        let thread_name = format!("lsp-reader[{server_name}]");
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    match read_message(&mut reader) {
+                        Ok(value) => {
+                            if tx.send(Ok(value)).is_err() {
+                                break; // receiver dropped
+                            }
+                        }
+                        Err(err) => {
+                            // Best-effort delivery of the terminal error;
+                            // ignore send failure since the receiver may
+                            // already be gone.
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("spawning LSP stdout reader thread")?;
+
         Ok(Self {
             child: Some(child),
             stdin,
-            stdout,
+            rx: Some(rx),
             next_id: AtomicI64::new(1),
-            server_name: command.to_string(),
+            server_name,
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
         })
     }
@@ -292,7 +333,13 @@ impl LspClient {
     fn read_response_for(&mut self, expected_id: i64) -> Result<Value> {
         let deadline = Instant::now() + self.response_timeout;
         loop {
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                // Tear the child down before bubbling the error so a
+                // hung server cannot live longer than its first stuck
+                // request. The reader thread exits on its own once
+                // stdout closes.
+                self.force_kill();
                 bail!(
                     "timed out waiting {:?} for LSP response id={} from `{}`",
                     self.response_timeout,
@@ -300,9 +347,36 @@ impl LspClient {
                     self.server_name
                 );
             }
-            let message = read_message(&mut self.stdout).with_context(|| {
-                format!("reading message from LSP server `{}`", self.server_name)
-            })?;
+            let remaining = deadline - now;
+            let rx = self
+                .rx
+                .as_ref()
+                .ok_or_else(|| anyhow!("LSP stdout receiver already closed"))?;
+            let message = match rx.recv_timeout(remaining) {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => {
+                    // Terminal error from reader thread — bubble up with
+                    // context so callers see which server died.
+                    return Err(err).with_context(|| {
+                        format!("reading message from LSP server `{}`", self.server_name)
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.force_kill();
+                    bail!(
+                        "timed out waiting {:?} for LSP response id={} from `{}`",
+                        self.response_timeout,
+                        expected_id,
+                        self.server_name
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!(
+                        "LSP server `{}` closed stdout before sending a complete response",
+                        self.server_name
+                    );
+                }
+            };
             // A response always has both `id` and either `result` or
             // `error`. Anything else (notifications, server-initiated
             // requests) we silently ignore — the next iteration of the
@@ -339,6 +413,19 @@ impl LspClient {
             // Notification — nothing to do.
         }
     }
+
+    /// Hard-terminate the child process and drop the stdout receiver.
+    /// Used when a response times out or when the user explicitly
+    /// asks for a forceful shutdown. Idempotent.
+    fn force_kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Drop the receiver so the reader thread observes a disconnect
+        // and exits. The thread itself is detached.
+        self.rx.take();
+    }
 }
 
 impl Drop for LspClient {
@@ -347,6 +434,7 @@ impl Drop for LspClient {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.rx.take();
     }
 }
 
@@ -740,6 +828,34 @@ mod tests {
         assert!(uri.contains("file.swift"));
         assert!(!uri.contains(' '));
         assert!(uri.contains("%E4%B8%AD")); // 中 in UTF-8 → percent encoded
+    }
+
+    /// Regression for P12 复核 [P1]: when an LSP server reads our stdin
+    /// but never writes a reply, `read_response_for` must honour
+    /// `set_response_timeout` and bail (eventually killing the child),
+    /// not block forever on the blocking stdout read. The previous
+    /// implementation called `BufRead::read_line` inside `read_message`
+    /// which would never return.
+    #[test]
+    #[cfg(unix)]
+    fn request_times_out_when_lsp_server_never_writes() {
+        // `sleep 30` is a process that holds stdin open without ever
+        // writing to stdout — the worst case for our reader loop.
+        let mut client = LspClient::spawn("sleep", &["30"], Path::new("/"))
+            .expect("sleep should be spawnable on Unix");
+        client.set_response_timeout(Duration::from_millis(150));
+        let started = Instant::now();
+        let err = client.initialize("file:///tmp").unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "LSP request did not honour the 150ms timeout (took {elapsed:?})"
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("timed out") || msg.contains("超时"),
+            "expected a timeout error, got: {msg}"
+        );
     }
 
     #[test]
