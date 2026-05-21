@@ -21,6 +21,22 @@ use crate::git_diff::{git_diff, parse_unified_diff, ChangedFile, Hunk};
 use crate::index::{index_repository, IndexOptions};
 use crate::slice::SliceItem;
 
+/// P15 — one real graph edge traversed while building an
+/// [`ImpactReport`]. The Mermaid exporter renders these edges
+/// verbatim so the diagram cannot show relationships that are not
+/// backed by the store.
+///
+/// `kind` mirrors [`EdgeKind::as_str`] lowercased (`"calls"`,
+/// `"declares_implementation"`, …). We carry it as a string so we
+/// can also surface synthetic-but-structural kinds (`"contains"`
+/// for `file → changed_symbol`) without inflating `EdgeKind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImpactOptions {
     pub repo_root: PathBuf,
@@ -113,6 +129,13 @@ pub struct ImpactReport {
     /// stable (id-sorted) so JSON snapshots stay deterministic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub propagated_symbols: Vec<SliceItem>,
+    /// P15 — real edges traversed while building the report. The
+    /// CLI's `--format mermaid` consumes this trace so diagrams
+    /// don't synthesise approximate edges between changed symbols
+    /// and downstream artefacts. Sorted lexicographically by
+    /// `(from, to, kind)` for deterministic output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impact_edges: Vec<ImpactEdge>,
     pub warnings: Vec<String>,
     pub info: Vec<String>,
 }
@@ -153,6 +176,7 @@ pub fn compute_impact_with_policy(
     let mut affected_reqs: BTreeSet<ArtifactId> = BTreeSet::new();
     let mut changed_symbol_ids: BTreeSet<ArtifactId> = BTreeSet::new();
     let mut changed_doc_section_ids: BTreeSet<ArtifactId> = BTreeSet::new();
+    let mut edge_trace: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut any_test_changed = false;
 
     for file in changed {
@@ -174,6 +198,14 @@ pub fn compute_impact_with_policy(
                     name: Some(symbol.qualified_name.clone()),
                     line_range: Some((symbol.start_line, symbol.end_line)),
                 });
+                // P15 — structural `file → symbol` containment so
+                // the Mermaid diagram can anchor changed symbols
+                // under their file without inventing an edge.
+                edge_trace.insert((
+                    file.path.clone(),
+                    symbol.symbol_id.to_string(),
+                    "contains".into(),
+                ));
 
                 // Propagate from symbol → declared requirement. By default we
                 // walk parent symbols; config can disable that for stricter
@@ -188,6 +220,15 @@ pub fn compute_impact_with_policy(
                     let mut hit = false;
                     for edge in store.list_edges_from(&id)? {
                         if edge.kind == EdgeKind::DeclaresImplementation {
+                            // P15 — record the *real* declarer (which
+                            // may be `id` itself or an ancestor when
+                            // policy walks parents) instead of pinning
+                            // every requirement onto the changed leaf.
+                            edge_trace.insert((
+                                id.to_string(),
+                                edge.to_id.to_string(),
+                                "declares_implementation".into(),
+                            ));
                             affected_reqs.insert(edge.to_id);
                             hit = true;
                         }
@@ -226,6 +267,11 @@ pub fn compute_impact_with_policy(
                     }
                     for edge in store.list_edges_from(&sec.id)? {
                         if edge.kind == EdgeKind::Documents {
+                            edge_trace.insert((
+                                sec.id.to_string(),
+                                edge.to_id.to_string(),
+                                "documents".into(),
+                            ));
                             affected_reqs.insert(edge.to_id);
                         }
                     }
@@ -242,12 +288,27 @@ pub fn compute_impact_with_policy(
         for edge in store.list_edges_to(req_id)? {
             match edge.kind {
                 EdgeKind::Documents => {
+                    edge_trace.insert((
+                        edge.from_id.to_string(),
+                        req_id.to_string(),
+                        "documents".into(),
+                    ));
                     docs_set.insert(edge.from_id);
                 }
                 EdgeKind::DeclaresVerification => {
+                    edge_trace.insert((
+                        edge.from_id.to_string(),
+                        req_id.to_string(),
+                        "declares_verification".into(),
+                    ));
                     tests_set.insert(edge.from_id);
                 }
                 EdgeKind::DeclaresImplementation => {
+                    edge_trace.insert((
+                        edge.from_id.to_string(),
+                        req_id.to_string(),
+                        "declares_implementation".into(),
+                    ));
                     impl_set.insert(edge.from_id);
                 }
                 _ => {}
@@ -314,6 +375,7 @@ pub fn compute_impact_with_policy(
         &changed_symbol_ids,
         policy.propagation.call_depth,
         policy.propagation.max_propagated_symbols,
+        &mut edge_trace,
     )?;
 
     sort_items(&mut report.changed_symbols);
@@ -323,6 +385,14 @@ pub fn compute_impact_with_policy(
     sort_items(&mut report.linked_tests);
     sort_items(&mut report.linked_implementations);
     sort_items(&mut report.propagated_symbols);
+
+    // P15 — drain the dedup set into `impact_edges` in stable order.
+    // The set already enforces `(from, to, kind)` uniqueness so the
+    // Mermaid exporter can iterate without an additional pass.
+    report.impact_edges = edge_trace
+        .into_iter()
+        .map(|(from, to, kind)| ImpactEdge { from, to, kind })
+        .collect();
 
     // Warnings & info.
     if !report.affected_requirements.is_empty()
@@ -434,6 +504,7 @@ fn propagate_via_calls_and_references(
     changed_symbol_ids: &BTreeSet<ArtifactId>,
     depth: usize,
     max_total: usize,
+    edge_trace: &mut BTreeSet<(String, String, String)>,
 ) -> Result<()> {
     if depth == 0 || changed_symbol_ids.is_empty() {
         return Ok(());
@@ -451,6 +522,15 @@ fn propagate_via_calls_and_references(
                     continue;
                 }
                 let caller = edge.from_id;
+                // P15 — always record the *real* (caller → callee)
+                // edge even when we have already visited the caller
+                // through a different path. The dedup set below
+                // handles uniqueness.
+                edge_trace.insert((
+                    caller.to_string(),
+                    id.to_string(),
+                    edge.kind.as_str().to_string(),
+                ));
                 if !visited.insert(caller.clone()) {
                     continue;
                 }

@@ -146,6 +146,22 @@ pub struct LspLocation {
     pub character: u32,
 }
 
+/// One entry from `callHierarchy/outgoingCalls`. Bundles the callee
+/// (`to`) with the *caller-side* call sites the server reported in
+/// `fromRanges` so SpecSlice can record edge evidence at the actual
+/// call location instead of the callee's declaration line.
+///
+/// `from_ranges` carries `(line, character)` 0-based pairs in the
+/// caller's file (the URI we issued `prepareCallHierarchy` against).
+/// An empty vector means the server elided the field — common for
+/// older sourcekit-lsp builds; the indexer falls back to the
+/// caller's identifier line in that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspOutgoingCall {
+    pub to: LspCallHierarchyItem,
+    pub from_ranges: Vec<(u32, u32)>,
+}
+
 /// Result delivered by the background reader thread for one stdout
 /// frame. We send a single terminal `Err` and then close the channel
 /// so blocking receivers wake up on EOF / I/O failure.
@@ -354,33 +370,21 @@ impl LspClient {
         Ok(parse_call_hierarchy_items(&raw))
     }
 
-    /// P13 — `callHierarchy/outgoingCalls`. Given a previously-prepared
-    /// call hierarchy item, return the callees the server reports. We
-    /// drop `fromRanges` because SpecSlice's edge model carries only
-    /// the target symbol identity.
+    /// P13 / P15 — `callHierarchy/outgoingCalls`. Given a previously
+    /// prepared call-hierarchy item, return the callees the server
+    /// reports together with the caller-side `fromRanges` it attached
+    /// to each. The indexer uses `fromRanges[0]` as the audit-trail
+    /// evidence location for the `Calls` edge so the row in
+    /// `references` points at where the call actually occurs, not at
+    /// the callee's declaration.
     ///
     /// We echo the server's original `CallHierarchyItem` JSON
     /// verbatim — the LSP spec requires the opaque `data` field to be
     /// round-tripped unchanged, and sourcekit-lsp in particular puts a
     /// `{ usr }` in there which is the only thing the indexer keys on.
-    pub fn outgoing_calls(
-        &mut self,
-        item: &LspCallHierarchyItem,
-    ) -> Result<Vec<LspCallHierarchyItem>> {
+    pub fn outgoing_calls(&mut self, item: &LspCallHierarchyItem) -> Result<Vec<LspOutgoingCall>> {
         let raw = self.request("callHierarchy/outgoingCalls", json!({ "item": item.raw }))?;
-        let Some(items) = raw.as_array() else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for entry in items {
-            let Some(to) = entry.get("to") else {
-                continue;
-            };
-            if let Some(parsed) = parse_call_hierarchy_item(to) {
-                out.push(parsed);
-            }
-        }
-        Ok(out)
+        Ok(parse_outgoing_calls(&raw))
     }
 
     /// P13 — `textDocument/references`. Returns each `Location` where
@@ -725,6 +729,38 @@ fn parse_call_hierarchy_items(raw: &Value) -> Vec<LspCallHierarchyItem> {
         if let Some(parsed) = parse_call_hierarchy_item(item) {
             out.push(parsed);
         }
+    }
+    out
+}
+
+/// Parse a `CallHierarchyOutgoingCall[]` JSON payload — one entry
+/// per callee, each carrying `to` (the callee item) and `fromRanges`
+/// (call sites inside the caller). Defensive: entries missing `to`
+/// or whose `to` cannot be parsed are dropped silently so a single
+/// malformed item does not nuke the rest of the response.
+fn parse_outgoing_calls(raw: &Value) -> Vec<LspOutgoingCall> {
+    let Some(items) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for entry in items {
+        let Some(to_value) = entry.get("to") else {
+            continue;
+        };
+        let Some(to) = parse_call_hierarchy_item(to_value) else {
+            continue;
+        };
+        let from_ranges = entry
+            .get("fromRanges")
+            .and_then(Value::as_array)
+            .map(|ranges| {
+                ranges
+                    .iter()
+                    .filter_map(extract_position)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(LspOutgoingCall { to, from_ranges });
     }
     out
 }
@@ -1108,6 +1144,52 @@ mod tests {
         assert!(
             msg.contains("timed out") || msg.contains("超时"),
             "expected a timeout error, got: {msg}"
+        );
+    }
+
+    /// P15 — `callHierarchy/outgoingCalls` returns
+    /// `{ to: CallHierarchyItem, fromRanges: Range[] }`. SpecSlice
+    /// needs both: `to` identifies the callee while `fromRanges`
+    /// pinpoints the call sites inside the *caller* file — that is
+    /// the audit-trail location we want to record as edge evidence.
+    /// Earlier revisions only kept `to`, which made `Calls` edges
+    /// look like they originated from the callee's declaration.
+    #[test]
+    fn parse_outgoing_calls_returns_from_ranges_alongside_callee() {
+        let payload = json!([
+            {
+                "to": {
+                    "name": "greet",
+                    "kind": 6,
+                    "uri": "file:///tmp/Greeter.swift",
+                    "range": { "start": { "line": 20, "character": 0 }, "end": { "line": 23, "character": 1 } },
+                    "selectionRange": { "start": { "line": 21, "character": 16 }, "end": { "line": 21, "character": 21 } }
+                },
+                "fromRanges": [
+                    { "start": { "line": 7, "character": 4 }, "end": { "line": 7, "character": 9 } },
+                    { "start": { "line": 11, "character": 12 }, "end": { "line": 11, "character": 17 } }
+                ]
+            },
+            {
+                "to": {
+                    "name": "goodbye",
+                    "kind": 6,
+                    "uri": "file:///tmp/Greeter.swift",
+                    "range": { "start": { "line": 30, "character": 0 }, "end": { "line": 34, "character": 1 } },
+                    "selectionRange": { "start": { "line": 31, "character": 16 }, "end": { "line": 31, "character": 23 } }
+                }
+                // no fromRanges — accept and surface empty list
+            },
+            { "garbage": true } // missing `to` — must be skipped
+        ]);
+        let parsed = parse_outgoing_calls(&payload);
+        assert_eq!(parsed.len(), 2, "expected two valid outgoing calls");
+        assert_eq!(parsed[0].to.name, "greet");
+        assert_eq!(parsed[0].from_ranges, vec![(7, 4), (11, 12)]);
+        assert_eq!(parsed[1].to.name, "goodbye");
+        assert!(
+            parsed[1].from_ranges.is_empty(),
+            "expected empty fromRanges when server omitted them"
         );
     }
 

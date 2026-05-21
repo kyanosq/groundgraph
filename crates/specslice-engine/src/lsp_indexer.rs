@@ -29,7 +29,7 @@ use specslice_core::ArtifactId;
 use specslice_core::NodeKind;
 
 use crate::lsp_client::{
-    file_uri_to_path, path_to_file_uri, LspCallHierarchyItem, LspClient, LspDocumentSymbol,
+    file_uri_to_path, path_to_file_uri, LspClient, LspDocumentSymbol, LspOutgoingCall,
     LspSymbolKind,
 };
 
@@ -471,21 +471,46 @@ fn probe_call_hierarchy_and_references(
             continue;
         }
         // --- 1) outgoing calls via prepareCallHierarchy → outgoingCalls ---
+        //
+        // P15 evidence accuracy: LSP `outgoingCalls[].fromRanges`
+        // are *caller-side* ranges (in `sym.file_uri`) that name the
+        // actual call sites. The earlier implementation used the
+        // callee's `selection_line`, which records the *declaration*
+        // of the called function — useless for "go to the call site
+        // that produced this edge". We now record one edge per
+        // call site (deduped by `(from, to, kind)` in `push_edge`)
+        // using `(sym.file_rel, fromRange.line + 1)` as evidence.
+        // When the server emits no `fromRanges` (older servers),
+        // fall back to the caller's identifier line — strictly
+        // worse than the call site but still inside the caller's
+        // file, never the callee declaration.
         match probe_outgoing_calls(client, sym) {
             Ok(items) => {
-                for callee in items {
-                    if let Some((target_id, _kind, target_rel)) =
-                        resolver.resolve(&callee.uri, callee.selection_line)
-                    {
-                        push_edge(
-                            batch,
-                            &sym.symbol_id,
-                            &target_id,
-                            EdgeKind::Calls,
-                            &target_rel,
-                            callee.selection_line.saturating_add(1),
-                        );
-                    }
+                for outgoing in items {
+                    let Some((target_id, _kind, _target_rel)) =
+                        resolver.resolve(&outgoing.to.uri, outgoing.to.selection_line)
+                    else {
+                        continue;
+                    };
+                    // First `fromRange` wins for evidence; the
+                    // `(from, to, kind)` dedup below would collapse
+                    // additional rows anyway. When the server emits
+                    // no `fromRanges`, anchor on the caller's
+                    // identifier line — still inside the caller
+                    // file, which is what auditors need.
+                    let (evidence_line_zero_based,) = outgoing
+                        .from_ranges
+                        .first()
+                        .map(|(line, _ch)| (*line,))
+                        .unwrap_or((sym.selection_line,));
+                    push_edge(
+                        batch,
+                        &sym.symbol_id,
+                        &target_id,
+                        EdgeKind::Calls,
+                        &sym.file_rel,
+                        evidence_line_zero_based.saturating_add(1),
+                    );
                 }
             }
             Err(err) => {
@@ -595,7 +620,7 @@ fn warmup_call_hierarchy(client: &mut LspClient, ingested: &[IngestedSymbol]) {
 fn probe_outgoing_calls(
     client: &mut LspClient,
     sym: &IngestedSymbol,
-) -> Result<Vec<LspCallHierarchyItem>> {
+) -> Result<Vec<LspOutgoingCall>> {
     let items = client.prepare_call_hierarchy(
         &sym.file_uri,
         sym.selection_line,

@@ -16,10 +16,14 @@ use assert_cmd::Command;
 use serde_json::{json, Value};
 use specslice_mcp::server::Server;
 
-fn fixture_path() -> PathBuf {
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+}
+
+fn fixture_path() -> PathBuf {
+    workspace_root()
         .join("tests")
         .join("fixtures")
         .join("flutter_watermark_app")
@@ -106,6 +110,55 @@ fn dispatcher_tools_list_advertises_six_tools_with_input_schemas() {
             tool["inputSchema"]["type"].as_str() == Some("object"),
             "tool {} missing JSON Schema",
             tool["name"]
+        );
+    }
+}
+
+#[test]
+fn packaged_skill_matches_mcp_launch_and_tool_contract() {
+    let skill = std::fs::read_to_string(
+        workspace_root()
+            .join("packaging")
+            .join("skills")
+            .join("specslice")
+            .join("SKILL.md"),
+    )
+    .expect("read packaged SpecSlice skill");
+
+    assert!(
+        skill.contains("specslice-mcp --repo-root /path/to/repo"),
+        "Skill must document the real MCP binary launch command"
+    );
+    assert!(
+        !skill.contains("specslice --repo-root /path/to/repo mcp serve"),
+        "Skill must not document a non-existent `specslice mcp serve` CLI command"
+    );
+    assert!(
+        !skill.contains("candidate_*"),
+        "Skill must not advertise candidate_* MCP tools; candidates are exposed through context_pack/explain_symbol"
+    );
+    assert!(
+        skill.contains(".specslice.yaml"),
+        "Skill must point Swift/Go users at the root .specslice.yaml config"
+    );
+    assert!(
+        !skill.contains(".specslice/config.yaml"),
+        "Skill must not point users at a stale .specslice/config.yaml path"
+    );
+
+    let server = Server::new(PathBuf::from("."));
+    let raw = r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#;
+    let response_line = server.dispatch(raw).expect("response expected");
+    let value: Value = serde_json::from_str(&response_line).unwrap();
+    for name in value["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+    {
+        assert!(
+            skill.contains(name),
+            "Skill must mention advertised MCP tool `{name}`"
         );
     }
 }

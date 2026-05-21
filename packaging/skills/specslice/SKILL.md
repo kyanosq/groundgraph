@@ -74,6 +74,60 @@ Search HTML output defaults to `.specslice/export/search-<query>.html` unless
 `--output` is passed. Prefer search HTML for large repositories because it opens
 on a ranked result list plus a small focus graph instead of a full graph dump.
 
+5. Export local Mermaid diagrams (P14/P15) — small enough for PR
+   descriptions and design docs, edges come from the real graph
+   facts (impact uses `ImpactReport.impact_edges`, search uses
+   the subgraph, candidate uses manifest evidence):
+
+```bash
+specslice --repo-root /path/to/repo search "login" --format mermaid \
+    --depth 1 --output /tmp/login.mmd
+specslice --repo-root /path/to/repo impact --base origin/main \
+    --format mermaid --output /tmp/pr-impact.mmd
+specslice --repo-root /path/to/repo candidate show <candidate-id> \
+    --format mermaid > /tmp/candidate.mmd
+```
+
+Do not try to render the whole repo with `graph --format mermaid` for
+sizeable projects — the local exporters above are the right tool.
+
+## MCP Server (P11 / P15)
+
+For AI agents, prefer the JSON-RPC MCP server over scraping CLI text.
+It exposes `search_graph`, `get_subgraph`, `explain_symbol`,
+`impact`, `dead_code`, and `context_pack`. Each returns structured
+JSON matching the CLI's `--json` schema. Candidate context is exposed
+through `context_pack` / `explain_symbol`, not separate
+candidate-prefixed MCP tools.
+
+```bash
+specslice-mcp --repo-root /path/to/repo
+```
+
+`get_subgraph` accepts a `resolvers: [...]` filter
+(`"swift_lsp"`, `"go_lsp"`, `"dart_analyzer"`, …) so an agent can
+restrict expansion to a single language adapter when needed.
+
+## Swift / Go via LSP (P11–P15)
+
+When `swift.enabled: true` (or `go.enabled: true`) is set in
+the root `.specslice.yaml`, the indexer drives `sourcekit-lsp` /
+`gopls` over LSP and surfaces:
+
+- file + symbol nodes (`swift_class`, `swift_struct`,
+  `swift_protocol`, `swift_method`, `swift_function`,
+  `swift_initializer`, `swift_enum`; `go_struct`, `go_interface`,
+  `go_method`, `go_function`);
+- `EdgeKind::Calls` from `callHierarchy/outgoingCalls`. Edge
+  evidence (`source_file` / call line) points at the caller-side
+  `fromRanges`, i.e. the actual call site, not the callee
+  declaration;
+- `EdgeKind::References` from `textDocument/references`.
+
+If the server is missing, the indexer skips silently and
+reports the reason via `result.sidecar_skip_reason`. Always check
+that field before claiming Swift / Go data is present.
+
 ## Dead-Code Candidate Workflow
 
 Use `dead-code` only as a candidate report. It is not an automatic deletion

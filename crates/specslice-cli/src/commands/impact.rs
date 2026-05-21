@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -57,18 +58,25 @@ pub fn run(
 
 /// Build an impact-focused Mermaid graph:
 ///
-/// * `changed_files` → root rectangles
+/// * `changed_files` → root rectangles (synthetic `file::{path}` ids)
 /// * `changed_symbols` / `linked_implementations` / `propagated_symbols` → Fact
 /// * `affected_requirements` → Confirmed (rounded)
 /// * `affected_confirmed_candidates` → Candidate (parallelogram)
 /// * `linked_tests` → Confirmed (tests are the "should-run" answer)
 ///
-/// Edges are synthesised from the report rather than the store so the
-/// diagram always matches the JSON `linked_tests` / `propagated_symbols`
-/// arrays exactly, even when the graph store later evolves.
+/// P15 — edges come from `report.impact_edges`, the *real* set of
+/// graph edges traversed while computing the report. The previous
+/// implementation synthesised cross-product approximations
+/// (changed_symbols × requirements, all propagated_symbols hung onto
+/// a single changed_symbol) which silently lied about provenance.
+///
+/// The only exceptions are `affected_confirmed_candidates`: those
+/// arrive from the candidate manifest YAML, not from the store, so
+/// we draw a single `evidence` edge per candidate from the first
+/// available anchor (changed symbol, then changed file). That edge
+/// is labelled `evidence` rather than a graph kind so the reader
+/// understands it is a manifest link, not a store edge.
 pub fn render_impact_mermaid(report: &ImpactReport) -> String {
-    use std::collections::BTreeSet;
-
     let mut nodes: Vec<MermaidNode> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let push_node = |nodes: &mut Vec<MermaidNode>,
@@ -87,8 +95,10 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
         }
     };
 
-    // Anchor: changed files as Fact rectangles. Use a synthetic id
-    // prefix so it never collides with an artifact id.
+    // Anchor: changed files as Fact rectangles. Synthetic id prefix
+    // so they never collide with artifact ids in the graph.
+    let changed_file_set: BTreeSet<&str> =
+        report.changed_files.iter().map(String::as_str).collect();
     for file in &report.changed_files {
         push_node(
             &mut nodes,
@@ -110,7 +120,6 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
     for item in &report.affected_requirements {
         push_node(
             &mut nodes,
@@ -121,7 +130,6 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
     for item in &report.linked_implementations {
         push_node(
             &mut nodes,
@@ -132,7 +140,6 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
     for item in &report.linked_tests {
         push_node(
             &mut nodes,
@@ -143,7 +150,6 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
     for item in &report.affected_confirmed_candidates {
         push_node(
             &mut nodes,
@@ -154,7 +160,6 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
     for item in &report.propagated_symbols {
         push_node(
             &mut nodes,
@@ -165,96 +170,101 @@ pub fn render_impact_mermaid(report: &ImpactReport) -> String {
             item.path.clone(),
         );
     }
-
-    let mut edges: Vec<MermaidEdge> = Vec::new();
-
-    // changed_files → changed_symbols (via path match)
-    for sym in &report.changed_symbols {
-        if let Some(path) = &sym.path {
-            edges.push(MermaidEdge {
-                from: format!("file::{path}"),
-                to: sym.id.clone(),
-                kind: "contains".into(),
-                layer: GraphLayer::Fact,
-            });
-        }
+    for item in &report.changed_doc_sections {
+        push_node(
+            &mut nodes,
+            &mut seen,
+            &item.id,
+            label_for(item),
+            GraphLayer::Fact,
+            item.path.clone(),
+        );
+    }
+    for item in &report.affected_docs {
+        push_node(
+            &mut nodes,
+            &mut seen,
+            &item.id,
+            label_for(item),
+            GraphLayer::Fact,
+            item.path.clone(),
+        );
     }
 
-    // changed_symbols → propagated_symbols (synthetic "calls/refs" edge,
-    // since the underlying edge could be either kind).
-    for prop in &report.propagated_symbols {
+    // Real edges from impact_edges. We translate `from`/`to` to the
+    // diagram's id space:
+    //   * if it matches a changed-file path, use `file::{path}`;
+    //   * otherwise keep the artifact id as-is.
+    let mut edges: Vec<MermaidEdge> = Vec::new();
+    let mut edge_seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for edge in &report.impact_edges {
+        let from_id = if changed_file_set.contains(edge.from.as_str()) {
+            format!("file::{}", edge.from)
+        } else {
+            edge.from.clone()
+        };
+        let to_id = if changed_file_set.contains(edge.to.as_str()) {
+            format!("file::{}", edge.to)
+        } else {
+            edge.to.clone()
+        };
+        let key = (from_id.clone(), to_id.clone(), edge.kind.clone());
+        if !edge_seen.insert(key) {
+            continue;
+        }
+        let layer = match edge.kind.as_str() {
+            "declares_implementation" | "declares_verification" | "documents" => {
+                GraphLayer::Confirmed
+            }
+            _ => GraphLayer::Fact,
+        };
         edges.push(MermaidEdge {
-            from: sym_anchor(&report.changed_symbols).unwrap_or_default(),
-            to: prop.id.clone(),
-            kind: "calls/refs".into(),
-            layer: GraphLayer::Fact,
+            from: from_id,
+            to: to_id,
+            kind: edge.kind.clone(),
+            layer,
         });
     }
 
-    // changed_symbols → affected_requirements (declares_implementation).
-    for sym in &report.changed_symbols {
-        for req in &report.affected_requirements {
-            edges.push(MermaidEdge {
-                from: sym.id.clone(),
-                to: req.id.clone(),
-                kind: "declares_implementation".into(),
-                layer: GraphLayer::Confirmed,
-            });
-        }
-    }
-
-    // affected_requirements → linked_implementations (declares_implementation).
-    for req in &report.affected_requirements {
-        for impl_item in &report.linked_implementations {
-            edges.push(MermaidEdge {
-                from: impl_item.id.clone(),
-                to: req.id.clone(),
-                kind: "declares_implementation".into(),
-                layer: GraphLayer::Confirmed,
-            });
-        }
-    }
-
-    // affected_requirements → linked_tests (declares_verification).
-    for req in &report.affected_requirements {
-        for test in &report.linked_tests {
-            edges.push(MermaidEdge {
-                from: test.id.clone(),
-                to: req.id.clone(),
-                kind: "declares_verification".into(),
-                layer: GraphLayer::Confirmed,
-            });
-        }
-    }
-
-    // changed_symbols / changed_files → affected_confirmed_candidates.
+    // Confirmed-candidate edges live in the manifest YAML, not the
+    // store. Surface a single synthetic `evidence` edge per candidate
+    // from the most specific available anchor so the reader can spot
+    // which candidates are touched.
     for cand in &report.affected_confirmed_candidates {
         if let Some(anchor) = sym_anchor(&report.changed_symbols) {
-            edges.push(MermaidEdge {
-                from: anchor,
-                to: cand.id.clone(),
-                kind: "evidence".into(),
-                layer: GraphLayer::Candidate,
-            });
+            let key = (anchor.clone(), cand.id.clone(), "evidence".to_string());
+            if edge_seen.insert(key) {
+                edges.push(MermaidEdge {
+                    from: anchor,
+                    to: cand.id.clone(),
+                    kind: "evidence".into(),
+                    layer: GraphLayer::Candidate,
+                });
+            }
         } else if let Some(first_file) = report.changed_files.first() {
-            edges.push(MermaidEdge {
-                from: format!("file::{first_file}"),
-                to: cand.id.clone(),
-                kind: "evidence".into(),
-                layer: GraphLayer::Candidate,
-            });
+            let from = format!("file::{first_file}");
+            let key = (from.clone(), cand.id.clone(), "evidence".to_string());
+            if edge_seen.insert(key) {
+                edges.push(MermaidEdge {
+                    from,
+                    to: cand.id.clone(),
+                    kind: "evidence".into(),
+                    layer: GraphLayer::Candidate,
+                });
+            }
         }
     }
 
     let notes = vec![format!(
         "specslice impact — changed_files={} changed_symbols={} affected_requirements={} \
-         linked_tests={} candidates={} propagated_symbols={}",
+         linked_tests={} candidates={} propagated_symbols={} impact_edges={}",
         report.changed_files.len(),
         report.changed_symbols.len(),
         report.affected_requirements.len(),
         report.linked_tests.len(),
         report.affected_confirmed_candidates.len(),
         report.propagated_symbols.len(),
+        report.impact_edges.len(),
     )];
     render_parts(&nodes, &edges, &notes)
 }
@@ -373,6 +383,7 @@ mod tests {
     }
 
     fn sample_report() -> ImpactReport {
+        use specslice_engine::impact::ImpactEdge;
         ImpactReport {
             changed_files: vec!["lib/foo.dart".into()],
             changed_symbols: vec![item(
@@ -403,6 +414,32 @@ mod tests {
                 "Bar.baz",
                 Some("lib/bar.dart"),
             )],
+            impact_edges: vec![
+                // file → changed_symbol (real structural edge)
+                ImpactEdge {
+                    from: "lib/foo.dart".into(),
+                    to: "dart_method::lib/foo.dart#Foo.bar".into(),
+                    kind: "contains".into(),
+                },
+                // changed_symbol declares_implementation REQ-X
+                ImpactEdge {
+                    from: "dart_method::lib/foo.dart#Foo.bar".into(),
+                    to: "req::REQ-X".into(),
+                    kind: "declares_implementation".into(),
+                },
+                // test → REQ-X (declares_verification, reverse direction)
+                ImpactEdge {
+                    from: "test_case::test/foo_test.dart#bar works".into(),
+                    to: "req::REQ-X".into(),
+                    kind: "declares_verification".into(),
+                },
+                // caller → callee (propagation)
+                ImpactEdge {
+                    from: "dart_method::lib/bar.dart#Bar.baz".into(),
+                    to: "dart_method::lib/foo.dart#Foo.bar".into(),
+                    kind: "calls".into(),
+                },
+            ],
             warnings: vec![],
             info: vec![],
         }
@@ -433,15 +470,36 @@ mod tests {
             out.contains("-.->|evidence|"),
             "missing candidate evidence arrow: {out}"
         );
-        // Propagated symbol appears with calls/refs label.
+        // Propagated symbol appears via real `calls` edge from the
+        // caller, not a synthesised "calls/refs" approximation.
         assert!(
-            out.contains("---|calls/refs|"),
-            "missing propagated arrow: {out}"
+            out.contains("---|calls|"),
+            "missing real calls arrow: {out}"
         );
-        // Note line carries the summary so reviewers can sanity-check.
+        assert!(
+            !out.contains("calls/refs"),
+            "synthesised `calls/refs` label leaked through: {out}"
+        );
+        // The contains edge anchors the changed file → changed symbol.
+        assert!(
+            out.contains("---|contains|"),
+            "missing structural contains arrow: {out}"
+        );
+        // The declares_implementation edge runs from the changed
+        // symbol to the requirement, not from every changed symbol.
+        assert!(
+            out.contains("-->|declares_implementation|"),
+            "missing declares_implementation arrow: {out}"
+        );
+        // Note line carries the summary including impact_edges count
+        // so reviewers can sanity-check provenance.
         assert!(
             out.contains("specslice impact"),
             "missing summary comment: {out}"
+        );
+        assert!(
+            out.contains("impact_edges=4"),
+            "summary missing impact_edges count: {out}"
         );
         // No raw artifact ids leak through.
         assert!(!out.contains("dart_method::"));

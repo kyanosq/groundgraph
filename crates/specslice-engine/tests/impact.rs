@@ -340,6 +340,150 @@ fn impact_propagates_via_calls_and_references_to_callers_and_tests() {
     );
 }
 
+/// P15 — `impact_edges` must reflect *real* edges traversed during
+/// impact computation, not synthesised cross-products. The Mermaid
+/// exporter consumes this trace so PR diagrams show provenance
+/// truthfully. We assert both call-graph propagation edges and the
+/// `declares_implementation` / `declares_verification` edges that
+/// anchor a requirement to its impl/test set.
+#[test]
+fn impact_records_real_edges_for_calls_and_requirement_anchors() {
+    let tmp = TempDir::new().unwrap();
+    let mut store = Store::open(tmp.path().join("graph.db")).unwrap();
+    store.migrate().unwrap();
+
+    let path = "lib/foo.dart";
+    let req_id = ArtifactId::new("req::REQ-FOO-1");
+    let cls_id = ArtifactId::new("dart_class::lib/foo.dart#A");
+    let a_id = ArtifactId::new("dart_method::lib/foo.dart#A.greet");
+    let b_id = ArtifactId::new("dart_method::lib/foo.dart#B.welcome");
+    let t_id = ArtifactId::new("test_case::test/foo_test.dart#greet works");
+
+    // Nodes.
+    let mut req_node = Node::new(req_id.clone(), NodeKind::Requirement);
+    req_node.name = Some("REQ-FOO-1".into());
+    req_node.indexer = Some("test_fixture".into());
+    store.upsert_node(&req_node).unwrap();
+
+    for (id, kind, name, start, end, file) in [
+        (cls_id.clone(), NodeKind::DartClass, "A", 5u32, 25u32, path),
+        (a_id.clone(), NodeKind::DartMethod, "A.greet", 10, 20, path),
+        (
+            b_id.clone(),
+            NodeKind::DartMethod,
+            "B.welcome",
+            30,
+            35,
+            path,
+        ),
+        (
+            t_id.clone(),
+            NodeKind::TestCase,
+            "greet works",
+            5,
+            8,
+            "test/foo_test.dart",
+        ),
+    ] {
+        let mut node = Node::new(id.clone(), kind);
+        node.name = Some(name.into());
+        node.path = Some(file.into());
+        node.start_line = Some(start);
+        node.end_line = Some(end);
+        node.indexer = Some("test_fixture".into());
+        store.upsert_node(&node).unwrap();
+        store
+            .upsert_symbol_range(&SymbolRange {
+                file_path: file.into(),
+                symbol_id: id.clone(),
+                start_line: start,
+                end_line: end,
+                symbol_kind: kind,
+                qualified_name: name.into(),
+                parent_symbol_id: if id == a_id {
+                    Some(cls_id.clone())
+                } else {
+                    None
+                },
+            })
+            .unwrap();
+    }
+
+    // Edges.
+    for (from, to, kind) in [
+        // The *class* declares the requirement, not the method —
+        // verifies that parent-walk traversal still records the
+        // real edge that connected to the requirement.
+        (
+            cls_id.clone(),
+            req_id.clone(),
+            EdgeKind::DeclaresImplementation,
+        ),
+        // A test declares verification of the requirement.
+        (t_id.clone(), req_id.clone(), EdgeKind::DeclaresVerification),
+        // Call chain B → A and T → B (reverse direction = caller → callee).
+        (b_id.clone(), a_id.clone(), EdgeKind::Calls),
+        (t_id.clone(), b_id.clone(), EdgeKind::Calls),
+    ] {
+        let mut edge = EdgeAssertion::fact(from, to, kind, EdgeSource::LanguageAdapter);
+        edge.indexer = Some("test_fixture".into());
+        store.upsert_edge(&edge).unwrap();
+    }
+
+    let changed = vec![ChangedFile {
+        path: path.into(),
+        status: ChangeStatus::Modified,
+        hunks: vec![Hunk {
+            new_start: 15,
+            new_end: 15,
+        }],
+    }];
+
+    let report = compute_impact_with_policy(
+        &store,
+        &changed,
+        ImpactPolicy {
+            propagation: ImpactPropagation {
+                call_depth: 2,
+                ..ImpactPropagation::default()
+            },
+            // Keep the warning text out of the way — we only care
+            // about edges here.
+            missing_test_change_level: "off".into(),
+            ..ImpactPolicy::default()
+        },
+    )
+    .unwrap();
+
+    let edges: Vec<(&str, &str, &str)> = report
+        .impact_edges
+        .iter()
+        .map(|e| (e.from.as_str(), e.to.as_str(), e.kind.as_str()))
+        .collect();
+
+    // Real DeclaresImplementation edge from the parent class, not the
+    // changed method.
+    assert!(
+        edges.contains(&(cls_id.as_str(), req_id.as_str(), "declares_implementation")),
+        "expected real declares_implementation edge (class → req), got {edges:?}"
+    );
+    // Real DeclaresVerification edge from test → req.
+    assert!(
+        edges.contains(&(t_id.as_str(), req_id.as_str(), "declares_verification")),
+        "expected real declares_verification edge (test → req), got {edges:?}"
+    );
+    // Real Calls edges from the BFS — not collapsed onto a single
+    // changed_symbol, but the actual (caller, callee, calls) trace.
+    assert!(
+        edges.contains(&(b_id.as_str(), a_id.as_str(), "calls")),
+        "expected real B → A calls edge, got {edges:?}"
+    );
+    assert!(
+        edges.contains(&(t_id.as_str(), b_id.as_str(), "calls")),
+        "expected real T → B calls edge, got {edges:?}"
+    );
+}
+
 #[test]
 fn impact_policy_can_disable_parent_doc_and_warning_propagation() {
     let (_tmp, store) = fresh_store_with_index();

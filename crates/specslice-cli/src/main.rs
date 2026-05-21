@@ -289,15 +289,17 @@ struct SearchArgs {
     /// 等别名。
     #[arg(long, value_delimiter = ',')]
     kind: Vec<String>,
-    /// 输出格式：`text`（默认）/ `json` / `html`。
-    /// HTML 是搜索驱动的单文件阅读器。
+    /// 输出格式：`text`（默认）/ `json` / `html` / `mermaid`。
+    /// - `html` 渲染搜索驱动的单文件阅读器；
+    /// - `mermaid` 输出 `flowchart LR` 子图，适合 PR / 设计文档。
     #[arg(long, value_enum, default_value_t = SearchFormatArg::Text)]
     format: SearchFormatArg,
     /// 兼容别名 — 等价于 `--format json`。
     #[arg(long)]
     json: bool,
-    /// `--format html` 的输出文件路径。默认写到
-    /// `<repo_root>/.specslice/export/search-<slug>.html`。
+    /// `--format html` 的默认写入路径为
+    /// `<repo_root>/.specslice/export/search-<slug>.html`；当
+    /// `--format mermaid` 时直接写入指定路径（默认打印到 stdout）。
     #[arg(long)]
     output: Option<PathBuf>,
     /// 保留 framework 噪声 calls（toString / build / dispose / …）。
@@ -400,12 +402,13 @@ struct ImpactArgs {
     /// `--format json` and kept for back-compat.
     #[arg(long)]
     json: bool,
-    /// P14 — output format. `mermaid` renders a local `flowchart LR`
-    /// of "changed files → impacted business → suggested tests".
+    /// 输出格式：`text`（默认）/ `json` / `mermaid`。`mermaid`
+    /// 渲染 "changed files → impacted business → suggested tests" 的
+    /// 局部 `flowchart LR`，边来自 `ImpactReport.impact_edges`
+    /// （真实图边），不是合成近似关系。
     #[arg(long, value_enum, default_value_t = ImpactFormatArg::Text)]
     format: ImpactFormatArg,
-    /// P14 — destination file for `--format mermaid`. Falls back to
-    /// stdout when omitted.
+    /// `--format mermaid` 的输出文件路径；省略时打印到 stdout。
     #[arg(long)]
     output: Option<std::path::PathBuf>,
 }
