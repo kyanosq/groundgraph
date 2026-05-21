@@ -8,7 +8,7 @@ SpecSlice 的核心目标是证明一个非侵入式闭环：
 文档事实 / Dart 事实 / 测试事实 -> AI 业务逻辑候选与关联候选 -> 人工确认 -> confirmed graph -> PR Impact / Agent Context Pack / Graph 浏览
 ```
 
-MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart analyzer sidecar、Flutter/Riverpod 语义边和 AI 业务候选层落到主线。P10 落地 `specslice dead-code`，P11 把 MCP 工具层与可展开/可过滤的搜索阅读器并入主线，P12 通过 LSP sidecar 加入 Swift / Go 的结构事实图。当前阶段仍不做 GraphRAG、不把 LLM 输出直接写进 confirmed graph，也不在 Swift / Go 代码里加任何注解。价值判断看三件事：
+MVP-0 ~ MVP-5 已完成；P6 ~ P9 已把只读图浏览、代码事实边、Dart analyzer sidecar、Flutter/Riverpod 语义边和 AI 业务候选层落到主线。P10 落地 `specslice dead-code`，P11 把 MCP 工具层与可展开/可过滤的搜索阅读器并入主线，P12 通过 LSP sidecar 加入 Swift / Go 的结构事实图，P13 在同一 LSP 通路上补全 `callHierarchy` + `references`，让 Swift / Go 的调用 / 引用边和 Dart analyzer 保持同一可信链路。当前阶段仍不做 GraphRAG、不把 LLM 输出直接写进 confirmed graph，也不在 Swift / Go 代码里加任何注解。价值判断看三件事：
 
 - AI 能否基于文档/代码/测试事实生成高质量业务逻辑候选和候选关联。
 - 人工确认后的外置 graph 能否在不改业务代码/业务文档的前提下稳定查询、反查和审阅。
@@ -649,14 +649,41 @@ specslice graph --format html --view business
 - 不写自家 parser；语言事实由上游官方 LSP 服务器（`sourcekit-lsp` / `gopls`）产出，SpecSlice 只做结构化吸纳。
 - 不在 Swift / Go 代码中加注解、不依赖运行时反射 / 字符串约定；缺少 `Package.swift` 或 `go.mod` 时优雅退化为「跳过」并保留可读原因。
 - 不联网；LSP 完全本地 stdio 通信，CLI / MCP 的搜索 / 死代码 / Context Pack 路径在 Swift / Go 启用后保持同一可信链路。
-- 不引入新的事实通路：Swift / Go 沿用 `EdgeKind::Contains`（File → Symbol → Symbol），后续 `callHierarchy` / `references` 会作为新 PR 单独跟进，不会回头改既有 Dart 路径。
+- 不引入新的事实通路：Swift / Go 沿用 `EdgeKind::Contains`（File → Symbol → Symbol），调用 / 引用边在 P13 通过 `callHierarchy` / `references` 单独引入，仍不会回头改既有 Dart 路径。
 
 **P12 复核修复（已落地）：**
 
 - **LSP 运行期失败一律降级**：`run_profile` 现在把 `spawn / initialize / didOpen / documentSymbol` 的所有错误捕获并写入 `LspIndexOutcome::Skipped` 或 `Indexed { stats.skip_reason }`，不再让 `index_repository` 因 sourcekit-lsp 沙箱权限、`gopls` cache 缺失等环境问题整体失败。`run_profile_downgrades_runtime_lsp_failure_to_skipped` 用 `/usr/bin/true` 冒充 LSP 复现这条契约。
 - **read 超时真正生效**：`LspClient` 把 stdout 读取放到后台线程并通过 `mpsc::Receiver::recv_timeout` 等待应答，`set_response_timeout` 到期会立刻 `force_kill` 子进程；新增 `request_times_out_when_lsp_server_never_writes` 用 `sleep 30` 复现「LSP 吃掉请求但不回包」的死锁场景，断言 150ms 超时内 bail。
 - **CLI 输出 Swift / Go 段**：`specslice index` 的 `print_result` 拆出 `format_result`，在配置启用 `swift.enabled` / `go.enabled` 时分别打印 files / symbols / resolver_used / skip_reason；五条新 `format_result` 单测同时覆盖「未启用」「Indexed」「Skipped 含 PATH 提示」三种渲染分支。
-- 现阶段 Swift / Go 仍只覆盖结构事实（files + symbols + contains），调用/引用边会作为后续 PR 通过 `callHierarchy` / `references` 单独引入。
+
+## P13 Swift / Go callHierarchy + references（已落地）
+
+P12 留下的最大短板是 Swift / Go 只有结构边、没有调用 / 引用关系，导致 `slice` / `impact` / `dead-code` 在多语言仓库里只能停在文件级。P13 在 LSP sidecar 内补上 `callHierarchy` 与 `textDocument/references`，把这两个图谱通路拉齐到 Dart analyzer 的事实级别。
+
+**实现要点：**
+
+- `LspClient` 扩展三组同步 RPC：`prepare_call_hierarchy(uri, line, character)`、`outgoing_calls(item)`、`references(uri, line, character)`。新增 `LspCallHierarchyItem` 与 `LspLocation` 类型，**完整保留服务器返回的 `data` 字段**（sourcekit-lsp 在 `data.usr` 里塞 USR，没回传会被服务器视为不存在的 item，导致 `outgoingCalls` 永远返回空）。
+- `initialize` 客户端能力声明里追加 `textDocument.callHierarchy` 和 `textDocument.references`，让上游显式启用 `callHierarchyProvider`，否则 sourcekit-lsp 不会广告对应 provider。
+- `LspDocumentSymbol` 额外携带 `selection_line` / `selection_character`（取自 `selectionRange.start`），确保 `prepareCallHierarchy` 拿到的是标识符光标位置而非整条声明开头。
+- `lsp_indexer` 在结构事实写完之后做一遍 best-effort 探测：
+  - `SymbolResolver` 用 `repo_root` + per-file SymbolRange 表把 LSP 回来的 `Location.uri + line` 反向解析成已索引的 `ArtifactId`；外部 stdlib / 第三方调用解析不到时直接丢弃，**不会自动合成 stub 节点**，保持「非侵入式」契约。
+  - `warmup_call_hierarchy` 给每个有 callable 的文件做一轮 `prepareCallHierarchy` 轮询（每 250ms 一次，整体上限 15s）以等 sourcekit-lsp 的 `IndexStoreDB` 异步装入；轮询失败就放弃该探针，不阻塞其他文件。
+  - 每个 callable 走完 `callHierarchy/outgoingCalls`（产出 `EdgeKind::Calls`，方向 `from sym → to callee`）与 `textDocument/references`（产出 `EdgeKind::References`，方向 `from caller → to sym`）。两类边都进 `LanguageIndexBatch.references`，最终由 `ingest_language_batch_minimal` 写入 store，**沿用 Dart 的允许集合**，不会引入新的 EdgeKind。
+- 跨文件 URI 解析特别处理 macOS：`SymbolResolver::build` 对 `repo_root` 做 `canonicalize`，并对每个 LSP URI 也做 `canonicalize`，避开 `/var/folders/...` ↔ `/private/var/folders/...` symlink 不匹配的死角。
+- 关键 bugfix：`code_roots = ["."]` 时 `walkdir` 会保留中段的 `./`，让 `gopls` 报 `no package metadata`；`discover_files` 现在直接用 `repo_root.join(rel)` 重建绝对路径再去算 URI。
+
+**测试覆盖：**
+
+- 单测：`parse_call_hierarchy_items_normalises_kind_selection_and_preserves_data`（断言 `data.usr` 原样保留）、`parse_locations_collects_line_character_for_references`、`file_uri_to_path_round_trips_through_path_to_file_uri` / `file_uri_to_path_handles_lenient_forms`。
+- 集成测：`swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present` 在 `sourcekit-lsp` 可用且 `swift build` 成功时**强制要求** `EdgeKind::Calls` 至少有一条，且每条目标必须落在已索引节点上；`go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present` 对 `gopls` 做同样的断言（无需预 build，gopls 在初始化阶段就准备好了）。
+- 当 `swift build` 缺失或失败时，Swift 集成测试会回落到只验证结构事实并打印一条日志，保证流水线在无 Swift 工具链环境（如纯 Linux CI）下不会假阳性。
+
+**非侵入式约束（沿用 P11 / P12）：**
+
+- LSP 调用仍然是 best-effort：任何一条 `prepareCallHierarchy` / `outgoingCalls` / `references` 错误都不会让 `specslice index` 失败，只会进 `stats.skip_reason` 让 CLI 渲染出来。
+- 不联网、不写第三方 IDE 配置、不向用户代码注入注解；新增的 `Calls` / `References` 边纯粹由上游官方 LSP 服务器算出。
+- 不引入新的 EdgeKind / NodeKind；callHierarchy / references 落回 Dart adapter 已有的允许集合，所以 `dead-code` / `slice` / `impact` / MCP / HTML / 搜索全链路自动看到 Swift / Go 的调用关系，无需再修一行下游代码。
 
 ## 后续验收方式
 

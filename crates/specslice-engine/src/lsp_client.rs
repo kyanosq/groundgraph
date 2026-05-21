@@ -107,7 +107,43 @@ pub struct LspDocumentSymbol {
     pub start_line: u32,
     /// 0-based inclusive end line.
     pub end_line: u32,
+    /// 0-based line where the identifier sits — `selectionRange.start.line`
+    /// per the LSP spec, used as the cursor position for
+    /// `prepareCallHierarchy` / `references` requests.
+    pub selection_line: u32,
+    /// 0-based character offset inside [`Self::selection_line`].
+    pub selection_character: u32,
     pub children: Vec<LspDocumentSymbol>,
+}
+
+/// Minimum-viable `CallHierarchyItem`: the fields we actually
+/// dereference when resolving outgoing calls back to known SpecSlice
+/// symbols. Both `range` and `selectionRange` are 0-based per the LSP
+/// spec; we only keep the identifier line for the resolver.
+///
+/// The `raw` field holds the unmodified JSON the server sent us. The
+/// LSP spec requires this to be passed back verbatim on
+/// `callHierarchy/outgoingCalls` (and `incomingCalls`); some servers
+/// — sourcekit-lsp in particular — attach a `data: { usr }` field
+/// that they use as the lookup key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspCallHierarchyItem {
+    pub name: String,
+    pub kind: LspSymbolKind,
+    pub uri: String,
+    pub selection_line: u32,
+    pub selection_character: u32,
+    pub raw: Value,
+}
+
+/// `Location` as returned by `textDocument/references`. We collapse
+/// the range to its 0-based start line + character — every consumer
+/// inside SpecSlice only needs the position, not the span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspLocation {
+    pub uri: String,
+    pub line: u32,
+    pub character: u32,
 }
 
 /// Result delivered by the background reader thread for one stdout
@@ -219,6 +255,12 @@ impl LspClient {
                             "valueSet": (1..=26).collect::<Vec<i64>>(),
                         },
                     },
+                    // P13 — opt-in to call hierarchy + references so
+                    // sourcekit-lsp / gopls advertise the corresponding
+                    // providers in their reply and accept our follow-up
+                    // requests.
+                    "callHierarchy": { "dynamicRegistration": false },
+                    "references": { "dynamicRegistration": false },
                 },
                 "workspace": {
                     "workspaceFolders": true,
@@ -289,6 +331,72 @@ impl LspClient {
         } else {
             Ok(normalise_document_symbols(&items))
         }
+    }
+
+    /// P13 — `textDocument/prepareCallHierarchy`. Returns the set of
+    /// call-hierarchy items the server identified at `(line, character)`
+    /// (0-based per the LSP spec). An empty vector means the server
+    /// could not anchor the position (typical for whitespace / unknown
+    /// identifiers).
+    pub fn prepare_call_hierarchy(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspCallHierarchyItem>> {
+        let raw = self.request(
+            "textDocument/prepareCallHierarchy",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )?;
+        Ok(parse_call_hierarchy_items(&raw))
+    }
+
+    /// P13 — `callHierarchy/outgoingCalls`. Given a previously-prepared
+    /// call hierarchy item, return the callees the server reports. We
+    /// drop `fromRanges` because SpecSlice's edge model carries only
+    /// the target symbol identity.
+    ///
+    /// We echo the server's original `CallHierarchyItem` JSON
+    /// verbatim — the LSP spec requires the opaque `data` field to be
+    /// round-tripped unchanged, and sourcekit-lsp in particular puts a
+    /// `{ usr }` in there which is the only thing the indexer keys on.
+    pub fn outgoing_calls(
+        &mut self,
+        item: &LspCallHierarchyItem,
+    ) -> Result<Vec<LspCallHierarchyItem>> {
+        let raw = self.request("callHierarchy/outgoingCalls", json!({ "item": item.raw }))?;
+        let Some(items) = raw.as_array() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in items {
+            let Some(to) = entry.get("to") else {
+                continue;
+            };
+            if let Some(parsed) = parse_call_hierarchy_item(to) {
+                out.push(parsed);
+            }
+        }
+        Ok(out)
+    }
+
+    /// P13 — `textDocument/references`. Returns each `Location` where
+    /// the symbol at `(line, character)` is referenced. We deliberately
+    /// pass `includeDeclaration: false` because the declaration is
+    /// already a SpecSlice symbol; what we need are the *call sites*.
+    pub fn references(&mut self, uri: &str, line: u32, character: u32) -> Result<Vec<LspLocation>> {
+        let raw = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": false },
+            }),
+        )?;
+        Ok(parse_locations(&raw))
     }
 
     /// Politely terminate the server using the LSP `shutdown` + `exit`
@@ -459,6 +567,13 @@ fn parse_document_symbol(item: &Value) -> Option<LspDocumentSymbol> {
     let kind_raw = u32::try_from(obj.get("kind")?.as_u64()?).ok()?;
     let range = obj.get("range").or_else(|| obj.get("selectionRange"))?;
     let (start_line, end_line) = extract_range_lines(range)?;
+    // Prefer the identifier-only `selectionRange` for call-hierarchy /
+    // references positions. Fall back to the wider `range` when the
+    // server only emitted one (older SymbolInformation responses go
+    // through a different normaliser).
+    let selection_range = obj.get("selectionRange").or(Some(range))?;
+    let (selection_line, selection_character) =
+        extract_position(selection_range).unwrap_or((start_line, 0));
     let children = obj
         .get("children")
         .and_then(Value::as_array)
@@ -470,6 +585,8 @@ fn parse_document_symbol(item: &Value) -> Option<LspDocumentSymbol> {
         kind: LspSymbolKind::from_raw(kind_raw),
         start_line,
         end_line,
+        selection_line,
+        selection_character,
         children,
     })
 }
@@ -565,6 +682,8 @@ fn normalise_symbol_information(items: &[Value]) -> Vec<LspDocumentSymbol> {
                 kind: flat.kind,
                 start_line: flat.start_line,
                 end_line: flat.end_line,
+                selection_line: flat.start_line,
+                selection_character: 0,
                 children,
             });
         }
@@ -584,6 +703,8 @@ fn normalise_symbol_information(items: &[Value]) -> Vec<LspDocumentSymbol> {
             name: flat.name.clone(),
             detail: flat.detail.clone(),
             kind: flat.kind,
+            selection_line: flat.start_line,
+            selection_character: 0,
             start_line: flat.start_line,
             end_line: flat.end_line,
             children,
@@ -592,11 +713,85 @@ fn normalise_symbol_information(items: &[Value]) -> Vec<LspDocumentSymbol> {
     tree
 }
 
+/// Parse a `CallHierarchyItem[]` JSON payload into our normalised
+/// shape. The protocol allows `null` as an empty result; we treat
+/// anything that is not an array as "no items".
+fn parse_call_hierarchy_items(raw: &Value) -> Vec<LspCallHierarchyItem> {
+    let Some(items) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(parsed) = parse_call_hierarchy_item(item) {
+            out.push(parsed);
+        }
+    }
+    out
+}
+
+fn parse_call_hierarchy_item(item: &Value) -> Option<LspCallHierarchyItem> {
+    let obj = item.as_object()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    let uri = obj.get("uri")?.as_str()?.to_string();
+    let kind_raw = u32::try_from(obj.get("kind")?.as_u64()?).ok()?;
+    let position_source = obj.get("selectionRange").or_else(|| obj.get("range"))?;
+    let (line, character) = extract_position(position_source)?;
+    Some(LspCallHierarchyItem {
+        name,
+        uri,
+        kind: LspSymbolKind::from_raw(kind_raw),
+        selection_line: line,
+        selection_character: character,
+        raw: item.clone(),
+    })
+}
+
+/// Parse a `Location[]` JSON payload into our normalised shape.
+/// `Location | LocationLink[]` would be a more complete typing but
+/// `textDocument/references` only ever returns the simple `Location`
+/// variant.
+fn parse_locations(raw: &Value) -> Vec<LspLocation> {
+    let Some(items) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(uri) = obj.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(range) = obj.get("range") else {
+            continue;
+        };
+        let Some((line, character)) = extract_position(range) else {
+            continue;
+        };
+        out.push(LspLocation {
+            uri: uri.to_string(),
+            line,
+            character,
+        });
+    }
+    out
+}
+
 fn extract_range_lines(range: &Value) -> Option<(u32, u32)> {
     let start = u32::try_from(range.get("start")?.get("line")?.as_u64()?).ok()?;
     let end = u32::try_from(range.get("end")?.get("line")?.as_u64()?).ok()?;
     let end = end.max(start);
     Some((start, end))
+}
+
+/// Read `{ "start": { "line": L, "character": C } }` from an LSP range.
+/// Returns 0-based `(line, character)` so callers can hand the position
+/// straight to `prepareCallHierarchy` / `textDocument/references`.
+fn extract_position(range: &Value) -> Option<(u32, u32)> {
+    let start = range.get("start")?;
+    let line = u32::try_from(start.get("line")?.as_u64()?).ok()?;
+    let character = u32::try_from(start.get("character")?.as_u64()?).ok()?;
+    Some((line, character))
 }
 
 fn write_message<W: Write>(writer: &mut W, body: &Value) -> Result<()> {
@@ -672,6 +867,64 @@ pub fn path_to_file_uri(path: &Path) -> String {
         }
     }
     out
+}
+
+/// Reverse of [`path_to_file_uri`]. Accepts both the canonical
+/// `file:///abs/path` form and lenient forms occasionally produced by
+/// language servers (`file:/abs/path` or even bare paths). Returns
+/// `None` when the URI scheme is not `file` so the caller can ignore
+/// remote / virtual documents.
+pub fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))?;
+    // Some servers emit `file:///abs/path`, others `file://localhost/abs/path`;
+    // strip the optional authority component if present.
+    let after_authority = if let Some(idx) = rest.find('/') {
+        if rest[..idx].is_empty() {
+            // `file:///abs/...` (no authority) → leave the leading slash.
+            rest
+        } else {
+            // `file://host/abs/...` (we ignore the host).
+            &rest[idx..]
+        }
+    } else {
+        rest
+    };
+    let decoded = percent_decode(after_authority);
+    Some(std::path::PathBuf::from(decoded))
+}
+
+/// Minimal percent-decoder shared by [`file_uri_to_path`]. Only handles
+/// `%XX` triplets; anything malformed is passed through verbatim so we
+/// never silently drop characters the operator can see.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                // `h` and `l` are 4-bit hex digits (max 0x0F), so the
+                // composite fits in a single byte. `try_from` keeps
+                // clippy's strict cast lints happy without runtime cost.
+                if let Ok(byte) = u8::try_from((h << 4) | l) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|err| {
+        // Fallback: lossy decode rather than losing the whole URI.
+        let bytes = err.into_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 /// Flatten a hierarchical [`LspDocumentSymbol`] tree into parent-child
@@ -859,6 +1112,77 @@ mod tests {
     }
 
     #[test]
+    fn parse_call_hierarchy_items_normalises_kind_selection_and_preserves_data() {
+        // The `data` field is opaque (sourcekit-lsp puts a USR there).
+        // Our parser must keep it intact under `raw` so the indexer
+        // can echo the whole `CallHierarchyItem` back on
+        // `callHierarchy/outgoingCalls`.
+        let payload = json!([
+            {
+                "name": "greet",
+                "kind": 6,
+                "uri": "file:///tmp/Greeter.swift",
+                "range": { "start": { "line": 20, "character": 0 }, "end": { "line": 23, "character": 1 } },
+                "selectionRange": { "start": { "line": 21, "character": 16 }, "end": { "line": 21, "character": 21 } },
+                "data": { "usr": "s:7GreeterAAC5greetSSyF" }
+            },
+            { "broken": true }
+        ]);
+        let items = parse_call_hierarchy_items(&payload);
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.name, "greet");
+        assert_eq!(it.kind, LspSymbolKind::Method);
+        assert_eq!(it.uri, "file:///tmp/Greeter.swift");
+        assert_eq!(it.selection_line, 21);
+        assert_eq!(it.selection_character, 16);
+        assert_eq!(
+            it.raw
+                .get("data")
+                .and_then(|d| d.get("usr"))
+                .and_then(|u| u.as_str()),
+            Some("s:7GreeterAAC5greetSSyF")
+        );
+    }
+
+    #[test]
+    fn parse_locations_collects_line_character_for_references() {
+        let payload = json!([
+            {
+                "uri": "file:///tmp/Caller.swift",
+                "range": { "start": { "line": 7, "character": 4 }, "end": { "line": 7, "character": 9 } },
+            },
+            { "uri": "file:///tmp/B.swift" /* missing range */ }
+        ]);
+        let locs = parse_locations(&payload);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].line, 7);
+        assert_eq!(locs[0].character, 4);
+        assert_eq!(locs[0].uri, "file:///tmp/Caller.swift");
+    }
+
+    #[test]
+    fn file_uri_to_path_round_trips_through_path_to_file_uri() {
+        let original = Path::new("/tmp/specslice/中文 路径/file.swift");
+        let uri = path_to_file_uri(original);
+        let recovered = file_uri_to_path(&uri).expect("recoverable");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn file_uri_to_path_handles_lenient_forms() {
+        assert_eq!(
+            file_uri_to_path("file:/tmp/x.swift"),
+            Some(std::path::PathBuf::from("/tmp/x.swift"))
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/tmp/x.swift"),
+            Some(std::path::PathBuf::from("/tmp/x.swift"))
+        );
+        assert_eq!(file_uri_to_path("https://example.com"), None);
+    }
+
+    #[test]
     fn flatten_pairs_walks_pre_order() {
         let tree = vec![LspDocumentSymbol {
             name: "A".into(),
@@ -866,12 +1190,16 @@ mod tests {
             kind: LspSymbolKind::Class,
             start_line: 0,
             end_line: 100,
+            selection_line: 0,
+            selection_character: 6,
             children: vec![LspDocumentSymbol {
                 name: "A.m".into(),
                 detail: None,
                 kind: LspSymbolKind::Method,
                 start_line: 1,
                 end_line: 5,
+                selection_line: 1,
+                selection_character: 2,
                 children: Vec::new(),
             }],
         }];

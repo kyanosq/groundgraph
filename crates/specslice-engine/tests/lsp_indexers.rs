@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use specslice_core::edge::EdgeKind;
 use specslice_engine::{
     go_indexer::{go_lsp_available, index_go, GoIndexOptions, GO_LSP_COMMAND_ENV},
     swift_indexer::{index_swift, swift_lsp_available, SwiftIndexOptions, SWIFT_LSP_COMMAND_ENV},
@@ -120,6 +121,21 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
     copy_dir(&fixture, tmp.path());
     let (mut store, _db) = open_temp_store(tmp.path());
 
+    // P13 — sourcekit-lsp's callHierarchy / references rely on
+    // SwiftPM's resolved checkout. We can't ask the operator to
+    // pre-build, but for this fixture `swift build` is trivially
+    // fast. If the binary is missing or the build fails we still
+    // run the structural assertions (they only need documentSymbol)
+    // and drop the Calls assertion at the end.
+    let swift_build_ok = std::process::Command::new("swift")
+        .args(["build", "--package-path"])
+        .arg(tmp.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
     let opts = SwiftIndexOptions {
         repo_root: tmp.path().to_path_buf(),
         code_roots: vec![PathBuf::from("Sources"), PathBuf::from("Tests")],
@@ -191,6 +207,36 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
         .iter()
         .find(|n| n.kind.as_str() == "swift_initializer")
         .unwrap_or_else(|| panic!("Swift initialiser missing; saw {:?}", debug_kinds(&nodes)));
+
+    // P13 — when SwiftPM resolved (we ran `swift build` above) the
+    // call-hierarchy probe must surface at least one `Calls` edge:
+    // `makeGreeter()` invokes the Greeter initializer and
+    // `GreeterTests.testGreetsByName` calls `Greeter.greet`. If
+    // `swift build` was unavailable / failed, sourcekit-lsp silently
+    // returns empty results and we skip the Calls assertion — that
+    // is the documented fallback contract for the operator UX.
+    let calls = store
+        .list_edges_by_kind(EdgeKind::Calls)
+        .expect("calls edges queryable");
+    if swift_build_ok {
+        assert!(
+            !calls.is_empty(),
+            "expected at least one Calls edge from Swift call-hierarchy after `swift build`, got 0; nodes: {:?}",
+            debug_kinds(&nodes)
+        );
+        for edge in &calls {
+            let to_node = nodes.iter().find(|n| n.id.as_str() == edge.to_id.as_str());
+            assert!(
+                to_node.is_some(),
+                "Calls edge target `{}` not present in the indexed graph",
+                edge.to_id.as_str()
+            );
+        }
+    } else {
+        eprintln!(
+            "swift_indexer_emits_*: `swift build` unavailable — skipping Swift Calls edge assertion"
+        );
+    }
 }
 
 fn debug_kinds(nodes: &[specslice_core::Node]) -> Vec<(String, String)> {
@@ -276,4 +322,24 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
                 && (n.name.as_deref() == Some("Greet") || n.name.as_deref() == Some("Server.Greet"))
         })
         .unwrap_or_else(|| panic!("Greet callable missing; saw {:?}", debug_kinds(&nodes)));
+
+    // P13 — gopls must surface at least one `Calls` edge for the
+    // fixture: `cmd/server/main.go::main` invokes `api.NewServer`
+    // and `Server.Greet`.
+    let calls = store
+        .list_edges_by_kind(EdgeKind::Calls)
+        .expect("calls edges queryable");
+    assert!(
+        !calls.is_empty(),
+        "expected at least one Calls edge from Go call-hierarchy, got 0; nodes: {:?}",
+        debug_kinds(&nodes)
+    );
+    for edge in &calls {
+        let to_node = nodes.iter().find(|n| n.id.as_str() == edge.to_id.as_str());
+        assert!(
+            to_node.is_some(),
+            "Calls edge target `{}` not present in the indexed graph",
+            edge.to_id.as_str()
+        );
+    }
 }
