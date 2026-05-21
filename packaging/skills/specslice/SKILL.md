@@ -133,25 +133,77 @@ overlapping passes:
      skipped (no toolchain installed).
    AST-produced rows carry `indexer = python_ast`.
 
-`specslice index` reports both Python files and pytest tests:
+`specslice index` reports both Python files, pytest tests, and the
+P17 framework entrypoint count:
 
 ```
 Python index:
-  Python files: 12
-  Symbols: 47
-  TestCases: 18
-  Imports: 6
-  Resolver: python_lsp
+  Python files: 162
+  Symbols: 1216
+  TestCases: 272
+  Imports: 662
+  Framework entrypoints: 45
+  Resolver: python_ast
+  LSP skipped: 无法启动 python LSP `pylsp`：spawning LSP server `pylsp`
 ```
 
 When `Resolver: python_ast` appears the LSP server was unavailable —
 read the `LSP skipped` line for the exact reason
-(missing binary, venv override mismatched, etc.).
+(missing binary, venv override mismatched, broken shebang interpreter,
+etc.). The validated atagent FastAPI backend hit exactly this branch
+because its `pylsp` script pointed at a deleted Anaconda interpreter;
+the AST pass still produced a usable graph including all 45 framework
+entrypoints.
 
 Python `Calls` should be treated as a *line, not a fact*. The agent
-should still cross-check with the surrounding AST scanner output and
-framework facts (P17 will introduce FastAPI / Flask / Django / Celery
-route facts) before claiming a function is unused or unreachable.
+should cross-check with the surrounding AST scanner output and the
+P17 framework facts before claiming a function is unused or
+unreachable.
+
+## Framework facts (P17)
+
+Decorator-based entry points are detected during the AST pass and
+recorded as `metadata_json` on the wrapped symbol. The detection is
+purely structural (no LSP required) and covers the most common
+Python application frameworks:
+
+- **FastAPI / Starlette / APIRouter** routes — `@router.get(...)`,
+  `@app.post(...)`, `@app.websocket(...)`, `@app.api_route(...)`,
+  including HTTP verb and path extraction.
+- **Flask / Blueprint** routes — `@app.route(...)`,
+  `@bp.route("/login", methods=["POST"])`.
+- **Django** view decorators — `@login_required`,
+  `@require_http_methods(...)`, `@api_view`, …
+- **Celery / RQ / Dramatiq** background tasks — `@shared_task`,
+  `@app.task(queue="emails")`, `@job(queue="high")`, `@dramatiq.actor`.
+- **Click / Typer** CLI commands — `@click.command`, `@click.group`,
+  `@app.command(...)`, `@cli.callback`.
+- **FastAPI lifecycle events** — `@app.on_event("startup")`.
+- **FastAPI exception handlers / middleware** —
+  `@app.exception_handler(Exception)`, `@app.middleware("http")`.
+- **SQLAlchemy event listeners** — `@event.listens_for(...)`.
+- **Pydantic validators** — `@validator(...)`, `@field_validator(...)`,
+  `@model_validator(...)`.
+- **Dataclasses** — `@dataclass`, `@attrs.define`, `@attrs.frozen`
+  (recorded as metadata only — *not* treated as entry points).
+
+The classifier intentionally rejects look-alike calls (e.g.
+`httpx.get("/items")`, `os.get(...)`) by requiring the decorator's
+object name to look like a router (`app / router / api / blueprint /
+*Router / *_router / *_app`).
+
+For every framework-decorated symbol, two surfaces light up:
+
+1. **`specslice dead-code`** treats the symbol as an entry point, so
+   route handlers, Celery tasks, Click commands, Pydantic validators
+   and ASGI exception handlers/middleware are no longer flagged as
+   "possibly dead" just because the framework — not any in-repo
+   caller — invokes them.
+2. **`specslice search` / MCP `search_graph`** returns
+   `framework_role: "fastapi_route" | "background_task" |
+   "pydantic_validator" | "asgi_infrastructure" | …` on every match.
+   Agents and humans can spot framework entry points at a glance
+   without re-parsing the underlying `metadata_json`.
 
 ## Swift / Go via LSP (P11–P15)
 

@@ -27,6 +27,13 @@ pub struct SymbolArtifact {
     pub start_line: u32,
     pub end_line: u32,
     pub parent_symbol_id: Option<ArtifactId>,
+    /// Optional structured metadata produced by a language adapter
+    /// (framework facts, confidence, similarity fingerprint, …).
+    /// The string is JSON so different adapters can publish their own
+    /// schemas without forcing a single struct. `None` keeps the
+    /// minimal artifact size for adapters that have nothing to add.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

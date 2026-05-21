@@ -47,6 +47,12 @@ pub struct PythonSymbol {
     /// True iff the declaration is `async def` rather than plain `def`.
     /// Mirrors LSP's lack of a distinct async function kind.
     pub is_async: bool,
+    /// Raw decorator text (without the leading `@`), in source order.
+    /// Empty for declarations without decorators. The text is whatever
+    /// remained on the decorator line after the `@`, so callers see
+    /// `app.get("/items")`, `router.post('/run', tags=['x'])`,
+    /// `pytest.fixture` etc. and can run their own classifier.
+    pub decorators: Vec<String>,
 }
 
 /// `import x.y`, `from x.y import a, b`, `from . import sibling` …
@@ -176,6 +182,7 @@ pub fn scan(source: &str) -> PythonScan {
                 let has_parametrize = pending_decorators
                     .iter()
                     .any(|d| is_pytest_parametrize_decorator(d));
+                let captured = std::mem::take(&mut pending_decorators);
                 symbols.push(PythonSymbol {
                     kind,
                     name: name.clone(),
@@ -186,9 +193,9 @@ pub fn scan(source: &str) -> PythonScan {
                     is_pytest_fixture: is_fixture,
                     has_parametrize,
                     is_async,
+                    decorators: captured,
                 });
                 scope_stack.push((indent, qualified, kind));
-                pending_decorators.clear();
             }
             continue;
         }
@@ -200,6 +207,7 @@ pub fn scan(source: &str) -> PythonScan {
                     Some(q) => format!("{q}.{name}"),
                     None => name.clone(),
                 };
+                let captured = std::mem::take(&mut pending_decorators);
                 symbols.push(PythonSymbol {
                     kind: NodeKind::PythonClass,
                     name: name.clone(),
@@ -210,9 +218,9 @@ pub fn scan(source: &str) -> PythonScan {
                     is_pytest_fixture: false,
                     has_parametrize: false,
                     is_async: false,
+                    decorators: captured,
                 });
                 scope_stack.push((indent, qualified, NodeKind::PythonClass));
-                pending_decorators.clear();
             }
             continue;
         }
@@ -484,6 +492,89 @@ def actual_function():
             .map(|s| s.qualified_name.as_str())
             .collect();
         assert_eq!(names, vec!["actual_function"]);
+    }
+
+    #[test]
+    fn captures_decorators_on_classes_and_functions() {
+        // Mirrors common FastAPI / Flask / Celery patterns we rely on
+        // for P17 framework detection — the raw decorator text must
+        // round-trip with parentheses intact so the classifier sees
+        // method / route info verbatim.
+        let source = r#"
+from fastapi import APIRouter
+import pytest
+
+router = APIRouter()
+
+
+@router.get("/items", tags=["catalog"])
+def list_items():
+    return []
+
+
+@router.post("/items")
+async def create_item(payload):
+    return payload
+
+
+@app.task(queue="emails")
+def send_email():
+    return None
+
+
+@dataclass
+class Item:
+    id: int
+
+
+@pytest.fixture
+def naked():
+    return None
+"#;
+        let scan = scan(source);
+        let list = scan
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "list_items")
+            .expect("list_items captured");
+        assert_eq!(
+            list.decorators,
+            vec!["router.get(\"/items\", tags=[\"catalog\"])".to_string()]
+        );
+        let create = scan
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "create_item")
+            .expect("create_item captured");
+        assert!(create.is_async);
+        assert_eq!(
+            create.decorators,
+            vec!["router.post(\"/items\")".to_string()]
+        );
+        let task = scan
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "send_email")
+            .expect("send_email captured");
+        assert_eq!(
+            task.decorators,
+            vec!["app.task(queue=\"emails\")".to_string()]
+        );
+        let item = scan
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "Item")
+            .expect("Item class captured");
+        assert_eq!(item.decorators, vec!["dataclass".to_string()]);
+        // Bare functions still record an empty decorator list so the
+        // field is always present and never accidentally `None`-like.
+        let naked = scan
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "naked")
+            .expect("naked fixture captured");
+        assert!(naked.is_pytest_fixture);
+        assert_eq!(naked.decorators, vec!["pytest.fixture".to_string()]);
     }
 
     #[test]

@@ -233,6 +233,19 @@ pub fn analyze_dead_code_with_store(
             }
             _ => {}
         }
+        // P17: any symbol whose `metadata_json` carries a framework
+        // role classified as an "externally triggered" entry point
+        // (FastAPI route, Celery task, Click/Typer command, …) is
+        // not really dead — the framework calls it. We parse the
+        // JSON inline; failures fall back to the default rules so a
+        // malformed payload never flips a real symbol into reachable.
+        if is_code_kind(n.kind) {
+            if let Some(json) = n.metadata_json.as_deref() {
+                if is_python_framework_entrypoint_metadata(json) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+        }
         // public_api_roots: anything under those paths.
         if let Some(p) = n.path.as_deref() {
             if matches_set(&public_set, p) && is_code_kind(n.kind) {
@@ -527,6 +540,22 @@ fn is_swift_entry_name(name: Option<&str>) -> bool {
 /// CLI dispatch — treating them as dead would generate noise. We are
 /// intentionally conservative because Python is highly dynamic: only
 /// the very common entrypoints get the "never dead" tag.
+/// Inspect a node's `metadata_json` payload (typically written by
+/// the Python adapter via [`crate::python_frameworks::FrameworkRole`])
+/// and decide whether the symbol is a framework-triggered entry
+/// point that the engine must NOT flag as dead. We only deserialize
+/// when the payload looks like a framework role to avoid pulling in
+/// serde_json for unrelated metadata schemas.
+fn is_python_framework_entrypoint_metadata(json: &str) -> bool {
+    if !json.contains("\"framework\"") {
+        return false;
+    }
+    match serde_json::from_str::<crate::python_frameworks::FrameworkRole>(json) {
+        Ok(role) => role.is_framework_entrypoint(),
+        Err(_) => false,
+    }
+}
+
 fn is_python_entry_name(name: Option<&str>) -> bool {
     let Some(raw) = name else {
         return false;
@@ -1313,6 +1342,98 @@ mod tests {
         assert!(
             ids.contains(&orphan.as_str()),
             "private Swift helper with no inbound edge must still surface as dead, got {ids:?}"
+        );
+    }
+
+    fn insert_python_function_with_metadata(
+        store: &mut Store,
+        file: &str,
+        name: &str,
+        metadata_json: Option<&str>,
+    ) -> String {
+        let id = format!("python::{file}::{name}");
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::PythonFunction,
+                path: Some(file.into()),
+                name: Some(name.into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("python_ast".into()),
+                index_generation: None,
+                metadata_json: metadata_json.map(str::to_string),
+            })
+            .unwrap();
+        id
+    }
+
+    /// P17 regression — a Python function whose `metadata_json`
+    /// carries a `FrameworkRole::FastapiRoute` payload is invoked
+    /// by the framework, not by in-repo callers. Dead-code must
+    /// treat it as an entry point so 88%+ of Python web backends do
+    /// not surface every route handler as "possibly dead" when LSP
+    /// is unavailable.
+    #[test]
+    fn python_framework_decorated_symbols_are_treated_as_entrypoints() {
+        let (mut store, _dir) = empty_store();
+        // FastAPI route — externally triggered, must NOT be dead.
+        let route_meta = serde_json::json!({
+            "framework": "fastapi_route",
+            "verb": "get",
+            "path": "/items",
+            "decorator": "router.get(\"/items\")"
+        })
+        .to_string();
+        let route = insert_python_function_with_metadata(
+            &mut store,
+            "app/web.py",
+            "list_items",
+            Some(&route_meta),
+        );
+        // Pydantic dataclass — NOT a framework entry, baseline
+        // remains the existing reachability rules.
+        let data_meta = serde_json::json!({
+            "framework": "data_class",
+            "runtime": "stdlib"
+        })
+        .to_string();
+        let pojo = insert_python_function_with_metadata(
+            &mut store,
+            "app/types.py",
+            "ItemDTO",
+            Some(&data_meta),
+        );
+        // Plain helper with no metadata — must still be dead.
+        let helper =
+            insert_python_function_with_metadata(&mut store, "app/utils.py", "_helper", None);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+        let ids: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&route.as_str()),
+            "FastAPI route handler must be treated as entry point, got dead set {ids:?}"
+        );
+        assert!(
+            ids.contains(&pojo.as_str()),
+            "dataclass-only symbols are NOT framework entrypoints; expected `{pojo}` dead, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&helper.as_str()),
+            "metadata-less helper must remain dead, got {ids:?}"
         );
     }
 }

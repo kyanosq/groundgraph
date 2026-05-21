@@ -165,6 +165,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 start_line: line_no,
                 end_line: line_no,
                 parent_symbol_id: None,
+                metadata_json: None,
             };
             symbols.push(sym);
             let opens_brace = line.contains('{');
@@ -268,6 +269,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     start_line: line_no,
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
+                    metadata_json: None,
                 });
                 let depth_before = depth;
                 update_depth(&line, &mut depth);
@@ -331,6 +333,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     start_line: line_no,
                     end_line: line_no,
                     parent_symbol_id: Some(class.0.clone()),
+                    metadata_json: None,
                 });
                 let depth_before = depth;
                 update_depth(&line, &mut depth);
@@ -377,6 +380,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     start_line: line_no,
                     end_line: line_no,
                     parent_symbol_id: None,
+                    metadata_json: None,
                 });
                 let depth_before = depth;
                 update_depth(&line, &mut depth);

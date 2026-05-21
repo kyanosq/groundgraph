@@ -138,6 +138,12 @@ pub struct SearchMatch {
     pub score: i32,
     pub source: Option<String>,
     pub match_reasons: Vec<String>,
+    /// Framework role inferred from decorator metadata (P17). When
+    /// set, callers can show "FastAPI route", "Celery task", … next
+    /// to the symbol in search UIs and Agent context packs without
+    /// having to re-parse the raw `metadata_json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1074,6 +1080,7 @@ fn keyword_matches(
                 score,
                 source: Some("business_logic.yaml".into()),
                 match_reasons: reasons,
+                framework_role: None,
             });
         }
     }
@@ -1244,6 +1251,12 @@ fn make_match(node: &Node, score: i32, reasons: Vec<String>) -> SearchMatch {
         (Some(s), Some(e)) => Some((s, e)),
         _ => None,
     };
+    // P17: surface the framework family ("fastapi_route",
+    // "background_task", …) so search UIs and Agent context packs
+    // don't have to re-parse `metadata_json`. We only deserialize
+    // when the payload looks like a framework role to keep this
+    // helper cheap for the 99% of nodes that have no metadata.
+    let framework_role = node.metadata_json.as_deref().and_then(framework_family);
     SearchMatch {
         id: node.id.to_string(),
         kind: node.kind.as_str().into(),
@@ -1253,7 +1266,17 @@ fn make_match(node: &Node, score: i32, reasons: Vec<String>) -> SearchMatch {
         score,
         source: node.indexer.clone(),
         match_reasons: reasons,
+        framework_role,
     }
+}
+
+fn framework_family(metadata_json: &str) -> Option<String> {
+    if !metadata_json.contains("\"framework\"") {
+        return None;
+    }
+    serde_json::from_str::<crate::python_frameworks::FrameworkRole>(metadata_json)
+        .ok()
+        .map(|role| role.family().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1316,7 @@ fn position_matches(store: &Store, path: &str, line: u32) -> Result<Vec<SearchMa
                 score: SCORE_EXACT_ID,
                 source: None,
                 match_reasons: vec![format!("symbol at {path}:{line}")],
+                framework_role: None,
             });
         }
     }
@@ -1683,6 +1707,78 @@ mod tests {
             "reasons: {:?}",
             top.match_reasons
         );
+    }
+
+    #[test]
+    fn framework_family_extracts_role_label_from_metadata_json() {
+        let route = serde_json::json!({
+            "framework": "fastapi_route",
+            "verb": "get",
+            "path": "/items",
+            "decorator": "router.get(\"/items\")"
+        })
+        .to_string();
+        assert_eq!(framework_family(&route).as_deref(), Some("fastapi_route"));
+        let validator = serde_json::json!({
+            "framework": "pydantic_validator",
+            "decorator": "validator(\"name\")"
+        })
+        .to_string();
+        assert_eq!(
+            framework_family(&validator).as_deref(),
+            Some("pydantic_validator")
+        );
+        // Unrelated metadata payloads (P19 confidence, similarity
+        // fingerprints) must NOT be misclassified.
+        let other = serde_json::json!({
+            "confidence": 0.7,
+            "indexer": "dart_analyzer"
+        })
+        .to_string();
+        assert!(framework_family(&other).is_none());
+        // Malformed JSON drops cleanly.
+        assert!(framework_family("{not json").is_none());
+    }
+
+    #[test]
+    fn search_match_carries_framework_role_for_decorated_symbols() {
+        let (mut store, _dir) = empty_store();
+        // Stamp a PythonFunction node manually with the same metadata
+        // shape the python_indexer publishes. This isolates the
+        // assertion to make_match without depending on the AST.
+        let id = "python::app/api.py::list_items".to_string();
+        let metadata = serde_json::json!({
+            "framework": "fastapi_route",
+            "verb": "get",
+            "path": "/items",
+            "decorator": "router.get(\"/items\")"
+        })
+        .to_string();
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::PythonFunction,
+                path: Some("app/api.py".into()),
+                name: Some("list_items".into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some("app/api.py".into()),
+                source_hash: None,
+                indexer: Some("python_ast".into()),
+                index_generation: None,
+                metadata_json: Some(metadata),
+            })
+            .unwrap();
+        let kinds: HashSet<_> = default_search_kinds().into_iter().collect();
+        let tokens = vec!["list".into(), "items".into()];
+        let hits = keyword_matches(&store, Path::new("."), &tokens, &kinds).unwrap();
+        let hit = hits
+            .iter()
+            .find(|m| m.id == id)
+            .expect("framework-decorated symbol still matches search");
+        assert_eq!(hit.framework_role.as_deref(), Some("fastapi_route"));
     }
 
     #[test]

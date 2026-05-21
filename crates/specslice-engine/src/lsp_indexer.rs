@@ -817,6 +817,7 @@ fn visit_symbols(
             start_line,
             end_line,
             parent_symbol_id: frame.parent_id.cloned(),
+            metadata_json: None,
         };
         batch.symbol_ranges.push(SymbolRange {
             file_path: frame.file_rel.into(),

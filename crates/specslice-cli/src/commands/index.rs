@@ -76,6 +76,15 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
         writeln!(out, "  Symbols: {}", python.symbols).ok();
         writeln!(out, "  TestCases: {}", python.tests).ok();
         writeln!(out, "  Imports: {}", python.imports).ok();
+        // P17: framework entry points are surfaced here even when
+        // they are 0 so operators can see whether the classifier
+        // wired up against their codebase at all.
+        writeln!(
+            out,
+            "  Framework entrypoints: {}",
+            python.framework_entrypoints
+        )
+        .ok();
         if !python.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", python.resolver_used).ok();
         }
@@ -176,6 +185,7 @@ mod tests {
                 symbols: 20,
                 tests: 3,
                 imports: 7,
+                framework_entrypoints: 4,
                 resolver_used: "python_lsp".into(),
                 sidecar_skip_reason: String::new(),
             }),
@@ -192,6 +202,10 @@ mod tests {
         );
         assert!(out.contains("TestCases: 3"));
         assert!(out.contains("Imports: 7"));
+        assert!(
+            out.contains("Framework entrypoints: 4"),
+            "missing framework entrypoint count: {out}"
+        );
     }
 
     #[test]
@@ -202,6 +216,7 @@ mod tests {
                 symbols: 4,
                 tests: 0,
                 imports: 1,
+                framework_entrypoints: 0,
                 resolver_used: "python_ast".into(),
                 sidecar_skip_reason: "未在 PATH / .venv 中找到 pyright/basedpyright/pylsp".into(),
             }),

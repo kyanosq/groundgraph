@@ -409,6 +409,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             parent_symbol_id: None,
+            metadata_json: None,
         }
     }
 
@@ -422,6 +423,7 @@ mod tests {
             start_line: start,
             end_line: end,
             parent_symbol_id: Some(dart_class_id(path, class_name)),
+            metadata_json: None,
         }
     }
 
@@ -622,6 +624,7 @@ mod tests {
             start_line: 1,
             end_line: 5,
             parent_symbol_id: None,
+            metadata_json: None,
         };
         let sources = vec![FileSource {
             path: "lib/x_test.dart".into(),

@@ -411,6 +411,9 @@ pub fn ingest_language_batch_minimal(
         node.start_line = Some(symbol.start_line);
         node.end_line = Some(symbol.end_line);
         node.indexer = Some(indexer_name.into());
+        if let Some(meta) = symbol.metadata_json.clone() {
+            node.metadata_json = Some(meta);
+        }
         store.upsert_node(&node)?;
 
         let mut contains = if let Some(parent) = &symbol.parent_symbol_id {
@@ -743,6 +746,7 @@ mod ingest_tests {
             start_line: 1,
             end_line: 5,
             parent_symbol_id: None,
+            metadata_json: None,
         });
         ingest(&mut store, &batch, RESOLVER_DART_LIGHTWEIGHT).unwrap();
         let contains = store.list_edges_by_kind(EdgeKind::Contains).unwrap();

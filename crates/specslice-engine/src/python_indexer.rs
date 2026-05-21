@@ -41,6 +41,7 @@ use crate::lsp_indexer::{
     binary_on_path, run_profile, LspIndexOptions, LspIndexOutcome, LspProfile,
 };
 use crate::python_ast::{is_pytest_test_class, is_pytest_test_function, scan, PythonSymbol};
+use crate::python_frameworks::{classify_decorators, FrameworkRole};
 
 pub const PYTHON_INDEXER_NAME: &str = "python_lsp";
 pub const PYTHON_AST_INDEXER_NAME: &str = "python_ast";
@@ -65,6 +66,11 @@ pub struct PythonIndexResult {
     pub symbols: usize,
     pub tests: usize,
     pub imports: usize,
+    /// Count of structural symbols whose decorators were classified
+    /// as a framework entry point (FastAPI route, Celery task,
+    /// Click/Typer command, …). 0 in pure-stdlib repos. P17.
+    #[serde(default)]
+    pub framework_entrypoints: usize,
     /// `python_lsp` when an LSP server ran the structural pass,
     /// `python_ast` when only the AST scanner contributed, empty when
     /// both passes skipped.
@@ -132,6 +138,7 @@ pub fn index_python(store: &mut Store, options: &PythonIndexOptions) -> Result<P
         symbols: total_symbols,
         tests: ast_outcome.tests,
         imports: ast_outcome.imports,
+        framework_entrypoints: ast_outcome.framework_entrypoints,
         resolver_used,
         sidecar_skip_reason: skip_reason,
     })
@@ -149,6 +156,14 @@ struct AstOutcome {
     symbols: usize,
     tests: usize,
     imports: usize,
+    /// Count of symbols whose decorators were classified as a
+    /// framework entry point (FastAPI route, Celery task, Click
+    /// command, …). Used by the CLI to surface "X framework
+    /// entrypoints detected" so operators can validate P17 made it
+    /// past the AST scanner. Counted *additionally* to `symbols`,
+    /// not as a subset, so it can grow without affecting the
+    /// symbol total.
+    framework_entrypoints: usize,
 }
 
 fn run_ast_pass(
@@ -240,7 +255,17 @@ fn run_ast_pass(
                     continue;
                 }
             }
-            push_structural_symbol(&mut batch, &file.relative, sym);
+            let framework_role = classify_decorators(&sym.decorators);
+            let metadata_json = framework_role
+                .as_ref()
+                .and_then(|role| serde_json::to_string(role).ok());
+            if framework_role
+                .as_ref()
+                .is_some_and(FrameworkRole::is_framework_entrypoint)
+            {
+                outcome.framework_entrypoints += 1;
+            }
+            push_structural_symbol(&mut batch, &file.relative, sym, metadata_json);
             outcome.symbols += 1;
         }
     }
@@ -257,7 +282,12 @@ fn run_ast_pass(
     Ok(outcome)
 }
 
-fn push_structural_symbol(batch: &mut LanguageIndexBatch, file_rel: &str, sym: &PythonSymbol) {
+fn push_structural_symbol(
+    batch: &mut LanguageIndexBatch,
+    file_rel: &str,
+    sym: &PythonSymbol,
+    metadata_json: Option<String>,
+) {
     let id = python_symbol_id(file_rel, sym);
     let qualified = python_qualify(file_rel, None, &sym.qualified_name);
     let parent_id = sym
@@ -273,6 +303,7 @@ fn push_structural_symbol(batch: &mut LanguageIndexBatch, file_rel: &str, sym: &
         start_line: sym.start_line,
         end_line: sym.end_line,
         parent_symbol_id: parent_id.clone(),
+        metadata_json,
     });
     batch.symbol_ranges.push(SymbolRange {
         file_path: file_rel.into(),
@@ -785,6 +816,71 @@ mod tests {
                 && e.to_id.as_str() == "file::app/greeter.py"
         });
         assert!(imports_target_greeter, "imports edge resolved across files");
+    }
+
+    #[test]
+    fn framework_decorated_symbols_get_metadata_and_entry_status() {
+        // We seed a tiny FastAPI / Celery / Click triple, run the AST
+        // pass, and verify the resulting Node has a populated
+        // `metadata_json` field that round-trips through serde into
+        // a FrameworkRole the engine recognises as an entry point.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/__init__.py"), "").unwrap();
+        std::fs::write(
+            root.join("app/web.py"),
+            r#"
+from fastapi import APIRouter
+router = APIRouter()
+
+
+@router.get("/items")
+def list_items():
+    return []
+
+
+@app.task(queue="emails")
+def send_email():
+    return None
+
+
+@click.command
+def cli_run():
+    return None
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".specslice.yaml"), "repo:\n  root: .\n").unwrap();
+        let db_path = root.join(".specslice/graph.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut store = Store::open(&db_path).unwrap();
+        store.migrate().unwrap();
+        let opts = PythonIndexOptions {
+            repo_root: root.to_path_buf(),
+            code_roots: vec![PathBuf::from("app")],
+            exclude_globs: vec![],
+            lsp_command: Some("specslice_nonexistent_python_lsp_999".into()),
+            disable_venv_discovery: true,
+        };
+        let result = index_python(&mut store, &opts).expect("index_python ok");
+        assert_eq!(
+            result.framework_entrypoints, 3,
+            "expected 3 framework entrypoints (route + task + cli), got {result:?}"
+        );
+        let nodes = store.list_all_nodes().unwrap();
+        let list_items = nodes
+            .iter()
+            .find(|n| n.name.as_deref() == Some("list_items"))
+            .expect("list_items node");
+        let meta = list_items
+            .metadata_json
+            .as_deref()
+            .expect("metadata_json populated for FastAPI route");
+        let role: crate::python_frameworks::FrameworkRole =
+            serde_json::from_str(meta).expect("metadata round-trips");
+        assert_eq!(role.family(), "fastapi_route");
+        assert!(role.is_framework_entrypoint());
     }
 
     #[test]
