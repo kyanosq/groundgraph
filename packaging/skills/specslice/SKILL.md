@@ -336,6 +336,56 @@ specslice --repo-root /path/to/repo graph --format json --view business --pretty
 specslice --repo-root /path/to/repo graph --format json --view business --include-candidates=false
 ```
 
+## Similar code report (P18, tier 1 — structural duplicates)
+
+`specslice similar` flags Python / Dart function / method bodies whose
+normalized token streams (identifiers / literals / comments stripped)
+collide on the same 64-bit fingerprint. It is a **candidate** report —
+never auto-merges, never auto-deletes.
+
+```bash
+specslice --repo-root /path/to/repo similar
+specslice --repo-root /path/to/repo similar --format json
+specslice --repo-root /path/to/repo similar --node python::backend/app/foo.py::Foo.bar
+specslice --repo-root /path/to/repo similar --min-tokens 24 --min-cluster-size 3
+```
+
+Output schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "stats": { "symbols_scanned": 1043, "symbols_skipped": 63, "clusters_reported": 107 },
+  "clusters": [
+    {
+      "fingerprint": "60f13e8878a10ce3",
+      "duplicate_type": "exact_ast",
+      "recommendation": "review",
+      "normalized_token_count": 187,
+      "members": [
+        { "id": "...", "kind": "python_method", "label": "...", "path": "...", "line_range": [229, 260] },
+        { "id": "...", "kind": "python_method", "label": "...", "path": "...", "line_range": [297, 329] }
+      ]
+    }
+  ]
+}
+```
+
+Rules for agents consuming this report:
+
+- Treat every cluster as a *review candidate*, not a fact.
+- Before recommending a merge, run `specslice graph --focus <id>` for
+  each member to verify both call sites really invoke the same
+  semantics — structural identity does NOT imply behavioral identity
+  in dynamic languages.
+- Override pairs (e.g. `BaseRepository.list_blocks` vs
+  `Repository.list_blocks`) often appear in clusters — that is
+  expected; surface them as "intentional override" candidates rather
+  than duplicates.
+- Tier 2 (near-duplicate via SimHash) and tier 3 (behavioral
+  duplicate via shared graph neighborhood) are not yet implemented.
+  Do not claim they exist.
+
 ## Reporting
 
 In the final answer, include:

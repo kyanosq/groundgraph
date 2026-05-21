@@ -53,6 +53,25 @@ enum Commands {
     /// 不会自动删除任何文件。
     #[command(name = "dead-code")]
     DeadCode(DeadCodeArgs),
+    /// 相似代码候选 — 结构层指纹比对 (P18 tier 1)。
+    /// 报告结构完全相同的函数 / 方法簇，不会自动合并或删除。
+    Similar(SimilarArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct SimilarArgs {
+    /// 仅返回包含此 symbol id 的相似簇。
+    #[arg(long, value_name = "SYMBOL_ID")]
+    node: Option<String>,
+    /// 函数体最少 normalized token 数，低于此值忽略（默认 12）。
+    #[arg(long, value_name = "N", default_value_t = specslice_engine::similarity::DEFAULT_MIN_TOKENS)]
+    min_tokens: usize,
+    /// 单个簇内最少成员数（默认 2，任意重复都报告）。
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    min_cluster_size: usize,
+    /// 输出格式：`text`、`json`。
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -628,5 +647,12 @@ fn run() -> Result<()> {
                 json: args.json,
             })
         }
+        Commands::Similar(args) => commands::similar::run(commands::similar::SimilarRunArgs {
+            repo_root: cli.repo_root.clone(),
+            focus_symbol_id: args.node,
+            min_tokens: args.min_tokens,
+            min_cluster_size: args.min_cluster_size,
+            format: args.format,
+        }),
     }
 }

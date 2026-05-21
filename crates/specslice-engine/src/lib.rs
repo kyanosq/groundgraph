@@ -28,6 +28,7 @@ pub mod python_ast;
 pub mod python_frameworks;
 pub mod python_indexer;
 pub mod search;
+pub mod similarity;
 pub mod slice;
 pub mod swift_indexer;
 
@@ -76,6 +77,10 @@ pub use search::{
     SearchEdge, SearchMatch, SearchNode, SearchOptions, SearchQuery, SearchResult, SearchSubgraph,
     DEFAULT_DEPTH as SEARCH_DEFAULT_DEPTH, DEFAULT_LIMIT as SEARCH_DEFAULT_LIMIT,
     EXPANSION_EDGE_KINDS as SEARCH_EXPANSION_EDGE_KINDS,
+};
+pub use similarity::{
+    analyze_similarity, analyze_similarity_with_store, SimilarityCluster, SimilarityMember,
+    SimilarityOptions, SimilarityReport, SimilarityStats, SIMILARITY_SCHEMA_VERSION,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
 

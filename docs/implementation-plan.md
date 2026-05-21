@@ -812,6 +812,47 @@ P16 之后 Python 通路已能稳定产出 imports + pytest + 结构符号，但
 - Python `Calls` 边仍然只来源于 LSP；P17 不试图从 AST 推断 call graph，只在装饰器层提取「外部触发入口」事实。
 - `metadata_json` 字段对老配置完全向后兼容：旧 Node 行 `metadata_json IS NULL` 走原 dead-code 规则，新行才参与框架入口判定。
 
+## P18 相似代码候选 — tier 1 结构指纹（已落地）
+
+P18 的整体目标是把"两个函数其实是同一段逻辑的不同副本"作为候选报告呈现，但不自动合并、不自动删除——把判断权留给人和 AI。tier 1 只做"结构完全相同"这一最确定的子集；近似重复（tier 2，token shingles / SimHash）与业务重复（tier 3，图邻域）会在后续迭代里以同一份归一化 token 流为基础叠加。
+
+**实现要点：**
+
+- 新模块 `crates/specslice-engine/src/similarity.rs` 提供 `Language::{Python, Dart}` 共用的归一化器：剥掉标识符（→ `ID`）、字符串 / 数字字面量（→ `STR` / `NUM`）、Python `#` 注释 / Dart `// /* */` 注释、Python 三引号 docstring、所有空白；同时保留 `if / elif / else / for / while / return / yield / def / class / import / from / try / except / async / await / and / or / not / in / is / None / True / False / ...` 等结构性关键字与多字符运算符（`==`、`!=`、`->`、`=>`、`//`、`**`、`::`、`..` 等），从而让 `+` 与 `-`、`==` 与 `=` 这类语义关键差异不会被折叠掉。
+- 归一化结果通过 FNV-1a 哈希得到 64 bit 结构指纹；`analyze_similarity_with_store` 扫描所有 `python_function / python_method / dart_function / dart_method / dart_constructor` 节点，按指纹分桶。`min_tokens`（默认 12）过滤掉 `return None` / `pass` 这类只会污染报告的 trivial body；`min_cluster_size`（默认 2）控制最小报告粒度；`focus_symbol_id` 在 `--node SYMBOL_ID` 模式下只返回包含该节点的簇。
+- 报告字段保持 AI 友好且只含候选语义：`schema_version: 1`、`stats { symbols_scanned, symbols_skipped, clusters_reported }`、`clusters[]: { fingerprint, duplicate_type: "exact_ast", recommendation: "review", normalized_token_count, members: [{ id, kind, label, path, line_range }] }`。tier 1 永远写 `recommendation: "review"`，不会输出 `consolidate / keep_separate`——那些应交给 tier 3 + 人工。
+- 新增 CLI `specslice similar [--node SYMBOL_ID] [--min-tokens N] [--min-cluster-size N] [--format text|json]`。文本输出按 normalized_token_count 降序排列簇，方便操作者先看「最大段重复」；JSON 通路供 MCP / 上层 Agent 直接消费。
+
+**测试覆盖：**
+
+- `similarity::tests::normalize_strips_identifiers_literals_and_comments` — Python 同结构、不同字段名 / 字面量 / 注释的两个函数归一化后 token 流必须完全一致。
+- `similarity::tests::normalize_drops_python_docstrings` — 三引号 docstring 必须被剔除，避免 copyright header 污染指纹。
+- `similarity::tests::normalize_dart_handles_line_and_block_comments` — Dart `//` 与 `/* */` 注释都被剔除。
+- `similarity::tests::fingerprints_differ_when_structure_differs` — `return a + b` 与 `return a - b` 必须产出不同指纹，否则会把语义不同的代码误聚成簇。
+- `similarity::tests::analyze_returns_cluster_for_two_structurally_identical_python_functions` — 端到端：写两个仅参数名 / 局部变量名 / 字符串字面量不同的 Python 函数，跑 `analyze_similarity_with_store` 必须输出 1 个 cluster、两个成员、`duplicate_type = exact_ast`、`recommendation = review`。
+- `similarity::tests::analyze_drops_clusters_below_min_tokens` — 两个 `def f(): pass` 在 `min_tokens=10` 下必须被 skip，不会成为簇。
+- `similarity::tests::analyze_filters_to_focus_symbol_when_requested` — `focus_symbol_id` 指向单成员符号时返回空；指向多成员簇时只返回该簇。
+- CLI 端 `commands::similar::tests::text_output_lists_cluster_members_and_recommendation` — 锁 JSON 序列化包含 `duplicate_type / recommendation / members` 关键字段。
+
+**atagent 真实仓库验证（沿用 P16 / P17 验证方法，不修改任何业务代码）：**
+
+- 索引规模与 P17 一致：1367 Python 符号、235 Python 文件、668 imports、45 framework entrypoints。
+- `specslice similar` 扫描 1043 函数 / 方法（跳过 63 个 body < 12 tokens 的 trivial），输出 **107 个结构重复簇**；过滤掉 `vscode-copilot-chat/...` 第三方 fixture 后仍有 **96 个 backend/ 内部纯净簇**，全部为真实重构候选。
+- 最大簇（187 tokens, 2 成员）：`UIFactory.create_design_failure_blocks` vs `UIFactory.create_edit_image_failure_blocks` — 同为「header MD block → empty gallery block → 2 个 retry action」结构，仅 `UITextKeys` / `ActionID` 字面量不同；是教科书级别的"复制 handler 改字段名"重复。
+- 第二大簇（139 tokens）：`RunEventWriter._ensure_pool` vs `RunEventStreamer._ensure_query_pool` — 数据库连接池初始化逻辑被复制到两个不同 writer。
+- 第三大簇（136 tokens）：`stylist_agent._request_design_image_logic` vs `stylist_agent._request_person_image_logic` — 同 agent 内部两条 request 路径结构一致，参数 / 服务调用名不同。
+- 簇大小分布：2 成员 76 簇 / 3 成员 18 簇 / 4 成员 8 簇 / 5 成员 3 簇 / 6 成员 2 簇，整体形状符合预期（多数为成对复制，少数为基类 + 派生类的镜像实现）。
+- `specslice similar --node ... --format json` 模式输出符合 schema_version=1 的 JSON，可直接灌入 MCP / 自动化流水线。
+- 验证完成后已清理 `/Users/qjs/Code/Projects/atagent/.specslice` 工作区，目标仓库代码零修改。
+
+**显式延期（不在 tier 1 内）：**
+
+- tier 2 近似重复（70%~95% 相似）：基于已有 token 流叠加 shingle + SimHash / MinHash，单独迭代。
+- tier 3 行为重复：基于代码图邻域（共调用、共测试、共 route / storage）判定语义等价。需要 P19 的 confidence / evidence 升级落地后再开工，避免没有 evidence 就把"看似相似"的两段代码推荐为可合并。
+- HTML / Mermaid 报告渲染：与 P14 search/impact/candidate Mermaid 同一通路，等 tier 2/3 落地后一次性接入。
+- MCP `find_similar` 工具：CLI 接口先稳定一两个版本，确认 schema 后再接入 MCP 工具描述符。
+- `--changed-only --base origin/main`：与 P19 `Graph Diff` 子项绑定，统一在那里实现 diff-aware 子图。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：
