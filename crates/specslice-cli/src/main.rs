@@ -197,9 +197,31 @@ struct CandidateListArgs {
 struct CandidateShowArgs {
     /// 候选 id。
     id: String,
-    /// 输出 JSON。
+    /// 输出 JSON。等价于 `--format json`。
     #[arg(long)]
     json: bool,
+    /// P14 — 输出格式。`mermaid` 会渲染“业务描述 → evidence files/
+    /// symbols/tests”的局部 flowchart，状态会映射为已接受 (Confirmed)
+    /// 或候选 (Candidate) 形状。
+    #[arg(long, value_enum, default_value_t = CandidateShowFormatArg::Text)]
+    format: CandidateShowFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CandidateShowFormatArg {
+    Text,
+    Json,
+    Mermaid,
+}
+
+impl CandidateShowFormatArg {
+    fn into_command_format(self) -> commands::candidate::CandidateShowFormat {
+        match self {
+            CandidateShowFormatArg::Text => commands::candidate::CandidateShowFormat::Text,
+            CandidateShowFormatArg::Json => commands::candidate::CandidateShowFormat::Json,
+            CandidateShowFormatArg::Mermaid => commands::candidate::CandidateShowFormat::Mermaid,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -289,6 +311,9 @@ enum SearchFormatArg {
     Text,
     Json,
     Html,
+    /// P14 — emit a Mermaid `flowchart LR` of the search subgraph,
+    /// suitable for embedding in PR descriptions or design docs.
+    Mermaid,
 }
 
 impl SearchFormatArg {
@@ -297,6 +322,7 @@ impl SearchFormatArg {
             SearchFormatArg::Text => commands::search::SearchFormat::Text,
             SearchFormatArg::Json => commands::search::SearchFormat::Json,
             SearchFormatArg::Html => commands::search::SearchFormat::Html,
+            SearchFormatArg::Mermaid => commands::search::SearchFormat::Mermaid,
         }
     }
 }
@@ -370,9 +396,35 @@ struct ImpactArgs {
     /// Head git ref (default: `HEAD`).
     #[arg(long, default_value = "HEAD")]
     head: String,
-    /// Output a machine-readable JSON document.
+    /// Output a machine-readable JSON document. Equivalent to
+    /// `--format json` and kept for back-compat.
     #[arg(long)]
     json: bool,
+    /// P14 — output format. `mermaid` renders a local `flowchart LR`
+    /// of "changed files → impacted business → suggested tests".
+    #[arg(long, value_enum, default_value_t = ImpactFormatArg::Text)]
+    format: ImpactFormatArg,
+    /// P14 — destination file for `--format mermaid`. Falls back to
+    /// stdout when omitted.
+    #[arg(long)]
+    output: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ImpactFormatArg {
+    Text,
+    Json,
+    Mermaid,
+}
+
+impl ImpactFormatArg {
+    fn into_command_format(self) -> commands::impact::ImpactFormat {
+        match self {
+            ImpactFormatArg::Text => commands::impact::ImpactFormat::Text,
+            ImpactFormatArg::Json => commands::impact::ImpactFormat::Json,
+            ImpactFormatArg::Mermaid => commands::impact::ImpactFormat::Mermaid,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -382,6 +434,11 @@ struct SliceArgs {
     /// Output a machine-readable JSON document instead of human text.
     #[arg(long)]
     json: bool,
+    /// P14 — how many hops to follow `Calls` / `References` from each
+    /// declared implementation symbol. `0` recovers the manifest-only
+    /// slice.
+    #[arg(long, default_value_t = 1)]
+    call_depth: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -426,9 +483,19 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Init => commands::init::run(&cli.repo_root),
         Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only),
-        Commands::Slice(args) => commands::slice::run(&cli.repo_root, &args.requirement, args.json),
+        Commands::Slice(args) => commands::slice::run(
+            &cli.repo_root,
+            &args.requirement,
+            args.json,
+            args.call_depth,
+        ),
         Commands::Impact(args) => {
-            commands::impact::run(&cli.repo_root, &args.base, &args.head, args.json)
+            let format = if args.json {
+                commands::impact::ImpactFormat::Json
+            } else {
+                args.format.into_command_format()
+            };
+            commands::impact::run(&cli.repo_root, &args.base, &args.head, format, args.output)
         }
         Commands::Check(args) => {
             let exit = commands::check::run(&cli.repo_root, args.json, args.fail_on_warning)?;
@@ -467,7 +534,12 @@ fn run() -> Result<()> {
                 commands::candidate::run_list(&cli.repo_root, mode, a.json)
             }
             CandidateSub::Show(a) => {
-                let exit = commands::candidate::run_show(&cli.repo_root, &a.id, a.json)?;
+                let format = if a.json {
+                    commands::candidate::CandidateShowFormat::Json
+                } else {
+                    a.format.into_command_format()
+                };
+                let exit = commands::candidate::run_show(&cli.repo_root, &a.id, format)?;
                 if exit != 0 {
                     std::process::exit(exit);
                 }

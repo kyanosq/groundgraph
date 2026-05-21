@@ -4,6 +4,7 @@
 //! walk only confirmed/declared edges to assemble docs, declared
 //! implementation symbols, linked tests and risks.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,6 +23,12 @@ pub struct FeatureSlice {
     pub implementation: Vec<SliceItem>,
     pub linked_tests: Vec<SliceItem>,
     pub risks: Vec<String>,
+    /// P14 — symbols reached one or more hops along forward
+    /// `EdgeKind::Calls` / `EdgeKind::References` edges from
+    /// [`Self::implementation`]. Empty when `call_depth = 0` or no
+    /// implementation produces fact-edges. Order is stable (id-sorted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_fanout: Vec<SliceItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,17 +44,62 @@ pub struct SliceItem {
 pub struct SliceOptions {
     pub repo_root: PathBuf,
     pub requirement: String,
+    /// P14 — how many hops to follow `EdgeKind::Calls` /
+    /// `EdgeKind::References` from each declared implementation symbol.
+    /// Defaults to `1` so reviewers see the immediate callees a
+    /// requirement touches; set to `0` to recover the pre-P14 manifest-
+    /// only slice.
+    pub fanout: SliceFanoutOptions,
 }
+
+impl Default for SliceOptions {
+    fn default() -> Self {
+        Self {
+            repo_root: PathBuf::new(),
+            requirement: String::new(),
+            fanout: SliceFanoutOptions::default(),
+        }
+    }
+}
+
+/// P14 — knobs for the slice fact-edge fan-out. Kept in its own struct
+/// (rather than inline on [`SliceOptions`]) so the CLI / MCP layer can
+/// pass through future toggles (`include_synthetic`, `skip_noise`, …)
+/// without breaking call-sites that only care about `call_depth`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceFanoutOptions {
+    /// BFS depth on outgoing `Calls` / `References` edges from each
+    /// implementation node. `0` disables propagation entirely.
+    pub call_depth: usize,
+}
+
+impl Default for SliceFanoutOptions {
+    fn default() -> Self {
+        Self { call_depth: 1 }
+    }
+}
+
+/// Hard cap on the fan-out result size so a noisy graph does not blow
+/// up `slice` JSON output.
+const SLICE_FANOUT_MAX: usize = 256;
 
 pub fn slice_requirement(options: SliceOptions) -> Result<FeatureSlice> {
     let config = load_config(&options.repo_root)?;
     let db_path = resolve_storage_path(&options.repo_root, &config);
     let store = Store::open(&db_path)
         .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
-    slice_from_store(&store, &options.requirement)
+    slice_from_store_with_options(&store, &options.requirement, options.fanout)
 }
 
 pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice> {
+    slice_from_store_with_options(store, requirement, SliceFanoutOptions::default())
+}
+
+pub fn slice_from_store_with_options(
+    store: &Store,
+    requirement: &str,
+    fanout: SliceFanoutOptions,
+) -> Result<FeatureSlice> {
     let req_id = requirement_id(requirement);
     let req_node = store
         .find_node(&req_id)?
@@ -60,6 +112,7 @@ pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice
         implementation: Vec::new(),
         linked_tests: Vec::new(),
         risks: Vec::new(),
+        code_fanout: Vec::new(),
     };
 
     let docs_edges = store.list_edges_to(&req_id)?;
@@ -88,6 +141,13 @@ pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice
     sort_items(&mut slice.implementation);
     sort_items(&mut slice.linked_tests);
 
+    // P14 — fact-edge fan-out. We seed with the implementation symbol
+    // ids and walk outward via `Calls` / `References` so the slice
+    // reflects what the requirement's code actually exercises today,
+    // not just what the manifest claims.
+    fanout_calls_and_references(store, &mut slice, fanout.call_depth)?;
+    sort_items(&mut slice.code_fanout);
+
     if slice.linked_tests.is_empty() && !slice.implementation.is_empty() {
         slice.risks.push(
             "Requirement has linked implementation but no linked verification tests.".to_string(),
@@ -105,6 +165,56 @@ pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice
     }
 
     Ok(slice)
+}
+
+fn fanout_calls_and_references(
+    store: &Store,
+    slice: &mut FeatureSlice,
+    depth: usize,
+) -> Result<()> {
+    if depth == 0 || slice.implementation.is_empty() {
+        return Ok(());
+    }
+    let seeds: BTreeSet<ArtifactId> = slice
+        .implementation
+        .iter()
+        .map(|item| ArtifactId::new(item.id.clone()))
+        .collect();
+    let mut visited: BTreeSet<ArtifactId> = seeds.clone();
+    let mut frontier: Vec<ArtifactId> = seeds.iter().cloned().collect();
+    let mut truncated = false;
+    'outer: for _ in 0..depth {
+        let mut next: Vec<ArtifactId> = Vec::new();
+        for id in &frontier {
+            for edge in store.list_edges_from(id)? {
+                if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
+                    continue;
+                }
+                let target = edge.to_id;
+                if !visited.insert(target.clone()) {
+                    continue;
+                }
+                if slice.code_fanout.len() >= SLICE_FANOUT_MAX {
+                    truncated = true;
+                    break 'outer;
+                }
+                if let Some(node) = store.find_node(&target)? {
+                    slice.code_fanout.push(node_to_item(&node));
+                }
+                next.push(target);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    if truncated {
+        slice.risks.push(format!(
+            "slice: 调用 / 引用 fanout 达到上限 {SLICE_FANOUT_MAX}，结果已截断"
+        ));
+    }
+    Ok(())
 }
 
 fn node_to_item(node: &specslice_core::Node) -> SliceItem {

@@ -1,12 +1,14 @@
 use std::path::Path;
 
 use anyhow::Result;
+use specslice_engine::slice::SliceFanoutOptions;
 use specslice_engine::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
 
-pub fn run(repo_root: &Path, requirement: &str, json: bool) -> Result<()> {
+pub fn run(repo_root: &Path, requirement: &str, json: bool, call_depth: usize) -> Result<()> {
     let slice = slice_requirement(SliceOptions {
         repo_root: repo_root.to_path_buf(),
         requirement: requirement.to_string(),
+        fanout: SliceFanoutOptions { call_depth },
     })?;
     if json {
         println!("{}", serde_json::to_string_pretty(&slice)?);
@@ -31,6 +33,11 @@ fn print_human(slice: &FeatureSlice) {
     println!();
     println!("Linked Tests:");
     print_items(&slice.linked_tests);
+    if !slice.code_fanout.is_empty() {
+        println!();
+        println!("Code Fan-out (calls / references):");
+        print_items(&slice.code_fanout);
+    }
     if !slice.risks.is_empty() {
         println!();
         println!("Risks:");

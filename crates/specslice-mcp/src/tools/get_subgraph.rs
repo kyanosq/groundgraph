@@ -23,7 +23,11 @@ pub fn descriptor() -> ToolDescriptor {
             relevant anchor. Edges are filtered to fact-bearing kinds \
             (calls / references / persists_to / navigates_to / \
             reads_provider / subscribes_stream / derives_from / \
-            declares_implementation / declares_verification / contains).",
+            declares_implementation / declares_verification / contains). \
+            Optional `resolvers` lets callers narrow expansion to edges \
+            produced by a specific indexer label (e.g. `swift_lsp`, \
+            `go_lsp`, `dart_analyzer`) so debugging cross-language \
+            provenance is straightforward.",
         input_schema: object_schema(
             json!({
                 "node_id": {
@@ -40,6 +44,11 @@ pub fn descriptor() -> ToolDescriptor {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Restrict expansion to these edge kinds. Defaults to all expansion kinds."
+                },
+                "resolvers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict expansion to edges whose `indexer` label is in this set (e.g. `swift_lsp`, `go_lsp`, `dart_analyzer`). Empty / omitted means no filter."
                 },
                 "include_noise": {
                     "type": "boolean",
@@ -68,6 +77,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(SEARCH_DEFAULT_DEPTH);
     let edge_kinds_filter = parse_edge_kinds(args.get("edge_kinds").unwrap_or(&Value::Null))?;
+    let resolvers_filter = parse_resolvers(args.get("resolvers").unwrap_or(&Value::Null))?;
     let include_noise = args
         .get("include_noise")
         .and_then(|v| v.as_bool())
@@ -106,6 +116,9 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
             if !allow_edge_kind.contains(kind_str) {
                 continue;
             }
+            if !resolver_allowed(&edge, &resolvers_filter) {
+                continue;
+            }
             if !include_noise && is_noise_calls(kind_str, edge.to_id.as_str()) {
                 continue;
             }
@@ -124,6 +137,9 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         for edge in store.list_edges_to(&aid)? {
             let kind_str = edge.kind.as_str();
             if !allow_edge_kind.contains(kind_str) {
+                continue;
+            }
+            if !resolver_allowed(&edge, &resolvers_filter) {
                 continue;
             }
             if !include_noise && is_noise_calls(kind_str, edge.to_id.as_str()) {
@@ -195,6 +211,46 @@ fn edge_to_json(edge: &specslice_core::EdgeAssertion) -> Value {
     })
 }
 
+/// Parse the optional `resolvers` argument from `tools/call` params.
+///
+/// Accepts an array of strings (e.g. `["swift_lsp", "go_lsp"]`); empty
+/// / missing / `null` disables filtering. We don't validate against a
+/// closed set here because adapter labels evolve as we add languages;
+/// `crates/specslice-engine/src/{swift,go,dart}_indexer.rs` are the
+/// source of truth.
+fn parse_resolvers(values: &Value) -> Result<HashSet<String>> {
+    if values.is_null() {
+        return Ok(HashSet::new());
+    }
+    let Some(arr) = values.as_array() else {
+        bail!("`resolvers` must be an array of strings");
+    };
+    let mut out = HashSet::with_capacity(arr.len());
+    for v in arr {
+        let s = v
+            .as_str()
+            .ok_or_else(|| anyhow!("`resolvers` entries must be strings"))?;
+        out.insert(s.trim().to_string());
+    }
+    out.remove("");
+    Ok(out)
+}
+
+/// Empty `resolvers` = no filter. Otherwise the edge's `indexer` label
+/// must be present in the set. Edges without an `indexer` (older data,
+/// manifest-driven edges, etc.) are excluded once the filter is active
+/// — callers asking "show me Swift LSP edges" don't want manifest
+/// edges leaking in.
+fn resolver_allowed(edge: &specslice_core::EdgeAssertion, allow: &HashSet<String>) -> bool {
+    if allow.is_empty() {
+        return true;
+    }
+    match edge.indexer.as_deref() {
+        Some(name) => allow.contains(name),
+        None => false,
+    }
+}
+
 fn is_noise_calls(kind: &str, to_id: &str) -> bool {
     if kind != "calls" {
         return false;
@@ -220,4 +276,75 @@ fn is_noise_calls(kind: &str, to_id: &str) -> bool {
         None => "",
     };
     NOISE.contains(&target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_resolvers, resolver_allowed};
+    use serde_json::json;
+    use specslice_core::{
+        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+    };
+
+    fn make_edge(indexer: Option<&str>) -> EdgeAssertion {
+        EdgeAssertion {
+            id: ArtifactId::new("e".to_string()),
+            from_id: ArtifactId::new("a".to_string()),
+            to_id: ArtifactId::new("b".to_string()),
+            kind: EdgeKind::Calls,
+            source: EdgeSource::LanguageAdapter,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: indexer.map(|s| s.to_string()),
+            index_generation: None,
+            metadata_json: None,
+        }
+    }
+
+    #[test]
+    fn parse_resolvers_accepts_string_array_and_rejects_other_shapes() {
+        let parsed = parse_resolvers(&json!(["swift_lsp", "go_lsp"])).unwrap();
+        assert!(parsed.contains("swift_lsp"));
+        assert!(parsed.contains("go_lsp"));
+        assert_eq!(parsed.len(), 2);
+
+        // null and missing → empty filter (allow all).
+        assert!(parse_resolvers(&serde_json::Value::Null)
+            .unwrap()
+            .is_empty());
+
+        // wrong shape must surface an error so callers learn fast.
+        assert!(parse_resolvers(&json!("swift_lsp")).is_err());
+        assert!(parse_resolvers(&json!([1, 2, 3])).is_err());
+
+        // empty strings get dropped so accidental whitespace doesn't filter to nothing.
+        let parsed = parse_resolvers(&json!(["", "  ", "swift_lsp"])).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains("swift_lsp"));
+    }
+
+    #[test]
+    fn resolver_allowed_passes_through_when_filter_empty_and_filters_when_set() {
+        let edge_swift = make_edge(Some("swift_lsp"));
+        let edge_dart = make_edge(Some("dart_analyzer"));
+        let edge_unknown = make_edge(None);
+
+        // No filter → all edges flow through.
+        let empty = parse_resolvers(&serde_json::Value::Null).unwrap();
+        assert!(resolver_allowed(&edge_swift, &empty));
+        assert!(resolver_allowed(&edge_dart, &empty));
+        assert!(resolver_allowed(&edge_unknown, &empty));
+
+        // Filter set → only matching indexer survives; missing indexer
+        // is excluded so callers asking for `swift_lsp` don't see
+        // manifest-driven edges leaking in.
+        let only_swift = parse_resolvers(&json!(["swift_lsp"])).unwrap();
+        assert!(resolver_allowed(&edge_swift, &only_swift));
+        assert!(!resolver_allowed(&edge_dart, &only_swift));
+        assert!(!resolver_allowed(&edge_unknown, &only_swift));
+    }
 }

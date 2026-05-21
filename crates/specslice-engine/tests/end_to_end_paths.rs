@@ -91,6 +91,7 @@ fn index_then_slice_path_entrypoint_returns_fixture_artifacts() {
     let slice = slice_requirement(SliceOptions {
         repo_root: tmp.path().into(),
         requirement: "REQ-WATERMARK-001".into(),
+        ..SliceOptions::default()
     })
     .unwrap();
     assert_eq!(slice.requirement_id, "REQ-WATERMARK-001");
@@ -191,6 +192,7 @@ fn slice_requirement_missing_workspace_errors_with_message() {
     let err = slice_requirement(SliceOptions {
         repo_root: tmp.path().into(),
         requirement: "REQ-X".into(),
+        ..SliceOptions::default()
     })
     .unwrap_err()
     .to_string();

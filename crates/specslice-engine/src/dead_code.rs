@@ -1156,4 +1156,115 @@ mod tests {
             "production symbol exercised by test main must remain reachable"
         );
     }
+
+    fn insert_swift_method(store: &mut Store, file: &str, qualified: &str) -> String {
+        let id = format!("swift_method::{file}#{qualified}");
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::SwiftMethod,
+                path: Some(file.into()),
+                name: Some(qualified.into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("swift_lsp".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        id
+    }
+
+    fn insert_swift_function(store: &mut Store, file: &str, name: &str) -> String {
+        let id = format!("swift_function::{file}#{name}");
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.clone()),
+                kind: NodeKind::SwiftFunction,
+                path: Some(file.into()),
+                name: Some(name.into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("swift_lsp".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        id
+    }
+
+    fn insert_lsp_calls(store: &mut Store, from: &str, to: &str, indexer: &str) {
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("calls::{from}->{to}")),
+                from_id: ArtifactId::new(from.to_string()),
+                to_id: ArtifactId::new(to.to_string()),
+                kind: EdgeKind::Calls,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some(indexer.into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+    }
+
+    /// P14 regression — `EdgeKind::Calls` produced by the Swift LSP
+    /// indexer must participate in the dead-code BFS exactly the same
+    /// way Dart `Calls` does:
+    ///
+    /// * a Swift `test*` method is an automatic entry root, so a
+    ///   private helper it calls must not be flagged;
+    /// * a sibling private helper with no inbound call edge is High
+    ///   confidence dead.
+    ///
+    /// This locks behaviour against future refactors that could
+    /// accidentally allowlist edges by indexer label.
+    #[test]
+    fn swift_lsp_calls_participate_in_dead_code_reachability() {
+        let (mut store, _dir) = empty_store();
+        let test_root = insert_swift_method(
+            &mut store,
+            "Tests/AppTests/AppTests.swift",
+            "AppTests.testGreeter",
+        );
+        let reached =
+            insert_swift_function(&mut store, "Sources/App/Greeter.swift", "_privateHello");
+        let orphan = insert_swift_function(&mut store, "Sources/App/Greeter.swift", "_neverCalled");
+        insert_lsp_calls(&mut store, &test_root, &reached, "swift_lsp");
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&reached.as_str()),
+            "Swift LSP `Calls` edge from a test* root must keep the callee reachable, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&orphan.as_str()),
+            "private Swift helper with no inbound edge must still surface as dead, got {ids:?}"
+        );
+    }
 }

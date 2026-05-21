@@ -12,16 +12,19 @@
 //! Output mode: `--json` for machine consumption (default is a
 //! human-friendly text rendering).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use specslice_core::NodeKind;
+use specslice_engine::graph::GraphLayer;
 use specslice_engine::search::{
     compute_search_html_payload, run_search, SearchOptions, SearchQuery, SearchResult,
     HTML_DEFAULT_FOCUS_BUDGET,
 };
 use specslice_engine::{default_search_kinds, SEARCH_DEFAULT_DEPTH, SEARCH_DEFAULT_LIMIT};
 
+use crate::commands::graph_mermaid::{render_parts, MermaidEdge, MermaidNode};
 use crate::commands::search_html;
 
 /// Output mode selected on the command line.
@@ -33,6 +36,8 @@ pub enum SearchFormat {
     Json,
     /// Self-contained search-driven HTML reader.
     Html,
+    /// P14 — local Mermaid `flowchart LR` of the search subgraph.
+    Mermaid,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +90,92 @@ pub fn run(args: SearchRunArgs) -> Result<()> {
             std::fs::write(&out_path, html)
                 .with_context(|| format!("writing HTML to {}", out_path.display()))?;
             println!("HTML 已生成: {}", out_path.display());
+        }
+        SearchFormat::Mermaid => {
+            let mermaid = render_search_mermaid(&result);
+            write_or_stdout(
+                &args.repo_root,
+                &args.output,
+                "search",
+                &result.query,
+                &mermaid,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a Mermaid `flowchart LR` from a `SearchResult`. Matches are
+/// rendered as `Confirmed` (rounded) nodes so reviewers can spot them
+/// against expansion-only `Fact` (rectangular) neighbours at a glance.
+pub fn render_search_mermaid(result: &SearchResult) -> String {
+    let match_ids: BTreeSet<String> = result.matches.iter().map(|m| m.id.clone()).collect();
+    let nodes: Vec<MermaidNode> = result
+        .subgraph
+        .nodes
+        .iter()
+        .map(|node| {
+            let layer = if match_ids.contains(&node.id) {
+                GraphLayer::Confirmed
+            } else {
+                GraphLayer::Fact
+            };
+            MermaidNode {
+                id: node.id.clone(),
+                label: node.label.clone(),
+                layer,
+                path: node.path.clone(),
+            }
+        })
+        .collect();
+    let edges: Vec<MermaidEdge> = result
+        .subgraph
+        .edges
+        .iter()
+        .map(|edge| MermaidEdge {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            kind: edge.kind.clone(),
+            layer: GraphLayer::Fact,
+        })
+        .collect();
+    let notes = vec![format!(
+        "specslice search \"{}\" matches={} subgraph_nodes={} edges={}",
+        result.query.replace('"', "'"),
+        result.matches.len(),
+        result.subgraph.nodes.len(),
+        result.subgraph.edges.len()
+    )];
+    render_parts(&nodes, &edges, &notes)
+}
+
+/// Resolve `--output` (or default to stdout) for plain-text Mermaid /
+/// other future text exports. `kind` and `slug_basis` only matter when
+/// the caller wants the default-path behaviour applied — for now, both
+/// `search` and `impact` go to stdout when `--output` is omitted, so we
+/// keep the surface intentionally narrow.
+fn write_or_stdout(
+    _repo_root: &Path,
+    output: &Option<PathBuf>,
+    _kind: &str,
+    _slug_basis: &str,
+    contents: &str,
+) -> Result<()> {
+    match output {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("creating output directory {}", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(path, contents)
+                .with_context(|| format!("writing output to {}", path.display()))?;
+            println!("已写入: {}", path.display());
+        }
+        None => {
+            print!("{contents}");
         }
     }
     Ok(())
@@ -287,4 +378,86 @@ pub fn default_depth() -> usize {
 #[allow(dead_code)]
 pub fn default_limit() -> usize {
     SEARCH_DEFAULT_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use specslice_engine::search::{SearchEdge, SearchMatch, SearchNode, SearchSubgraph};
+
+    fn mk_result() -> SearchResult {
+        SearchResult {
+            query: "login".into(),
+            tokens: vec!["login".into()],
+            matches: vec![SearchMatch {
+                id: "dart_method::lib/auth.dart#A.signIn".into(),
+                kind: "dart_method".into(),
+                label: "A.signIn".into(),
+                path: Some("lib/auth.dart".into()),
+                line_range: Some((10, 20)),
+                score: 100,
+                source: None,
+                match_reasons: vec![],
+            }],
+            subgraph: SearchSubgraph {
+                nodes: vec![
+                    SearchNode {
+                        id: "dart_method::lib/auth.dart#A.signIn".into(),
+                        kind: "dart_method".into(),
+                        label: "A.signIn".into(),
+                        path: Some("lib/auth.dart".into()),
+                        line_range: Some((10, 20)),
+                    },
+                    SearchNode {
+                        id: "dart_method::lib/auth.dart#B.callee".into(),
+                        kind: "dart_method".into(),
+                        label: "B.callee".into(),
+                        path: Some("lib/auth.dart".into()),
+                        line_range: Some((30, 35)),
+                    },
+                ],
+                edges: vec![SearchEdge {
+                    id: "edge1".into(),
+                    from: "dart_method::lib/auth.dart#A.signIn".into(),
+                    to: "dart_method::lib/auth.dart#B.callee".into(),
+                    kind: "calls".into(),
+                    source_file: None,
+                    line_range: None,
+                    snippet: None,
+                }],
+            },
+            graph_commands: vec![],
+        }
+    }
+
+    #[test]
+    fn search_mermaid_highlights_matches_as_confirmed_nodes_and_uses_aliases() {
+        let out = render_search_mermaid(&mk_result());
+        assert!(out.starts_with("flowchart LR\n"), "missing header: {out}");
+        // Match (A.signIn) → Confirmed → rounded shape `(...)`.
+        assert!(
+            out.contains("n0(\"A.signIn (lib/auth.dart)\")"),
+            "expected rounded match node, got: {out}"
+        );
+        // Expansion node (B.callee) → Fact → rectangle `[...]`.
+        assert!(
+            out.contains("n1[\"B.callee (lib/auth.dart)\"]"),
+            "expected rectangular expansion node, got: {out}"
+        );
+        // Edge uses Fact arrow `---` and `calls` label.
+        assert!(
+            out.contains("n0 ---|calls| n1"),
+            "expected `---|calls|` arrow, got: {out}"
+        );
+        // No raw artifact ids leak through.
+        assert!(
+            !out.contains("dart_method::"),
+            "raw ids leaked into Mermaid: {out}"
+        );
+        // Note line includes search context for human readers.
+        assert!(
+            out.contains("specslice search \"login\""),
+            "expected search context comment, got: {out}"
+        );
+    }
 }

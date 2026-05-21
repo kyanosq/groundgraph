@@ -36,6 +36,32 @@ pub struct ImpactPolicy {
     pub include_doc_changes: bool,
     pub stale_doc_level: String,
     pub missing_test_change_level: String,
+    pub propagation: ImpactPropagation,
+}
+
+/// P14 — knobs that control fact-edge propagation from
+/// `changed_symbols`. The default follows `EdgeKind::Calls` /
+/// `EdgeKind::References` one hop outward (callers of the changed
+/// symbols) and lifts any reachable `TestCase` / `TestGroup` into
+/// `linked_tests`. Set `call_depth = 0` to disable for repos where the
+/// LSP / analyzer edges are noisy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactPropagation {
+    /// Maximum BFS depth on reverse `Calls` / `References` edges from
+    /// `changed_symbols`. `0` disables propagation entirely.
+    pub call_depth: usize,
+    /// Hard cap on the total number of propagated symbols to keep
+    /// blast-radius bounded on big repos.
+    pub max_propagated_symbols: usize,
+}
+
+impl Default for ImpactPropagation {
+    fn default() -> Self {
+        Self {
+            call_depth: 1,
+            max_propagated_symbols: 256,
+        }
+    }
 }
 
 impl Default for ImpactPolicy {
@@ -45,6 +71,7 @@ impl Default for ImpactPolicy {
             include_doc_changes: true,
             stale_doc_level: "info".into(),
             missing_test_change_level: "warning".into(),
+            propagation: ImpactPropagation::default(),
         }
     }
 }
@@ -56,6 +83,7 @@ impl From<&crate::config::ImpactConfig> for ImpactPolicy {
             include_doc_changes: value.include_doc_changes,
             stale_doc_level: value.stale_doc_level.clone(),
             missing_test_change_level: value.missing_test_change_level.clone(),
+            propagation: ImpactPropagation::default(),
         }
     }
 }
@@ -79,6 +107,12 @@ pub struct ImpactReport {
     /// change against them now warrants a re-review.
     #[serde(default)]
     pub affected_confirmed_candidates: Vec<SliceItem>,
+    /// P14 — symbols reached via reverse `Calls` / `References` BFS
+    /// from `changed_symbols`. Empty when propagation is disabled
+    /// (depth=0) or when no caller exists in the graph. Order is
+    /// stable (id-sorted) so JSON snapshots stay deterministic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub propagated_symbols: Vec<SliceItem>,
     pub warnings: Vec<String>,
     pub info: Vec<String>,
 }
@@ -269,12 +303,26 @@ pub fn compute_impact_with_policy(
         }
     }
 
+    // P14 — propagate from changed_symbols along reverse Calls /
+    // References edges so callers / tests that exercise the touched
+    // code surface even without a manual `declares_verification`
+    // manifest. Done before the warning pass so a propagated test
+    // suppresses the "no linked test changed" warning.
+    propagate_via_calls_and_references(
+        store,
+        &mut report,
+        &changed_symbol_ids,
+        policy.propagation.call_depth,
+        policy.propagation.max_propagated_symbols,
+    )?;
+
     sort_items(&mut report.changed_symbols);
     sort_items(&mut report.changed_doc_sections);
     sort_items(&mut report.affected_requirements);
     sort_items(&mut report.affected_docs);
     sort_items(&mut report.linked_tests);
     sort_items(&mut report.linked_implementations);
+    sort_items(&mut report.propagated_symbols);
 
     // Warnings & info.
     if !report.affected_requirements.is_empty()
@@ -362,6 +410,87 @@ pub fn merge_confirmed_candidates(report: &mut ImpactReport, repo_root: &Path) -
         report.info.push(format!(
             "{} accepted candidate(s) intersect this change — re-review recommended",
             report.affected_confirmed_candidates.len()
+        ));
+    }
+    Ok(())
+}
+
+/// P14 — BFS along reverse `EdgeKind::Calls` / `EdgeKind::References`
+/// edges from `changed_symbols`. Each newly-reached symbol is appended
+/// to `report.propagated_symbols`; `TestCase` / `TestGroup` nodes are
+/// additionally lifted into `report.linked_tests` so PR reviewers see
+/// downstream tests even when the requirement manifest does not yet
+/// link them.
+///
+/// `depth = 0` is a no-op. `max_total` bounds the total number of
+/// propagated symbols (best-effort): once exceeded, we stop expanding
+/// and surface a `info` line. The implementation is intentionally
+/// dependency-free — we use the store's existing `list_edges_to`
+/// surface and a manual visited-set BFS so we never accidentally
+/// expand across edge kinds we didn't whitelist.
+fn propagate_via_calls_and_references(
+    store: &Store,
+    report: &mut ImpactReport,
+    changed_symbol_ids: &BTreeSet<ArtifactId>,
+    depth: usize,
+    max_total: usize,
+) -> Result<()> {
+    if depth == 0 || changed_symbol_ids.is_empty() {
+        return Ok(());
+    }
+    let already_linked_tests: BTreeSet<String> =
+        report.linked_tests.iter().map(|t| t.id.clone()).collect();
+    let mut visited: BTreeSet<ArtifactId> = changed_symbol_ids.clone();
+    let mut frontier: Vec<ArtifactId> = changed_symbol_ids.iter().cloned().collect();
+    let mut truncated = false;
+    'outer: for _ in 0..depth {
+        let mut next: Vec<ArtifactId> = Vec::new();
+        for id in &frontier {
+            for edge in store.list_edges_to(id)? {
+                if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::References) {
+                    continue;
+                }
+                let caller = edge.from_id;
+                if !visited.insert(caller.clone()) {
+                    continue;
+                }
+                if report.propagated_symbols.len() >= max_total {
+                    truncated = true;
+                    break 'outer;
+                }
+                let Some(node) = store.find_node(&caller)? else {
+                    continue;
+                };
+                let item = SliceItem {
+                    id: node.id.to_string(),
+                    kind: node.kind.as_str().to_string(),
+                    path: node.path.clone(),
+                    name: node.name.clone(),
+                    line_range: match (node.start_line, node.end_line) {
+                        (Some(s), Some(e)) => Some((s, e)),
+                        _ => None,
+                    },
+                };
+                // Reachable tests must also appear in linked_tests so
+                // the reviewer's "what should I run?" answer benefits
+                // from the fact edges without us double-counting.
+                if matches!(node.kind, NodeKind::TestCase | NodeKind::TestGroup)
+                    && !already_linked_tests.contains(&item.id)
+                {
+                    report.linked_tests.push(item.clone());
+                }
+                report.propagated_symbols.push(item);
+                next.push(caller);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    if truncated {
+        report.info.push(format!(
+            "impact: 调用 / 引用 传播达到上限 {max_total}，结果已截断"
         ));
     }
     Ok(())

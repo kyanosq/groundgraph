@@ -9,10 +9,21 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use specslice_engine::graph::GraphLayer;
 use specslice_engine::{
     apply_review, list_for_review, BusinessCandidate, CandidateListSnapshot, ReviewStatus,
     ReviewVerdict,
 };
+
+use crate::commands::graph_mermaid::{render_parts, MermaidEdge, MermaidNode};
+
+/// P14 — output format for `specslice candidate show`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateShowFormat {
+    Text,
+    Json,
+    Mermaid,
+}
 
 /// CLI 状态过滤选项。
 #[derive(Debug, Clone, Copy)]
@@ -34,7 +45,7 @@ pub fn run_list(repo_root: &Path, mode: ListMode, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run_show(repo_root: &Path, candidate_id: &str, json: bool) -> Result<i32> {
+pub fn run_show(repo_root: &Path, candidate_id: &str, format: CandidateShowFormat) -> Result<i32> {
     let snapshot = list_for_review(repo_root)
         .with_context(|| format!("加载候选 ({})", repo_root.display()))?;
     let candidate = snapshot
@@ -46,12 +57,99 @@ pub fn run_show(repo_root: &Path, candidate_id: &str, json: bool) -> Result<i32>
         eprintln!("specslice: 找不到候选 `{candidate_id}`。");
         return Ok(2);
     };
-    if json {
-        println!("{}", serde_json::to_string_pretty(c)?);
-    } else {
-        print_human_show(c);
+    match format {
+        CandidateShowFormat::Json => println!("{}", serde_json::to_string_pretty(c)?),
+        CandidateShowFormat::Text => print_human_show(c),
+        CandidateShowFormat::Mermaid => print!("{}", render_candidate_mermaid(c)),
     }
     Ok(0)
+}
+
+/// Render a candidate as a local Mermaid `flowchart LR`:
+///
+/// * the candidate itself is a Confirmed (accepted) or Candidate
+///   (other) shape — matching the conventions of `graph_mermaid.rs`;
+/// * each cited evidence id becomes a Fact rectangle annotated with
+///   the artifact kind it encodes (`dart_method`, `test_case`,
+///   `doc_section`, …) so reviewers can read it without looking up
+///   the artifact id grammar;
+/// * the edge from candidate → evidence is labelled `evidence` and
+///   uses the Candidate dashed arrow when the candidate is unconfirmed
+///   so the diagram doesn't visually promote evidence into "fact".
+pub fn render_candidate_mermaid(c: &BusinessCandidate) -> String {
+    let candidate_layer = match c.review_status() {
+        Some(ReviewStatus::Accepted) => GraphLayer::Confirmed,
+        _ => GraphLayer::Candidate,
+    };
+    let candidate_node_id = format!("candidate::{}", c.id);
+    let candidate_label = if c.description.trim().is_empty() {
+        c.name.clone()
+    } else {
+        let first_line = c
+            .description
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("");
+        if first_line.is_empty() || first_line == c.name {
+            c.name.clone()
+        } else {
+            format!("{} — {}", c.name, truncate_for_terminal(first_line, 60))
+        }
+    };
+
+    let mut nodes = vec![MermaidNode {
+        id: candidate_node_id.clone(),
+        label: candidate_label,
+        layer: candidate_layer,
+        path: None,
+    }];
+    let mut edges: Vec<MermaidEdge> = Vec::new();
+
+    for ev in &c.evidence {
+        let (kind, body) = ev
+            .split_once("::")
+            .map(|(k, b)| (k.to_string(), b.to_string()))
+            .unwrap_or_else(|| ("evidence".into(), ev.clone()));
+        let (file_part, symbol_part) = body
+            .split_once('#')
+            .map(|(f, s)| (Some(f.to_string()), Some(s.to_string())))
+            .unwrap_or((Some(body.clone()), None));
+        let label = match (&symbol_part, &kind) {
+            (Some(sym), _) => format!("{sym} [{kind}]"),
+            (None, kind) => format!("{} [{kind}]", file_part.clone().unwrap_or_default()),
+        };
+        nodes.push(MermaidNode {
+            id: ev.clone(),
+            label,
+            layer: GraphLayer::Fact,
+            path: file_part,
+        });
+        edges.push(MermaidEdge {
+            from: candidate_node_id.clone(),
+            to: ev.clone(),
+            kind: "evidence".into(),
+            layer: candidate_layer,
+        });
+    }
+
+    let status = match c.review_status() {
+        Some(ReviewStatus::Accepted) => "accepted",
+        Some(ReviewStatus::Rejected) => "rejected",
+        Some(ReviewStatus::NeedsChanges) => "needs_changes",
+        Some(ReviewStatus::Pending) => "pending",
+        None => "ai_proposed",
+    };
+    let notes = vec![format!(
+        "specslice candidate show {} status={} evidence={} confidence={}",
+        c.id,
+        status,
+        c.evidence.len(),
+        c.confidence
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".into())
+    )];
+    render_parts(&nodes, &edges, &notes)
 }
 
 pub struct ReviewArgs<'a> {
@@ -333,4 +431,101 @@ fn print_json(snapshot: &CandidateListSnapshot, mode: ListMode) -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod mermaid_tests {
+    use super::*;
+    use specslice_engine::{BusinessCandidate, CandidateReview};
+
+    fn candidate_with(
+        id: &str,
+        name: &str,
+        review: Option<CandidateReview>,
+        evidence: &[&str],
+    ) -> BusinessCandidate {
+        let mut c = BusinessCandidate {
+            id: id.into(),
+            name: name.into(),
+            description: format!("{name} 的简短描述"),
+            evidence: evidence.iter().map(|s| s.to_string()).collect(),
+            confidence: Some(0.82),
+            status: "proposed".into(),
+            review,
+            ..BusinessCandidate::default()
+        };
+        // status normalisation happens on YAML load; for the in-memory
+        // accepted case the test sets `review.status = "accepted"`, so
+        // leave `c.status` untouched here.
+        c.recommendation = None;
+        c
+    }
+
+    #[test]
+    fn candidate_mermaid_renders_evidence_as_fact_rectangles_with_accepted_shape() {
+        let review = CandidateReview {
+            status: "accepted".into(),
+            reviewer: None,
+            note: None,
+            reviewed_at: None,
+            answered_questions: vec![],
+        };
+        let c = candidate_with(
+            "complete_purchase_unlocks_pro",
+            "Complete purchase unlocks Pro",
+            Some(review),
+            &[
+                "dart_method::lib/purchase.dart#Purchase.complete",
+                "test_case::test/purchase_test.dart#unlocks pro",
+            ],
+        );
+
+        let out = render_candidate_mermaid(&c);
+        assert!(out.starts_with("flowchart LR\n"));
+        // Accepted candidate → Confirmed → rounded `(…)`.
+        assert!(
+            out.contains("n0(\""),
+            "expected Confirmed rounded shape for accepted candidate, got: {out}"
+        );
+        // Evidence symbol → Fact rectangle, kind annotation present.
+        assert!(
+            out.contains("[dart_method]"),
+            "missing dart_method tag: {out}"
+        );
+        assert!(out.contains("[test_case]"), "missing test_case tag: {out}");
+        // Arrow uses Confirmed `-->` because the candidate is accepted.
+        assert!(
+            out.contains("-->|evidence|"),
+            "expected `-->|evidence|` arrow: {out}"
+        );
+        // Summary comment carries status.
+        assert!(
+            out.contains("status=accepted"),
+            "missing status note: {out}"
+        );
+        // No raw artifact ids leak into rendered output.
+        assert!(!out.contains("dart_method::lib"));
+    }
+
+    #[test]
+    fn candidate_mermaid_uses_candidate_shape_when_not_accepted() {
+        let c = candidate_with(
+            "unconfirmed",
+            "An unconfirmed business candidate",
+            None,
+            &["doc_section::docs/x.md#Intro"],
+        );
+        let out = render_candidate_mermaid(&c);
+        // Candidate parallelogram `[/.../]`.
+        assert!(
+            out.contains("n0[/\""),
+            "expected Candidate parallelogram, got: {out}"
+        );
+        // Dashed arrow for unconfirmed.
+        assert!(
+            out.contains("-.->|evidence|"),
+            "expected dashed arrow: {out}"
+        );
+        assert!(out.contains("status=ai_proposed"));
+    }
 }
