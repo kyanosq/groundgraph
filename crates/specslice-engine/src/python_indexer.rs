@@ -165,6 +165,16 @@ fn run_ast_pass(
         return Ok(AstOutcome::default());
     }
 
+    // Project layouts vary: a flat `app/foo.py` repo resolves
+    // `import app.foo` directly, but a `src/`-style layout
+    // (`backend/app/foo.py`) needs us to know that `backend/` is a
+    // *source root*. We infer those roots from where the
+    // `__init__.py` chain starts: any directory that is *not* itself
+    // a package but whose child is becomes a source root. Validated
+    // against atagent (`backend/app/...`) where the un-fixed resolver
+    // missed ~85% of `from app.X import ...` lines.
+    let src_roots = discover_python_src_roots(&py_files);
+
     let mut outcome = AstOutcome::default();
     let mut batch = LanguageIndexBatch {
         language: PYTHON_LANGUAGE_ID.into(),
@@ -207,7 +217,7 @@ fn run_ast_pass(
 
         for import in &scan.imports {
             if let Some(target) =
-                resolve_python_import(&py_files, &file.relative, &import.module_path)
+                resolve_python_import(&py_files, &src_roots, &file.relative, &import.module_path)
             {
                 batch.imports.push(ImportEdge {
                     from_file: file_id(&file.relative),
@@ -424,6 +434,7 @@ fn is_python_skip_dir(entry: &walkdir::DirEntry) -> bool {
 
 fn resolve_python_import(
     files: &[DiscoveredPyFile],
+    src_roots: &[String],
     from_file: &str,
     module_path: &str,
 ) -> Option<String> {
@@ -454,8 +465,26 @@ fn resolve_python_import(
         let candidate = base.join("/");
         return resolve_python_candidate(files, &candidate);
     }
-    let candidate = module.replace('.', "/");
-    resolve_python_candidate(files, &candidate)
+    let base = module.replace('.', "/");
+    // 1) Flat-layout match: `module` already encodes the on-disk path.
+    if let Some(hit) = resolve_python_candidate(files, &base) {
+        return Some(hit);
+    }
+    // 2) src-layout match: prepend each discovered source root.
+    for root in src_roots {
+        let candidate = if root.is_empty() {
+            base.clone()
+        } else {
+            format!("{root}/{base}")
+        };
+        if candidate == base {
+            continue; // already tried in step 1
+        }
+        if let Some(hit) = resolve_python_candidate(files, &candidate) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 fn resolve_python_candidate(files: &[DiscoveredPyFile], base: &str) -> Option<String> {
@@ -467,6 +496,52 @@ fn resolve_python_candidate(files: &[DiscoveredPyFile], base: &str) -> Option<St
         }
     }
     None
+}
+
+/// Walk every `__init__.py` we discovered upwards until the parent
+/// directory stops being a Python package (no `__init__.py`). That
+/// parent is a *source root*: imports resolve against it as if it
+/// were on `sys.path`. The repo root is included implicitly as the
+/// empty-string root so flat layouts keep working. Returned roots
+/// are de-duplicated and sorted by depth (deepest first) so we try
+/// the most specific match before falling back.
+fn discover_python_src_roots(files: &[DiscoveredPyFile]) -> Vec<String> {
+    let mut init_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in files {
+        let trimmed = file.relative.strip_suffix("/__init__.py").or_else(|| {
+            if file.relative == "__init__.py" {
+                Some("")
+            } else {
+                None
+            }
+        });
+        if let Some(dir) = trimmed {
+            init_dirs.insert(dir.to_string());
+        }
+    }
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Always include the empty root so unprefixed imports resolve in
+    // flat repos.
+    roots.insert(String::new());
+    for dir in &init_dirs {
+        let mut cur = dir.clone();
+        loop {
+            let parent = match cur.rfind('/') {
+                Some(idx) => cur[..idx].to_string(),
+                None => String::new(),
+            };
+            if !init_dirs.contains(&parent) {
+                roots.insert(parent);
+                break;
+            }
+            cur = parent;
+        }
+    }
+    // Sort deepest-first so more specific roots win when multiple
+    // resolutions are possible. Empty root naturally sorts last.
+    let mut out: Vec<String> = roots.into_iter().collect();
+    out.sort_by_key(|r| std::cmp::Reverse(r.matches('/').count() + usize::from(!r.is_empty())));
+    out
 }
 
 fn python_profile() -> LspProfile {
@@ -750,20 +825,85 @@ mod tests {
                 absolute: PathBuf::from("/tmp/app/utils.py"),
             },
         ];
+        let src_roots = discover_python_src_roots(&files);
         assert_eq!(
-            resolve_python_import(&files, "tests/test_greeter.py", "app.greeter"),
+            resolve_python_import(&files, &src_roots, "tests/test_greeter.py", "app.greeter"),
             Some("app/greeter.py".into())
         );
         assert_eq!(
-            resolve_python_import(&files, "tests/test_greeter.py", "app"),
+            resolve_python_import(&files, &src_roots, "tests/test_greeter.py", "app"),
             Some("app/__init__.py".into())
         );
         assert_eq!(
-            resolve_python_import(&files, "app/greeter.py", ".utils"),
+            resolve_python_import(&files, &src_roots, "app/greeter.py", ".utils"),
             Some("app/utils.py".into())
         );
         // Non-resolvable imports drop quietly so we never inject fake
         // file nodes for `import os` etc.
-        assert_eq!(resolve_python_import(&files, "app/greeter.py", "os"), None);
+        assert_eq!(
+            resolve_python_import(&files, &src_roots, "app/greeter.py", "os"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_python_import_handles_src_layout_via_discovered_roots() {
+        // Mirrors atagent's `backend/app/...` layout. `backend/` is
+        // not itself a package (no `__init__.py` directly under it)
+        // but every dir below it is — making `backend/` the source
+        // root that `from app.core.config import ...` resolves against.
+        let files = vec![
+            DiscoveredPyFile {
+                relative: "backend/app/__init__.py".into(),
+                absolute: PathBuf::from("/tmp/backend/app/__init__.py"),
+            },
+            DiscoveredPyFile {
+                relative: "backend/app/main.py".into(),
+                absolute: PathBuf::from("/tmp/backend/app/main.py"),
+            },
+            DiscoveredPyFile {
+                relative: "backend/app/core/__init__.py".into(),
+                absolute: PathBuf::from("/tmp/backend/app/core/__init__.py"),
+            },
+            DiscoveredPyFile {
+                relative: "backend/app/core/config.py".into(),
+                absolute: PathBuf::from("/tmp/backend/app/core/config.py"),
+            },
+            DiscoveredPyFile {
+                relative: "backend/tests/test_config.py".into(),
+                absolute: PathBuf::from("/tmp/backend/tests/test_config.py"),
+            },
+        ];
+        let src_roots = discover_python_src_roots(&files);
+        assert!(
+            src_roots.contains(&"backend".to_string()),
+            "expected `backend` in src roots, got {src_roots:?}"
+        );
+        assert_eq!(
+            resolve_python_import(
+                &files,
+                &src_roots,
+                "backend/tests/test_config.py",
+                "app.core.config"
+            ),
+            Some("backend/app/core/config.py".into())
+        );
+        assert_eq!(
+            resolve_python_import(&files, &src_roots, "backend/app/main.py", "app.core.config"),
+            Some("backend/app/core/config.py".into())
+        );
+    }
+
+    #[test]
+    fn discover_python_src_roots_includes_repo_root_for_flat_layout() {
+        let files = vec![DiscoveredPyFile {
+            relative: "app/foo.py".into(),
+            absolute: PathBuf::from("/tmp/app/foo.py"),
+        }];
+        let roots = discover_python_src_roots(&files);
+        assert!(
+            roots.contains(&String::new()),
+            "expected `\"\"` in {roots:?}"
+        );
     }
 }

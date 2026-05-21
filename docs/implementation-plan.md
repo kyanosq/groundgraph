@@ -766,6 +766,16 @@ P15 闭环 Swift / Go 后，下一道短板是 Python 这条 SpecSlice 用户最
 - AST 扫描器不依赖第三方解析器：纯 Rust 实现避免引入 `rustpython-parser` / `tree-sitter` 体量；扫描结果只用于补 Imports / pytest，结构语义保留 LSP 的优先权。
 - 配置 `python.enabled: false` 时，整条 Python 通路不开启，沙箱与 Dart-only 工作流的行为零变化。
 
+### P16 真实仓库回归（atagent / 165 py 文件）
+
+P16 落地后我们在 `/Users/qjs/Code/Projects/atagent`（典型 FastAPI 后端，~165 py 文件，无 `__init__.py` 的 `backend/` src layout）做了非侵入式验证，只在仓库根写入临时 `.specslice/` 工作区并在结束时清理，未触碰任何业务源码。验证结论：
+
+- AST 通路在没有可用 LSP 时仍能产出可用图：files 162 / Symbols 1216 / TestCases 272 / Imports 662 / Resolver `python_ast`。其中 LSP 是因为 PATH 上的 `pylsp` shebang 指向已删除的 Anaconda 解释器导致 `execve(2)` 失败，被 `python_indexer` 优雅降级，CLI 输出明确写出 `LSP skipped: 无法启动 python LSP …`。
+- 暴露并修掉一个 src-layout 解析 bug：未引入 `discover_python_src_roots` 之前，`from app.core.config import settings` 这类导入只匹配纯扁平布局，仅 34 / 244 `from app.*` 命中；现在自动从 `__init__.py` 链反推 `backend/` 等 src 根目录，命中数提升到 662（≈20×），覆盖 atagent 几乎全部包内导入。
+- `dead-code --json` 在 LSP 缺席时仍按设计返回较高 candidate 数（1066/1216）。这不是 bug：Python AST 通路不会伪造 `Calls / References`，因此可达性主要依赖 file→Imports→file 链路。当前结果与"AST-only 模式仅适合作为线索 / 后续 P17 框架装饰器入口收敛"的契约一致；同时 entry 集合已经覆盖 pytest test_*、dunder、`main / app / cli / run / create_app` 等典型 Python 框架触发点，避免把框架反射调用误报为高置信死代码。
+- 其余 CLI 流程（`check / logic / candidate list / search --format mermaid`）在该仓库上零异常，搜索 `Middleware` 子图能正确返回 `python_class`、`python_function` 节点与 `Contains` 边，证明 P16 与既有 search / mermaid 通路完全打通。
+- 已新增 `python_indexer::tests::resolve_python_import_handles_src_layout_via_discovered_roots / discover_python_src_roots_includes_repo_root_for_flat_layout`，把 atagent 这类 src-layout 直接锁回归。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：
