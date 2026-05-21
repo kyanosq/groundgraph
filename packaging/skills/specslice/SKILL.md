@@ -108,6 +108,51 @@ specslice-mcp --repo-root /path/to/repo
 (`"swift_lsp"`, `"go_lsp"`, `"dart_analyzer"`, …) so an agent can
 restrict expansion to a single language adapter when needed.
 
+## Python via LSP + AST 补强 (P16)
+
+`python.enabled: true` activates the Python adapter. It runs in two
+overlapping passes:
+
+1. **LSP pass (preferred).** Discovery order:
+   `SPECSLICE_PYTHON_LSP_BIN` → `python.lsp_command` →
+   `<repo>/.venv/bin/basedpyright-langserver` →
+   `<repo>/.venv/bin/pyright-langserver` →
+   `<repo>/.venv/bin/pylsp` → same three binaries on PATH. The chosen
+   server gets `--stdio` automatically. Surfaced node kinds:
+   `python_module`, `python_class`, `python_method`, `python_function`.
+   `Calls` / `References` come from `callHierarchy/outgoingCalls` and
+   `textDocument/references`. Edges are tagged
+   `indexer = python_lsp` so callers know the provenance.
+2. **AST pass (always).** A tiny indentation-driven scanner adds the
+   facts no LSP exposes directly:
+   - `Imports` edges (resolved across repo files; unresolvable
+     stdlib / third-party imports drop silently);
+   - pytest `TestCase` / `TestGroup` nodes via `def test_*` and
+     `class Test*`;
+   - structural class / function / method symbols when the LSP pass
+     skipped (no toolchain installed).
+   AST-produced rows carry `indexer = python_ast`.
+
+`specslice index` reports both Python files and pytest tests:
+
+```
+Python index:
+  Python files: 12
+  Symbols: 47
+  TestCases: 18
+  Imports: 6
+  Resolver: python_lsp
+```
+
+When `Resolver: python_ast` appears the LSP server was unavailable —
+read the `LSP skipped` line for the exact reason
+(missing binary, venv override mismatched, etc.).
+
+Python `Calls` should be treated as a *line, not a fact*. The agent
+should still cross-check with the surrounding AST scanner output and
+framework facts (P17 will introduce FastAPI / Flask / Django / Celery
+route facts) before claiming a function is unused or unreachable.
+
 ## Swift / Go via LSP (P11–P15)
 
 When `swift.enabled: true` (or `go.enabled: true`) is set in

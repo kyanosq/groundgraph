@@ -222,6 +222,15 @@ pub fn analyze_dead_code_with_store(
                     entry_ids.insert(n.id.to_string());
                 }
             }
+            // Python: pytest discovers `def test_*` / `class Test*` by
+            // name, and conventional entrypoints (`main`, `__main__`,
+            // `app`, `cli`) are invoked through reflection / frameworks.
+            // Tag them so reachability never flags them as dead.
+            NodeKind::PythonFunction | NodeKind::PythonMethod => {
+                if is_python_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
             _ => {}
         }
         // public_api_roots: anything under those paths.
@@ -425,6 +434,10 @@ fn is_code_kind(kind: NodeKind) -> bool {
             | NodeKind::GoInterface
             | NodeKind::GoMethod
             | NodeKind::GoFunction
+            | NodeKind::PythonModule
+            | NodeKind::PythonClass
+            | NodeKind::PythonFunction
+            | NodeKind::PythonMethod
     )
 }
 
@@ -508,6 +521,35 @@ fn is_swift_entry_name(name: Option<&str>) -> bool {
             | "scene"
             | "body"
     ) || last.starts_with("test")
+}
+
+/// Names that Python frameworks / runtimes invoke via reflection or
+/// CLI dispatch — treating them as dead would generate noise. We are
+/// intentionally conservative because Python is highly dynamic: only
+/// the very common entrypoints get the "never dead" tag.
+fn is_python_entry_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    if matches!(
+        last,
+        "main" | "__main__" | "app" | "cli" | "create_app" | "run"
+    ) {
+        return true;
+    }
+    // `pytest` collects `def test_*` and `class Test*.test_*`. They are
+    // also surfaced as `TestCase` nodes, but the underlying function
+    // node should not be dead either.
+    if last.starts_with("test_") {
+        return true;
+    }
+    // Dunder lifecycle hooks (`__init__`, `__call__`, `__enter__`,
+    // `__exit__`, etc.) are framework-invoked.
+    if last.starts_with("__") && last.ends_with("__") {
+        return true;
+    }
+    false
 }
 
 fn is_private_dart_name(name: Option<&str>) -> bool {
@@ -625,6 +667,12 @@ fn reason_unreached(node: &specslice_core::Node) -> String {
             "未被 Go 入口（main / init / 公开 API / 测试）任一入口点可达".into()
         }
         NodeKind::GoStruct | NodeKind::GoInterface => "类型未被任何 Go 入口点引用".into(),
+        NodeKind::PythonMethod | NodeKind::PythonFunction => {
+            "未被 Python 入口（main / app / pytest / dunder / 公开 API）任一入口点可达".into()
+        }
+        NodeKind::PythonClass | NodeKind::PythonModule => {
+            "类型 / 模块未被任何 Python 入口点引用".into()
+        }
         _ => "未被任何入口点可达".into(),
     }
 }

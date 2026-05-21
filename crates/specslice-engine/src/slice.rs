@@ -281,6 +281,10 @@ pub fn is_implementation_kind(kind: NodeKind) -> bool {
             | NodeKind::GoInterface
             | NodeKind::GoMethod
             | NodeKind::GoFunction
+            | NodeKind::PythonModule
+            | NodeKind::PythonClass
+            | NodeKind::PythonFunction
+            | NodeKind::PythonMethod
     )
 }
 

@@ -24,6 +24,8 @@ pub mod links_indexer;
 pub mod logic_confidence;
 pub mod lsp_client;
 pub mod lsp_indexer;
+pub mod python_ast;
+pub mod python_indexer;
 pub mod search;
 pub mod slice;
 pub mod swift_indexer;
@@ -79,6 +81,10 @@ pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
 pub use go_indexer::{
     build_go_batch, go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME,
     GO_LSP_COMMAND_ENV,
+};
+pub use python_indexer::{
+    index_python, python_lsp_available, PythonIndexOptions, PythonIndexResult,
+    PYTHON_AST_INDEXER_NAME, PYTHON_INDEXER_NAME, PYTHON_LSP_COMMAND_ENV,
 };
 pub use swift_indexer::{
     build_swift_batch, index_swift, swift_lsp_available, SwiftIndexOptions, SwiftIndexResult,

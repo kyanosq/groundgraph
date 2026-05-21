@@ -891,7 +891,11 @@ fn column_for(kind: NodeKind) -> GraphColumn {
         | NodeKind::GoStruct
         | NodeKind::GoInterface
         | NodeKind::GoMethod
-        | NodeKind::GoFunction => GraphColumn::Code,
+        | NodeKind::GoFunction
+        | NodeKind::PythonModule
+        | NodeKind::PythonClass
+        | NodeKind::PythonFunction
+        | NodeKind::PythonMethod => GraphColumn::Code,
         NodeKind::TestCase | NodeKind::TestGroup => GraphColumn::Tests,
     }
 }
@@ -1309,9 +1313,9 @@ fn kind_rank(kind: &str) -> u8 {
         // graph reader keeps "container first, members later" order
         // regardless of language.
         "dart_class" | "swift_class" | "swift_struct" | "swift_enum" | "swift_protocol"
-        | "go_struct" | "go_interface" => 4,
-        "dart_function" | "swift_function" | "go_function" => 5,
-        "dart_method" | "swift_method" | "go_method" => 6,
+        | "go_struct" | "go_interface" | "python_class" | "python_module" => 4,
+        "dart_function" | "swift_function" | "go_function" | "python_function" => 5,
+        "dart_method" | "swift_method" | "go_method" | "python_method" => 6,
         "dart_constructor" | "swift_initializer" => 7,
         "test_group" => 8,
         "test_case" => 9,

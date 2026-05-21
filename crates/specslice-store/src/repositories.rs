@@ -339,6 +339,10 @@ fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         "go_interface" => NodeKind::GoInterface,
         "go_method" => NodeKind::GoMethod,
         "go_function" => NodeKind::GoFunction,
+        "python_module" => NodeKind::PythonModule,
+        "python_class" => NodeKind::PythonClass,
+        "python_function" => NodeKind::PythonFunction,
+        "python_method" => NodeKind::PythonMethod,
         other => return Err(decode_error(1, format!("unknown node kind {other}"))),
     };
     Ok(Node {
@@ -422,6 +426,10 @@ fn symbol_range_from_row(row: &Row<'_>) -> Result<SymbolRange, rusqlite::Error> 
         "go_interface" => NodeKind::GoInterface,
         "go_method" => NodeKind::GoMethod,
         "go_function" => NodeKind::GoFunction,
+        "python_module" => NodeKind::PythonModule,
+        "python_class" => NodeKind::PythonClass,
+        "python_function" => NodeKind::PythonFunction,
+        "python_method" => NodeKind::PythonMethod,
         "test_case" => NodeKind::TestCase,
         "test_group" => NodeKind::TestGroup,
         "doc_section" => NodeKind::DocSection,

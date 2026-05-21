@@ -65,6 +65,24 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             writeln!(out, "  LSP skipped: {}", go.sidecar_skip_reason).ok();
         }
     }
+    // P16 — Python adapter status. The resolver field disambiguates
+    // between `python_lsp` (pyright/basedpyright/pylsp ran) and
+    // `python_ast` (AST-only fallback). The `LSP skipped` line surfaces
+    // exactly *why* the LSP layer was bypassed so operators see whether
+    // their venv was discovered or not.
+    if let Some(python) = &result.python {
+        writeln!(out, "Python index:").ok();
+        writeln!(out, "  Python files: {}", python.files).ok();
+        writeln!(out, "  Symbols: {}", python.symbols).ok();
+        writeln!(out, "  TestCases: {}", python.tests).ok();
+        writeln!(out, "  Imports: {}", python.imports).ok();
+        if !python.resolver_used.is_empty() {
+            writeln!(out, "  Resolver: {}", python.resolver_used).ok();
+        }
+        if !python.sidecar_skip_reason.is_empty() {
+            writeln!(out, "  LSP skipped: {}", python.sidecar_skip_reason).ok();
+        }
+    }
     if let Some(links) = &result.links {
         writeln!(out, "Links index:").ok();
         writeln!(out, "  Requirements: {}", links.requirements).ok();
@@ -79,7 +97,7 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::format_result;
-    use specslice_engine::{GoIndexResult, IndexResult, SwiftIndexResult};
+    use specslice_engine::{GoIndexResult, IndexResult, PythonIndexResult, SwiftIndexResult};
 
     #[test]
     fn render_omits_swift_section_when_adapter_is_disabled() {
@@ -148,6 +166,60 @@ mod tests {
         assert!(out.contains("4"), "missing Go file count: {out}");
         assert!(out.contains("18"), "missing Go symbol count: {out}");
         assert!(out.contains("go_lsp"), "missing Go resolver: {out}");
+    }
+
+    #[test]
+    fn render_includes_python_section_with_lsp_resolver_when_indexed() {
+        let result = IndexResult {
+            python: Some(PythonIndexResult {
+                files: 5,
+                symbols: 20,
+                tests: 3,
+                imports: 7,
+                resolver_used: "python_lsp".into(),
+                sidecar_skip_reason: String::new(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            out.contains("Python index"),
+            "missing Python section: {out}"
+        );
+        assert!(
+            out.contains("python_lsp"),
+            "missing Python resolver label: {out}"
+        );
+        assert!(out.contains("TestCases: 3"));
+        assert!(out.contains("Imports: 7"));
+    }
+
+    #[test]
+    fn render_includes_python_section_with_ast_fallback_reason_when_lsp_missing() {
+        let result = IndexResult {
+            python: Some(PythonIndexResult {
+                files: 2,
+                symbols: 4,
+                tests: 0,
+                imports: 1,
+                resolver_used: "python_ast".into(),
+                sidecar_skip_reason: "未在 PATH / .venv 中找到 pyright/basedpyright/pylsp".into(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            out.contains("Python index"),
+            "missing Python section: {out}"
+        );
+        assert!(
+            out.contains("python_ast"),
+            "missing AST fallback resolver: {out}"
+        );
+        assert!(
+            out.contains("LSP skipped"),
+            "missing skip reason in Python section: {out}"
+        );
     }
 
     #[test]

@@ -45,6 +45,13 @@ pub struct EngineConfig {
     /// semantics as `swift`.
     #[serde(default)]
     pub go: LanguageAdapterConfig,
+    /// P16 — opt-in Python language adapter. Drives `pyright-langserver`
+    /// / `basedpyright-langserver` / `pylsp` (with venv auto-discovery)
+    /// for structural symbols + Calls/References, and unconditionally
+    /// runs the AST scanner for imports + pytest cases. When LSP is
+    /// unavailable the AST scanner takes over the structural pass.
+    #[serde(default)]
+    pub python: LanguageAdapterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

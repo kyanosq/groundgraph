@@ -314,6 +314,10 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         NodeKind::GoInterface,
         NodeKind::GoMethod,
         NodeKind::GoFunction,
+        NodeKind::PythonModule,
+        NodeKind::PythonClass,
+        NodeKind::PythonFunction,
+        NodeKind::PythonMethod,
     ]
 }
 
@@ -798,6 +802,10 @@ fn badge_for(m: &SearchMatch, candidate: Option<&SearchCandidateDetails>) -> Str
         "go_interface" => "Go 接口".into(),
         "go_method" => "Go 方法".into(),
         "go_function" => "Go 函数".into(),
+        "python_module" => "Python 模块".into(),
+        "python_class" => "Python 类".into(),
+        "python_function" => "Python 函数".into(),
+        "python_method" => "Python 方法".into(),
         other => other.to_string(),
     }
 }

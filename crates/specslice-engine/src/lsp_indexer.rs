@@ -418,6 +418,8 @@ fn is_probable_callsite_kind(kind: NodeKind) -> bool {
             | NodeKind::SwiftInitializer
             | NodeKind::GoMethod
             | NodeKind::GoFunction
+            | NodeKind::PythonMethod
+            | NodeKind::PythonFunction
             | NodeKind::TestCase
     )
 }
@@ -862,7 +864,7 @@ fn visit_symbols(
 /// `*` vs `**` distinction is explicit. Backtracking is fine for the
 /// patterns operators put in `.specslice.yaml` (a handful of segments
 /// at most).
-fn simple_glob_match(pattern: &str, path: &str) -> bool {
+pub(crate) fn simple_glob_match(pattern: &str, path: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = path.chars().collect();
     glob_match_rec(&pat, 0, &txt, 0)

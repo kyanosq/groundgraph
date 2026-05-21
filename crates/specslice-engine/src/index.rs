@@ -12,6 +12,10 @@ use crate::go_indexer::{
     index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
 };
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
+use crate::python_indexer::{
+    index_python, PythonIndexOptions, PythonIndexResult, PYTHON_AST_INDEXER_NAME,
+    PYTHON_INDEXER_NAME, PYTHON_LSP_COMMAND_ENV,
+};
 use crate::swift_indexer::{
     index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
 };
@@ -57,6 +61,10 @@ pub struct IndexResult {
     /// P11 — Go adapter counterpart. Same semantics as `swift`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go: Option<GoIndexResult>,
+    /// P16 — Python adapter (LSP-first, AST 补强). `None` when the
+    /// adapter is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<PythonIndexResult>,
 }
 
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
@@ -139,6 +147,31 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             };
             let go = index_go(&mut store, &go_options).context("indexing Go sources")?;
             result.go = Some(go);
+        }
+
+        // P16 — Python adapter (LSP first, AST always). Both
+        // contributors share a `clear_indexer_outputs` reset so we do
+        // not leave stale rows from a previous resolver.
+        if config.python.enabled {
+            store
+                .clear_indexer_outputs(PYTHON_INDEXER_NAME)
+                .context("clearing previous Python LSP outputs")?;
+            store
+                .clear_indexer_outputs(PYTHON_AST_INDEXER_NAME)
+                .context("clearing previous Python AST outputs")?;
+            let python_paths = config.python.paths_or(&["."]);
+            let python_options = PythonIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: python_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.python.exclude.clone(),
+                lsp_command: std::env::var(PYTHON_LSP_COMMAND_ENV)
+                    .ok()
+                    .or_else(|| config.python.lsp_command.clone()),
+                disable_venv_discovery: false,
+            };
+            let python =
+                index_python(&mut store, &python_options).context("indexing Python sources")?;
+            result.python = Some(python);
         }
     }
 

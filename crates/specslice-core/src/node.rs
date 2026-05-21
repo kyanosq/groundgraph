@@ -61,6 +61,15 @@ pub enum NodeKind {
     GoInterface,
     GoMethod,
     GoFunction,
+    // ---- P16 Python (LSP first, AST 补强) ----------------------------------
+    // Python is reached via `pyright-langserver`/`basedpyright-langserver`/
+    // `pylsp` when one is available; otherwise a minimal AST scanner
+    // produces the same structural kinds. Modules are surfaced as their
+    // own node so module-level imports / pytest hooks have an anchor.
+    PythonModule,
+    PythonClass,
+    PythonFunction,
+    PythonMethod,
 }
 
 impl NodeKind {
@@ -92,6 +101,10 @@ impl NodeKind {
             NodeKind::GoInterface => "go_interface",
             NodeKind::GoMethod => "go_method",
             NodeKind::GoFunction => "go_function",
+            NodeKind::PythonModule => "python_module",
+            NodeKind::PythonClass => "python_class",
+            NodeKind::PythonFunction => "python_function",
+            NodeKind::PythonMethod => "python_method",
         }
     }
 }
@@ -167,8 +180,29 @@ mod tests {
             NodeKind::GoInterface,
             NodeKind::GoMethod,
             NodeKind::GoFunction,
+            NodeKind::PythonModule,
+            NodeKind::PythonClass,
+            NodeKind::PythonFunction,
+            NodeKind::PythonMethod,
         ] {
             assert!(!kind.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn python_kinds_serialise_with_language_prefix() {
+        let cases = [
+            (NodeKind::PythonModule, "python_module"),
+            (NodeKind::PythonClass, "python_class"),
+            (NodeKind::PythonFunction, "python_function"),
+            (NodeKind::PythonMethod, "python_method"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            let json = serde_json::to_string(&kind).expect("serialise");
+            assert_eq!(json, format!("\"{}\"", expected));
+            let back: NodeKind = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(back, kind);
         }
     }
 

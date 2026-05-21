@@ -260,6 +260,10 @@ fn collect_orphan_symbols(store: &Store) -> Result<Vec<EvidenceSymbol>> {
         NodeKind::GoInterface,
         NodeKind::GoMethod,
         NodeKind::GoFunction,
+        NodeKind::PythonModule,
+        NodeKind::PythonClass,
+        NodeKind::PythonFunction,
+        NodeKind::PythonMethod,
     ] {
         for node in store.list_nodes_by_kind(kind)? {
             let edges_out = store.list_edges_from(&node.id)?;

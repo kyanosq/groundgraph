@@ -297,6 +297,11 @@ fn match_kind(name: &str) -> Result<NodeKind> {
         "go_interface" | "gointerface" => NodeKind::GoInterface,
         "go_method" => NodeKind::GoMethod,
         "go_function" | "gofunc" => NodeKind::GoFunction,
+        // P16 — Python kinds (full names + short aliases).
+        "python_module" | "py_module" => NodeKind::PythonModule,
+        "python_class" | "py_class" => NodeKind::PythonClass,
+        "python_function" | "py_function" | "pyfunc" => NodeKind::PythonFunction,
+        "python_method" | "py_method" => NodeKind::PythonMethod,
         other => {
             bail!(
                 "unknown --kind `{other}`. valid: {}",

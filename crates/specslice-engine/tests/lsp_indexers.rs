@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use specslice_core::edge::EdgeKind;
 use specslice_engine::{
     go_indexer::{go_lsp_available, index_go, GoIndexOptions, GO_LSP_COMMAND_ENV},
+    python_indexer::{index_python, PythonIndexOptions, PYTHON_LSP_COMMAND_ENV},
     swift_indexer::{index_swift, swift_lsp_available, SwiftIndexOptions, SWIFT_LSP_COMMAND_ENV},
 };
 use specslice_store::Store;
@@ -277,6 +278,142 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[test]
+fn python_indexer_ast_pass_runs_against_python_hello_fixture_without_lsp() {
+    // The AST fallback must work without any toolchain installed. We
+    // point `lsp_command` at a bogus binary and disable venv discovery
+    // so this test is fully deterministic in sandboxed CI.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = workspace_root().join("tests/fixtures/python_hello");
+    copy_dir(&fixture, tmp.path());
+    let (mut store, _db) = open_temp_store(tmp.path());
+    let opts = PythonIndexOptions {
+        repo_root: tmp.path().to_path_buf(),
+        code_roots: vec![PathBuf::from("app"), PathBuf::from("tests")],
+        exclude_globs: Vec::new(),
+        lsp_command: Some("specslice_nonexistent_python_lsp_xyz".into()),
+        disable_venv_discovery: true,
+    };
+    let result = index_python(&mut store, &opts).expect("python indexer ran");
+    assert_eq!(result.resolver_used, "python_ast");
+    assert!(
+        result.files >= 4,
+        "expected >=4 python files in fixture, got {}",
+        result.files
+    );
+    assert!(
+        result.symbols >= 4,
+        "expected >=4 structural symbols, got {}",
+        result.symbols
+    );
+    assert!(
+        result.tests >= 3,
+        "expected >=3 pytest tests/groups, got {}",
+        result.tests
+    );
+    assert!(
+        result.imports >= 2,
+        "expected >=2 resolvable imports, got {}",
+        result.imports
+    );
+    assert!(
+        result.sidecar_skip_reason.contains("AST fallback")
+            || result.sidecar_skip_reason.contains("未找到"),
+        "expected AST fallback reason, got `{}`",
+        result.sidecar_skip_reason
+    );
+
+    let nodes = store.list_all_nodes().unwrap();
+    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+    for required in [
+        "python_class",
+        "python_method",
+        "python_function",
+        "test_case",
+        "test_group",
+        "file",
+    ] {
+        assert!(
+            kinds.contains(required),
+            "expected `{required}` in {:?}",
+            kinds
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pyright/basedpyright/pylsp installed in a venv; run with --include-ignored"]
+fn python_indexer_emits_class_function_method_nodes_when_lsp_present() {
+    let lsp_override = std::env::var(PYTHON_LSP_COMMAND_ENV).ok();
+    let probe = PythonIndexOptions {
+        repo_root: workspace_root(),
+        code_roots: Vec::new(),
+        exclude_globs: Vec::new(),
+        lsp_command: lsp_override.clone(),
+        disable_venv_discovery: false,
+    };
+    if !specslice_engine::python_indexer::python_lsp_available(&probe) {
+        eprintln!(
+            "skipping {} — no Python LSP discovered on PATH / .venv and {PYTHON_LSP_COMMAND_ENV} not set",
+            module_path!()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = workspace_root().join("tests/fixtures/python_hello");
+    copy_dir(&fixture, tmp.path());
+    let (mut store, _db) = open_temp_store(tmp.path());
+
+    let opts = PythonIndexOptions {
+        repo_root: tmp.path().to_path_buf(),
+        code_roots: vec![PathBuf::from("app"), PathBuf::from("tests")],
+        exclude_globs: Vec::new(),
+        lsp_command: lsp_override,
+        disable_venv_discovery: false,
+    };
+    let result = index_python(&mut store, &opts).expect("python indexer ran");
+    assert_eq!(result.resolver_used, "python_lsp");
+    assert!(result.files >= 4);
+    assert!(result.symbols >= 4);
+
+    let nodes = store.list_all_nodes().unwrap();
+    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+    for required in ["python_class", "python_method", "python_function"] {
+        assert!(
+            kinds.contains(required),
+            "expected `{required}` in {:?}",
+            kinds
+        );
+    }
+    let _greeter = nodes
+        .iter()
+        .find(|n| n.kind.as_str() == "python_class" && n.name.as_deref() == Some("Greeter"))
+        .unwrap_or_else(|| panic!("Greeter class missing; saw {:?}", debug_kinds(&nodes)));
+
+    // Pyright / basedpyright / pylsp all support callHierarchy, but
+    // warmup time varies wildly. Treat empty calls as a soft warning
+    // like the Swift / Go opt-in tests.
+    let calls = store
+        .list_edges_by_kind(EdgeKind::Calls)
+        .expect("calls edges queryable");
+    if calls.is_empty() {
+        eprintln!(
+            "python_indexer_emits_*: LSP returned no Calls — likely cross-file resolve \
+             pending or stdlib not surveyed in budget"
+        );
+    } else {
+        for edge in &calls {
+            let to_node = nodes.iter().find(|n| n.id.as_str() == edge.to_id.as_str());
+            assert!(
+                to_node.is_some(),
+                "Calls edge target `{}` not present in indexed graph",
+                edge.to_id.as_str()
+            );
+        }
     }
 }
 
