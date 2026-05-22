@@ -110,7 +110,14 @@ impl EdgeQualitySummary {
 ///
 /// Skips deprecated edges entirely so stale evidence doesn't inflate
 /// the low tier.
-pub fn summarize_edges(edges: &[EdgeAssertion], scope: EdgeQualityScope) -> EdgeQualitySummary {
+///
+/// Generic over the iterator so call sites can pass `&[EdgeAssertion]`
+/// (via `.iter()`) or `Vec<&EdgeAssertion>` (via `.iter().copied()`)
+/// without cloning.
+pub fn summarize_edges<'a, I>(edges: I, scope: EdgeQualityScope) -> EdgeQualitySummary
+where
+    I: IntoIterator<Item = &'a EdgeAssertion>,
+{
     let mut s = EdgeQualitySummary::default();
     for edge in edges {
         if matches!(edge.status, EdgeStatus::Deprecated) {
@@ -137,7 +144,7 @@ pub fn inbound_edge_quality(
     let edges = store
         .list_edges_to(&aid)
         .with_context(|| format!("listing inbound edges for `{node_id}`"))?;
-    Ok(summarize_edges(&edges, scope))
+    Ok(summarize_edges(edges.iter(), scope))
 }
 
 pub fn outbound_edge_quality(
@@ -149,7 +156,7 @@ pub fn outbound_edge_quality(
     let edges = store
         .list_edges_from(&aid)
         .with_context(|| format!("listing outbound edges for `{node_id}`"))?;
-    Ok(summarize_edges(&edges, scope))
+    Ok(summarize_edges(edges.iter(), scope))
 }
 
 /// Lightweight neighbour info — id + name + kind of the *other endpoint*

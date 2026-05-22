@@ -91,6 +91,15 @@ pub struct DeadCodeReport {
     pub min_confidence: String,
     pub stats: DeadCodeStats,
     pub candidates: Vec<DeadCodeCandidate>,
+    /// Engine-side warnings collected while building the report
+    /// (e.g. failed edge-quality probes). Mirrors the pattern used by
+    /// [`impact::ImpactReport`](crate::impact::ImpactReport) and
+    /// [`logic_confidence::LogicConfidenceReport`](crate::logic_confidence::LogicConfidenceReport):
+    /// engine never writes to stderr; consumers render warnings
+    /// explicitly. Skipped in JSON when empty to keep old consumers
+    /// fully backward compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -391,6 +400,7 @@ pub fn analyze_dead_code_with_store(
             ignored_by_pattern: ignored_count,
         },
         candidates,
+        warnings: Vec::new(),
     })
 }
 
@@ -642,6 +652,25 @@ fn classify(
         // Inbound from live nodes but still unreached — only happens
         // when forward edges are missing (e.g., reflective access).
         reasons.push("入边存在但未被入口点覆盖".into());
+    }
+
+    // v0.3.0-A: if every surviving inbound usage edge sits in the
+    // low-tier bucket (per `edge_confidence::confidence_for_edge`),
+    // tell the operator the evidence is weak — typical when the
+    // candidate is reached only via `*_ast` AST fallback or via
+    // git-diff provisional edges. Reach-set decisions stay unchanged;
+    // this is reason-string-only.
+    if !inbound_usage.is_empty() {
+        let summary = crate::confidence_view::summarize_edges(
+            inbound_usage.iter().map(|e| **e),
+            crate::confidence_view::EdgeQualityScope::Usage,
+        );
+        if summary.is_only_low() {
+            reasons.push(format!(
+                "仅有 {} 条 low-tier 入边（来自低置信 indexer / AST fallback / lightweight resolver），证据较弱",
+                summary.low,
+            ));
+        }
     }
 
     for m in &mitigating_factors {
@@ -1418,5 +1447,171 @@ mod tests {
             ids.contains(&helper.as_str()),
             "metadata-less helper must remain dead, got {ids:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0-A — `evidence_quality` plumbing into dead-code reason strings
+    // -----------------------------------------------------------------------
+
+    /// Helper: insert a `calls` edge with an explicit indexer name so we
+    /// can control whether `confidence_for_edge` returns High/Medium/Low.
+    fn insert_calls_with_indexer(store: &mut Store, from: &str, to: &str, indexer: &str) {
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("calls::{from}->{to}::{indexer}")),
+                from_id: ArtifactId::new(from.to_string()),
+                to_id: ArtifactId::new(to.to_string()),
+                kind: EdgeKind::Calls,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some(indexer.into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+    }
+
+    /// v0.3.0-A: a dead-island whose only inbound usage edges are
+    /// produced by an `*_ast` adapter (medium tier) should not trigger
+    /// the new "low-tier evidence" reason — the threshold is *only* the
+    /// low bucket. Locks in the rule that "weak but not stale" stays
+    /// silent so the new reason is precise.
+    ///
+    /// The existing `low_confidence_dead_island_when_inbound_is_also_dead`
+    /// test uses `dart_analyzer` (high tier) and remains untouched.
+    #[test]
+    fn low_confidence_dead_island_with_medium_tier_inbound_does_not_get_extra_reason() {
+        let (mut store, _dir) = empty_store();
+        let _main = insert_function(&mut store, "lib/main.dart", "main");
+        let a = insert_method(&mut store, "lib/util.dart", "_orphan_a");
+        let b = insert_method(&mut store, "lib/util.dart", "_orphan_b");
+        // `python_ast`-style indexer → Medium tier per edge_confidence.
+        insert_calls_with_indexer(&mut store, &a, &b, "python_ast");
+        insert_calls_with_indexer(&mut store, &b, &a, "python_ast");
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let a_card = report
+            .candidates
+            .iter()
+            .find(|c| c.id == a)
+            .expect("dead island member A");
+        assert!(
+            !a_card.reasons.iter().any(|r| r.contains("low-tier 入边")),
+            "medium-tier inbound must NOT trigger the low-tier reason, got: {:?}",
+            a_card.reasons,
+        );
+    }
+
+    /// v0.3.0-A: a dead-island whose only inbound usage edges are
+    /// `GitDiff`-sourced (low tier — provisional) gains an extra reason
+    /// line explaining the weak evidence. The bucket itself stays at
+    /// `Low` (BFS unchanged).
+    #[test]
+    fn low_confidence_dead_island_with_only_low_tier_inbound_gets_extra_reason() {
+        let (mut store, _dir) = empty_store();
+        let _main = insert_function(&mut store, "lib/main.dart", "main");
+        let a = insert_method(&mut store, "lib/util.dart", "_orphan_a");
+        let b = insert_method(&mut store, "lib/util.dart", "_orphan_b");
+        // GitDiff source → Low tier per edge_confidence rule.
+        let mut e_ab = EdgeAssertion {
+            id: ArtifactId::new(format!("calls::{a}->{b}::gitdiff")),
+            from_id: ArtifactId::new(a.clone()),
+            to_id: ArtifactId::new(b.clone()),
+            kind: EdgeKind::Calls,
+            source: EdgeSource::GitDiff,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: Some("git_diff".into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_edge(&e_ab).unwrap();
+        e_ab.id = ArtifactId::new(format!("calls::{b}->{a}::gitdiff"));
+        std::mem::swap(&mut e_ab.from_id, &mut e_ab.to_id);
+        store.upsert_edge(&e_ab).unwrap();
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let a_card = report
+            .candidates
+            .iter()
+            .find(|c| c.id == a)
+            .expect("dead island member A");
+        assert_eq!(a_card.confidence, DeadCodeConfidence::Low);
+        // Old reason still present (regression guard).
+        assert!(
+            a_card.reasons.iter().any(|r| r.contains("dead island")),
+            "old `dead island` reason must remain, got: {:?}",
+            a_card.reasons,
+        );
+        // New reason kicks in.
+        assert!(
+            a_card.reasons.iter().any(|r| r.contains("low-tier 入边")),
+            "low-tier inbound must add the new evidence-strength reason, got: {:?}",
+            a_card.reasons,
+        );
+        assert!(
+            a_card.reasons.iter().any(|r| r.contains("证据较弱")),
+            "low-tier reason must explain that evidence is weak, got: {:?}",
+            a_card.reasons,
+        );
+    }
+
+    /// `DeadCodeReport.warnings` is a new field. When empty it must be
+    /// skipped from the serialized JSON so old consumers see the exact
+    /// schema they did before v0.3.0-A.
+    #[test]
+    fn dead_code_report_warnings_field_skipped_when_empty() {
+        let (store, _dir) = empty_store();
+        let report =
+            analyze_dead_code_with_store(&store, DeadCodeOptions::default(), &config_with(vec![]))
+                .unwrap();
+        assert!(report.warnings.is_empty());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("\"warnings\""),
+            "empty warnings field must be omitted from JSON for back-compat, got: {json}",
+        );
+    }
+
+    /// `DeadCodeReport.warnings` round-trips through JSON when present.
+    /// Mirror the same skip-if-empty pattern used by `ImpactReport`.
+    #[test]
+    fn dead_code_report_warnings_field_round_trips_when_present() {
+        let (store, _dir) = empty_store();
+        let mut report =
+            analyze_dead_code_with_store(&store, DeadCodeOptions::default(), &config_with(vec![]))
+                .unwrap();
+        report.warnings.push("warn: synthetic".into());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"warnings\""));
+        let back: DeadCodeReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warnings, vec!["warn: synthetic".to_string()]);
     }
 }
