@@ -56,6 +56,50 @@ enum Commands {
     /// 相似代码候选 — 结构层指纹比对 (P18 tier 1)。
     /// 报告结构完全相同的函数 / 方法簇，不会自动合并或删除。
     Similar(SimilarArgs),
+    /// 测试选择 — 给定 diff 输出应当运行的测试列表 (P19)。
+    /// 不会自动执行任何测试，仅给出带原因 / 置信度的清单。
+    #[command(name = "select-tests")]
+    SelectTests(SelectTestsArgs),
+    /// 功能区聚类 — 启发式归纳代码图里的功能簇 (P19)。
+    /// 仅作为浏览入口；不是权威功能划分。
+    Features(FeaturesArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FeaturesArgs {
+    /// 输出的最大簇数（默认 20）。
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    max_clusters: usize,
+    /// 标签传播的最大 BFS 深度（默认 3）。
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    max_depth: usize,
+    /// 簇内最小节点数，低于此值不报告（默认 3）。
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    min_cluster_size: usize,
+    /// 输出格式：`text`、`json`。
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct SelectTestsArgs {
+    /// 基准分支 / commit (默认 main)。
+    #[arg(long, default_value = "main")]
+    base: String,
+    /// 目标分支 / commit (默认 HEAD)。
+    #[arg(long, default_value = "HEAD")]
+    head: String,
+    /// 让算法沿反向 `Calls` / `References` 边再走几步，
+    /// 把间接依赖的测试也纳入候选。默认关闭，因为
+    /// 信号完整度依赖代码图本身的质量。
+    #[arg(long)]
+    include_deps: bool,
+    /// `--include-deps` 模式下反向 BFS 的最大深度（默认 2）。
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    max_depth: usize,
+    /// 输出格式：`text`、`json`。
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -668,6 +712,23 @@ fn run() -> Result<()> {
             min_similarity: args.min_score,
             shingle_k: args.shingle_k,
             max_pairwise: args.max_pairwise,
+            format: args.format,
+        }),
+        Commands::SelectTests(args) => {
+            commands::select_tests::run(commands::select_tests::SelectTestsRunArgs {
+                repo_root: cli.repo_root.clone(),
+                base_ref: args.base,
+                head_ref: args.head,
+                include_dependent: args.include_deps,
+                max_propagation_depth: args.max_depth,
+                format: args.format,
+            })
+        }
+        Commands::Features(args) => commands::features::run(commands::features::FeaturesRunArgs {
+            repo_root: cli.repo_root.clone(),
+            max_clusters: args.max_clusters,
+            max_propagation_depth: args.max_depth,
+            min_cluster_size: args.min_cluster_size,
             format: args.format,
         }),
     }

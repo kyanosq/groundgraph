@@ -15,6 +15,7 @@ pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
 pub mod export;
+pub mod feature_map;
 pub mod git_diff;
 pub mod go_indexer;
 pub mod graph;
@@ -32,6 +33,7 @@ pub mod search;
 pub mod similarity;
 pub mod slice;
 pub mod swift_indexer;
+pub mod test_selection;
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,
@@ -59,6 +61,10 @@ pub use dead_code::{
 pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
 pub use edge_confidence::{confidence_for_edge, derive_confidence, EdgeConfidence};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
+pub use feature_map::{
+    analyze_feature_map, analyze_feature_map_with_store, FeatureCluster, FeatureClusterMember,
+    FeatureMap, FeatureMapOptions, FeatureMapStats, FEATURE_MAP_SCHEMA_VERSION,
+};
 pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
     GraphStats, GraphStatus, GraphView, GraphViewModel, GRAPH_SCHEMA_VERSION,
@@ -88,6 +94,10 @@ pub use similarity::{
     DEFAULT_SHINGLE_K as SIMILARITY_DEFAULT_SHINGLE_K, SIMILARITY_SCHEMA_VERSION,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
+pub use test_selection::{
+    select_tests, select_tests_with_store, SelectedTest, TestSelection, TestSelectionOptions,
+    TestSelectionStats, TEST_SELECTION_SCHEMA_VERSION,
+};
 
 pub use go_indexer::{
     build_go_batch, go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME,
