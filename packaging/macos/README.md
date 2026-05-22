@@ -46,6 +46,33 @@ and add its `bin` directory to PATH.
 For TS / Java the AST pass always runs even when the LSP is unavailable, so
 imports and tests still land in the graph as a usable baseline.
 
+### Enable an opt-in adapter
+
+`specslice init` writes every non-Dart adapter to `.specslice.yaml` with
+`enabled: false` so a fresh workspace never pulls in unrelated languages.
+To turn one on, edit the matching block and re-index. Example for a
+TypeScript project:
+
+```yaml
+typescript:
+  enabled: true
+  paths: [src, tests]   # roots where SpecSlice should look
+  exclude: []
+  lsp_command: null     # null = auto-discover (node_modules/.bin → PATH)
+```
+
+```bash
+specslice --repo-root /path/to/repo index
+# look for the `TypeScript index:` block in the output
+```
+
+Same shape for `swift`, `go`, `python`, `java`. When the LSP is on PATH
+**and** survives a smoke launch (the unified `lsp_probe` runs every
+`*_lsp_command` through `--help` with a 1.5 s timeout), the resolver
+column in `index` output reads `<lang>_lsp`; otherwise it reads
+`<lang>_ast` and `LSP skipped:` explains why (binary missing, broken
+shebang, `SOURCEKITD FATAL ERROR`, missing JRE, etc).
+
 ## Dart analyzer sidecar
 
 For Flutter/Dart repositories, install a Dart or Flutter SDK on the machine:
