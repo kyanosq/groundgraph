@@ -239,7 +239,7 @@ fn edges_can_round_trip_every_kind_and_source_and_status() {
 fn list_all_nodes_returns_every_inserted_kind() {
     let (_tmp, mut store) = fresh_store();
     use specslice_core::NodeKind;
-    for (idx, kind) in [
+    let kinds = [
         NodeKind::File,
         NodeKind::Requirement,
         NodeKind::AcceptanceCriterion,
@@ -251,16 +251,45 @@ fn list_all_nodes_returns_every_inserted_kind() {
         NodeKind::DartConstructor,
         NodeKind::TestCase,
         NodeKind::TestGroup,
-    ]
-    .iter()
-    .enumerate()
-    {
+        NodeKind::DartProvider,
+        NodeKind::Route,
+        NodeKind::Storage,
+        NodeKind::BusinessCandidate,
+        NodeKind::SwiftClass,
+        NodeKind::SwiftStruct,
+        NodeKind::SwiftEnum,
+        NodeKind::SwiftProtocol,
+        NodeKind::SwiftMethod,
+        NodeKind::SwiftFunction,
+        NodeKind::SwiftInitializer,
+        NodeKind::GoStruct,
+        NodeKind::GoInterface,
+        NodeKind::GoMethod,
+        NodeKind::GoFunction,
+        NodeKind::PythonModule,
+        NodeKind::PythonClass,
+        NodeKind::PythonFunction,
+        NodeKind::PythonMethod,
+        NodeKind::TypescriptModule,
+        NodeKind::TypescriptClass,
+        NodeKind::TypescriptInterface,
+        NodeKind::TypescriptEnum,
+        NodeKind::TypescriptFunction,
+        NodeKind::TypescriptMethod,
+        NodeKind::JavaPackage,
+        NodeKind::JavaClass,
+        NodeKind::JavaInterface,
+        NodeKind::JavaEnum,
+        NodeKind::JavaMethod,
+        NodeKind::JavaConstructor,
+    ];
+    for (idx, kind) in kinds.iter().enumerate() {
         let mut node = Node::new(ArtifactId::new(format!("n::{idx}")), *kind);
         node.name = Some(format!("{kind:?}"));
         store.upsert_node(&node).unwrap();
     }
     let all = store.list_all_nodes().unwrap();
-    assert_eq!(all.len(), 11);
+    assert_eq!(all.len(), kinds.len());
 }
 
 #[test]

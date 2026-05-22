@@ -285,23 +285,16 @@ pub fn analyze_feature_map_with_store(
             .then(a.name.cmp(&b.name))
     });
 
-    // Unassigned counter
+    // Unassigned counter — route through the cross-language trait
+    // layer so new languages (TypeScript / Java / ...) automatically
+    // contribute to the "nodes_unassigned" stat without a hand-edit
+    // here. Module-level nodes are deliberately excluded — they sit
+    // closer to the seed and would inflate the metric.
     let assigned_ids: BTreeSet<&ArtifactId> = assignments.keys().collect();
     for n in &nodes {
         if !assigned_ids.contains(&n.id)
-            && matches!(
-                n.kind,
-                NodeKind::PythonFunction
-                    | NodeKind::PythonMethod
-                    | NodeKind::PythonClass
-                    | NodeKind::DartFunction
-                    | NodeKind::DartMethod
-                    | NodeKind::DartClass
-                    | NodeKind::SwiftFunction
-                    | NodeKind::SwiftMethod
-                    | NodeKind::GoFunction
-                    | NodeKind::GoMethod
-            )
+            && (specslice_core::language_traits::is_callable(n.kind)
+                || specslice_core::language_traits::is_type(n.kind))
         {
             total_unassigned += 1;
         }

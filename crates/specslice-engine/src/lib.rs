@@ -19,9 +19,12 @@ pub mod feature_map;
 pub mod git_diff;
 pub mod go_indexer;
 pub mod graph;
+pub mod graph_diff;
 pub mod impact;
 pub mod index;
 pub mod init;
+pub mod java_ast;
+pub mod java_indexer;
 pub mod links_indexer;
 pub mod logic_confidence;
 pub mod lsp_client;
@@ -29,11 +32,14 @@ pub mod lsp_indexer;
 pub mod python_ast;
 pub mod python_frameworks;
 pub mod python_indexer;
+pub mod questions;
 pub mod search;
 pub mod similarity;
 pub mod slice;
 pub mod swift_indexer;
 pub mod test_selection;
+pub mod typescript_ast;
+pub mod typescript_indexer;
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,
@@ -69,6 +75,10 @@ pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
     GraphStats, GraphStatus, GraphView, GraphViewModel, GRAPH_SCHEMA_VERSION,
 };
+pub use graph_diff::{
+    diff_graphs, diff_graphs_with_stores, DiffEdge, DiffEdgeStatusChange, DiffNode,
+    DiffNodeKindChange, GraphDiff, GraphDiffOptions, GraphDiffStats, GRAPH_DIFF_SCHEMA_VERSION,
+};
 pub use impact::{
     compute_impact, compute_impact_with_policy, merge_confirmed_candidates, run_impact,
     ImpactOptions, ImpactReport,
@@ -79,6 +89,10 @@ pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_
 pub use logic_confidence::{
     compute_logic_confidence, run_logic_confidence, LogicConfidenceItem, LogicConfidenceKind,
     LogicConfidenceOptions, LogicConfidenceReport, LogicConfidenceSource, LogicConfidenceSummary,
+};
+pub use questions::{
+    analyze_questions, analyze_questions_with_store, Question, QuestionsOptions, QuestionsReport,
+    QuestionsStats, QUESTIONS_SCHEMA_VERSION,
 };
 pub use search::{
     default_search_kinds, run_search, run_search_with_store, tokenise_code, tokenise_keywords,
@@ -103,6 +117,10 @@ pub use go_indexer::{
     build_go_batch, go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME,
     GO_LSP_COMMAND_ENV,
 };
+pub use java_indexer::{
+    index_java, java_lsp_available, JavaIndexOptions, JavaIndexResult, JAVA_AST_INDEXER_NAME,
+    JAVA_INDEXER_NAME, JAVA_LSP_COMMAND_ENV,
+};
 pub use python_indexer::{
     index_python, python_lsp_available, PythonIndexOptions, PythonIndexResult,
     PYTHON_AST_INDEXER_NAME, PYTHON_INDEXER_NAME, PYTHON_LSP_COMMAND_ENV,
@@ -110,4 +128,8 @@ pub use python_indexer::{
 pub use swift_indexer::{
     build_swift_batch, index_swift, swift_lsp_available, SwiftIndexOptions, SwiftIndexResult,
     SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+};
+pub use typescript_indexer::{
+    index_typescript, typescript_lsp_available, TypescriptIndexOptions, TypescriptIndexResult,
+    TYPESCRIPT_AST_INDEXER_NAME, TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
 };

@@ -225,6 +225,57 @@ If the server is missing, the indexer skips silently and
 reports the reason via `result.sidecar_skip_reason`. Always check
 that field before claiming Swift / Go data is present.
 
+## TypeScript / Java via LSP + AST 补强 (P20)
+
+`typescript.enabled: true` and `java.enabled: true` activate the
+TypeScript and Java adapters. Both follow the same shape as Python:
+
+- **LSP-first**: TypeScript drives `typescript-language-server --stdio`
+  (auto-detected at `node_modules/.bin/typescript-language-server`,
+  PATH, or `SPECSLICE_TYPESCRIPT_LSP_BIN`); Java drives `jdtls`
+  (PATH or `SPECSLICE_JAVA_LSP_BIN`). The LSP pass contributes
+  structural nodes + `Calls` / `References`.
+- **AST always**: a tolerant in-house scanner runs alongside, contributing
+  `Imports` and test cases unconditionally, plus structural symbols when
+  the LSP is unavailable. AST rows are tagged `indexer = typescript_ast`
+  / `indexer = java_ast`; LSP rows are `typescript_lsp` / `java_lsp`.
+
+Node kinds:
+
+- TypeScript: `typescript_module`, `typescript_class`,
+  `typescript_interface`, `typescript_enum`, `typescript_function`,
+  `typescript_method`.
+- Java: `java_package`, `java_class`, `java_interface`, `java_enum`,
+  `java_method`, `java_constructor`. `enum` declarations get their own
+  `java_enum` kind (so graph filters can distinguish enum cases from
+  plain classes); `record` declarations currently collapse to
+  `java_class`. Class qualification follows the file's `package`
+  declaration (`java::com.example.Greeter`).
+
+Test recovery:
+
+- TypeScript: vitest / jest `describe(...)` / `it(...)` / `test(...)`
+  calls become `TestGroup` / `TestCase`.
+- Java: methods annotated with `@Test`, `@ParameterizedTest`,
+  `@RepeatedTest`, `@TestFactory`, `@TestTemplate`, or `@Theory`
+  become `TestCase`.
+
+TypeScript / Java `Calls` should be treated the same way as Python
+`Calls`: a *line, not a fact*. The AST pass never synthesizes
+`Calls` edges. Always check `result.resolver_used` and
+`result.sidecar_skip_reason` before claiming LSP-quality data is
+present.
+
+## Cross-language consistency (P20)
+
+Every consumer (`questions`, `dead-code`, `slice`, `feature_map`,
+`search`, MCP `parse_node_kind`, store decoding) routes node-kind
+predicates through `specslice_core::language_traits`. New node
+kinds must update `language_of`, `family_of`,
+`default_dead_code_reason`, `search_aliases`, and the `ALL_KINDS`
+matrix in `language_traits::tests` — the compiler + matrix tests
+will refuse to ship a kind that any predicate forgot.
+
 ## Dead-Code Candidate Workflow
 
 Use `dead-code` only as a candidate report. It is not an automatic deletion
@@ -336,36 +387,57 @@ specslice --repo-root /path/to/repo graph --format json --view business --pretty
 specslice --repo-root /path/to/repo graph --format json --view business --include-candidates=false
 ```
 
-## Similar code report (P18, tier 1 — structural duplicates)
+## Similar code report (P18 — structural + near-duplicate)
 
-`specslice similar` flags Python / Dart function / method bodies whose
-normalized token streams (identifiers / literals / comments stripped)
-collide on the same 64-bit fingerprint. It is a **candidate** report —
-never auto-merges, never auto-deletes.
+`specslice similar` ships two tiers:
+
+- **tier 1 (`exact_ast`)** — Python / Dart function / method bodies
+  whose normalized token streams (identifiers / literals / comments
+  stripped) collide on the same 64-bit FNV-1a fingerprint.
+- **tier 2 (`near_token`, SimHash)** — pairs whose SimHash over
+  k-shingles has Hamming distance below the threshold derived from
+  `--min-score` (default 0.85). Catches "copy + rename a few fields,
+  add or remove a couple of statements".
+
+It is always a **candidate** report — never auto-merges, never
+auto-deletes.
 
 ```bash
 specslice --repo-root /path/to/repo similar
-specslice --repo-root /path/to/repo similar --format json
+specslice --repo-root /path/to/repo similar --mode exact
+specslice --repo-root /path/to/repo similar --mode near --min-score 0.8
 specslice --repo-root /path/to/repo similar --node python::backend/app/foo.py::Foo.bar
-specslice --repo-root /path/to/repo similar --min-tokens 24 --min-cluster-size 3
+specslice --repo-root /path/to/repo similar --format json
 ```
 
-Output schema (`schema_version: 1`):
+Output schema (`schema_version: 1`, backward compatible):
 
 ```json
 {
   "schema_version": 1,
-  "stats": { "symbols_scanned": 1043, "symbols_skipped": 63, "clusters_reported": 107 },
+  "stats": {
+    "symbols_scanned": 944,
+    "symbols_skipped": 50,
+    "clusters_reported": 151,
+    "exact_clusters": 96,
+    "near_clusters": 55,
+    "near_pairwise_skipped": false
+  },
   "clusters": [
     {
       "fingerprint": "60f13e8878a10ce3",
       "duplicate_type": "exact_ast",
       "recommendation": "review",
       "normalized_token_count": 187,
-      "members": [
-        { "id": "...", "kind": "python_method", "label": "...", "path": "...", "line_range": [229, 260] },
-        { "id": "...", "kind": "python_method", "label": "...", "path": "...", "line_range": [297, 329] }
-      ]
+      "members": [ { "id": "...", "kind": "python_method", "label": "...", "path": "...", "line_range": [229, 260] } ]
+    },
+    {
+      "fingerprint": "1ae3c00f2d4be0a1",
+      "duplicate_type": "near_token",
+      "recommendation": "review",
+      "normalized_token_count": 1240,
+      "similarity_score": 0.859,
+      "members": [ /* … */ ]
     }
   ]
 }
@@ -374,6 +446,9 @@ Output schema (`schema_version: 1`):
 Rules for agents consuming this report:
 
 - Treat every cluster as a *review candidate*, not a fact.
+- `exact_ast` clusters omit `similarity_score` (always 1.0 by
+  construction). `near_token` clusters carry the worst-case lower
+  bound across all pairwise comparisons inside the cluster.
 - Before recommending a merge, run `specslice graph --focus <id>` for
   each member to verify both call sites really invoke the same
   semantics — structural identity does NOT imply behavioral identity
@@ -382,6 +457,104 @@ Rules for agents consuming this report:
   `Repository.list_blocks`) often appear in clusters — that is
   expected; surface them as "intentional override" candidates rather
   than duplicates.
+- If `stats.near_pairwise_skipped: true`, the graph had more
+  uncovered symbols than `--max-pairwise` allows; near tier did
+  NOT run. Re-scope with `code_roots` or raise the limit.
+
+## Edge confidence (P19 base)
+
+Every edge in `specslice graph --format json` now carries an
+`evidence_quality: "high" | "medium" | "low"` field derived from
+`(kind, source, certainty, status, indexer)`:
+
+- **high** — `Contains`, `Imports`, `Documents` (Markdown),
+  `DeclaresImplementation` / `DeclaresVerification`, and any
+  `Calls` / `References` / `ReadsProvider` / `NavigatesTo` /
+  `PersistsTo` / `SubscribesStream` resolved by an LSP (`*_lsp`
+  indexer) or Dart analyzer.
+- **medium** — AST-only `Calls` / `References` (`*_ast` indexer);
+  unknown combinations.
+- **low** — AI-derived `DerivesFrom`, GitDiff edges, anything
+  with `EdgeStatus::Deprecated`.
+
+Agents should weight reasoning by this label. Never claim
+"verified" for `low` edges without a follow-up step (running a
+test, reading the source, asking the user).
+
+## Test selection (P19)
+
+`specslice select-tests --base main [--head HEAD] [--include-deps]`
+emits a confidence-tagged list of tests to run for a given diff:
+
+```bash
+specslice select-tests --base main
+specslice select-tests --base main --include-deps --max-depth 2
+specslice select-tests --base main --format json
+```
+
+Each `tests[]` entry carries:
+
+- `reasons`: ordered list, one of
+  `test_file_directly_changed` (high),
+  `references_changed_symbol` (high),
+  `imports_changed_module` (medium),
+  `transitive_caller_of_changed_symbol` (medium, only with `--include-deps`).
+- `confidence`: `high` / `medium` / `low` — the strongest tier among the reasons.
+
+Rules:
+
+- Never claim "the test suite passes" from this report alone — it
+  decides *which tests to run*, not *whether they pass*.
+- An empty `tests` list does NOT mean "no risk"; pair with
+  `specslice impact --base main` to verify business surfaces aren't affected.
+
+## Feature map (P19)
+
+`specslice features` clusters File / Module / Class nodes into
+"functional areas" by walking Contains / Imports / Calls /
+References edges from framework-anchored seeds. Output is a
+heuristic — improve it by indexing with LSP enabled.
+
+```bash
+specslice features
+specslice features --max-clusters 10 --min-cluster-size 5
+specslice features --format json
+```
+
+Each cluster carries `name`, `seed_path`, `seed_score`, `roles`
+(framework families detected on the seed), and a top-N
+`representative_symbols` list ordered by distance from the seed.
+
+## Graph diff (P19)
+
+`specslice graph-diff --base-db <path> --head-db <path>` compares
+two `.specslice/graph.db` snapshots and reports `nodes_added /
+nodes_removed / nodes_kind_changed / edges_added / edges_removed /
+edges_status_changed`. The MVP expects the caller to have already
+indexed both commits — historic auto-reindex is a later iteration.
+
+## Clarifying questions (P19)
+
+`specslice questions` surfaces unresolved facts the AI / human
+should confirm before acting on the graph. Four categories:
+
+- `orphan_symbol` (info) — no incoming Calls/References/Imports and
+  no framework role.
+- `pending_candidate` (warn) — AI business candidate not yet
+  accepted into the confirmed graph.
+- `test_without_references` (info) — TestCase / TestGroup with no
+  Calls/References to any indexed symbol.
+- `dangling_import` (info) — test imports a module SpecSlice
+  doesn't have a node for.
+
+```bash
+specslice questions
+specslice questions --max-per-category 5 --format json
+```
+
+Each question is written as a natural-language prompt ready to
+hand to a chat agent verbatim; `artifact_id` and `path` give the
+agent the next file / id to read.
 - Tier 2 (near-duplicate via SimHash) and tier 3 (behavioral
   duplicate via shared graph neighborhood) are not yet implemented.
   Do not claim they exist.

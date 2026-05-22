@@ -92,6 +92,36 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             writeln!(out, "  LSP skipped: {}", python.sidecar_skip_reason).ok();
         }
     }
+    // P20 — TypeScript / Java adapter status. Same shape as Python:
+    // `Resolver` disambiguates `typescript_lsp` vs `typescript_ast` /
+    // `java_lsp` vs `java_ast`; `LSP skipped` surfaces why the LSP
+    // pass was bypassed (binary missing, broken shebang, etc).
+    if let Some(ts) = &result.typescript {
+        writeln!(out, "TypeScript index:").ok();
+        writeln!(out, "  TypeScript files: {}", ts.files).ok();
+        writeln!(out, "  Symbols: {}", ts.symbols).ok();
+        writeln!(out, "  TestCases: {}", ts.tests).ok();
+        writeln!(out, "  Imports: {}", ts.imports).ok();
+        if !ts.resolver_used.is_empty() {
+            writeln!(out, "  Resolver: {}", ts.resolver_used).ok();
+        }
+        if !ts.sidecar_skip_reason.is_empty() {
+            writeln!(out, "  LSP skipped: {}", ts.sidecar_skip_reason).ok();
+        }
+    }
+    if let Some(java) = &result.java {
+        writeln!(out, "Java index:").ok();
+        writeln!(out, "  Java files: {}", java.files).ok();
+        writeln!(out, "  Symbols: {}", java.symbols).ok();
+        writeln!(out, "  TestCases: {}", java.tests).ok();
+        writeln!(out, "  Imports: {}", java.imports).ok();
+        if !java.resolver_used.is_empty() {
+            writeln!(out, "  Resolver: {}", java.resolver_used).ok();
+        }
+        if !java.sidecar_skip_reason.is_empty() {
+            writeln!(out, "  LSP skipped: {}", java.sidecar_skip_reason).ok();
+        }
+    }
     if let Some(links) = &result.links {
         writeln!(out, "Links index:").ok();
         writeln!(out, "  Requirements: {}", links.requirements).ok();
@@ -106,7 +136,10 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::format_result;
-    use specslice_engine::{GoIndexResult, IndexResult, PythonIndexResult, SwiftIndexResult};
+    use specslice_engine::{
+        GoIndexResult, IndexResult, JavaIndexResult, PythonIndexResult, SwiftIndexResult,
+        TypescriptIndexResult,
+    };
 
     #[test]
     fn render_omits_swift_section_when_adapter_is_disabled() {
@@ -119,6 +152,14 @@ mod tests {
         assert!(
             !out.contains("Go index"),
             "Go section should not appear when go adapter disabled: {out}"
+        );
+        assert!(
+            !out.contains("TypeScript index"),
+            "TypeScript section should not appear when ts adapter disabled: {out}"
+        );
+        assert!(
+            !out.contains("Java index"),
+            "Java section should not appear when java adapter disabled: {out}"
         );
     }
 
@@ -253,6 +294,110 @@ mod tests {
         assert!(
             out.contains("PATH"),
             "missing skip reason in Go section: {out}"
+        );
+    }
+
+    #[test]
+    fn render_includes_typescript_section_with_lsp_resolver_when_indexed() {
+        let result = IndexResult {
+            typescript: Some(TypescriptIndexResult {
+                files: 6,
+                symbols: 19,
+                tests: 4,
+                imports: 11,
+                resolver_used: "typescript_lsp".into(),
+                sidecar_skip_reason: String::new(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            out.contains("TypeScript index"),
+            "missing TypeScript section: {out}"
+        );
+        assert!(
+            out.contains("typescript_lsp"),
+            "missing TypeScript resolver label: {out}"
+        );
+        assert!(out.contains("TestCases: 4"));
+        assert!(out.contains("Imports: 11"));
+    }
+
+    #[test]
+    fn render_includes_typescript_section_with_ast_fallback_when_lsp_missing() {
+        let result = IndexResult {
+            typescript: Some(TypescriptIndexResult {
+                files: 3,
+                symbols: 8,
+                tests: 2,
+                imports: 5,
+                resolver_used: "typescript_ast".into(),
+                sidecar_skip_reason:
+                    "未在 PATH / node_modules/.bin 找到 typescript-language-server，已退化为 AST fallback"
+                        .into(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            out.contains("TypeScript index"),
+            "missing TypeScript section: {out}"
+        );
+        assert!(
+            out.contains("typescript_ast"),
+            "missing AST fallback resolver: {out}"
+        );
+        assert!(
+            out.contains("LSP skipped"),
+            "missing skip reason in TypeScript section: {out}"
+        );
+    }
+
+    #[test]
+    fn render_includes_java_section_with_lsp_resolver_when_indexed() {
+        let result = IndexResult {
+            java: Some(JavaIndexResult {
+                files: 7,
+                symbols: 22,
+                tests: 5,
+                imports: 9,
+                resolver_used: "java_lsp".into(),
+                sidecar_skip_reason: String::new(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(out.contains("Java index"), "missing Java section: {out}");
+        assert!(
+            out.contains("java_lsp"),
+            "missing Java resolver label: {out}"
+        );
+        assert!(out.contains("TestCases: 5"));
+        assert!(out.contains("Imports: 9"));
+    }
+
+    #[test]
+    fn render_includes_java_section_with_ast_fallback_when_lsp_missing() {
+        let result = IndexResult {
+            java: Some(JavaIndexResult {
+                files: 2,
+                symbols: 4,
+                tests: 1,
+                imports: 3,
+                resolver_used: "java_ast".into(),
+                sidecar_skip_reason: "未在 PATH 找到 jdtls，已退化为 AST fallback".into(),
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(out.contains("Java index"), "missing Java section: {out}");
+        assert!(
+            out.contains("java_ast"),
+            "missing AST fallback resolver: {out}"
+        );
+        assert!(
+            out.contains("LSP skipped"),
+            "missing skip reason in Java section: {out}"
         );
     }
 }

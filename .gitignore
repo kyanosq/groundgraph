@@ -14,3 +14,14 @@ dist/
 tool/specslice_dart_analyzer/.dart_tool/
 tool/specslice_dart_analyzer/build/
 tool/specslice_dart_analyzer/pubspec.lock
+
+# P20 multi-language fixtures — we ship the source trees but never the
+# resolved tooling outputs. `target/` is already gitignored at the
+# repo root for the Rust workspace; these patterns explicitly catch
+# the JVM / Node tooling outputs that would otherwise leak in if an
+# operator runs `mvn`, `npm install`, or `tsc` against the fixtures.
+tests/fixtures/java_hello/target/
+tests/fixtures/typescript_hello/node_modules/
+tests/fixtures/typescript_hello/dist/
+tests/fixtures/typescript_hello/.turbo/
+**/*.class

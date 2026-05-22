@@ -52,6 +52,16 @@ pub struct EngineConfig {
     /// unavailable the AST scanner takes over the structural pass.
     #[serde(default)]
     pub python: LanguageAdapterConfig,
+    /// P20 — opt-in TypeScript adapter driven by
+    /// `typescript-language-server --stdio`. AST 补强 always runs for
+    /// import edges + jest/vitest test cases regardless of LSP state.
+    #[serde(default)]
+    pub typescript: LanguageAdapterConfig,
+    /// P20 — opt-in Java adapter driven by `jdtls`. AST 补强 always
+    /// runs for package declarations + JUnit test methods regardless
+    /// of LSP state.
+    #[serde(default)]
+    pub java: LanguageAdapterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

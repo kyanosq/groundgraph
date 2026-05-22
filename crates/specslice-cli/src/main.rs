@@ -63,6 +63,43 @@ enum Commands {
     /// 功能区聚类 — 启发式归纳代码图里的功能簇 (P19)。
     /// 仅作为浏览入口；不是权威功能划分。
     Features(FeaturesArgs),
+    /// Graph 快照比对 — 对比两份 `.specslice/graph.db` (P19)。
+    /// 调用方需自己保存 base / head 的图文件（CI artefact 等）。
+    #[command(name = "graph-diff")]
+    GraphDiff(GraphDiffArgs),
+    /// AI 澄清问题包 — 列出代码图里需要人 / Agent 确认的事实 (P19)。
+    Questions(QuestionsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct GraphDiffArgs {
+    /// 基准图数据库路径。
+    #[arg(long, value_name = "PATH")]
+    base_db: std::path::PathBuf,
+    /// 目标图数据库路径。
+    #[arg(long, value_name = "PATH")]
+    head_db: std::path::PathBuf,
+    /// 可选：基准仓库根路径。与 `--head-root` 同时提供时，graph-diff
+    /// 会额外读取两边的 `.specslice/candidates/business_logic.yaml`
+    /// 并报告业务候选 added / removed / 状态变更。
+    #[arg(long = "base-root", value_name = "PATH")]
+    base_repo_root: Option<std::path::PathBuf>,
+    /// 可选：目标仓库根路径。见 `--base-root`。
+    #[arg(long = "head-root", value_name = "PATH")]
+    head_repo_root: Option<std::path::PathBuf>,
+    /// 输出格式：`text`、`json`。
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct QuestionsArgs {
+    /// 每个类别最多输出的问题数（默认 20）。
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    max_per_category: usize,
+    /// 输出格式：`text`、`json`。
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -731,5 +768,21 @@ fn run() -> Result<()> {
             min_cluster_size: args.min_cluster_size,
             format: args.format,
         }),
+        Commands::GraphDiff(args) => {
+            commands::graph_diff::run(commands::graph_diff::GraphDiffRunArgs {
+                base_db: args.base_db,
+                head_db: args.head_db,
+                base_repo_root: args.base_repo_root,
+                head_repo_root: args.head_repo_root,
+                format: args.format,
+            })
+        }
+        Commands::Questions(args) => {
+            commands::questions::run(commands::questions::QuestionsRunArgs {
+                repo_root: cli.repo_root.clone(),
+                max_per_category: args.max_per_category,
+                format: args.format,
+            })
+        }
     }
 }

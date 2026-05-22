@@ -343,6 +343,18 @@ fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         "python_class" => NodeKind::PythonClass,
         "python_function" => NodeKind::PythonFunction,
         "python_method" => NodeKind::PythonMethod,
+        "typescript_module" => NodeKind::TypescriptModule,
+        "typescript_class" => NodeKind::TypescriptClass,
+        "typescript_interface" => NodeKind::TypescriptInterface,
+        "typescript_enum" => NodeKind::TypescriptEnum,
+        "typescript_function" => NodeKind::TypescriptFunction,
+        "typescript_method" => NodeKind::TypescriptMethod,
+        "java_package" => NodeKind::JavaPackage,
+        "java_class" => NodeKind::JavaClass,
+        "java_interface" => NodeKind::JavaInterface,
+        "java_enum" => NodeKind::JavaEnum,
+        "java_method" => NodeKind::JavaMethod,
+        "java_constructor" => NodeKind::JavaConstructor,
         other => return Err(decode_error(1, format!("unknown node kind {other}"))),
     };
     Ok(Node {

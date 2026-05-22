@@ -428,30 +428,13 @@ fn is_usage_edge(kind: EdgeKind) -> bool {
 }
 
 fn is_code_kind(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::DartClass
-            | NodeKind::DartMethod
-            | NodeKind::DartFunction
-            | NodeKind::DartConstructor
-            | NodeKind::TestCase
-            | NodeKind::TestGroup
-            | NodeKind::SwiftClass
-            | NodeKind::SwiftStruct
-            | NodeKind::SwiftEnum
-            | NodeKind::SwiftProtocol
-            | NodeKind::SwiftMethod
-            | NodeKind::SwiftFunction
-            | NodeKind::SwiftInitializer
-            | NodeKind::GoStruct
-            | NodeKind::GoInterface
-            | NodeKind::GoMethod
-            | NodeKind::GoFunction
-            | NodeKind::PythonModule
-            | NodeKind::PythonClass
-            | NodeKind::PythonFunction
-            | NodeKind::PythonMethod
-    )
+    // Dead-code analysis counts every code symbol (any family-callable,
+    // family-type, or known module-level node) plus tests as a thing
+    // worth following reachability into. We route through the
+    // `language_traits` predicates so adding a new language gives the
+    // dead-code analyzer free coverage instead of silent drift.
+    specslice_core::language_traits::is_code_symbol(kind)
+        || specslice_core::language_traits::is_test(kind)
 }
 
 /// Flutter / Dart names that look like framework callbacks. Anything

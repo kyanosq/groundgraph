@@ -164,6 +164,22 @@ pub(crate) fn parse_node_kind(raw: &str) -> Result<NodeKind> {
         "python_class" | "py_class" => NodeKind::PythonClass,
         "python_function" | "py_function" | "pyfunc" => NodeKind::PythonFunction,
         "python_method" | "py_method" => NodeKind::PythonMethod,
+        // P20 — TypeScript / Java kinds. We accept the canonical name
+        // plus a single short alias each (matching the Dart/Swift/Go/Python
+        // convention) so MCP filters work with whatever the agent already
+        // knows.
+        "typescript_module" | "ts_module" => NodeKind::TypescriptModule,
+        "typescript_class" | "ts_class" => NodeKind::TypescriptClass,
+        "typescript_interface" | "ts_interface" => NodeKind::TypescriptInterface,
+        "typescript_enum" | "ts_enum" => NodeKind::TypescriptEnum,
+        "typescript_function" | "ts_function" | "tsfunc" => NodeKind::TypescriptFunction,
+        "typescript_method" | "ts_method" => NodeKind::TypescriptMethod,
+        "java_package" => NodeKind::JavaPackage,
+        "java_class" => NodeKind::JavaClass,
+        "java_interface" => NodeKind::JavaInterface,
+        "java_enum" => NodeKind::JavaEnum,
+        "java_method" => NodeKind::JavaMethod,
+        "java_constructor" | "java_init" => NodeKind::JavaConstructor,
         other => bail!(
             "unknown node kind `{other}`. valid: {}",
             default_search_kinds()

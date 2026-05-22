@@ -885,35 +885,38 @@ fn shorten_for_badge(s: &str) -> String {
 }
 
 fn column_for(kind: NodeKind) -> GraphColumn {
-    match kind {
-        NodeKind::DocSection | NodeKind::AcceptanceCriterion | NodeKind::Adr => {
-            GraphColumn::Documents
+    // Delegate to the cross-language trait layer so every new language /
+    // kind (TypeScript, Java, …) lands in the right column automatically.
+    // We only special-case the few non-language kinds the trait layer
+    // can't decide on its own (requirements + candidates land in
+    // Business; framework anchors and synthetic targets land in Code).
+    use specslice_core::language_traits::{family_of, SymbolFamily};
+    match family_of(kind) {
+        SymbolFamily::Doc => GraphColumn::Documents,
+        SymbolFamily::Candidate => GraphColumn::Business,
+        SymbolFamily::Test => GraphColumn::Tests,
+        SymbolFamily::Module
+        | SymbolFamily::Type
+        | SymbolFamily::Callable
+        | SymbolFamily::Framework => GraphColumn::Code,
+    }
+    .merge_requirement(kind)
+}
+
+/// Tiny extension trait so `Requirement` (which `language_traits` flags
+/// as `Doc`, since it lives in markdown) can still resolve to the
+/// `Business` column the original `column_for` exposed.
+trait MergeRequirementColumn {
+    fn merge_requirement(self, kind: NodeKind) -> Self;
+}
+
+impl MergeRequirementColumn for GraphColumn {
+    fn merge_requirement(self, kind: NodeKind) -> Self {
+        if matches!(kind, NodeKind::Requirement) {
+            GraphColumn::Business
+        } else {
+            self
         }
-        NodeKind::Requirement | NodeKind::BusinessCandidate => GraphColumn::Business,
-        NodeKind::File
-        | NodeKind::DartClass
-        | NodeKind::DartMethod
-        | NodeKind::DartFunction
-        | NodeKind::DartConstructor
-        | NodeKind::DartProvider
-        | NodeKind::Route
-        | NodeKind::Storage
-        | NodeKind::SwiftClass
-        | NodeKind::SwiftStruct
-        | NodeKind::SwiftEnum
-        | NodeKind::SwiftProtocol
-        | NodeKind::SwiftMethod
-        | NodeKind::SwiftFunction
-        | NodeKind::SwiftInitializer
-        | NodeKind::GoStruct
-        | NodeKind::GoInterface
-        | NodeKind::GoMethod
-        | NodeKind::GoFunction
-        | NodeKind::PythonModule
-        | NodeKind::PythonClass
-        | NodeKind::PythonFunction
-        | NodeKind::PythonMethod => GraphColumn::Code,
-        NodeKind::TestCase | NodeKind::TestGroup => GraphColumn::Tests,
     }
 }
 

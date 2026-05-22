@@ -324,6 +324,18 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         NodeKind::PythonClass,
         NodeKind::PythonFunction,
         NodeKind::PythonMethod,
+        NodeKind::TypescriptModule,
+        NodeKind::TypescriptClass,
+        NodeKind::TypescriptInterface,
+        NodeKind::TypescriptEnum,
+        NodeKind::TypescriptFunction,
+        NodeKind::TypescriptMethod,
+        NodeKind::JavaPackage,
+        NodeKind::JavaClass,
+        NodeKind::JavaInterface,
+        NodeKind::JavaEnum,
+        NodeKind::JavaMethod,
+        NodeKind::JavaConstructor,
     ]
 }
 

@@ -644,35 +644,55 @@ impl ProbeOutcome {
     /// names a binary we never silently substitute another one. Steps
     /// 3+ are best-effort discovery and may all be skipped without
     /// affecting correctness.
+    ///
+    /// Each candidate is then **smoke-launched** by [`runs_ok`] — the
+    /// previous probe only checked `is_file()`, which let through a
+    /// classic broken-interpreter shebang (e.g. `pylsp` shipped by a
+    /// removed conda env).
     fn from_options(options: &PythonIndexOptions) -> Self {
-        if let Ok(env_cmd) = std::env::var(PYTHON_LSP_COMMAND_ENV) {
-            if binary_on_path(&env_cmd) {
-                return Self {
-                    command: Some(env_cmd),
+        // Helper: wrap a resolved command + authoritative source label
+        // ("env" / "config") so the caller-side authoritative branches
+        // produce a useful skip_reason if the smoke launch fails.
+        let accept_authoritative = |cmd: String, label: &str| -> Self {
+            if runs_ok(&cmd) {
+                Self {
+                    command: Some(cmd),
                     skip_reason: String::new(),
+                }
+            } else {
+                Self {
+                    command: None,
+                    skip_reason: format!(
+                        "{label}=`{cmd}` 启动失败 — 二进制存在但 `--help` 未在 1.5s 内成功退出（典型情况：shebang 指向已删除的解释器）。已退化为 AST fallback"
+                    ),
+                }
+            }
+        };
+        if let Ok(env_cmd) = std::env::var(PYTHON_LSP_COMMAND_ENV) {
+            if !binary_on_path(&env_cmd) {
+                return Self {
+                    command: None,
+                    skip_reason: format!(
+                        "{PYTHON_LSP_COMMAND_ENV}=`{env_cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    ),
                 };
             }
-            return Self {
-                command: None,
-                skip_reason: format!(
-                    "{PYTHON_LSP_COMMAND_ENV}=`{env_cmd}` 未找到对应可执行文件，已退化为 AST fallback"
-                ),
-            };
+            return accept_authoritative(env_cmd, PYTHON_LSP_COMMAND_ENV);
         }
         if let Some(cmd) = options.lsp_command.as_deref() {
-            if binary_on_path(cmd) {
+            if !binary_on_path(cmd) {
                 return Self {
-                    command: Some(cmd.to_string()),
-                    skip_reason: String::new(),
+                    command: None,
+                    skip_reason: format!(
+                        "`python.lsp_command = {cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    ),
                 };
             }
-            return Self {
-                command: None,
-                skip_reason: format!(
-                    "`python.lsp_command = {cmd}` 未找到对应可执行文件，已退化为 AST fallback"
-                ),
-            };
+            return accept_authoritative(cmd.to_string(), "python.lsp_command");
         }
+        // Best-effort discovery: skip silently if the candidate fails
+        // the smoke launch and try the next entry. Operators get a
+        // useful summary if nothing works at the end.
         if !options.disable_venv_discovery {
             for relative in [
                 ".venv/bin/basedpyright-langserver",
@@ -680,16 +700,23 @@ impl ProbeOutcome {
                 ".venv/bin/pylsp",
             ] {
                 let candidate = options.repo_root.join(relative);
-                if candidate.is_file() {
+                if !candidate.is_file() {
+                    continue;
+                }
+                let cmd = candidate.to_string_lossy().into_owned();
+                if runs_ok(&cmd) {
                     return Self {
-                        command: Some(candidate.to_string_lossy().into_owned()),
+                        command: Some(cmd),
                         skip_reason: String::new(),
                     };
                 }
             }
         }
         for fallback in ["basedpyright-langserver", "pyright-langserver", "pylsp"] {
-            if binary_on_path(fallback) {
+            if !binary_on_path(fallback) {
+                continue;
+            }
+            if runs_ok(fallback) {
                 return Self {
                     command: Some(fallback.to_string()),
                     skip_reason: String::new(),
@@ -699,9 +726,74 @@ impl ProbeOutcome {
         Self {
             command: None,
             skip_reason:
-                "未在 PATH / .venv 中找到 pyright/basedpyright/pylsp，已退化为 AST fallback".into(),
+                "未在 PATH / .venv 中找到可启动的 pyright/basedpyright/pylsp（要么不存在，要么 `--help` 启动失败），已退化为 AST fallback".into(),
         }
     }
+}
+
+/// Smoke-launch a candidate Python LSP binary. Returns `true` only if
+/// `<cmd> --help` spawns and reaches a terminal state within 1.5s.
+/// Any non-success outcome (spawn error, shebang failure, timeout
+/// followed by a kill) returns `false` and lets the caller move on to
+/// the next candidate.
+///
+/// We accept non-zero exit codes — some LSP servers (notably old
+/// `pylsp` builds) return 1 from `--help` while still being healthy
+/// when actually driven via stdio. The decisive failure modes we
+/// must reject are: `spawn()` errors, shebang failures (which surface
+/// as a non-zero exit + stderr like `bad interpreter`), and hangs.
+fn runs_ok(cmd: &str) -> bool {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = match Command::new(cmd)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let timeout = Duration::from_millis(1500);
+    let start = Instant::now();
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return false,
+        }
+    };
+    // Drain stderr so we can pattern-match the classic shebang
+    // failures. Use a small bounded read — `--help` output is tiny.
+    let mut stderr_buf = String::new();
+    if let Some(s) = child.stderr.take() {
+        let _ = s.take(4096).read_to_string(&mut stderr_buf);
+    }
+    let lower = stderr_buf.to_ascii_lowercase();
+    let shebang_failed = lower.contains("bad interpreter")
+        || lower.contains("no such file or directory")
+        || lower.contains("no module named")
+        || lower.contains("cannot execute")
+        || lower.contains("command not found");
+    if shebang_failed {
+        return false;
+    }
+    // Accept on a clean exit (most common: 0 from `--help`). We
+    // intentionally do NOT trust non-zero exit codes here — they
+    // mean the binary at least ran a real interpreter but didn't
+    // recognise `--help`, which is far more often a "wrong binary"
+    // signal than a healthy LSP server.
+    exit.map(|s| s.success()).unwrap_or(false)
 }
 
 // `sha2::Sha256` is reachable via the existing engine dep tree; we use
@@ -903,6 +995,68 @@ def cli_run():
             disable_venv_discovery: true,
         };
         assert!(!python_lsp_available(&opts));
+    }
+
+    /// Regression — a binary whose shebang points at a missing
+    /// interpreter (the exact failure mode on the reviewer's box:
+    /// `pylsp` exists on PATH but `bad interpreter:
+    /// /Users/.../anaconda3/bin/python: no such file or directory`)
+    /// must be rejected. The previous probe only checked file
+    /// existence, so it claimed the binary was usable and the
+    /// downstream `index_python` silently fell back to AST — the
+    /// opt-in smoke test then failed its `resolver_used == python_lsp`
+    /// assertion.
+    #[test]
+    #[cfg(unix)]
+    fn python_lsp_available_rejects_binary_with_broken_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("bad_pylsp");
+        std::fs::write(
+            &bin,
+            "#!/specslice/nonexistent/python\nprint('unreachable')\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let opts = PythonIndexOptions {
+            repo_root: tmp.path().to_path_buf(),
+            code_roots: vec![PathBuf::from(".")],
+            exclude_globs: vec![],
+            lsp_command: Some(bin.to_string_lossy().into_owned()),
+            disable_venv_discovery: true,
+        };
+        assert!(
+            !python_lsp_available(&opts),
+            "broken-shebang binary should not register as available"
+        );
+    }
+
+    /// A binary that runs and prints help text (positive control) must
+    /// stay registered as available. We use the system `echo` so this
+    /// test works on any CI box without depending on `pylsp` being
+    /// installed.
+    #[test]
+    #[cfg(unix)]
+    fn python_lsp_available_accepts_executable_that_runs() {
+        let tmp = tempdir().unwrap();
+        let bin = tmp.path().join("fake_pylsp");
+        std::fs::write(&bin, "#!/bin/sh\necho 'usage: fake_pylsp [...]'\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let opts = PythonIndexOptions {
+            repo_root: tmp.path().to_path_buf(),
+            code_roots: vec![PathBuf::from(".")],
+            exclude_globs: vec![],
+            lsp_command: Some(bin.to_string_lossy().into_owned()),
+            disable_venv_discovery: true,
+        };
+        assert!(python_lsp_available(&opts));
     }
 
     #[test]

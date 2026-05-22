@@ -259,33 +259,12 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 }
 
 /// True for nodes whose kind represents an "implementation" symbol that
-/// can carry behaviour — Dart classes/methods/functions/constructors plus
-/// the Swift and Go equivalents emitted by the LSP-backed adapters in P11.
-/// Routes / providers / storage are deliberately excluded because they
-/// are synthetic anchors, not bodies of code.
+/// can carry behaviour — code-symbols across every supported language.
+/// Routes / providers / storage / candidates are deliberately excluded
+/// because they are synthetic anchors, not bodies of code; that mapping
+/// is centralised in [`specslice_core::language_traits::is_code_symbol`].
 pub fn is_implementation_kind(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::DartClass
-            | NodeKind::DartMethod
-            | NodeKind::DartFunction
-            | NodeKind::DartConstructor
-            | NodeKind::SwiftClass
-            | NodeKind::SwiftStruct
-            | NodeKind::SwiftEnum
-            | NodeKind::SwiftProtocol
-            | NodeKind::SwiftMethod
-            | NodeKind::SwiftFunction
-            | NodeKind::SwiftInitializer
-            | NodeKind::GoStruct
-            | NodeKind::GoInterface
-            | NodeKind::GoMethod
-            | NodeKind::GoFunction
-            | NodeKind::PythonModule
-            | NodeKind::PythonClass
-            | NodeKind::PythonFunction
-            | NodeKind::PythonMethod
-    )
+    specslice_core::language_traits::is_code_symbol(kind)
 }
 
 /// Helper for downstream modules: collect all requirements an artifact

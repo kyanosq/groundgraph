@@ -1,0 +1,14 @@
+{
+  "name": "specslice-typescript-hello",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Tiny TypeScript fixture used by SpecSlice's TS indexer tests.",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

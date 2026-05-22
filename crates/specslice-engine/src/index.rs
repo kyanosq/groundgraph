@@ -11,6 +11,10 @@ use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_IN
 use crate::go_indexer::{
     index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
 };
+use crate::java_indexer::{
+    index_java, JavaIndexOptions, JavaIndexResult, JAVA_AST_INDEXER_NAME, JAVA_INDEXER_NAME,
+    JAVA_LSP_COMMAND_ENV,
+};
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 use crate::python_indexer::{
     index_python, PythonIndexOptions, PythonIndexResult, PYTHON_AST_INDEXER_NAME,
@@ -18,6 +22,10 @@ use crate::python_indexer::{
 };
 use crate::swift_indexer::{
     index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+};
+use crate::typescript_indexer::{
+    index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_AST_INDEXER_NAME,
+    TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +73,14 @@ pub struct IndexResult {
     /// adapter is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<PythonIndexResult>,
+    /// P20 — TypeScript adapter (LSP-first, AST 补强). `None` when
+    /// the adapter is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typescript: Option<TypescriptIndexResult>,
+    /// P20 — Java adapter (LSP-first, AST 补强). `None` when the
+    /// adapter is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java: Option<JavaIndexResult>,
 }
 
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
@@ -172,6 +188,49 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             let python =
                 index_python(&mut store, &python_options).context("indexing Python sources")?;
             result.python = Some(python);
+        }
+
+        // P20 — TypeScript adapter (LSP first, AST always).
+        if config.typescript.enabled {
+            store
+                .clear_indexer_outputs(TYPESCRIPT_INDEXER_NAME)
+                .context("clearing previous TypeScript LSP outputs")?;
+            store
+                .clear_indexer_outputs(TYPESCRIPT_AST_INDEXER_NAME)
+                .context("clearing previous TypeScript AST outputs")?;
+            let ts_paths = config.typescript.paths_or(&["src", "tests", "test"]);
+            let ts_options = TypescriptIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: ts_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.typescript.exclude.clone(),
+                lsp_command: std::env::var(TYPESCRIPT_LSP_COMMAND_ENV)
+                    .ok()
+                    .or_else(|| config.typescript.lsp_command.clone()),
+            };
+            let ts =
+                index_typescript(&mut store, &ts_options).context("indexing TypeScript sources")?;
+            result.typescript = Some(ts);
+        }
+
+        // P20 — Java adapter (LSP first, AST always).
+        if config.java.enabled {
+            store
+                .clear_indexer_outputs(JAVA_INDEXER_NAME)
+                .context("clearing previous Java LSP outputs")?;
+            store
+                .clear_indexer_outputs(JAVA_AST_INDEXER_NAME)
+                .context("clearing previous Java AST outputs")?;
+            let java_paths = config.java.paths_or(&["src"]);
+            let java_options = JavaIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: java_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.java.exclude.clone(),
+                lsp_command: std::env::var(JAVA_LSP_COMMAND_ENV)
+                    .ok()
+                    .or_else(|| config.java.lsp_command.clone()),
+            };
+            let java = index_java(&mut store, &java_options).context("indexing Java sources")?;
+            result.java = Some(java);
         }
     }
 

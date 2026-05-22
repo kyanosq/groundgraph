@@ -70,6 +70,28 @@ pub enum NodeKind {
     PythonClass,
     PythonFunction,
     PythonMethod,
+    // ---- P20 TypeScript (LSP first, AST 补强) ------------------------------
+    // Driven by `typescript-language-server` (`tsserver` under the hood).
+    // The AST scanner handles imports and `describe/it` (jest / vitest)
+    // when no LSP is configured. `TypescriptEnum` is kept distinct from
+    // `TypescriptClass` because `tsserver` reports it separately and the
+    // graph view colours them differently.
+    TypescriptModule,
+    TypescriptClass,
+    TypescriptInterface,
+    TypescriptEnum,
+    TypescriptFunction,
+    TypescriptMethod,
+    // ---- P20 Java (LSP first, AST 补强) -----------------------------------
+    // Driven by `jdtls` (Eclipse JDT Language Server). The AST scanner
+    // handles `package` declarations and JUnit 4/5 test methods so
+    // ungenerated configurations still produce a usable graph.
+    JavaPackage,
+    JavaClass,
+    JavaInterface,
+    JavaEnum,
+    JavaMethod,
+    JavaConstructor,
 }
 
 impl NodeKind {
@@ -105,6 +127,18 @@ impl NodeKind {
             NodeKind::PythonClass => "python_class",
             NodeKind::PythonFunction => "python_function",
             NodeKind::PythonMethod => "python_method",
+            NodeKind::TypescriptModule => "typescript_module",
+            NodeKind::TypescriptClass => "typescript_class",
+            NodeKind::TypescriptInterface => "typescript_interface",
+            NodeKind::TypescriptEnum => "typescript_enum",
+            NodeKind::TypescriptFunction => "typescript_function",
+            NodeKind::TypescriptMethod => "typescript_method",
+            NodeKind::JavaPackage => "java_package",
+            NodeKind::JavaClass => "java_class",
+            NodeKind::JavaInterface => "java_interface",
+            NodeKind::JavaEnum => "java_enum",
+            NodeKind::JavaMethod => "java_method",
+            NodeKind::JavaConstructor => "java_constructor",
         }
     }
 }
@@ -184,8 +218,45 @@ mod tests {
             NodeKind::PythonClass,
             NodeKind::PythonFunction,
             NodeKind::PythonMethod,
+            NodeKind::TypescriptModule,
+            NodeKind::TypescriptClass,
+            NodeKind::TypescriptInterface,
+            NodeKind::TypescriptEnum,
+            NodeKind::TypescriptFunction,
+            NodeKind::TypescriptMethod,
+            NodeKind::JavaPackage,
+            NodeKind::JavaClass,
+            NodeKind::JavaInterface,
+            NodeKind::JavaEnum,
+            NodeKind::JavaMethod,
+            NodeKind::JavaConstructor,
         ] {
             assert!(!kind.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn typescript_and_java_kinds_serialise_with_language_prefix() {
+        let cases = [
+            (NodeKind::TypescriptModule, "typescript_module"),
+            (NodeKind::TypescriptClass, "typescript_class"),
+            (NodeKind::TypescriptInterface, "typescript_interface"),
+            (NodeKind::TypescriptEnum, "typescript_enum"),
+            (NodeKind::TypescriptFunction, "typescript_function"),
+            (NodeKind::TypescriptMethod, "typescript_method"),
+            (NodeKind::JavaPackage, "java_package"),
+            (NodeKind::JavaClass, "java_class"),
+            (NodeKind::JavaInterface, "java_interface"),
+            (NodeKind::JavaEnum, "java_enum"),
+            (NodeKind::JavaMethod, "java_method"),
+            (NodeKind::JavaConstructor, "java_constructor"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            let json = serde_json::to_string(&kind).expect("serialise");
+            assert_eq!(json, format!("\"{}\"", expected));
+            let back: NodeKind = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(back, kind);
         }
     }
 
