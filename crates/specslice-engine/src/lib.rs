@@ -13,6 +13,7 @@ pub mod dart_indexer;
 pub mod dart_sidecar;
 pub mod dead_code;
 pub mod docs_indexer;
+pub mod edge_confidence;
 pub mod export;
 pub mod git_diff;
 pub mod go_indexer;
@@ -56,6 +57,7 @@ pub use dead_code::{
     DeadCodeOptions, DeadCodeReport, DeadCodeStats, DEAD_CODE_SCHEMA_VERSION,
 };
 pub use docs_indexer::{DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
+pub use edge_confidence::{confidence_for_edge, derive_confidence, EdgeConfidence};
 pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
 pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
@@ -80,7 +82,10 @@ pub use search::{
 };
 pub use similarity::{
     analyze_similarity, analyze_similarity_with_store, SimilarityCluster, SimilarityMember,
-    SimilarityOptions, SimilarityReport, SimilarityStats, SIMILARITY_SCHEMA_VERSION,
+    SimilarityMode, SimilarityOptions, SimilarityReport, SimilarityStats,
+    DEFAULT_MAX_PAIRWISE_SYMBOLS as SIMILARITY_DEFAULT_MAX_PAIRWISE_SYMBOLS,
+    DEFAULT_MIN_SIMILARITY as SIMILARITY_DEFAULT_MIN_SIMILARITY,
+    DEFAULT_SHINGLE_K as SIMILARITY_DEFAULT_SHINGLE_K, SIMILARITY_SCHEMA_VERSION,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
 

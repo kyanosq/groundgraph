@@ -198,6 +198,7 @@ mod tests {
                 line_range: None,
                 snippet: None,
                 resolver: None,
+                evidence_quality: None,
             }],
             findings: vec![],
         }

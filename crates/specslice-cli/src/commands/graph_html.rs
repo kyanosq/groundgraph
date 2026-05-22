@@ -847,6 +847,7 @@ mod tests {
             line_range: None,
             snippet: None,
             resolver: None,
+            evidence_quality: None,
         });
         let html = render_html(&view);
         assert!(html.contains("module::lib"));

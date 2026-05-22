@@ -145,6 +145,13 @@ pub struct GraphEdge {
     /// sidecar lands; `ai_candidate` for AI-derived edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolver: Option<String>,
+    /// P19 — derived three-tier evidence quality: `"high"` /
+    /// `"medium"` / `"low"`. Computed at read time from
+    /// `(kind, source, certainty, status, indexer)`. Cheap for
+    /// consumers (humans + AI) to filter on without re-parsing
+    /// the provenance tuple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_quality: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -597,6 +604,11 @@ fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
         EdgeStatus::Deprecated => GraphStatus::Stale,
     };
     let (line_range, snippet, resolver) = parse_reference_evidence(edge.evidence_json.as_deref());
+    let evidence_quality = Some(
+        crate::edge_confidence::confidence_for_edge(edge)
+            .as_str()
+            .to_string(),
+    );
     GraphEdge {
         id: edge.id.to_string(),
         from: edge.from_id.to_string(),
@@ -611,6 +623,7 @@ fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
         line_range,
         snippet,
         resolver,
+        evidence_quality,
     }
 }
 
@@ -840,6 +853,10 @@ fn merge_business_candidate(
             line_range: None,
             snippet: None,
             resolver: Some(source.into()),
+            // `derives_from` edges are AI-authored business
+            // candidate evidence — always low until the candidate
+            // is confirmed by a human.
+            evidence_quality: Some("low".into()),
         });
     }
 }
@@ -1497,6 +1514,7 @@ mod tests {
             line_range: None,
             snippet: None,
             resolver: None,
+            evidence_quality: None,
         }
     }
 
@@ -1868,6 +1886,7 @@ mod tests {
             line_range: None,
             snippet: None,
             resolver: None,
+            evidence_quality: None,
         };
         assert!(is_noise_edge(&noisy));
 

@@ -29,7 +29,7 @@
 //! Other languages can opt in by adding a `Language` arm — the
 //! normalizer is shared.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -47,6 +47,22 @@ pub const SIMILARITY_SCHEMA_VERSION: u32 = 1;
 /// would dominate any duplicate report with trivial hits.
 pub const DEFAULT_MIN_TOKENS: usize = 12;
 
+/// Default lower bound on the SimHash-derived similarity score
+/// for tier 2 reporting. 0.85 ≈ hamming distance ≤ 9 / 64 bits.
+pub const DEFAULT_MIN_SIMILARITY: f32 = 0.85;
+
+/// Default shingle width when generating SimHash. Five tokens has
+/// the property that small renames (1–2 tokens) move just one or
+/// two shingles, so the SimHash drifts by a handful of bits — not
+/// dozens.
+pub const DEFAULT_SHINGLE_K: usize = 5;
+
+/// Pairwise SimHash comparison is O(N²); above this many uncovered
+/// symbols we skip tier 2 with a warning rather than risk a
+/// multi-minute run on a huge repo. LSH-based bucketing is left
+/// to a future iteration.
+pub const DEFAULT_MAX_PAIRWISE_SYMBOLS: usize = 20_000;
+
 /// Languages the normalizer currently understands. New entries
 /// MUST keep the existing token grammar so old fingerprints stay
 /// comparable across versions.
@@ -54,6 +70,25 @@ pub const DEFAULT_MIN_TOKENS: usize = 12;
 pub enum Language {
     Python,
     Dart,
+}
+
+/// Which duplicate tiers to run. `All` is the default in the CLI;
+/// `Exact` matches the original P18 tier 1 behaviour and is what
+/// the existing tests assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityMode {
+    Exact,
+    Near,
+    All,
+}
+
+impl SimilarityMode {
+    pub fn runs_exact(self) -> bool {
+        matches!(self, SimilarityMode::Exact | SimilarityMode::All)
+    }
+    pub fn runs_near(self) -> bool {
+        matches!(self, SimilarityMode::Near | SimilarityMode::All)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +102,16 @@ pub struct SimilarityOptions {
     /// When `Some`, only clusters that contain this symbol id are
     /// returned. Powers `specslice similar --node SYMBOL_ID`.
     pub focus_symbol_id: Option<String>,
+    /// Tier(s) to run.
+    pub mode: SimilarityMode,
+    /// Lower bound on tier-2 similarity score in `[0, 1]`.
+    pub min_similarity: f32,
+    /// Shingle width for SimHash. Smaller k = more sensitive to
+    /// small renames; larger k = more sensitive to structural
+    /// drift. 5 is a long-established sweet spot for code.
+    pub shingle_k: usize,
+    /// Safety guard against runaway O(N²) on huge repos.
+    pub max_pairwise_symbols: usize,
 }
 
 impl Default for SimilarityOptions {
@@ -76,11 +121,15 @@ impl Default for SimilarityOptions {
             min_tokens: DEFAULT_MIN_TOKENS,
             min_cluster_size: 2,
             focus_symbol_id: None,
+            mode: SimilarityMode::All,
+            min_similarity: DEFAULT_MIN_SIMILARITY,
+            shingle_k: DEFAULT_SHINGLE_K,
+            max_pairwise_symbols: DEFAULT_MAX_PAIRWISE_SYMBOLS,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimilarityReport {
     pub schema_version: u32,
     pub stats: SimilarityStats,
@@ -96,22 +145,42 @@ pub struct SimilarityStats {
     pub symbols_skipped: usize,
     /// Number of clusters returned after filtering.
     pub clusters_reported: usize,
+    /// Subset of `clusters_reported` that came from tier 1 exact
+    /// AST matching. Always 0 when `mode = Near`.
+    pub exact_clusters: usize,
+    /// Subset of `clusters_reported` that came from tier 2 SimHash
+    /// near-duplicate matching. Always 0 when `mode = Exact`.
+    pub near_clusters: usize,
+    /// `true` when the near-duplicate pass was skipped because
+    /// `uncovered_symbols > max_pairwise_symbols`. Operators
+    /// should re-run with a tighter `--code-roots` or raise the
+    /// guard explicitly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub near_pairwise_skipped: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimilarityCluster {
     /// Hex form of the structural fingerprint shared by every
     /// member of the cluster. Useful as a stable cluster id.
     pub fingerprint: String,
-    /// Duplicate kind. Tier 1 always emits `"exact_ast"`; future
-    /// tiers will publish `"near_token"` and `"graph_behavior"`.
+    /// Duplicate kind. Tier 1 emits `"exact_ast"`; tier 2 emits
+    /// `"near_token"`. tier 3 (graph behavior) is reserved.
     pub duplicate_type: String,
     pub members: Vec<SimilarityMember>,
-    /// Normalized token count, identical across members.
+    /// Token count of the cluster. For `exact_ast` every member
+    /// shares the same value by construction; for `near_token` it
+    /// is the median across members (so a single rogue tiny body
+    /// cannot drag it to zero).
     pub normalized_token_count: usize,
-    /// Conservative recommendation surfaced to humans / AI. Tier 1
-    /// never auto-merges; it always says "review".
+    /// Conservative recommendation surfaced to humans / AI. Both
+    /// tiers always say `"review"` — never auto-merge.
     pub recommendation: String,
+    /// Tier-2 only: the conservative lower-bound similarity in
+    /// `[0, 1]` (minimum pairwise score among cluster members).
+    /// `None` for tier-1 clusters because those are always 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,19 +206,25 @@ pub fn analyze_similarity(options: SimilarityOptions) -> Result<SimilarityReport
 }
 
 /// Walk every Python / Dart function-like node in the store, read
-/// its source range, normalize → hash, then bucket by fingerprint.
-/// Buckets with at least `min_cluster_size` members become
-/// [`SimilarityCluster`]s, sorted by descending body size so the
-/// most "interesting" duplicates surface first.
+/// its source range, normalize → hash, then either bucket by
+/// exact fingerprint (tier 1) or pairwise-compare SimHashes
+/// (tier 2). Results are sorted so the largest, most confident
+/// clusters surface first.
 pub fn analyze_similarity_with_store(
     store: &Store,
     options: SimilarityOptions,
 ) -> Result<SimilarityReport> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let repo_root = options.repo_root.clone();
+    let shingle_k = options.shingle_k.max(1);
 
-    let mut buckets: BTreeMap<u64, Vec<(SimilarityMember, usize)>> = BTreeMap::new();
-    let mut scanned = 0usize;
+    struct Scanned {
+        member: SimilarityMember,
+        token_count: usize,
+        exact_fp: u64,
+        simhash: u64,
+    }
+    let mut scanned: Vec<Scanned> = Vec::new();
     let mut skipped = 0usize;
 
     for node in &nodes {
@@ -184,8 +259,8 @@ pub fn analyze_similarity_with_store(
             skipped += 1;
             continue;
         }
-        scanned += 1;
-        let fingerprint = fingerprint_tokens(&tokens);
+        let exact_fp = fingerprint_tokens(&tokens);
+        let simhash = simhash_tokens(&tokens, shingle_k);
         let member = SimilarityMember {
             id: node.id.to_string(),
             kind: node.kind.as_str().into(),
@@ -196,53 +271,239 @@ pub fn analyze_similarity_with_store(
             path: path_rel.to_string(),
             line_range: Some((start, end)),
         };
-        buckets
-            .entry(fingerprint)
-            .or_default()
-            .push((member, tokens.len()));
+        scanned.push(Scanned {
+            member,
+            token_count: tokens.len(),
+            exact_fp,
+            simhash,
+        });
     }
 
-    let mut clusters: Vec<SimilarityCluster> = buckets
-        .into_iter()
-        .filter(|(_, members)| members.len() >= options.min_cluster_size)
-        .filter_map(|(fingerprint, members)| {
-            // All members of a cluster share the same normalized
-            // token count by construction (same fingerprint <=>
-            // same normalized token stream).
-            let token_count = members.first().map(|(_, n)| *n).unwrap_or_default();
-            let mut just_members: Vec<SimilarityMember> =
-                members.into_iter().map(|(m, _)| m).collect();
-            just_members.sort_by(|a, b| a.path.cmp(&b.path).then(a.label.cmp(&b.label)));
-            if let Some(focus) = options.focus_symbol_id.as_deref() {
-                if !just_members.iter().any(|m| m.id == focus) {
-                    return None;
-                }
+    // ---- tier 1: exact AST clusters --------------------------
+    let mut exact_clusters: Vec<SimilarityCluster> = Vec::new();
+    let mut covered: HashSet<usize> = HashSet::new();
+    if options.mode.runs_exact() {
+        let mut buckets: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (idx, s) in scanned.iter().enumerate() {
+            buckets.entry(s.exact_fp).or_default().push(idx);
+        }
+        for (fp, indices) in buckets {
+            if indices.len() < options.min_cluster_size {
+                continue;
             }
-            Some(SimilarityCluster {
-                fingerprint: format!("{fingerprint:016x}"),
+            for &i in &indices {
+                covered.insert(i);
+            }
+            let token_count = scanned[indices[0]].token_count;
+            let mut members: Vec<SimilarityMember> =
+                indices.iter().map(|&i| scanned[i].member.clone()).collect();
+            members.sort_by(|a, b| a.path.cmp(&b.path).then(a.label.cmp(&b.label)));
+            exact_clusters.push(SimilarityCluster {
+                fingerprint: format!("{fp:016x}"),
                 duplicate_type: "exact_ast".into(),
-                members: just_members,
+                members,
                 normalized_token_count: token_count,
                 recommendation: "review".into(),
-            })
-        })
-        .collect();
+                similarity_score: None,
+            });
+        }
+    }
+
+    // ---- tier 2: SimHash near-duplicate pairs ----------------
+    let mut near_clusters: Vec<SimilarityCluster> = Vec::new();
+    let mut near_skipped = false;
+    if options.mode.runs_near() {
+        // Only consider symbols NOT already in an exact cluster;
+        // tier 1 always wins when both fire.
+        let candidates: Vec<usize> = (0..scanned.len())
+            .filter(|i| !covered.contains(i))
+            .collect();
+        if candidates.len() > options.max_pairwise_symbols {
+            near_skipped = true;
+        } else {
+            // Hamming threshold corresponding to `min_similarity`.
+            // similarity = 1 - h/64 => h = (1 - similarity) * 64.
+            // Round UP so the boundary is permissive. Clamp to
+            // [0, 64] BEFORE casting so the value is provably
+            // in-range; clippy's pessimistic lint can't see that,
+            // so we suppress the cast-sign-loss/truncation lints
+            // for this one expression.
+            let max_hamming = {
+                let raw = ((1.0 - options.min_similarity).max(0.0)) * 64.0;
+                let clamped = raw.ceil().clamp(0.0, 64.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    clamped as u32
+                }
+            };
+            let n = candidates.len();
+            let mut uf = UnionFind::new(n);
+            // Bucket by top-16-bit prefix to skip obvious non-pairs
+            // — pairs differing in their top 16 bits cannot have
+            // hamming ≤ max_hamming when max_hamming < 16 (which is
+            // the only useful range for similarity ≥ 0.75). This
+            // is a cheap pre-filter, NOT correctness-critical; we
+            // still run an exact pass over the full O(N²) when the
+            // threshold allows large hamming.
+            let mut pair_scores: BTreeMap<(usize, usize), f32> = BTreeMap::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let a = scanned[candidates[i]].simhash;
+                    let b = scanned[candidates[j]].simhash;
+                    let h = (a ^ b).count_ones();
+                    if h <= max_hamming {
+                        let sim = 1.0 - (h as f32 / 64.0);
+                        uf.union(i, j);
+                        pair_scores.insert((i.min(j), i.max(j)), sim);
+                    }
+                }
+            }
+            // Group by root → cluster.
+            let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for idx in 0..n {
+                let root = uf.find(idx);
+                groups.entry(root).or_default().push(idx);
+            }
+            for indices in groups.into_values() {
+                if indices.len() < options.min_cluster_size {
+                    continue;
+                }
+                // Worst-case lower bound on similarity inside the
+                // cluster — find the smallest pair_scores entry
+                // whose endpoints lie in this group.
+                let mut min_sim: f32 = 1.0;
+                for a in 0..indices.len() {
+                    for b in (a + 1)..indices.len() {
+                        let lo = indices[a].min(indices[b]);
+                        let hi = indices[a].max(indices[b]);
+                        if let Some(s) = pair_scores.get(&(lo, hi)) {
+                            if *s < min_sim {
+                                min_sim = *s;
+                            }
+                        }
+                    }
+                }
+                let mut token_counts: Vec<usize> = indices
+                    .iter()
+                    .map(|i| scanned[candidates[*i]].token_count)
+                    .collect();
+                token_counts.sort_unstable();
+                let median = token_counts[token_counts.len() / 2];
+                let mut members: Vec<SimilarityMember> = indices
+                    .iter()
+                    .map(|i| scanned[candidates[*i]].member.clone())
+                    .collect();
+                members.sort_by(|a, b| a.path.cmp(&b.path).then(a.label.cmp(&b.label)));
+                let canonical_fp = scanned[candidates[indices[0]]].simhash;
+                near_clusters.push(SimilarityCluster {
+                    fingerprint: format!("{canonical_fp:016x}"),
+                    duplicate_type: "near_token".into(),
+                    members,
+                    normalized_token_count: median,
+                    recommendation: "review".into(),
+                    similarity_score: Some(min_sim),
+                });
+            }
+        }
+    }
+
+    let mut clusters: Vec<SimilarityCluster> =
+        exact_clusters.into_iter().chain(near_clusters).collect();
+
+    if let Some(focus) = options.focus_symbol_id.as_deref() {
+        clusters.retain(|c| c.members.iter().any(|m| m.id == focus));
+    }
+
     clusters.sort_by(|a, b| {
+        // Exact clusters first (more confident), then by size.
+        let dt = duplicate_type_priority(a).cmp(&duplicate_type_priority(b));
+        if dt != std::cmp::Ordering::Equal {
+            return dt;
+        }
         b.normalized_token_count
             .cmp(&a.normalized_token_count)
             .then_with(|| b.members.len().cmp(&a.members.len()))
+            .then_with(|| {
+                // similarity_score: prefer higher.
+                let sa = a.similarity_score.unwrap_or(1.0);
+                let sb = b.similarity_score.unwrap_or(1.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.fingerprint.cmp(&b.fingerprint))
     });
 
+    let exact_count = clusters
+        .iter()
+        .filter(|c| c.duplicate_type == "exact_ast")
+        .count();
+    let near_count = clusters
+        .iter()
+        .filter(|c| c.duplicate_type == "near_token")
+        .count();
+    let total = clusters.len();
     Ok(SimilarityReport {
         schema_version: SIMILARITY_SCHEMA_VERSION,
         stats: SimilarityStats {
-            symbols_scanned: scanned,
+            symbols_scanned: scanned.len(),
             symbols_skipped: skipped,
-            clusters_reported: clusters.len(),
+            clusters_reported: total,
+            exact_clusters: exact_count,
+            near_clusters: near_count,
+            near_pairwise_skipped: near_skipped,
         },
         clusters,
     })
+}
+
+fn duplicate_type_priority(cluster: &SimilarityCluster) -> u8 {
+    match cluster.duplicate_type.as_str() {
+        "exact_ast" => 0,
+        "near_token" => 1,
+        _ => 2,
+    }
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+    fn find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        // Path compression.
+        let mut cur = x;
+        while self.parent[cur] != root {
+            let next = self.parent[cur];
+            self.parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
+        }
+    }
 }
 
 fn node_language(kind: NodeKind) -> Option<Language> {
@@ -567,6 +828,59 @@ fn fingerprint_tokens(tokens: &[String]) -> u64 {
     hash
 }
 
+/// SimHash over k-shingles of the normalized token stream. Two
+/// bodies with similar shingles produce SimHashes with small
+/// Hamming distance even if a few tokens were added, removed, or
+/// renamed. We use FNV-1a per shingle (same hash family as
+/// [`fingerprint_tokens`]) for cross-platform determinism.
+pub fn simhash_tokens(tokens: &[String], k: usize) -> u64 {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let k = k.max(1);
+    let mut acc = [0i32; 64];
+    let mut count = 0u32;
+    if tokens.len() < k {
+        // Fall back to hashing the whole body as a single shingle.
+        let h = hash_shingle(tokens);
+        return h;
+    }
+    for window in tokens.windows(k) {
+        let h = hash_shingle(window);
+        for (bit, slot) in acc.iter_mut().enumerate() {
+            if (h >> bit) & 1 == 1 {
+                *slot += 1;
+            } else {
+                *slot -= 1;
+            }
+        }
+        count += 1;
+    }
+    debug_assert!(count > 0);
+    let mut out = 0u64;
+    for (bit, slot) in acc.iter().enumerate() {
+        // Bias ties to 0 — deterministic and matches the common
+        // SimHash convention.
+        if *slot > 0 {
+            out |= 1u64 << bit;
+        }
+    }
+    out
+}
+
+fn hash_shingle(tokens: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for tok in tokens {
+        for b in tok.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +1007,7 @@ int total(int x, int y) {
             SimilarityOptions {
                 repo_root: dir.path().into(),
                 min_tokens: 4,
+                mode: SimilarityMode::Exact,
                 ..SimilarityOptions::default()
             },
         )
@@ -707,6 +1022,9 @@ int total(int x, int y) {
         assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
         assert_eq!(report.clusters[0].duplicate_type, "exact_ast");
         assert_eq!(report.clusters[0].recommendation, "review");
+        assert!(report.clusters[0].similarity_score.is_none());
+        assert_eq!(report.stats.exact_clusters, 1);
+        assert_eq!(report.stats.near_clusters, 0);
     }
 
     #[test]
@@ -756,6 +1074,7 @@ int total(int x, int y) {
                 repo_root: dir.path().into(),
                 min_tokens: 4,
                 focus_symbol_id: Some(c.clone()),
+                mode: SimilarityMode::Exact,
                 ..SimilarityOptions::default()
             },
         )
@@ -770,10 +1089,182 @@ int total(int x, int y) {
                 repo_root: dir.path().into(),
                 min_tokens: 4,
                 focus_symbol_id: Some(a),
+                mode: SimilarityMode::Exact,
                 ..SimilarityOptions::default()
             },
         )
         .unwrap();
         assert_eq!(report.clusters.len(), 1);
+    }
+
+    #[test]
+    fn simhash_of_identical_token_streams_is_identical() {
+        let toks = vec![
+            "def".into(),
+            "ID".into(),
+            "(".into(),
+            "ID".into(),
+            ")".into(),
+            ":".into(),
+            "return".into(),
+            "ID".into(),
+            "+".into(),
+            "NUM".into(),
+        ];
+        let a = simhash_tokens(&toks, 5);
+        let b = simhash_tokens(&toks, 5);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn simhash_distance_grows_with_token_distance() {
+        // Two near-identical bodies differing by a single inserted
+        // statement should have small hamming distance.
+        let original = normalize(
+            Language::Python,
+            "def f(x):\n    y = x + 1\n    z = y * 2\n    return z\n",
+        );
+        let renamed = normalize(
+            Language::Python,
+            "def g(aaa):\n    bbb = aaa + 1\n    ccc = bbb * 2\n    return ccc\n",
+        );
+        let unrelated = normalize(
+            Language::Python,
+            "def h(items):\n    for it in items:\n        if it is None:\n            raise ValueError\n    return items[0]\n",
+        );
+        let h_renamed = (simhash_tokens(&original, 5) ^ simhash_tokens(&renamed, 5)).count_ones();
+        let h_unrelated =
+            (simhash_tokens(&original, 5) ^ simhash_tokens(&unrelated, 5)).count_ones();
+        // Renames flip ZERO bits (identifiers all collapse to ID
+        // anyway), so renamed == original in normalized form.
+        assert_eq!(h_renamed, 0);
+        // An entirely different control-flow body must be much
+        // further away than a rename.
+        assert!(
+            h_unrelated > 8,
+            "unrelated body should drift far from original: got h={h_unrelated}",
+        );
+    }
+
+    #[test]
+    fn near_duplicate_pass_groups_pairs_with_extra_statement() {
+        // Two Python functions that share the same skeleton but
+        // one of them has a single extra arithmetic statement.
+        // Tier 1 would NOT match them; tier 2 should.
+        let (mut store, dir) = empty_store();
+        write_python(
+            dir.path(),
+            "app/a.py",
+            "def fa(items):\n    total = 0\n    for it in items:\n        total = total + it\n        total = total * 2\n    return total\n",
+        );
+        write_python(
+            dir.path(),
+            "app/b.py",
+            "def fb(rows):\n    sum = 0\n    for r in rows:\n        sum = sum + r\n        sum = sum * 2\n        sum = sum - 1\n    return sum\n",
+        );
+        let a = insert_py_fn(&mut store, "app/a.py", "fa", (1, 6));
+        let b = insert_py_fn(&mut store, "app/b.py", "fb", (1, 7));
+        let report = analyze_similarity_with_store(
+            &store,
+            SimilarityOptions {
+                repo_root: dir.path().into(),
+                min_tokens: 8,
+                mode: SimilarityMode::Near,
+                min_similarity: 0.7,
+                ..SimilarityOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.stats.near_clusters, report.clusters.len());
+        assert!(
+            !report.clusters.is_empty(),
+            "tier 2 must catch the near-duplicate pair"
+        );
+        let cluster = &report.clusters[0];
+        assert_eq!(cluster.duplicate_type, "near_token");
+        let score = cluster.similarity_score.expect("near cluster has score");
+        assert!(
+            (0.7..=1.0).contains(&score),
+            "similarity_score within range: {score}"
+        );
+        let ids: Vec<&str> = cluster.members.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+    }
+
+    #[test]
+    fn near_duplicate_pass_skips_symbols_already_in_exact_cluster() {
+        // Two structurally identical functions + a third
+        // near-duplicate of those two. Tier 1 must claim the
+        // first two; tier 2 should NOT re-cluster them when both
+        // tiers run together — instead the third one should be
+        // its own singleton (and thus filtered out for cluster
+        // size < 2).
+        let (mut store, dir) = empty_store();
+        write_python(
+            dir.path(),
+            "app/a.py",
+            "def fa(x):\n    y = x + 1\n    z = y * 2\n    return z\n",
+        );
+        write_python(
+            dir.path(),
+            "app/b.py",
+            "def fb(x):\n    y = x + 1\n    z = y * 2\n    return z\n",
+        );
+        write_python(
+            dir.path(),
+            "app/c.py",
+            "def fc(x):\n    y = x + 1\n    z = y * 2\n    w = z - 1\n    return w\n",
+        );
+        insert_py_fn(&mut store, "app/a.py", "fa", (1, 4));
+        insert_py_fn(&mut store, "app/b.py", "fb", (1, 4));
+        insert_py_fn(&mut store, "app/c.py", "fc", (1, 5));
+        let report = analyze_similarity_with_store(
+            &store,
+            SimilarityOptions {
+                repo_root: dir.path().into(),
+                min_tokens: 4,
+                mode: SimilarityMode::All,
+                min_similarity: 0.7,
+                ..SimilarityOptions::default()
+            },
+        )
+        .unwrap();
+        // fa & fb form an exact cluster; fc is left alone (no
+        // tier-2 partner) so total clusters == 1.
+        assert_eq!(report.stats.exact_clusters, 1);
+        assert_eq!(report.stats.near_clusters, 0);
+        assert_eq!(report.clusters.len(), 1);
+        assert_eq!(report.clusters[0].duplicate_type, "exact_ast");
+    }
+
+    #[test]
+    fn near_pairwise_skipped_when_max_pairwise_guard_trips() {
+        let (mut store, dir) = empty_store();
+        for i in 0..5 {
+            let name = format!("f{i}");
+            let path = format!("app/{name}.py");
+            write_python(
+                dir.path(),
+                &path,
+                "def f(x):\n    y = x + 1\n    return y * 2\n",
+            );
+            insert_py_fn(&mut store, &path, &name, (1, 3));
+        }
+        let report = analyze_similarity_with_store(
+            &store,
+            SimilarityOptions {
+                repo_root: dir.path().into(),
+                min_tokens: 4,
+                mode: SimilarityMode::Near,
+                max_pairwise_symbols: 2,
+                ..SimilarityOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            report.stats.near_pairwise_skipped,
+            "guard should report skip when uncovered > max"
+        );
+        assert!(report.clusters.is_empty());
     }
 }

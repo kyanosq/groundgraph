@@ -1,12 +1,19 @@
-//! `specslice similar` — P18 tier 1, structural duplicate report.
+//! `specslice similar` — P18 tier 1 + tier 2 duplicate report.
 //!
-//! Tier 1 finds *exact AST duplicates*: function / method bodies that
-//! collapse to identical normalized token streams after stripping
-//! identifiers, literals and comments. Output is intentionally a
-//! candidate list — never an auto-merge instruction.
+//! Tier 1 (`exact_ast`): function / method bodies that collapse to
+//! identical normalized token streams after stripping identifiers,
+//! literals and comments.
+//!
+//! Tier 2 (`near_token`, SimHash): pairs whose SimHash over k-shingles
+//! has small Hamming distance — catches "copy + rename a few fields,
+//! add or remove a couple of statements".
+//!
+//! Output is always a candidate list — never an auto-merge instruction.
 //!
 //! ```text
 //! specslice similar
+//! specslice similar --mode exact
+//! specslice similar --mode near --min-score 0.8
 //! specslice similar --node python::app/foo.py::bar
 //! specslice similar --format json
 //! ```
@@ -15,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use specslice_engine::similarity::{
-    analyze_similarity, SimilarityCluster, SimilarityOptions, SimilarityReport,
+    analyze_similarity, SimilarityCluster, SimilarityMode, SimilarityOptions, SimilarityReport,
 };
 
 #[derive(Debug, Clone)]
@@ -24,15 +31,24 @@ pub struct SimilarRunArgs {
     pub focus_symbol_id: Option<String>,
     pub min_tokens: usize,
     pub min_cluster_size: usize,
+    pub mode: String,
+    pub min_similarity: f32,
+    pub shingle_k: usize,
+    pub max_pairwise: usize,
     pub format: String,
 }
 
 pub fn run(args: SimilarRunArgs) -> Result<()> {
+    let mode = parse_mode(&args.mode)?;
     let report = analyze_similarity(SimilarityOptions {
         repo_root: args.repo_root,
         min_tokens: args.min_tokens,
         min_cluster_size: args.min_cluster_size,
         focus_symbol_id: args.focus_symbol_id,
+        mode,
+        min_similarity: args.min_similarity,
+        shingle_k: args.shingle_k,
+        max_pairwise_symbols: args.max_pairwise,
     })
     .context("running similarity analysis")?;
     match args.format.as_str() {
@@ -48,17 +64,35 @@ pub fn run(args: SimilarRunArgs) -> Result<()> {
     Ok(())
 }
 
+fn parse_mode(raw: &str) -> Result<SimilarityMode> {
+    match raw {
+        "exact" => Ok(SimilarityMode::Exact),
+        "near" => Ok(SimilarityMode::Near),
+        "all" | "" => Ok(SimilarityMode::All),
+        other => anyhow::bail!("unsupported --mode `{other}` (expected exact|near|all)"),
+    }
+}
+
 fn print_text(report: &SimilarityReport) {
-    println!("SpecSlice similar (tier 1 · 结构指纹)");
+    println!("SpecSlice similar (tier 1 结构指纹 + tier 2 SimHash 近似)");
     println!(
-        "扫描函数 {} · 跳过 {} · 输出簇 {}",
-        report.stats.symbols_scanned, report.stats.symbols_skipped, report.stats.clusters_reported,
+        "扫描函数 {} · 跳过 {} · 输出簇 {} (exact {} · near {})",
+        report.stats.symbols_scanned,
+        report.stats.symbols_skipped,
+        report.stats.clusters_reported,
+        report.stats.exact_clusters,
+        report.stats.near_clusters,
     );
+    if report.stats.near_pairwise_skipped {
+        println!(
+            "⚠ near tier 已跳过 (uncovered 符号超过 --max-pairwise 上限)。请缩小 code-roots 或显式提高上限后重试。"
+        );
+    }
     println!();
     if report.clusters.is_empty() {
-        println!("(没有发现结构完全相同的代码簇)");
+        println!("(没有发现满足阈值的相似代码簇)");
         println!(
-            "提示: tier 1 仅识别『去除标识符 / 字面量 / 注释后完全一致』的函数；近似重复 (tier 2) 与业务重复 (tier 3) 仍在后续迭代。"
+            "提示: tier 3 业务重复 (graph 邻域) 仍在后续迭代；先用 `specslice search` 与 `specslice graph --focus <id>` 复核单点上下文。"
         );
         return;
     }
@@ -72,13 +106,18 @@ fn print_text(report: &SimilarityReport) {
 }
 
 fn print_cluster(index: usize, cluster: &SimilarityCluster) {
+    let score_suffix = match cluster.similarity_score {
+        Some(s) => format!(" · 相似度 {:.2}", s),
+        None => String::new(),
+    };
     println!(
-        "== 簇 #{} · {} · {} 个成员 · {} tokens · 指纹 {} ==",
+        "== 簇 #{} · {} · {} 个成员 · {} tokens · 指纹 {}{} ==",
         index + 1,
         cluster.duplicate_type,
         cluster.members.len(),
         cluster.normalized_token_count,
         cluster.fingerprint,
+        score_suffix,
     );
     println!("建议: {}", cluster.recommendation);
     for member in &cluster.members {
@@ -104,7 +143,7 @@ mod tests {
         SIMILARITY_SCHEMA_VERSION,
     };
 
-    fn cluster() -> SimilarityCluster {
+    fn exact_cluster() -> SimilarityCluster {
         SimilarityCluster {
             fingerprint: "deadbeefcafebabe".into(),
             duplicate_type: "exact_ast".into(),
@@ -126,26 +165,57 @@ mod tests {
             ],
             normalized_token_count: 24,
             recommendation: "review".into(),
+            similarity_score: None,
+        }
+    }
+
+    fn near_cluster() -> SimilarityCluster {
+        SimilarityCluster {
+            fingerprint: "1234567812345678".into(),
+            duplicate_type: "near_token".into(),
+            members: vec![
+                SimilarityMember {
+                    id: "python::app/c.py::fc".into(),
+                    kind: "python_function".into(),
+                    label: "fc".into(),
+                    path: "app/c.py".into(),
+                    line_range: Some((1, 8)),
+                },
+                SimilarityMember {
+                    id: "python::app/d.py::fd".into(),
+                    kind: "python_function".into(),
+                    label: "fd".into(),
+                    path: "app/d.py".into(),
+                    line_range: Some((1, 9)),
+                },
+            ],
+            normalized_token_count: 40,
+            recommendation: "review".into(),
+            similarity_score: Some(0.875),
         }
     }
 
     #[test]
-    fn text_output_lists_cluster_members_and_recommendation() {
-        // Re-routes stdout would be heavier than necessary — exercise
-        // by serialising to JSON, which uses the same `Serialize` impl.
+    fn report_serialisation_distinguishes_exact_and_near_clusters() {
         let report = SimilarityReport {
             schema_version: SIMILARITY_SCHEMA_VERSION,
             stats: SimilarityStats {
-                symbols_scanned: 5,
+                symbols_scanned: 8,
                 symbols_skipped: 2,
-                clusters_reported: 1,
+                clusters_reported: 2,
+                exact_clusters: 1,
+                near_clusters: 1,
+                near_pairwise_skipped: false,
             },
-            clusters: vec![cluster()],
+            clusters: vec![exact_cluster(), near_cluster()],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"duplicate_type\":\"exact_ast\""));
-        assert!(json.contains("\"recommendation\":\"review\""));
-        assert!(json.contains("python::app/a.py::fa"));
-        assert!(json.contains("python::app/b.py::fb"));
+        assert!(json.contains("\"duplicate_type\":\"near_token\""));
+        // Exact cluster omits similarity_score; near cluster carries it.
+        assert!(!json.contains("\"similarity_score\":null"));
+        assert!(json.contains("\"similarity_score\":0.875"));
+        assert!(json.contains("\"exact_clusters\":1"));
+        assert!(json.contains("\"near_clusters\":1"));
     }
 }

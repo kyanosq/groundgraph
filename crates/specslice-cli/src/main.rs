@@ -69,6 +69,18 @@ struct SimilarArgs {
     /// 单个簇内最少成员数（默认 2，任意重复都报告）。
     #[arg(long, value_name = "N", default_value_t = 2)]
     min_cluster_size: usize,
+    /// 检测层级：`exact` 仅结构指纹、`near` 仅 SimHash 近似、`all` 两者（默认）。
+    #[arg(long, value_name = "MODE", default_value = "all")]
+    mode: String,
+    /// 近似簇的最低 SimHash 相似度（仅在 `near` / `all` 模式生效，默认 0.85）。
+    #[arg(long, value_name = "FLOAT", default_value_t = specslice_engine::similarity::DEFAULT_MIN_SIMILARITY)]
+    min_score: f32,
+    /// SimHash shingle 宽度（默认 5）。
+    #[arg(long, value_name = "K", default_value_t = specslice_engine::similarity::DEFAULT_SHINGLE_K)]
+    shingle_k: usize,
+    /// 进入 O(N²) 近似比对的最大符号数；超过该值跳过 near tier 并在 stats 标记。默认 20000。
+    #[arg(long, value_name = "N", default_value_t = specslice_engine::similarity::DEFAULT_MAX_PAIRWISE_SYMBOLS)]
+    max_pairwise: usize,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
     format: String,
@@ -652,6 +664,10 @@ fn run() -> Result<()> {
             focus_symbol_id: args.node,
             min_tokens: args.min_tokens,
             min_cluster_size: args.min_cluster_size,
+            mode: args.mode,
+            min_similarity: args.min_score,
+            shingle_k: args.shingle_k,
+            max_pairwise: args.max_pairwise,
             format: args.format,
         }),
     }
