@@ -6,6 +6,7 @@
 
 pub mod business_candidates;
 pub mod checks;
+pub mod confidence_view;
 pub mod config;
 pub mod connect;
 pub mod context_pack;
