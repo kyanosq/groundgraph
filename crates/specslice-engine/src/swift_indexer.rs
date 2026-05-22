@@ -99,13 +99,30 @@ pub fn build_swift_batch(options: &SwiftIndexOptions) -> Result<Option<LanguageI
     }
 }
 
-/// True when `sourcekit-lsp` (or the override binary) is available.
+/// True when `sourcekit-lsp` (or the override binary) is actually
+/// runnable on this host — i.e. it can be launched, exits 0 from
+/// `--help` within the smoke timeout, and does not emit a known
+/// "broken stub" stderr marker (the most common real-world failure
+/// being `SOURCEKITD FATAL ERROR: Service is invalid` when the
+/// IndexStoreDB cache is stale or the toolchain mismatches).
+///
+/// This is intentionally stricter than the historical
+/// `binary_on_path` check, which let unusable binaries slip through
+/// and cascade into hard test failures during the v0.2.0 close-out.
 pub fn swift_lsp_available(options: &SwiftIndexOptions) -> bool {
     let command = options
         .lsp_command
         .clone()
         .unwrap_or_else(|| "sourcekit-lsp".into());
-    binary_on_path(&command)
+    if !binary_on_path(&command) {
+        return false;
+    }
+    crate::lsp_probe::probe_lsp_command(
+        &command,
+        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
+        crate::lsp_probe::DEFAULT_TIMEOUT,
+    )
+    .is_runnable()
 }
 
 fn swift_profile() -> LspProfile {

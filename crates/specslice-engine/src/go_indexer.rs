@@ -85,12 +85,25 @@ pub fn build_go_batch(options: &GoIndexOptions) -> Result<Option<LanguageIndexBa
     }
 }
 
+/// True when `gopls` (or the override binary) actually runs on this
+/// host. We require the smoke launch to succeed, not just the binary
+/// to exist on PATH — the historical "exists on PATH" gate let
+/// half-installed Go toolchains slip through and crash the indexer
+/// mid-session.
 pub fn go_lsp_available(options: &GoIndexOptions) -> bool {
     let command = options
         .lsp_command
         .clone()
         .unwrap_or_else(|| "gopls".into());
-    binary_on_path(&command)
+    if !binary_on_path(&command) {
+        return false;
+    }
+    crate::lsp_probe::probe_lsp_command(
+        &command,
+        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
+        crate::lsp_probe::DEFAULT_TIMEOUT,
+    )
+    .is_runnable()
 }
 
 fn go_profile() -> LspProfile {

@@ -29,6 +29,7 @@ pub mod links_indexer;
 pub mod logic_confidence;
 pub mod lsp_client;
 pub mod lsp_indexer;
+pub mod lsp_probe;
 pub mod python_ast;
 pub mod python_frameworks;
 pub mod python_indexer;

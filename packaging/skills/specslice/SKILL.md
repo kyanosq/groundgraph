@@ -266,6 +266,31 @@ TypeScript / Java `Calls` should be treated the same way as Python
 `result.sidecar_skip_reason` before claiming LSP-quality data is
 present.
 
+## Unified LSP probe (P20 close-out, batch 2)
+
+Every language adapter answers "is this LSP binary actually runnable
+on this host?" through the same gate: `specslice_engine::lsp_probe::
+probe_lsp_command(command, args, timeout)`. The probe spawns the
+binary, gives it `DEFAULT_TIMEOUT` (1500ms) to exit 0 from
+`--help`, drains stderr (4 KiB cap), and rejects the binary if any
+broken-stub marker appears: `bad interpreter`, `no such file or
+directory`, `no module named`, `cannot execute`, `command not
+found`, `SOURCEKITD FATAL ERROR`, `could not load`, `no java
+runtime`, `JAVA_HOME is not set`, or `node: command not found`.
+This catches the real-world failure modes operators hit during
+v0.2.0 close-out — a `pylsp` whose shebang resolves to a deleted
+Anaconda, a `sourcekit-lsp` that crashes IndexStoreDB on init, a
+`jdtls` with no JRE on PATH — *before* the indexer starts a stdio
+session that never finishes initialise.
+
+`swift_lsp_available`, `go_lsp_available`, `typescript_lsp_available`,
+`java_lsp_available`, and `python_lsp_available` all chain
+`binary_on_path` → `probe_lsp_command(…).is_runnable()`. The
+opt-in LSP smoke tests further convert `index_<lang>(…) → Err` into
+a soft-skip with an `eprintln!` diagnostic, so `cargo test
+--include-ignored` is green regardless of whether the operator's
+local LSP is healthy.
+
 ## Cross-language consistency (P20)
 
 Every consumer (`questions`, `dead-code`, `slice`, `feature_map`,

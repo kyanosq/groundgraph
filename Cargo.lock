@@ -773,7 +773,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "specslice-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "specslice-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "specslice-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "globset",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "specslice-lang-dart"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "sha2",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "specslice-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "specslice-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rusqlite",

@@ -123,7 +123,7 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
     };
     if !swift_lsp_available(&probe) {
         eprintln!(
-            "skipping {} — `sourcekit-lsp` not on PATH and {SWIFT_LSP_COMMAND_ENV} not set",
+            "skipping {} — `sourcekit-lsp` did not pass the shared `lsp_probe` smoke launch (binary missing on PATH, {SWIFT_LSP_COMMAND_ENV} unset, or LSP returned a `SOURCEKITD FATAL ERROR` / non-zero exit)",
             module_path!()
         );
         return;
@@ -155,14 +155,27 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
         exclude_globs: Vec::new(),
         lsp_command: lsp_override,
     };
-    let result = index_swift(&mut store, &opts).expect("Swift indexer ran");
-    // P20 unification — `swift_lsp_available` only checks the binary
-    // exists on disk; it can pass while the actual stdio session
-    // fails (sandboxed `IndexStoreDB` cache permissions, broken
-    // toolchain, etc). Treat any probe-pass + adapter-fallback as a
-    // soft-skip with a useful eprintln so the operator can diagnose
-    // without staring at a green "passed" with no signal — same shape
-    // as the Python / TypeScript / Java smokes.
+    // P20 close-out — the unified `lsp_probe` smoke launch already
+    // catches "binary exists but is broken" (e.g. `sourcekit-lsp`
+    // crashing with `SOURCEKITD FATAL ERROR: Service is invalid`)
+    // BEFORE we get here, by making `swift_lsp_available` return
+    // false. But sometimes the probe survives `--help` and the real
+    // stdio session still collapses (`IndexStoreDB` cache poisoning,
+    // sandboxed permissions, transient toolchain hiccups). We
+    // convert both that and "adapter fell back to AST anyway" into
+    // a soft-skip so a busted local LSP can't turn opt-in
+    // `--include-ignored` red. The eprintln is the operator-facing
+    // diagnostic.
+    let result = match index_swift(&mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "soft-skip {}: `index_swift` returned Err ({e}); LSP probe passed but session failed",
+                module_path!()
+            );
+            return;
+        }
+    };
     if result.resolver_used != "swift_lsp" {
         eprintln!(
             "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
@@ -377,7 +390,7 @@ fn python_indexer_emits_class_function_method_nodes_when_lsp_present() {
     };
     if !specslice_engine::python_indexer::python_lsp_available(&probe) {
         eprintln!(
-            "skipping {} — no Python LSP discovered on PATH / .venv and {PYTHON_LSP_COMMAND_ENV} not set",
+            "skipping {} — no Python LSP passed the shared `lsp_probe` smoke launch (PATH / .venv empty, or all candidates returned broken-stub stderr); {PYTHON_LSP_COMMAND_ENV} unset",
             module_path!()
         );
         return;
@@ -395,7 +408,16 @@ fn python_indexer_emits_class_function_method_nodes_when_lsp_present() {
         lsp_command: lsp_override,
         disable_venv_discovery: false,
     };
-    let result = index_python(&mut store, &opts).expect("python indexer ran");
+    let result = match index_python(&mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "soft-skip {}: `index_python` returned Err ({e}); LSP probe passed but session failed",
+                module_path!()
+            );
+            return;
+        }
+    };
     if result.resolver_used != "python_lsp" {
         // Soft skip — `python_lsp_available` claimed a binary, the
         // launcher decided otherwise (typical cause: the binary's
@@ -475,7 +497,7 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
     };
     if !go_lsp_available(&probe) {
         eprintln!(
-            "skipping {} — `gopls` not on PATH and {GO_LSP_COMMAND_ENV} not set",
+            "skipping {} — `gopls` did not pass the shared `lsp_probe` smoke launch (binary missing on PATH, {GO_LSP_COMMAND_ENV} unset, or non-zero exit / broken-stub stderr)",
             module_path!()
         );
         return;
@@ -492,7 +514,16 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
         exclude_globs: Vec::new(),
         lsp_command: lsp_override,
     };
-    let result = index_go(&mut store, &opts).expect("Go indexer ran");
+    let result = match index_go(&mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "soft-skip {}: `index_go` returned Err ({e}); LSP probe passed but session failed",
+                module_path!()
+            );
+            return;
+        }
+    };
     if result.resolver_used != "go_lsp" {
         eprintln!(
             "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
@@ -648,8 +679,7 @@ fn typescript_indexer_emits_class_function_method_nodes_when_lsp_present() {
     };
     if !typescript_lsp_available(&probe) {
         eprintln!(
-            "skipping {} — `typescript-language-server` not on PATH and \
-             {TYPESCRIPT_LSP_COMMAND_ENV} not set",
+            "skipping {} — `typescript-language-server` did not pass the shared `lsp_probe` smoke launch (PATH / node_modules/.bin empty, {TYPESCRIPT_LSP_COMMAND_ENV} unset, or non-zero exit / broken-node-shebang)",
             module_path!()
         );
         return;
@@ -666,7 +696,16 @@ fn typescript_indexer_emits_class_function_method_nodes_when_lsp_present() {
         exclude_globs: Vec::new(),
         lsp_command: lsp_override,
     };
-    let result = index_typescript(&mut store, &opts).expect("ts indexer ran");
+    let result = match index_typescript(&mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "soft-skip {}: `index_typescript` returned Err ({e}); LSP probe passed but session failed",
+                module_path!()
+            );
+            return;
+        }
+    };
     if result.resolver_used != "typescript_lsp" {
         eprintln!(
             "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
@@ -793,7 +832,7 @@ fn java_indexer_emits_class_method_nodes_when_lsp_present() {
     };
     if !java_lsp_available(&probe) {
         eprintln!(
-            "skipping {} — `jdtls` not on PATH and {JAVA_LSP_COMMAND_ENV} not set",
+            "skipping {} — `jdtls` did not pass the shared `lsp_probe` smoke launch (binary missing on PATH, {JAVA_LSP_COMMAND_ENV} unset, or missing JRE / non-zero exit)",
             module_path!()
         );
         return;
@@ -810,7 +849,16 @@ fn java_indexer_emits_class_method_nodes_when_lsp_present() {
         exclude_globs: Vec::new(),
         lsp_command: lsp_override,
     };
-    let result = index_java(&mut store, &opts).expect("Java indexer ran");
+    let result = match index_java(&mut store, &opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "soft-skip {}: `index_java` returned Err ({e}); LSP probe passed but session failed",
+                module_path!()
+            );
+            return;
+        }
+    };
     if result.resolver_used != "java_lsp" {
         eprintln!(
             "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",

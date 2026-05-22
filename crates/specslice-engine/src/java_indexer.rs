@@ -390,7 +390,7 @@ struct ProbeOutcome {
 impl ProbeOutcome {
     fn from_options(options: &JavaIndexOptions) -> Self {
         if let Ok(env_cmd) = std::env::var(JAVA_LSP_COMMAND_ENV) {
-            if binary_on_path(&env_cmd) {
+            if java_binary_runnable(&env_cmd) {
                 return Self {
                     command: Some(env_cmd),
                     skip_reason: String::new(),
@@ -399,12 +399,12 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "{JAVA_LSP_COMMAND_ENV}=`{env_cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    "{JAVA_LSP_COMMAND_ENV}=`{env_cmd}` smoke launch 未通过，已退化为 AST fallback"
                 ),
             };
         }
         if let Some(cmd) = options.lsp_command.as_deref() {
-            if binary_on_path(cmd) {
+            if java_binary_runnable(cmd) {
                 return Self {
                     command: Some(cmd.to_string()),
                     skip_reason: String::new(),
@@ -413,11 +413,11 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "`java.lsp_command = {cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    "`java.lsp_command = {cmd}` smoke launch 未通过，已退化为 AST fallback"
                 ),
             };
         }
-        if binary_on_path("jdtls") {
+        if java_binary_runnable("jdtls") {
             return Self {
                 command: Some("jdtls".into()),
                 skip_reason: String::new(),
@@ -425,9 +425,25 @@ impl ProbeOutcome {
         }
         Self {
             command: None,
-            skip_reason: "未在 PATH 找到 jdtls，已退化为 AST fallback".into(),
+            skip_reason: "未在 PATH 找到可启动的 jdtls，已退化为 AST fallback".into(),
         }
     }
+}
+
+/// Java probe gate: a binary is "available" only when it both
+/// resolves on PATH and survives the shared `lsp_probe` smoke launch.
+/// `jdtls` is a Python launcher that bootstraps a JVM; smoke catches
+/// the common failure of `java` not being on PATH at all.
+fn java_binary_runnable(cmd: &str) -> bool {
+    if !binary_on_path(cmd) {
+        return false;
+    }
+    crate::lsp_probe::probe_lsp_command(
+        cmd,
+        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
+        crate::lsp_probe::DEFAULT_TIMEOUT,
+    )
+    .is_runnable()
 }
 
 #[cfg(test)]

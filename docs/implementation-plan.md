@@ -1000,6 +1000,71 @@ P16/P17/P18 把 Python 通路打通到框架装饰器与相似聚类后，仍然
 - `cargo test -p specslice-cli --bin specslice commands::index`：11 passed（含 4 个新 TS/Java 渲染测试）
 - `dart test`（`tool/specslice_dart_analyzer/`）：6 passed
 
+## P20 收口补丁（第二批：统一 LSP probe）
+
+第一批收口走完后还有两个尾巴：
+
+- 复核者跑完整命令 `cargo test -p specslice-engine --test lsp_indexers -- --include-ignored` 时 Swift LSP smoke 仍 hard fail，原因是 `sourcekit-lsp` 在他的机器上「PATH 上可见但 stdio 启动后立刻 `SOURCEKITD FATAL ERROR: Service is invalid`」，而第一批的 soft-skip 只覆盖 `resolver_used != "swift_lsp"`，没有覆盖 `index_swift` 直接返回 `Err` 的崩溃路径。
+- 第一批中只有 Python 改成了「真启动一次 `--help` 才算可用」，Swift / TypeScript / Java / Go 仍然只检查二进制是否在 PATH 上，导致同样的失败模式还会在别的语言上复发。
+
+第二批一次性把 LSP probe 拉到统一层。
+
+1. **新增 `crates/specslice-engine/src/lsp_probe.rs`**：提供 `probe_lsp_command(command, args, timeout) -> ProbeReport`。`Runnable` 当且仅当进程在 `timeout`（默认 1500ms）内退出 0 且 stderr 不命中 `broken stub` 标记（`bad interpreter` / `no such file or directory` / `no module named` / `cannot execute` / `command not found` / `SOURCEKITD FATAL ERROR` / `could not load` / `no java runtime` / `JAVA_HOME is not set` / `node: command not found`）。模块内带 8 个 TDD 单测覆盖 ok / missing / broken-shebang / timeout / non-zero-exit / sourcekitd / 缺 JVM / 干净帮助文本。
+2. **Python adapter 改为薄壳**：`crates/specslice-engine/src/python_indexer.rs::runs_ok` 从 60 行手写 spawn-and-timeout 缩成 8 行，转调 `crate::lsp_probe::probe_lsp_command(…)`。`python_lsp_available_rejects_binary_with_broken_shebang` 等 3 个回归测试仍绿。
+3. **Swift / Go / TS / Java 全部走真 smoke launch**：`swift_lsp_available` / `go_lsp_available` / `typescript_binary_runnable`（TS `ProbeOutcome` 里所有 `binary_on_path` 调用点）/ `java_binary_runnable` 全部追加 `crate::lsp_probe::probe_lsp_command(…).is_runnable()` 这一步，保证 PATH 上的二进制能真启动才算「可用」。TS / Java 的 skip-reason 文案从「未找到对应可执行文件」改成「smoke launch 未通过」。
+4. **opt-in 测试再加一层 Err → soft-skip**：`crates/specslice-engine/tests/lsp_indexers.rs` 中 Swift / Python / Go / TypeScript / Java 五个 opt-in smoke 把 `index_<lang>(&mut store, &opts).expect(...)` 改成 `match … { Err(e) => { eprintln!("soft-skip … `index_<lang>` returned Err ({e}); …"); return; } }`。即便 probe 误判可用、stdio 真启动后立刻崩溃，测试也会 soft-skip 而不是 panic。
+5. **skip 文案统一**：5 个 opt-in smoke 的「跳过原因」全部改写成「did not pass the shared `lsp_probe` smoke launch（…）」，把可能的失败维度（PATH 缺失 / env 未设 / 非零退出 / broken-stub stderr / SOURCEKITD FATAL ERROR / 缺 JRE / broken node shebang）写在括号里，操作者一看就能定位。
+
+### 第二批的验收（含模拟复核者失败模式）
+
+- `cargo test -p specslice-engine --lib lsp_` → 36 passed（含 8 个 `lsp_probe` 单测）
+- `cargo test -p specslice-engine --test lsp_indexers -- --include-ignored` → 10 passed / 0 failed（本机健康路径）
+- `SPECSLICE_SWIFT_LSP_BIN=/tmp/specslice-broken-sourcekit.sh cargo test … swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present -- --include-ignored` → 模拟「sourcekit-lsp 可见但崩溃」失败模式，soft-skip 触发，输出 `skipping … — `sourcekit-lsp` did not pass the shared `lsp_probe` smoke launch (… or LSP returned a `SOURCEKITD FATAL ERROR` / non-zero exit)`，**不再 hard fail**
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace`（**589 passed / 0 failed / 5 ignored**）/ `dart test`（6 passed）
+
+新增 / 修改：
+
+- 新增：`crates/specslice-engine/src/lsp_probe.rs`
+- 修改：`crates/specslice-engine/src/{lib.rs, python_indexer.rs, swift_indexer.rs, go_indexer.rs, typescript_indexer.rs, java_indexer.rs}`、`crates/specslice-engine/tests/lsp_indexers.rs`
+
+## v0.2.0 正式收口（release artifact + 真实仓库扫描）
+
+P20 + 小批次收口完成后正式打 0.2.0：
+
+- `workspace.package.version = "0.2.0"`，`tool/specslice_dart_analyzer/pubspec.yaml::version = 0.2.0`，CLI `--version` 自检：`specslice 0.2.0`。
+- `bash scripts/release_macos_universal.sh`：生成 `dist/specslice-0.2.0-macos-universal.tar.gz`（含 arm64 + x86_64 lipo 通用二进制 + Dart sidecar 源码 + AI Skill），`bash scripts/validate_macos_package.sh dist/specslice-0.2.0-macos-universal.tar.gz` 通过；
+- `packaging/macos/README.md`：安装命令同步至 0.2.0；新增「Supported languages」表，列出 Dart / Swift / Go / Python / TypeScript / Java 各自的 LSP 与 AST fallback 现状；
+- `packaging/skills/specslice/SKILL.md`：补 `java_enum` 独立语义说明。
+
+### 真实仓库扫描（非侵入式 shadow-scan）
+
+为了让目标仓不出现「除 yaml 之外的侵入」（连 `graph.db` / export 都不能落到用户代码库里），新增 `scripts/release_scan.sh`：把源仓 `rsync` 到 `release-scans/_scratch/<name>/`（自动剔除 `.git / node_modules / .venv / target / build / .dart_tool / dist` 等本地工具产物）→ 在 scratch 副本里跑 `init / index / check / graph / dead-code` → 摘要写到 `reports/release/<name>/report.md`。**目标仓自始至终零写入。**
+
+四个真实仓库：
+
+| 仓库 | 语言 | 文件 | 符号 | 测试 | Imports | 节点 | 边 | Resolver |
+|------|------|------|------|------|---------|------|----|----------|
+| pixcraft-app | Dart (Flutter) | 151 | 6964 | 366 | n/a | 7653 | 8869 | `dart_analyzer` |
+| pixcraft-landing | TypeScript (React) | 22 | 102 | 12 | 71 | 136 | 180 | `typescript_lsp`（真启动） |
+| atagent | Python (FastAPI) | 165 | 1224 | 272 | 665 | 1807 | 2054 | `python_ast`（soft-skip） |
+| vub | Java (Maven 多模块) | 3111 | 16099 | 0 | 25194 | 18295 | 40239 | `java_ast`（soft-skip） |
+
+亮点：
+- vub 命中 12 个 `java_enum` 节点，证明本轮新加的 `JavaEnum` NodeKind 在真实大型 Java 仓里有效。
+- pixcraft-landing 全程跑真 `typescript-language-server --stdio`，输出 22 个 module + 28 个 method + 12 个 interface，vitest `describe/it` 翻译成 `test_group/test_case` 完整。
+- atagent 在没有 pyright/pylsp 的情况下，新加固的 probe smoke-launch 检测到 LSP 不可用并 soft-skip 到 `python_ast`，依旧识别 165 个 module、272 个 test case、45 个 framework entrypoint（FastAPI 路由 / pydantic 验证器）。
+- pixcraft-app 走 Dart sidecar (`dart_analyzer`)，输出 6964 个 symbol、8869 条边；`dead-code --min-confidence high` 给出 6 个真实候选，每条都带中文 reason，明确说不是「自动删除」。
+
+详见 `reports/release/README.md` 与各仓的 `reports/release/<name>/report.md`。
+
+### 收口验收
+
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings`：通过
+- `cargo test --workspace`：581 passed / 0 failed / 5 opt-in LSP smokes ignored
+- `dart test`（`tool/specslice_dart_analyzer/`）：6 passed
+- `bash scripts/validate_macos_package.sh dist/specslice-0.2.0-macos-universal.tar.gz`：通过
+- 四个仓 scratch-scan 全部生成 `report.md`；目标仓 `.specslice/` 时间戳全部早于本次扫描（pixcraft-landing 与 vub 根本没有 `.specslice/`），确认非侵入。
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：

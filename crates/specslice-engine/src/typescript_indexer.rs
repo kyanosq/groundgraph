@@ -126,6 +126,22 @@ pub fn typescript_lsp_available(options: &TypescriptIndexOptions) -> bool {
     ProbeOutcome::from_options(options).command.is_some()
 }
 
+/// Helper for the TypeScript probe: a binary is "available" only when
+/// it both resolves on PATH (or as an absolute path) AND survives the
+/// shared `lsp_probe` smoke launch. This catches `tsserver` wrappers
+/// whose `node` shebang points at a deleted nvm install.
+fn typescript_binary_runnable(cmd: &str) -> bool {
+    if !binary_on_path(cmd) {
+        return false;
+    }
+    crate::lsp_probe::probe_lsp_command(
+        cmd,
+        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
+        crate::lsp_probe::DEFAULT_TIMEOUT,
+    )
+    .is_runnable()
+}
+
 #[derive(Debug, Default)]
 struct AstOutcome {
     files: usize,
@@ -463,7 +479,7 @@ struct ProbeOutcome {
 impl ProbeOutcome {
     fn from_options(options: &TypescriptIndexOptions) -> Self {
         if let Ok(env_cmd) = std::env::var(TYPESCRIPT_LSP_COMMAND_ENV) {
-            if binary_on_path(&env_cmd) {
+            if typescript_binary_runnable(&env_cmd) {
                 return Self {
                     command: Some(env_cmd),
                     skip_reason: String::new(),
@@ -472,12 +488,12 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "{TYPESCRIPT_LSP_COMMAND_ENV}=`{env_cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    "{TYPESCRIPT_LSP_COMMAND_ENV}=`{env_cmd}` smoke launch 未通过，已退化为 AST fallback"
                 ),
             };
         }
         if let Some(cmd) = options.lsp_command.as_deref() {
-            if binary_on_path(cmd) {
+            if typescript_binary_runnable(cmd) {
                 return Self {
                     command: Some(cmd.to_string()),
                     skip_reason: String::new(),
@@ -486,7 +502,7 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "`typescript.lsp_command = {cmd}` 未找到对应可执行文件，已退化为 AST fallback"
+                    "`typescript.lsp_command = {cmd}` smoke launch 未通过，已退化为 AST fallback"
                 ),
             };
         }
@@ -494,13 +510,13 @@ impl ProbeOutcome {
         let local = options
             .repo_root
             .join("node_modules/.bin/typescript-language-server");
-        if local.is_file() {
+        if local.is_file() && typescript_binary_runnable(&local.to_string_lossy()) {
             return Self {
                 command: Some(local.to_string_lossy().into_owned()),
                 skip_reason: String::new(),
             };
         }
-        if binary_on_path("typescript-language-server") {
+        if typescript_binary_runnable("typescript-language-server") {
             return Self {
                 command: Some("typescript-language-server".into()),
                 skip_reason: String::new(),

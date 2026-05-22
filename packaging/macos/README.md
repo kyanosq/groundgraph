@@ -23,14 +23,28 @@ source under `tool/specslice_dart_analyzer/`.
 ## Install
 
 ```bash
-tar -xzf specslice-0.1.0-macos-universal.tar.gz
-sudo cp -R specslice-0.1.0-macos-universal /usr/local/specslice
+tar -xzf specslice-0.2.0-macos-universal.tar.gz
+sudo cp -R specslice-0.2.0-macos-universal /usr/local/specslice
 sudo ln -sf /usr/local/specslice/bin/specslice /usr/local/bin/specslice
 specslice --help
 ```
 
 If you do not want to use `/usr/local`, put the extracted directory anywhere
 and add its `bin` directory to PATH.
+
+## Supported languages (0.2.0)
+
+| Language   | Default | LSP                                                | AST fallback |
+|------------|---------|----------------------------------------------------|--------------|
+| Dart       | on      | bundled `specslice_dart_analyzer` (resolved AST)   | yes          |
+| Swift      | opt-in  | `sourcekit-lsp`                                    | no           |
+| Go         | opt-in  | `gopls`                                            | no           |
+| Python     | opt-in  | `pyright-langserver` / `basedpyright-langserver` / `pylsp` | yes  |
+| TypeScript | opt-in  | `typescript-language-server --stdio`                | yes          |
+| Java       | opt-in  | `jdtls`                                            | yes          |
+
+For TS / Java the AST pass always runs even when the LSP is unavailable, so
+imports and tests still land in the graph as a usable baseline.
 
 ## Dart analyzer sidecar
 

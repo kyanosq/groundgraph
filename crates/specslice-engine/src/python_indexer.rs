@@ -737,63 +737,17 @@ impl ProbeOutcome {
 /// followed by a kill) returns `false` and lets the caller move on to
 /// the next candidate.
 ///
-/// We accept non-zero exit codes — some LSP servers (notably old
-/// `pylsp` builds) return 1 from `--help` while still being healthy
-/// when actually driven via stdio. The decisive failure modes we
-/// must reject are: `spawn()` errors, shebang failures (which surface
-/// as a non-zero exit + stderr like `bad interpreter`), and hangs.
+/// Thin shim that delegates the actual smoke launch to the shared
+/// [`crate::lsp_probe`] module. Kept as a function — rather than
+/// inlining — so the rest of the Python adapter (and its regression
+/// tests) keep the same callsite shape.
 fn runs_ok(cmd: &str) -> bool {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let mut child = match Command::new(cmd)
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let timeout = Duration::from_millis(1500);
-    let start = Instant::now();
-    let exit = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => return false,
-        }
-    };
-    // Drain stderr so we can pattern-match the classic shebang
-    // failures. Use a small bounded read — `--help` output is tiny.
-    let mut stderr_buf = String::new();
-    if let Some(s) = child.stderr.take() {
-        let _ = s.take(4096).read_to_string(&mut stderr_buf);
-    }
-    let lower = stderr_buf.to_ascii_lowercase();
-    let shebang_failed = lower.contains("bad interpreter")
-        || lower.contains("no such file or directory")
-        || lower.contains("no module named")
-        || lower.contains("cannot execute")
-        || lower.contains("command not found");
-    if shebang_failed {
-        return false;
-    }
-    // Accept on a clean exit (most common: 0 from `--help`). We
-    // intentionally do NOT trust non-zero exit codes here — they
-    // mean the binary at least ran a real interpreter but didn't
-    // recognise `--help`, which is far more often a "wrong binary"
-    // signal than a healthy LSP server.
-    exit.map(|s| s.success()).unwrap_or(false)
+    crate::lsp_probe::probe_lsp_command(
+        cmd,
+        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
+        crate::lsp_probe::DEFAULT_TIMEOUT,
+    )
+    .is_runnable()
 }
 
 // `sha2::Sha256` is reachable via the existing engine dep tree; we use
