@@ -46,3 +46,4 @@ reports/release/**/.specslice/
 # `reports/release/<name>/report.md`, so we keep only the markdown
 # and gitignore the .txt to keep `git log -p` reviewable.
 reports/release/**/*.txt
+reports/release-v0.3.0a/**/*.json
