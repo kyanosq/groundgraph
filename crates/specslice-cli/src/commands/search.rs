@@ -374,6 +374,28 @@ fn print_human(r: &SearchResult) {
             println!("  $ {cmd}");
         }
     }
+    let block = render_warnings_block(&r.warnings);
+    if !block.is_empty() {
+        print!("{block}");
+    }
+}
+
+/// Build the human-readable warnings tail (`== Warnings ==`) so test
+/// code can assert it without capturing stdout.
+///
+/// Empty `warnings` yields an empty string — the caller must check
+/// before printing so we don't emit a blank trailing section.
+fn render_warnings_block(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push('\n');
+    s.push_str("== Warnings ==\n");
+    for w in warnings {
+        s.push_str(&format!("  - {w}\n"));
+    }
+    s
 }
 
 /// Surface the engine-side defaults so `main.rs` can wire `default_value_t`
@@ -468,6 +490,40 @@ mod tests {
         assert!(
             out.contains("specslice search \"login\""),
             "expected search context comment, got: {out}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0-A Phase 4 — CLI human renderer surfaces engine warnings.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_warnings_block_empty_returns_empty_string() {
+        assert_eq!(render_warnings_block(&[]), "");
+    }
+
+    #[test]
+    fn render_warnings_block_lists_each_warning_with_header_and_dash() {
+        let block = render_warnings_block(&[
+            "warn: 节点 X 的出边质量查询失败：sqlite locked".to_string(),
+            "warn: 节点 Y 的邻接查询失败：io error".to_string(),
+        ]);
+        assert!(
+            block.contains("== Warnings =="),
+            "expected `== Warnings ==` header, got: {block}",
+        );
+        assert!(
+            block.contains("- warn: 节点 X 的出边质量查询失败"),
+            "expected first warning rendered with dash, got: {block}",
+        );
+        assert!(
+            block.contains("- warn: 节点 Y 的邻接查询失败"),
+            "expected second warning rendered with dash, got: {block}",
+        );
+        assert!(
+            block.starts_with('\n'),
+            "warnings block must start with a blank line so it's visually \
+             separated from the previous section, got: {block:?}",
         );
     }
 }

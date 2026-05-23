@@ -66,3 +66,50 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
     let report = analyze_dead_code(opts).context("analysing dead code")?;
     Ok(serde_json::to_value(&report)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use specslice_engine::{DeadCodeReport, DeadCodeStats, DEAD_CODE_SCHEMA_VERSION};
+
+    /// v0.3.0-A Phase 4 — `serde_json::to_value(&report)` is the only
+    /// transformation the MCP tool performs, so verifying it carries
+    /// `warnings` is enough to lock down the wire shape.
+    #[test]
+    fn dead_code_response_carries_warnings_when_present() {
+        let report = DeadCodeReport {
+            schema_version: DEAD_CODE_SCHEMA_VERSION,
+            min_confidence: "medium".to_string(),
+            stats: DeadCodeStats::default(),
+            candidates: Vec::new(),
+            warnings: vec!["warn: 节点 X 的入边质量查询失败：sqlite locked".to_string()],
+        };
+        let value = serde_json::to_value(&report).expect("serialise DeadCodeReport");
+        let warnings = value
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .expect("warnings field must be present and an array when populated");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("入边质量查询失败"));
+    }
+
+    /// Empty `warnings` must NOT show up in the JSON payload so old
+    /// MCP clients keep working unchanged.
+    #[test]
+    fn dead_code_response_omits_warnings_when_empty() {
+        let report = DeadCodeReport {
+            schema_version: DEAD_CODE_SCHEMA_VERSION,
+            min_confidence: "medium".to_string(),
+            stats: DeadCodeStats::default(),
+            candidates: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let value = serde_json::to_value(&report).expect("serialise DeadCodeReport");
+        assert!(
+            value.get("warnings").is_none(),
+            "empty warnings must be skipped in JSON, got: {value}",
+        );
+    }
+}

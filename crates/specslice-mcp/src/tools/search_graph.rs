@@ -137,3 +137,62 @@ fn build_query(args: &Value) -> Result<SearchQuery> {
         line: line_u32,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use specslice_engine::search::SearchSubgraph;
+    use specslice_engine::SearchResult;
+
+    /// v0.3.0-A Phase 4 — the MCP tool delegates everything to
+    /// `serde_json::to_value(&result)` so the wire shape is whatever
+    /// `SearchResult` serialises to. Lock down that the new
+    /// `warnings` field round-trips into the JSON-RPC payload when
+    /// non-empty.
+    #[test]
+    fn search_graph_response_carries_warnings_when_present() {
+        let result = SearchResult {
+            query: "login".to_string(),
+            tokens: vec!["login".to_string()],
+            matches: Vec::new(),
+            subgraph: SearchSubgraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            graph_commands: Vec::new(),
+            warnings: vec!["warn: 节点 abc 的出边质量查询失败：disk i/o error".to_string()],
+        };
+        let value = serde_json::to_value(&result).expect("serialise SearchResult");
+        let warnings = value
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .expect("warnings field must be present and an array when populated");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("出边质量查询失败"));
+    }
+
+    /// Empty `warnings` must NOT show up in the JSON payload so older
+    /// MCP clients (and JSON consumers of `specslice search --json`)
+    /// remain fully backward compatible.
+    #[test]
+    fn search_graph_response_omits_warnings_when_empty() {
+        let result = SearchResult {
+            query: "login".to_string(),
+            tokens: vec!["login".to_string()],
+            matches: Vec::new(),
+            subgraph: SearchSubgraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            graph_commands: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let value = serde_json::to_value(&result).expect("serialise SearchResult");
+        assert!(
+            value.get("warnings").is_none(),
+            "empty warnings must be skipped in JSON, got: {value}",
+        );
+    }
+}
