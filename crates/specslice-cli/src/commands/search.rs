@@ -436,6 +436,7 @@ mod tests {
                 }],
             },
             graph_commands: vec![],
+            warnings: Vec::new(),
         }
     }
 

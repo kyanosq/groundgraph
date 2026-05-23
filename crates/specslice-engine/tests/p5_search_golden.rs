@@ -18,8 +18,8 @@ use specslice_engine::business_candidates::{apply_review, ReviewStatus, ReviewVe
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::init::{init_repository, InitOptions};
 use specslice_engine::search::{
-    compute_search_html_payload, run_search_with_store, SearchOptions, SearchQuery, SCORE_EXACT_ID,
-    SCORE_NAME_TOKEN, SCORE_PATH_SEGMENT,
+    compute_search_html_payload, run_search_with_store, SearchOptions, SearchQuery,
+    SCORE_EDGE_EVIDENCE, SCORE_EXACT_ID, SCORE_NAME_TOKEN, SCORE_PATH_SEGMENT,
 };
 
 fn fixture_path() -> PathBuf {
@@ -312,7 +312,18 @@ fn p5_file_line_input_resolves_to_enclosing_symbol() {
     .unwrap();
 
     let top = &result.matches[0];
-    assert_eq!(top.score, SCORE_EXACT_ID);
+    // Base score is SCORE_EXACT_ID; v0.3.0-A adds SCORE_EDGE_EVIDENCE
+    // when the resolved symbol has ≥1 high-tier outbound edge, which
+    // is the case for `listenToPurchaseUpdates` (it calls into the
+    // billing client via analyzer-resolved edges). Accept either the
+    // bare base score (fixture without high-tier outbound) or the
+    // boosted score.
+    assert!(
+        top.score == SCORE_EXACT_ID || top.score == SCORE_EXACT_ID + SCORE_EDGE_EVIDENCE,
+        "position-resolved hit must score at SCORE_EXACT_ID (100) or \
+         SCORE_EXACT_ID+SCORE_EDGE_EVIDENCE (130); got {}",
+        top.score,
+    );
     assert!(
         top.id.contains("listenToPurchaseUpdates"),
         "position search must resolve to enclosing symbol; got {}",

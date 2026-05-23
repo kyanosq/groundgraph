@@ -126,6 +126,14 @@ pub struct SearchResult {
     /// operator — first entry is always a `specslice graph --focus …`
     /// for the top hit so visual drill-down is one paste away.
     pub graph_commands: Vec<String>,
+    /// Engine-side warnings collected during ranking
+    /// (e.g. per-node edge-quality probe failures). Mirrors
+    /// `impact::ImpactReport.warnings` / `dead_code::DeadCodeReport.warnings`
+    /// so engine never writes to stderr — CLI / MCP / JSON callers
+    /// render warnings explicitly. Skipped in JSON when empty for
+    /// backward compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +409,10 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
         _ => keyword_matches(store, &options.repo_root, &tokens, &kinds_set)?,
     };
 
+    let mut warnings: Vec<String> = Vec::new();
+    apply_evidence_boost(store, &mut matches, &mut warnings);
+    apply_neighbor_boost(store, &mut matches, &mut warnings);
+
     matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     if matches.len() > limit {
         matches.truncate(limit);
@@ -417,7 +429,68 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
         matches,
         subgraph,
         graph_commands,
+        warnings,
     })
+}
+
+/// v0.3.0-A Pass A — boost each hit whose outbound edges carry
+/// high-tier evidence. Engine never writes to stderr; failures are
+/// collected into the result-level `warnings` vec.
+fn apply_evidence_boost(store: &Store, matches: &mut [SearchMatch], warnings: &mut Vec<String>) {
+    for hit in matches.iter_mut() {
+        match crate::confidence_view::outbound_edge_quality(
+            store,
+            &hit.id,
+            crate::confidence_view::EdgeQualityScope::SearchRanking,
+        ) {
+            Ok(summary) if summary.high >= 1 => {
+                hit.score += SCORE_EDGE_EVIDENCE;
+                hit.match_reasons.push(format!(
+                    "出边 evidence_quality=high ({} 条)，符号有强证据支撑",
+                    summary.high,
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warnings.push(format!("warn: 节点 {} 的出边质量查询失败：{}", hit.id, e));
+            }
+        }
+    }
+}
+
+/// v0.3.0-A Pass B — capped neighbor boost. Each hit can earn at most
+/// one `SCORE_NEIGHBOR` increment, reason lists at most the first two
+/// adjacent hit names (suffix "等" when more), so this acts as a
+/// tie-breaker rather than dominating the ranking.
+fn apply_neighbor_boost(store: &Store, matches: &mut [SearchMatch], warnings: &mut Vec<String>) {
+    if matches.len() < 2 {
+        return;
+    }
+    let hit_ids: HashSet<String> = matches.iter().map(|m| m.id.clone()).collect();
+    for hit in matches.iter_mut() {
+        let neighbors = match crate::confidence_view::neighbors_of(store, &hit.id, 8) {
+            Ok(ns) => ns,
+            Err(e) => {
+                warnings.push(format!("warn: 节点 {} 的邻接查询失败：{}", hit.id, e));
+                continue;
+            }
+        };
+        let matched: Vec<&crate::confidence_view::NeighborInfo> = neighbors
+            .iter()
+            .filter(|n| n.id != hit.id && hit_ids.contains(&n.id))
+            .collect();
+        let matches_total = matched.len();
+        if matches_total == 0 {
+            continue;
+        }
+        hit.score += SCORE_NEIGHBOR;
+        let reason_names: Vec<String> = matched.iter().take(2).map(|n| n.name.clone()).collect();
+        hit.match_reasons.push(format!(
+            "邻接其他命中（{}{}）",
+            reason_names.join("、"),
+            if matches_total > 2 { " 等" } else { "" },
+        ));
+    }
 }
 
 /// Business candidates live in `business_logic.yaml` and emit
@@ -2295,5 +2368,216 @@ candidates:
             hub_card.focus_hidden_count > 0,
             "hidden count must be >0 when truncated"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.3.0-A — Pass A (edge evidence boost) + Pass B (neighbor boost,
+    // capped) + structured warnings.
+    // -----------------------------------------------------------------------
+
+    fn insert_calls_edge_with_indexer(store: &mut Store, from: &str, to: &str, indexer: &str) {
+        let edge = EdgeAssertion {
+            id: ArtifactId::new(format!("calls::{from}->{to}::{indexer}")),
+            from_id: ArtifactId::new(from.to_string()),
+            to_id: ArtifactId::new(to.to_string()),
+            kind: EdgeKind::Calls,
+            source: EdgeSource::LanguageAdapter,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: Some(indexer.into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_edge(&edge).unwrap();
+    }
+
+    /// Pass A: a hit with an outbound high-tier `Calls` edge earns
+    /// SCORE_EDGE_EVIDENCE on top of its base score, and the boost is
+    /// explained in `match_reasons`.
+    #[test]
+    fn score_match_includes_edge_evidence_boost_when_high_tier_outbound_exists() {
+        let (mut store, dir) = empty_store();
+        let core = insert_method(&mut store, "lib/login.dart", "LoginService.signIn", (1, 5));
+        // Outbound high-tier call from the hit to some other symbol.
+        let downstream = insert_method(&mut store, "lib/api.dart", "ApiClient.post", (1, 3));
+        insert_calls_edge_with_indexer(&mut store, &core, &downstream, "dart_analyzer");
+
+        let mut opts = SearchOptions::keywords(dir.path(), "signin");
+        opts.limit = 25;
+        let result = run_search_with_store(&store, opts).unwrap();
+        let hit = result
+            .matches
+            .iter()
+            .find(|m| m.id == core)
+            .expect("expected hit on LoginService.signIn");
+        assert!(
+            hit.match_reasons
+                .iter()
+                .any(|r| r.contains("出边 evidence_quality=high")),
+            "match_reasons must record the high-tier evidence boost, got: {:?}",
+            hit.match_reasons,
+        );
+    }
+
+    /// Pass A negative path: a hit whose outbound usage edges are
+    /// only medium-tier (AST fallback) does NOT receive the boost.
+    #[test]
+    fn score_match_does_not_include_edge_evidence_boost_when_only_medium_outbound() {
+        let (mut store, dir) = empty_store();
+        let core = insert_method(&mut store, "lib/login.dart", "LoginService.signIn", (1, 5));
+        let downstream = insert_method(&mut store, "lib/api.dart", "ApiClient.post", (1, 3));
+        insert_calls_edge_with_indexer(&mut store, &core, &downstream, "python_ast");
+
+        let mut opts = SearchOptions::keywords(dir.path(), "signin");
+        opts.limit = 25;
+        let result = run_search_with_store(&store, opts).unwrap();
+        let hit = result
+            .matches
+            .iter()
+            .find(|m| m.id == core)
+            .expect("expected hit on LoginService.signIn");
+        assert!(
+            !hit.match_reasons
+                .iter()
+                .any(|r| r.contains("evidence_quality=high")),
+            "medium-tier outbound must not produce the evidence boost reason, got: {:?}",
+            hit.match_reasons,
+        );
+    }
+
+    /// Pass B: two adjacent hits both gain +SCORE_NEIGHBOR exactly once.
+    /// The boost is symmetric — neither hit gets a double boost when
+    /// they have multiple edges to each other.
+    #[test]
+    fn neighbor_boost_caps_at_single_increment_per_hit_and_is_symmetric() {
+        let (mut store, dir) = empty_store();
+        let a = insert_method(&mut store, "lib/auth.dart", "AuthFlow.signIn", (1, 5));
+        let b = insert_method(&mut store, "lib/auth.dart", "AuthFlow.signOut", (10, 15));
+        // Two edges between the same pair — boost must still cap at +1.
+        insert_calls_edge_with_indexer(&mut store, &a, &b, "dart_analyzer");
+        let mut second_edge_id = format!("references::{a}->{b}::dart_analyzer");
+        let edge2 = EdgeAssertion {
+            id: ArtifactId::new(second_edge_id.split_off(0)),
+            from_id: ArtifactId::new(a.clone()),
+            to_id: ArtifactId::new(b.clone()),
+            kind: EdgeKind::References,
+            source: EdgeSource::LanguageAdapter,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: Some("dart_analyzer".into()),
+            index_generation: None,
+            metadata_json: None,
+        };
+        store.upsert_edge(&edge2).unwrap();
+
+        let mut opts = SearchOptions::keywords(dir.path(), "authflow");
+        opts.limit = 25;
+        let result = run_search_with_store(&store, opts).unwrap();
+        let hit_a = result.matches.iter().find(|m| m.id == a).unwrap();
+        let hit_b = result.matches.iter().find(|m| m.id == b).unwrap();
+        let neighbor_a = hit_a
+            .match_reasons
+            .iter()
+            .filter(|r| r.contains("邻接其他命中"))
+            .count();
+        let neighbor_b = hit_b
+            .match_reasons
+            .iter()
+            .filter(|r| r.contains("邻接其他命中"))
+            .count();
+        assert_eq!(
+            neighbor_a, 1,
+            "Pass B must add at most one neighbor reason per hit (a), got: {:?}",
+            hit_a.match_reasons,
+        );
+        assert_eq!(
+            neighbor_b, 1,
+            "Pass B must add at most one neighbor reason per hit (b), got: {:?}",
+            hit_b.match_reasons,
+        );
+    }
+
+    /// Pass B no-op: a single hit can't get a neighbor boost.
+    #[test]
+    fn neighbor_boost_zero_when_no_hit_is_adjacent_to_another_hit() {
+        let (mut store, dir) = empty_store();
+        let lonely = insert_method(&mut store, "lib/foo.dart", "Foo.bar", (1, 2));
+        let mut opts = SearchOptions::keywords(dir.path(), "bar");
+        opts.limit = 25;
+        let result = run_search_with_store(&store, opts).unwrap();
+        let hit = result.matches.iter().find(|m| m.id == lonely).unwrap();
+        assert!(
+            !hit.match_reasons.iter().any(|r| r.contains("邻接其他命中")),
+            "single hit must not get a neighbor boost"
+        );
+    }
+
+    /// Pass B reason capping: when ≥ 3 adjacent hits surround a hit,
+    /// only the first two names are mentioned and the reason ends in
+    /// "等".
+    #[test]
+    fn neighbor_reason_appends_等_when_more_than_two_adjacent_hits() {
+        let (mut store, dir) = empty_store();
+        let core = insert_method(&mut store, "lib/auth.dart", "AuthCore.run", (1, 5));
+        let mut names = Vec::new();
+        for name in [
+            "AuthHelper.a",
+            "AuthHelper.b",
+            "AuthHelper.c",
+            "AuthHelper.d",
+        ] {
+            let id = insert_method(&mut store, "lib/auth.dart", name, (10, 12));
+            insert_calls_edge_with_indexer(&mut store, &core, &id, "dart_analyzer");
+            names.push(id);
+        }
+        let mut opts = SearchOptions::keywords(dir.path(), "auth");
+        opts.limit = 50;
+        let result = run_search_with_store(&store, opts).unwrap();
+        let hit_core = result.matches.iter().find(|m| m.id == core).unwrap();
+        let neighbor_reason = hit_core
+            .match_reasons
+            .iter()
+            .find(|r| r.contains("邻接其他命中"))
+            .expect("core hit must list a neighbor reason");
+        assert!(
+            neighbor_reason.contains("等"),
+            "neighbor reason must end with `等` when more than 2 adjacent hits, got: {neighbor_reason}",
+        );
+    }
+
+    /// SearchResult.warnings serialises with skip-if-empty for back-compat.
+    #[test]
+    fn search_result_warnings_field_skipped_when_empty() {
+        let (mut store, dir) = empty_store();
+        insert_method(&mut store, "lib/foo.dart", "Foo.bar", (1, 2));
+        let opts = SearchOptions::keywords(dir.path(), "bar");
+        let result = run_search_with_store(&store, opts).unwrap();
+        assert!(result.warnings.is_empty());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("\"warnings\""),
+            "empty warnings must be omitted, got: {json}",
+        );
+    }
+
+    /// SearchResult.warnings round-trips when populated.
+    #[test]
+    fn search_result_warnings_round_trips_when_present() {
+        let (mut store, dir) = empty_store();
+        insert_method(&mut store, "lib/foo.dart", "Foo.bar", (1, 2));
+        let opts = SearchOptions::keywords(dir.path(), "bar");
+        let mut result = run_search_with_store(&store, opts).unwrap();
+        result.warnings.push("warn: synthetic".into());
+        let json = serde_json::to_string(&result).unwrap();
+        let back: SearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warnings, vec!["warn: synthetic".to_string()]);
     }
 }
