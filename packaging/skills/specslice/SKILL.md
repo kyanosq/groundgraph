@@ -506,6 +506,39 @@ Agents should weight reasoning by this label. Never claim
 "verified" for `low` edges without a follow-up step (running a
 test, reading the source, asking the user).
 
+## v0.3.0-A — `evidence_quality` now drives ranking + explanations
+
+Starting with v0.3.0-A (branch-state, not yet released), the
+`evidence_quality` signal is **plumbed** through dead-code reasons
+and search ranking via a new `confidence_view` module. The schema
+does **not** change; nothing the agent already consumes breaks.
+
+- **dead-code**: candidates that survive BFS but whose inbound
+  *usage* edges (Calls / References / ReadsProvider / PersistsTo /
+  NavigatesTo / SubscribesStream / DeclaresVerification — i.e. NOT
+  Contains / Imports / DerivesFrom) are *all* `low` tier get an
+  extra reason line: `仅有 N 条 low-tier 入边（来自低置信
+  indexer / AST fallback / lightweight resolver），证据较弱`. BFS
+  reach set unchanged; this is purely an explanation upgrade.
+- **search**: two new scoring passes run before sort:
+  - **Pass A — evidence boost** (+30): hits whose `outbound`
+    usage-edge summary has `≥ 1` high-tier edge get `+30 score` and
+    a reason `出边 evidence_quality=high (N 条)，符号有强证据支撑`.
+    Empirically, pixcraft-app `--kind dart_method` "build" lifts
+    75/100 hits from 100 → 130.
+  - **Pass B — neighbor boost** (capped +20): hits whose 1-hop
+    neighbors (cap=8) include other hits get `+20 score` (at most
+    once per hit) and a reason `邻接其他命中（A、B [等]）`. Designed
+    as a tie-breaker, not a primary signal. vub/"service" lifts
+    30/30 neighbor-cluster hits.
+- **structured `warnings`**: both `DeadCodeReport` and
+  `SearchResult` now include `warnings: Vec<String>` with
+  `skip_serializing_if = "Vec::is_empty"`. Old MCP / JSON
+  consumers see zero shape change when nothing fails; new
+  consumers can surface engine-side advisories (e.g. sqlite probe
+  failures) without scraping stderr. CLI human output renders a
+  `== Warnings ==` block when present, otherwise stays silent.
+
 ## Test selection (P19)
 
 `specslice select-tests --base main [--head HEAD] [--include-deps]`

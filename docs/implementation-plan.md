@@ -1065,6 +1065,58 @@ P20 + 小批次收口完成后正式打 0.2.0：
 - `bash scripts/validate_macos_package.sh dist/specslice-0.2.0-macos-universal.tar.gz`：通过
 - 四个仓 scratch-scan 全部生成 `report.md`；目标仓 `.specslice/` 时间戳全部早于本次扫描（pixcraft-landing 与 vub 根本没有 `.specslice/`），确认非侵入。
 
+## v0.3.0-A 置信度贯通（已落地，未发版）
+
+v0.2.0 收口后，进入 v0.3.0 主题。第一个子项目 v0.3.0-A 把
+**已有的 `edge_confidence` 信号实际接入 dead-code reason 与
+search ranking**，并打通 engine → CLI / MCP / JSON 的结构化
+`warnings` 通道。这是纯 ranking / 解释性收口，不动 schema、
+不动 BFS 可达性、不动 MCP 输出字段集（warnings 字段
+`skip_serializing_if = "Vec::is_empty"` 保持完全向后兼容）。
+
+- 设计与决策：`docs/superpowers/specs/2026-05-22-v030-a-confidence-plumbing-design.md`
+- 6 段 TDD 实施计划：`docs/plans/2026-05-22-v030-a-implementation-plan.md`
+- 真实仓库行为对照：`reports/release-v0.3.0a/README.md`
+
+### 落地范围
+
+| Phase | 主体改动 | 关键新代码 / 测试 |
+|-------|----------|---------------------|
+| 1 | 新模块 `confidence_view`：`EdgeQualityScope` (`Usage` / `SearchRanking`) + `EdgeQualitySummary` + 纯函数 `summarize_edges` + store 查询 `inbound_edge_quality` / `outbound_edge_quality` + 邻接收集 `neighbors_of(cap)` | `crates/specslice-engine/src/confidence_view.rs`（20 单测） |
+| 2 | dead-code 在 `classify(...)` 末尾给"非 Low 桶但 inbound usage 边全是 low-tier"的候选追加 reason；`DeadCodeReport` 引入 `warnings: Vec<String>`（`skip_serializing_if = "Vec::is_empty"`） | `crates/specslice-engine/src/dead_code.rs`（+4 单测） |
+| 3 | search 在 `matches.sort_by` 之前插入 Pass A（出边 evidence_quality=high → +30 score）+ Pass B（邻接 cluster → 最多 +20 score，reason 最多列 2 个名字 + "等"）；`SearchResult` 引入同型 `warnings` 字段，engine 端**任何 stderr 都改 push warnings** | `crates/specslice-engine/src/search.rs`（+7 单测、回归修 `tests/p5_search_golden.rs::p5_file_line_input_resolves_to_enclosing_symbol`） |
+| 4 | CLI 渲染：`specslice search` / `specslice dead-code` 人类输出末尾增加 `== Warnings ==` 段（空列表完全静默）；MCP `search_graph` / `dead_code` tool 的 JSON-RPC 输出自然透传 warnings（通过 round-trip 测试锁死） | `crates/specslice-cli/src/commands/{search,dead_code}.rs`、`crates/specslice-mcp/src/tools/{search_graph,dead_code}.rs`（+4 CLI 单测、+4 MCP 单测） |
+| 5 | 用 v0.2.0 阶段的 4 份 `release-scans/_scratch/*/graph.db` 与新二进制对照跑 dead-code 与 search，把 Phase 2 / Phase 3 的真实触发率与样例落库 | `reports/release-v0.3.0a/README.md`、`scripts/release_scan_v030a_metrics.py` |
+
+### Phase 5 真实证据要点
+
+- **Pass A（evidence boost）** 在 pixcraft-app `--kind dart_method` "build"
+  查询上 75/100 命中触发，最高 score 从 100 涨到 130。
+  样例 `_EditorScreenState.build` 含 9 条 high-tier 出边。
+- **Pass B（neighbor boost）** 在 pixcraft-app/build 42/100 触发，
+  在 vub/"service" 30/30 触发（同 package cluster）；vub/save 0
+  触发，证明它只在真实邻接时给 tie-break。
+- **dead-code only-low-tier-inbound reason** 在四个仓 0/0/0/0 命中，
+  因为 `*_ast` indexer 出的边目前都是 Medium，Low 留给 AI-derive /
+  override / ignored 三类罕见情况。Phase 2 reason 加得保守，
+  不会误报，AI derive 接进来后会自然变得有意义。
+
+### 已知遗留 bug（不属于 v0.3.0-A 引入）
+
+- `specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
+  只覆盖 Dart / Swift / Go / Python 别名，**TypeScript / Java
+  NodeKind 别名缺失**，所以 `--kind typescript_function` /
+  `--kind java_method` 会被 CLI 本地解析器以 `unknown --kind` 拒绝，
+  尽管 engine 的 `default_search_kinds()` 已经列为 valid。
+  → 处置：留给 v0.3.0-B 或 P20 follow-up 补 `parse_kind` 别名表。
+
+### 收口验收（v0.3.0-A 仍以分支态，不发版）
+
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings`：通过
+- `cargo test --workspace -- --test-threads=4`：workspace 全绿（engine lib 272 测试、CLI 30 测试、MCP 6 测试，5 个 opt-in LSP smoke ignored）
+- `dart test`（`tool/specslice_dart_analyzer/`）：6 passed
+- 四个 scratch 副本 + raw JSON 已 gitignore，落库的只有人类可读的 `reports/release-v0.3.0a/README.md`
+
 ## 后续验收方式
 
 你开发后，我会按以下顺序验收：

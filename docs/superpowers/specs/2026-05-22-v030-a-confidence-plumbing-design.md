@@ -444,3 +444,67 @@ dead_code --json
   reason diff + search top-K diff
 - [ ] `docs/implementation-plan.md` 新增 v0.3.0 章节
   （v0.2.0 之后），登记本 sub-project 的范围与验收
+
+## 14. Implementation addendum — 实施过程中确认/微调的设计
+
+为了与最终落地的代码保持一致，把开发中确认的几处实现细节回写进
+本 spec，避免 spec ↔ 代码漂移。
+
+### 14.1 `confidence_view` 暴露第三个纯函数 `summarize_edges`
+
+设计稿原本只列了 `inbound_edge_quality / outbound_edge_quality`
+两个 store-aware API。实际开发时把"如何把 edges 切成 high/medium/low
+桶"抽成一个**纯函数** `summarize_edges`，签名：
+
+```rust
+pub fn summarize_edges<'a, I>(edges: I, scope: EdgeQualityScope) -> EdgeQualitySummary
+where
+    I: IntoIterator<Item = &'a EdgeAssertion>;
+```
+
+这样：
+- `inbound_edge_quality` / `outbound_edge_quality` 内部都走
+  `store.list_edges_*` → `summarize_edges(_, scope)`，零重复逻辑。
+- `dead_code::classify(...)` 复用已经在内存里的
+  `&[&EdgeAssertion]`（避免对 sqlite 做第二次查询），直接调
+  `summarize_edges(inbound_usage.iter().map(|e| **e), scope)`。
+- 纯函数完全可单测，无需 fixtures。
+
+### 14.2 `EdgeQualitySummary::is_only_low` 替代外部判定
+
+设计稿"dead-code only-low-tier reason"的判定逻辑被收敛进
+`EdgeQualitySummary::is_only_low(&self) -> bool` 方法
+（`self.high == 0 && self.medium == 0 && self.low > 0`）。
+这样未来 spec / 调用方修改阈值定义时只需改一个地方。
+
+同时为了 future-proof，summary 还附带 `total()` / `is_empty()` /
+`dominant() -> Option<EdgeConfidence>` 三个观察方法，供 v0.3.0-B 复用。
+
+### 14.3 Phase 5 真实仓库覆盖率回填
+
+完成 Phase 1-4 后，在 v0.2.0 阶段沉淀好的四份
+`release-scans/_scratch/*/graph.db`（pixcraft-app /
+atagent / pixcraft-landing / vub）上跑出真实数据：
+
+- dead-code only-low-tier-inbound reason 触发率为 0 / 0 / 0 / 0：
+  edge_confidence.rs 把 `*_ast` indexer 边都判到 Medium，Low 只
+  留给 AI-derive / override / ignored 三类罕见情况，因此 reason
+  现在加得保守不会误报；待 v0.3.0-B / C 接 AI derive 后会自然激活。
+- search Pass A 在 pixcraft-app `--kind dart_method` "build"
+  上 75/100 触发，最高 score 100 → 130；样例 `_EditorScreenState.build`
+  含 9 条 high-tier 出边。
+- search Pass B 在 vub/"service" 30/30 cluster 触发；vub/"save"
+  0 触发（命中分散在多个 package），证明 boost 只在真实邻接时给
+  tie-break 信号，不会无差别加分。
+
+报告在 `reports/release-v0.3.0a/README.md`，复现脚本在
+`scripts/release_scan_v030a_metrics.py`。
+
+### 14.4 不在 v0.3.0-A 范围内的遗留 bug
+
+- `specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
+  只覆盖 Dart / Swift / Go / Python 别名，**TypeScript / Java**
+  NodeKind 别名缺失。`--kind typescript_function` / `--kind
+  java_method` 在 CLI 本地解析器就被拒绝，尽管 engine 已经
+  把它们列为 valid。Phase 5 报告里以"不带 --kind"绕过。
+  → 留给 v0.3.0-B 或 P20 follow-up 补别名表。
