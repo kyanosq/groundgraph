@@ -173,6 +173,47 @@
 
 ---
 
+## 0.12 第六轮（2026-06-04 · 业务文档流水线 `propose → business-doc`：补齐 CodeGraph 根本不做的事）
+
+前五轮都在「缩小与 CodeGraph 在**代码检索广度/性能**上的差距」。本轮转向**护城河本身**：SpecSlice 的北极星是「**从代码构建可信业务文档**」，而 CodeGraph 的定位是「给 AI agent 的高性能代码上下文」——它没有业务声明、没有人工确认、没有面向人的文档产物。本轮把这条价值链**端到端跑通并产品化**，全程 TDD。
+
+**问题诊断（为什么之前到不了「业务文档」）：**
+
+- P9 早已定义了业务候选的**落盘格式**（`.specslice/candidates/business_logic.yaml`）与**人工确认闭环**（`specslice candidate review`），但候选的**生成**全靠人手翻图；
+- 唯一的「喂 AI」入口 `connect propose` 是**链路级**（孤儿符号/测试清单），且在真实大仓上**分钟级超时**（tailorx 上 >6 分钟未结束），无法用于生成业务文档；
+- `export` 命令只是把 DB 表 dump 成 JSONL，**不是面向人的业务文档**。
+
+**本轮交付（两个新命令，闭合整条流水线）：**
+
+```text
+specslice propose        代码/文档/测试事实  → 业务模块证据包 + 中文提示词
+  → AI 写 business_logic.yaml（仅基于证据 id，不臆造）
+  → specslice candidate review   人工确认 accepted / rejected / needs_changes
+  → specslice business-doc       已确认候选 + 解析回的证据 → 可读业务文档
+```
+
+1. **`specslice propose`（`business_pack` 引擎）——证据包生成。** 用仓库自身的 feature 目录约定（`lib/features/<x>`、`src/<x>`…）做**路径感知**的业务模块切分（区别于 `features` 的调用耦合聚类，更贴近人对业务的直觉）；单次内存加载图，按模块汇总语义信号（框架角色 / 路由 / Provider / 存储 / 流订阅 / 代表性入口符号 / 相关文档/测试 / 跨模块依赖），并附**约束式中文提示词**（只能引用证据包里真实出现的 id）。输出 json（喂 AI）/ markdown（含 Mermaid 依赖图 + 候选骨架 + 提示词）/ text。
+   - **质量收敛（均失败测试先行）**：文档/测试**按文件去重**（原按 section/case 重复几十次）、剔除 `test/docs/tool` 等**非业务脚手架桶**、入口符号**排除测试目录的 mock/fake 与 freezed/.g.dart 生成代码**、Mermaid 依赖图只留权重前 24 条边。
+
+2. **`specslice business-doc`（`business_doc` 引擎）——业务文档导出。** 默认只导出 **accepted** 候选（可信视图），`--include-proposed` 预览草稿；把每条候选的 `evidence` id **回解析到代码图**，按角色分组（代码/文档/测试/信号），引用真实 `path:line`，可逐条审计、可跳转；并做**证据漂移检测**（引用符号若已不在图中→单列告警，是 doc-code drift 的信号）。
+
+3. **tailorx 真实端到端验收（27,368 符号 / 1,108 文档 / 2,569 测试）：**
+
+   | 阶段 | 命令 | 结果 |
+   |---|---|---|
+   | 证据包 | `propose` | 25 个业务模块，**约 2 秒**（`connect propose` 曾 6 分钟未结束） |
+   | AI 候选 | 人工以证据包为据写 `business_logic.yaml` | 4 条候选（auth / order_measure / cart / design），证据 id 均取自证据包 |
+   | 人工确认 | `candidate review --accept` ×3 | auth / order_measure / cart 置 accepted，design 留作草稿 |
+   | 业务文档 | `business-doc` | 导出 3 条业务能力，证据**全部解析（0 漂移）**，每条带 `path:line`、开放问题、风险、审阅留痕 |
+
+   - 证据包质量修复**在真实数据上可见**：cart 模块入口由「freezed `$...CopyWith` 噪声」清理为 `CartRepository / CartApiClient / FinalizeDraftOrdersUseCase` 等真实业务入口。
+
+**与 CodeGraph 的对照（本轮新增差异化）：** CodeGraph 能告诉 agent「这段代码调用了什么」；SpecSlice 现在能产出「**这个模块在产品里负责什么业务、依据哪些可审计的代码/文档/测试证据、由谁在何时确认**」。前者是检索，后者是**带信任链的业务知识资产**——这是 CodeGraph 架构里没有的层。
+
+> 本轮代码改动：新增 `crates/specslice-engine/src/business_pack.rs`、`business_doc.rs`；新增 CLI `commands/propose.rs`、`commands/business_doc.rs` 并接入 `main.rs`。`fmt`/`clippy` 零告警，workspace 全绿（engine lib **404 测试**）。
+
+---
+
 ## 1. 两个项目的画像
 
 ### 1.1 SpecSlice 现状画像
@@ -187,18 +228,20 @@
 | 索引刷新 | 手动 `specslice index`（带 file-hash 增量），**无文件监听 / 无 auto-sync** |
 | 代码事实边 | `contains` / `imports` / `calls` / `references` |
 | 语义边 | `reads_provider` / `navigates_to` / `persists_to` / `subscribes_stream`（Flutter/Riverpod 专项）；Python 框架装饰器（FastAPI/Flask/Celery/Click/Pydantic）识别 |
-| CLI 命令面 | `init/index/slice/impact/check/context/connect/export/graph/candidate/logic/search/dead-code/similar/select-tests/features/graph-diff/questions` |
+| CLI 命令面 | `init/index/slice/impact/check/context/connect/export/graph/candidate/logic/`**`propose`**`/`**`business-doc`**`/search/dead-code/similar/select-tests/features/graph-diff/questions`（`propose`+`business-doc` 为业务文档流水线两端） |
 | MCP 工具 | 6 个：`search_graph` / `context_pack` / `explain_symbol` / `get_subgraph` / `impact` / `dead_code`（独立 `specslice-mcp` 二进制） |
 | 可视化 | 自包含、离线、零 CDN 的 HTML 代码图浏览器（Documents / Business / Code / Tests / Risks 五泳道，fact/confirmed/candidate/risk 四图层） |
-| 成熟度 | v0.2.0 已收口发版，v0.3.0-A（置信度贯通）+ P21/P22（tree-sitter 广度后端）+ P23（9 语言启发式调用解析全覆盖）已落地未发版；workspace 全绿（engine lib **379 测试**，含逐语言属性测试 + 9 语言调用解析 scan 测试） |
+| 成熟度 | v0.2.0 已收口发版，v0.3.0-A（置信度贯通）+ P21/P22（tree-sitter 广度后端）+ P23（9 语言启发式调用解析全覆盖）+ P24（业务文档流水线 `propose`/`business-doc`）已落地未发版；workspace 全绿（engine lib **404 测试**，含逐语言属性测试 + 9 语言调用解析 scan 测试 + 业务证据包/文档导出测试） |
 
 **核心价值链（产品主线）：**
 
 ```text
 文档事实 / 代码事实 / 测试事实
+  → specslice propose：按业务模块聚合的证据包 + 约束式中文提示词
   → AI 生成中文业务逻辑候选 + 候选关联（带 evidence / 可信度 / open questions）
-  → 人工确认（accepted / rejected / needs_changes / pending）
+  → specslice candidate review：人工确认（accepted / rejected / needs_changes / pending）
   → confirmed graph
+  → specslice business-doc：可读业务文档（证据回解析、path:line、漂移检测）
   → PR Impact / Agent Context Pack / 图浏览
 ```
 
@@ -297,6 +340,8 @@
 ## 4. SpecSlice 的差异化优势（护城河）
 
 这些是 CodeGraph **结构上不做**或**做不到**的，必须持续加固：
+
+> **头号差异化（0.12 起已端到端落地）：从代码生成可信业务文档。** `propose → AI 候选 → candidate review → business-doc` 这条流水线，把「代码事实」变成「带信任链、可审计、面向人的业务知识资产」。CodeGraph 是「给 agent 的代码检索」，到此为止；SpecSlice 多出「业务声明 + 人工确认 + 文档产物」整层。详见 0.12。
 
 1. **意图 ↔ 代码 ↔ 测试的可追溯闭环。** CodeGraph 只有代码结构；SpecSlice 把「为什么有这段代码（需求）/谁验证它（测试）/它在哪记录（文档）」连起来。这是 AI 编程当前最大的盲区（AI 不知道需求、不知道代码为何存在、不知道该读哪些测试）。
 2. **证据优先 + 人工确认的信任模型。** "Graph≠truth, Evidence=truth；LLM 建议，人确认；CI 只信确定边或确认边。" 这让结果可进 CI、可审计、可问责，而纯启发式图做不到。
