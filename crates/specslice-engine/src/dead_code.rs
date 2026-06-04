@@ -333,18 +333,22 @@ pub fn analyze_dead_code_with_store(
         }
     }
 
-    // Reachability fixpoint: follow usage edges forward, and propagate
-    // reachability *up* `Contains` edges onto module/file-family parents only
-    // (so genuine dead types/functions keep their own verdict — nothing ever
-    // "calls" a module). The set only grows, so this can never flip a
-    // reachable symbol back into a candidate.
+    // Reachability fixpoint (phase 1): follow usage edges forward — `Contains`
+    // included, so a reached type/file expands *down* to the members the
+    // framework or codegen drives without an in-repo call edge (getters reached
+    // through a property chain `_shiftDao.batchInsert()`, freezed factories,
+    // enum-like const values, lifecycle callbacks). Propagate reachability *up*
+    // onto module/file parents (and expand them so module-level references they
+    // anchor get followed), and let a reachable *constructor* keep its owning
+    // class alive (constructing a type uses it). The set only grows, so this
+    // can never flip a reachable symbol back into a candidate.
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut queue: std::collections::VecDeque<String> = entry_ids.iter().cloned().collect();
     while let Some(id) = queue.pop_front() {
         if !reachable.insert(id.clone()) {
             continue;
         }
-        // Forward: follow usage edges out of this node.
+        // Forward: follow usage edges (Contains included) out of this node.
         if let Some(out) = outbound.get(id.as_str()) {
             for e in out {
                 let to = e.to_id.to_string();
@@ -353,14 +357,10 @@ pub fn analyze_dead_code_with_store(
                 }
             }
         }
-        // Up: this node keeps its module/file containers alive, and a newly
-        // reachable container must be expanded too so any module-level
-        // references it anchors get followed. Additionally, a reachable
-        // *constructor* keeps its owning class alive: constructing a type is
-        // using it, even when the class is referenced only through its ctor
-        // (e.g. a private `_AppLocalizationsDelegate` named solely by
-        // `static const delegate = _AppLocalizationsDelegate()` — the
-        // construction edge lands on the ctor, never the class node).
+        // Up: keep module/file containers alive, and let a reachable ctor keep
+        // its owning class alive (the construction edge lands on the ctor, e.g.
+        // a private `_AppLocalizationsDelegate` named solely by
+        // `static const delegate = _AppLocalizationsDelegate()`).
         let current_is_ctor = node_index.get(id.as_str()).is_some_and(|n| {
             n.kind == NodeKind::DartConstructor || is_dart_constructor_shaped_method(n)
         });
@@ -371,6 +371,37 @@ pub fn analyze_dead_code_with_store(
                     .is_some_and(|n| specslice_core::language_traits::is_module_or_file(n.kind));
                 if (parent_is_container || current_is_ctor) && !reachable.contains(*parent) {
                     queue.push_back((*parent).to_string());
+                }
+            }
+        }
+    }
+
+    // Phase 2 — rescue live *containers*. A static-only class is never
+    // constructed and a class named only through a static call
+    // (`LunarService.generateDayInfoRange()`) gets no usage edge on the class
+    // node — the edge lands on the method — so phase 1 leaves the type unreached
+    // even though it plainly owns reachable code. Walk *up* `Contains` from
+    // every reachable symbol and mark each type/file/module ancestor alive.
+    // This only flows up and only rescues containers, so a class with one live
+    // member is saved while its genuinely-unused siblings (an unreferenced
+    // `AppButton.icon` ctor) keep their verdict: the candidate set can only
+    // shrink, never gain a false positive.
+    {
+        let mut up_queue: std::collections::VecDeque<String> = reachable.iter().cloned().collect();
+        let mut walked: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(id) = up_queue.pop_front() {
+            if !walked.insert(id.clone()) {
+                continue;
+            }
+            if let Some(parents) = contains_parents.get(id.as_str()) {
+                for parent in parents {
+                    let parent_is_container = node_index.get(*parent).is_some_and(|n| {
+                        specslice_core::language_traits::is_type(n.kind)
+                            || specslice_core::language_traits::is_module_or_file(n.kind)
+                    });
+                    if parent_is_container && reachable.insert((*parent).to_string()) {
+                        up_queue.push_back((*parent).to_string());
+                    }
                 }
             }
         }
@@ -1790,6 +1821,122 @@ mod tests {
             !dead.contains(&class_id),
             "a class kept alive only through its constructed ctor must not be \
              dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn class_named_only_through_a_static_method_call_is_not_dead() {
+        // `LunarService.generateDayInfoRange()` — a class used purely through a
+        // static method call. The call edge lands on the *method* node, never
+        // on the class, so without member→type up-propagation the class looks
+        // like dead code even though it is plainly in use. The unused sibling
+        // method stays a candidate (up-propagation never flows back down past
+        // what the existing container expansion already covers).
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+
+        let class_id = "dart_class::lib/lunar.dart#LunarService";
+        insert_node_kind(
+            &mut store,
+            class_id,
+            NodeKind::DartClass,
+            "lib/lunar.dart",
+            "LunarService",
+        );
+        let method_id = "dart_method::lib/lunar.dart#LunarService.generateDayInfoRange";
+        insert_node_kind(
+            &mut store,
+            method_id,
+            NodeKind::DartMethod,
+            "lib/lunar.dart",
+            "generateDayInfoRange",
+        );
+        insert_contains(&mut store, class_id, method_id);
+        // The entrypoint calls the static method; the edge lands on the method.
+        insert_calls(&mut store, &main_id, method_id);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&class_id),
+            "a class used only through a static method call must not be dead, got {dead:?}"
+        );
+        assert!(
+            !dead.contains(&method_id),
+            "the called method must not be dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn unused_member_of_a_live_class_is_still_dead() {
+        // Reaching a class through one member must NOT cascade *down* `Contains`
+        // and resurrect its other, genuinely unused members — e.g. an
+        // unreferenced `AppButton.icon` named ctor inside a widely-used
+        // `AppButton`. This guards against the over-masking failure mode where
+        // any live file/type swallows all its dead siblings.
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+
+        let class_id = "dart_class::lib/btn.dart#AppButton";
+        insert_node_kind(
+            &mut store,
+            class_id,
+            NodeKind::DartClass,
+            "lib/btn.dart",
+            "AppButton",
+        );
+        let used = "dart_method::lib/btn.dart#AppButton.build";
+        insert_node_kind(
+            &mut store,
+            used,
+            NodeKind::DartMethod,
+            "lib/btn.dart",
+            "build",
+        );
+        let unused = "dart_ctor::lib/btn.dart#AppButton.icon";
+        insert_node_kind(
+            &mut store,
+            unused,
+            NodeKind::DartConstructor,
+            "lib/btn.dart",
+            "icon",
+        );
+        insert_contains(&mut store, class_id, used);
+        insert_contains(&mut store, class_id, unused);
+        // Only `build` is reached; the `icon` named ctor is never constructed.
+        insert_calls(&mut store, &main_id, used);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&class_id),
+            "a class with a live member must not be dead, got {dead:?}"
+        );
+        assert!(
+            !dead.contains(&used),
+            "the used member must not be dead, got {dead:?}"
+        );
+        assert!(
+            dead.contains(&unused),
+            "an unused named ctor of a live class must still be reported, got {dead:?}"
         );
     }
 
