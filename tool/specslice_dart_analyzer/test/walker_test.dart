@@ -237,6 +237,63 @@ class Paywall {
     );
   });
 
+  test(
+      'walkRepository attributes calls inside a nested local function to the enclosing method',
+      () async {
+    // Flutter builders routinely construct widgets inside a *named local
+    // function* (`Widget _buildPage() { … return Foo(...); }`). The local
+    // function has no graph symbol, so the scope must fall back to the
+    // enclosing method — otherwise the construction edge is dropped and the
+    // constructed widget's ctor looks like dead code (Shift regression:
+    // ExportDayCell / ScheduleMonthExportPage built inside a local function).
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+    final libDir = Directory(p.join(root.path, 'lib'));
+    libDir.createSync(recursive: true);
+    File(p.join(libDir.path, 'widgets.dart')).writeAsStringSync('''
+class Cell {
+  const Cell();
+}
+
+class Builder {
+  Cell build() {
+    Cell make() {
+      return Cell();
+    }
+    return make();
+  }
+}
+''');
+
+    final response = await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+    final references =
+        response.toJson()['references'] as List<dynamic>? ?? const [];
+    final calls = references
+        .whereType<Map<String, dynamic>>()
+        .where((e) => e['kind'] == EdgeKindString.calls)
+        .toList();
+    expect(
+      calls,
+      contains(
+        isA<Map<String, dynamic>>()
+            .having(
+              (e) => e['from_symbol_id'],
+              'from_symbol_id',
+              'dart_method::lib/widgets.dart#Builder.build',
+            )
+            .having(
+              (e) => e['to_symbol_id'],
+              'to_symbol_id',
+              'dart_ctor::lib/widgets.dart#Cell.<default>',
+            ),
+      ),
+      reason:
+          '嵌套局部函数里的构造调用应归属到外层方法 Builder.build。当前 calls: $calls',
+    );
+  });
+
   test('walkRepository emits Hive openBox storage edge from const box name',
       () async {
     final root = await Directory.systemTemp.createTemp('specslice_sidecar_');

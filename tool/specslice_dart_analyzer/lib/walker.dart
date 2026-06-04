@@ -1024,7 +1024,13 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
   void visitFunctionDeclaration(FunctionDeclaration node) {
     final el = node.declaredFragment?.element;
     final prev = _currentSymbolId;
-    _currentSymbolId = el == null ? null : byElement[el];
+    // A *nested local function* (`Widget _buildPage() { … }` inside a method)
+    // has no graph symbol of its own — `byElement[el]` is null. Falling back to
+    // null would drop every call / construction in its body; instead inherit
+    // the enclosing scope so those edges attribute to the surrounding method or
+    // top-level function (the constructed widgets stay reachable).
+    final mapped = el == null ? null : byElement[el];
+    _currentSymbolId = mapped ?? prev;
     super.visitFunctionDeclaration(node);
     _currentSymbolId = prev;
   }
