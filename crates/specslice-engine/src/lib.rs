@@ -6,6 +6,7 @@
 
 pub mod business_candidates;
 pub mod business_pack;
+pub mod business_doc;
 pub mod c_treesitter;
 pub mod checks;
 pub mod confidence_view;
@@ -64,6 +65,10 @@ pub use business_pack::{
     propose_business_pack, propose_business_pack_with_store, BusinessPack, BusinessPackOptions,
     BusinessPackStats, EvidenceRef as BusinessEvidenceRef, EvidenceSymbol as BusinessEvidenceSymbol,
     ModuleDependency, ModuleEvidence, BUSINESS_PACK_SCHEMA_VERSION,
+};
+pub use business_doc::{
+    build_business_doc, BusinessDoc, BusinessDocEntry, BusinessDocOptions, BusinessDocStats,
+    DocEvidence, BUSINESS_DOC_SCHEMA_VERSION,
 };
 pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,

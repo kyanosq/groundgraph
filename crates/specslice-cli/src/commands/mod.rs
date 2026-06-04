@@ -1,3 +1,4 @@
+pub mod business_doc;
 pub mod candidate;
 pub mod check;
 pub mod connect;

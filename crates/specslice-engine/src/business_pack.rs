@@ -570,10 +570,14 @@ impl ModuleAcc<'_> {
     }
 
     fn entry_point_score(&self, node: &Node) -> i64 {
-        // Symbols defined in test scaffolding (mocks/fakes/helpers) are not
-        // business entry points; they are represented by the tests list.
-        if node.path.as_deref().map(is_test_path).unwrap_or(false) {
-            return 0;
+        // Symbols defined in test scaffolding (mocks/fakes/helpers) or in
+        // generated codegen files (.freezed.dart / .g.dart / …) are not
+        // business entry points; tests are covered by the tests list and
+        // codegen is noise.
+        if let Some(path) = node.path.as_deref() {
+            if is_test_path(path) || is_generated_path(path) {
+                return 0;
+            }
         }
         let name = node
             .name
@@ -835,6 +839,28 @@ fn is_test_path(path: &str) -> bool {
         || p.contains(".test.")
         || p.contains(".spec.")
         || p.contains("_spec.")
+}
+
+/// Heuristic: is this a generated / codegen file? Such symbols (freezed
+/// copyWith impls, json_serializable `.g.dart`, protobuf, mockito mocks)
+/// are machine-written plumbing, never a business entry point.
+fn is_generated_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    const GENERATED_SUFFIXES: &[&str] = &[
+        ".freezed.dart",
+        ".g.dart",
+        ".gr.dart",
+        ".config.dart",
+        ".mocks.dart",
+        ".pb.dart",
+        ".pbenum.dart",
+        ".pbjson.dart",
+        ".pbserver.dart",
+        ".gen.dart",
+    ];
+    GENERATED_SUFFIXES.iter().any(|suf| p.ends_with(suf))
+        || p.ends_with(".generated.ts")
+        || p.ends_with(".g.ts")
 }
 
 fn capped_sorted(set: &BTreeSet<String>, limit: usize) -> Vec<String> {
@@ -1255,6 +1281,43 @@ mod tests {
                 .iter()
                 .all(|e| e.name != "_MockCheckoutRepository"),
             "test-file mock must not be a business entry point"
+        );
+    }
+
+    #[test]
+    fn generated_codegen_symbols_are_not_entry_points() {
+        let (mut store, _dir) = empty_store();
+        // hand-written model
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/cart/data/models/my_cart_item_dto.dart#MyCartPageDto",
+                NodeKind::DartClass,
+                "lib/features/cart/data/models/my_cart_item_dto.dart",
+                "MyCartPageDto",
+            ))
+            .unwrap();
+        // freezed-generated copyWith noise (same module, .freezed.dart file)
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/cart/data/models/my_cart_item_dto.freezed.dart#_$MyCartPageDtoCopyWithImpl",
+                NodeKind::DartClass,
+                "lib/features/cart/data/models/my_cart_item_dto.freezed.dart",
+                "_$MyCartPageDtoCopyWithImpl",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let cart = pack.modules.iter().find(|m| m.id == "cart").expect("cart");
+        assert!(
+            cart.entry_points.iter().any(|e| e.name == "MyCartPageDto"),
+            "hand-written model is an entry point"
+        );
+        assert!(
+            cart.entry_points
+                .iter()
+                .all(|e| !e.name.contains("CopyWith")),
+            "freezed-generated copyWith classes must not be entry points"
         );
     }
 

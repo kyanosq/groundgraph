@@ -50,6 +50,10 @@ enum Commands {
     /// 业务模块证据包 — 把代码/文档/测试事实按业务模块聚合，产出供 AI
     /// 生成 `business_logic.yaml` 候选的证据 + 中文提示词（非侵入，只读图）。
     Propose(ProposeArgs),
+    /// 业务逻辑文档 — 把**已确认**的业务候选连同代码图中解析出的证据
+    /// （代码/文档/测试/信号）渲染成可读业务文档（pipeline 后半程）。
+    #[command(name = "business-doc")]
+    BusinessDoc(BusinessDocArgs),
     /// 代码图搜索 — `grep` 的代码图替代品。
     Search(SearchArgs),
     /// 死代码报告 — 标注无法从任何入口点可达的代码符号。
@@ -417,6 +421,44 @@ impl ProposeFormatArg {
 }
 
 #[derive(Debug, clap::Args)]
+struct BusinessDocArgs {
+    /// 输出格式：`markdown`（默认，可读业务文档）/ `json`（结构化）/
+    /// `text`（速览）。
+    #[arg(long, value_enum, default_value = "markdown")]
+    format: BusinessDocFormatArg,
+    /// 写入文件而非 stdout（如 `.specslice/export/business-doc.md`）。
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// 同时纳入尚未确认的候选（proposed / pending / needs_changes），
+    /// 在文档中标注为草稿。便于审阅未完成时预览。
+    #[arg(long)]
+    include_proposed: bool,
+    /// 同时纳入已被拒绝的候选（默认不纳入）。
+    #[arg(long)]
+    include_rejected: bool,
+    /// `--format json` 时美化输出。
+    #[arg(long)]
+    pretty: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BusinessDocFormatArg {
+    Markdown,
+    Json,
+    Text,
+}
+
+impl BusinessDocFormatArg {
+    fn into_command_format(self) -> commands::business_doc::BusinessDocFormat {
+        match self {
+            BusinessDocFormatArg::Markdown => commands::business_doc::BusinessDocFormat::Markdown,
+            BusinessDocFormatArg::Json => commands::business_doc::BusinessDocFormat::Json,
+            BusinessDocFormatArg::Text => commands::business_doc::BusinessDocFormat::Text,
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
 struct SearchArgs {
     /// 自由文本查询（关键词）。与 `--code` / `--file` 互斥。
     query: Option<String>,
@@ -775,6 +817,16 @@ fn run() -> Result<()> {
             max_modules: args.max_modules,
             max_entry_points: args.max_entry_points,
         }),
+        Commands::BusinessDoc(args) => {
+            commands::business_doc::run(commands::business_doc::BusinessDocRunArgs {
+                repo_root: cli.repo_root.clone(),
+                format: args.format.into_command_format(),
+                out: args.out,
+                include_proposed: args.include_proposed,
+                include_rejected: args.include_rejected,
+                pretty: args.pretty,
+            })
+        }
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
             format: args.format.into(),
