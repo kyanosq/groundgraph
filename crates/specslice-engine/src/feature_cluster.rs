@@ -43,10 +43,31 @@ const MAX_LEVELS: usize = 50;
 /// community label in `0..k` (contiguous, ordered by smallest member).
 /// With no usable edges every node is its own community.
 pub fn detect_communities(num_nodes: usize, edges: &[(usize, usize, f64)]) -> Vec<usize> {
+    detect_communities_with_resolution(num_nodes, edges, 1.0)
+}
+
+/// [`detect_communities`] with an explicit modularity **resolution** `γ`.
+///
+/// The local-moving gain becomes `w_ic - γ · Σ_tot[c] · k_i / 2m`; `γ = 1.0`
+/// is standard modularity. `γ > 1.0` penalises large communities, yielding
+/// more, smaller communities — the lever against modularity's *resolution
+/// limit*, where a single large connected graph (e.g. a 1k-file app with no
+/// feature folders) otherwise collapses into one community. Non-finite or
+/// non-positive `γ` falls back to `1.0`.
+pub fn detect_communities_with_resolution(
+    num_nodes: usize,
+    edges: &[(usize, usize, f64)],
+    resolution: f64,
+) -> Vec<usize> {
     if num_nodes == 0 {
         return Vec::new();
     }
-    let mut graph = Graph::from_edges(num_nodes, edges);
+    let resolution = if resolution.is_finite() && resolution > 0.0 {
+        resolution
+    } else {
+        1.0
+    };
+    let mut graph = Graph::from_edges(num_nodes, edges, resolution);
     // node_community[original_node] = community at the current top level.
     let mut node_community: Vec<usize> = (0..num_nodes).collect();
 
@@ -80,10 +101,13 @@ struct Graph {
     community: Vec<usize>,
     /// sigma_tot[c] = sum of degrees of nodes currently in community c.
     sigma_tot: Vec<f64>,
+    /// Modularity resolution γ (1.0 = standard). Carried across aggregation
+    /// levels so granularity stays consistent.
+    resolution: f64,
 }
 
 impl Graph {
-    fn from_edges(n: usize, edges: &[(usize, usize, f64)]) -> Graph {
+    fn from_edges(n: usize, edges: &[(usize, usize, f64)], resolution: f64) -> Graph {
         // Accumulate undirected weights into a per-node neighbour map so
         // duplicate / reversed edges combine deterministically.
         let mut neigh: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
@@ -132,6 +156,7 @@ impl Graph {
             m,
             community,
             sigma_tot,
+            resolution,
         }
     }
 
@@ -159,8 +184,9 @@ impl Graph {
                 let w_i_old = w_to_comm.get(&ci).copied().unwrap_or(0.0);
 
                 // baseline gain of staying in (now i-less) ci
+                let g = self.resolution;
                 let mut best_comm = ci;
-                let mut best_gain = w_i_old - self.sigma_tot[ci] * ki / two_m;
+                let mut best_gain = w_i_old - g * self.sigma_tot[ci] * ki / two_m;
 
                 // consider neighbour communities in deterministic order
                 let mut candidates: Vec<usize> = w_to_comm.keys().copied().collect();
@@ -170,7 +196,7 @@ impl Graph {
                         continue;
                     }
                     let w_ic = w_to_comm.get(&c).copied().unwrap_or(0.0);
-                    let gain = w_ic - self.sigma_tot[c] * ki / two_m;
+                    let gain = w_ic - g * self.sigma_tot[c] * ki / two_m;
                     if gain > best_gain + EPSILON {
                         best_gain = gain;
                         best_comm = c;
@@ -269,6 +295,7 @@ impl Graph {
             community: (0..num_comms).collect(),
             sigma_tot: degree.clone(),
             degree,
+            resolution: self.resolution,
         }
     }
 }
@@ -371,6 +398,47 @@ mod tests {
         assert_eq!(labels[3], labels[4]);
         assert_eq!(labels[4], labels[5]);
         assert_ne!(labels[0], labels[3]);
+    }
+
+    #[test]
+    fn resolution_controls_granularity_against_the_limit() {
+        // Canonical resolution-limit example: a ring of N triangles, adjacent
+        // ones joined by a single bridge. Standard modularity (γ=1) merges
+        // adjacent triangles into fewer, larger communities; a higher γ
+        // penalises large communities and recovers the finer structure.
+        const T: usize = 12;
+        let n = T * 3;
+        let mut edges = Vec::new();
+        for t in 0..T {
+            let (a, b, c) = (3 * t, 3 * t + 1, 3 * t + 2);
+            edges.push((a, b, 1.0));
+            edges.push((b, c, 1.0));
+            edges.push((a, c, 1.0));
+            // bridge to the next triangle in the ring
+            let next = 3 * ((t + 1) % T);
+            edges.push((c, next, 1.0));
+        }
+        let count = |labels: &[usize]| {
+            let mut u = labels.to_vec();
+            u.sort_unstable();
+            u.dedup();
+            u.len()
+        };
+        let low = count(&detect_communities_with_resolution(n, &edges, 1.0));
+        let high = count(&detect_communities_with_resolution(n, &edges, 2.0));
+        assert!(
+            low < T,
+            "γ=1 should merge adjacent triangles: {low} communities"
+        );
+        assert!(
+            high > low,
+            "a higher resolution must yield more communities: {high} vs {low}"
+        );
+        // Default keeps the resolution-1.0 behaviour for back-compat.
+        assert_eq!(
+            detect_communities(n, &edges),
+            detect_communities_with_resolution(n, &edges, 1.0)
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@
 //! `specslice features` after its P23.13 fix), so it stays sub-second on
 //! large repos where `connect propose` timed out.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -53,7 +53,7 @@ use specslice_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
 use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
-use crate::feature_cluster::detect_communities;
+use crate::feature_cluster::detect_communities_with_resolution;
 
 pub const BUSINESS_PACK_SCHEMA_VERSION: u32 = 1;
 
@@ -673,6 +673,120 @@ impl ModulePartition {
     }
 }
 
+/// Cluster the file graph into business-sized communities, defeating
+/// modularity's *resolution limit* (a 1k-file app with no feature folders
+/// otherwise collapses into one giant community).
+///
+/// Standard Louvain (γ=1) runs first. Any community larger than a size cap is
+/// then **recursively re-clustered on its own induced subgraph** — dropping
+/// the edges that pull outside the community changes the modularity landscape
+/// so genuine sub-features separate, while a truly monolithic blob stays put.
+/// This refines stubborn cores without over-fragmenting the parts that
+/// already cluster cleanly (a tidy `features/` repo never trips the cap).
+///
+/// `graph_placed[i]` marks files whose community label actually drives
+/// placement (connected, no explicit feature marker); the cap is judged over
+/// just those. `SPECSLICE_LOUVAIN_RESOLUTION` pins a single γ with no
+/// recursion (escape hatch).
+fn choose_communities(
+    n: usize,
+    edges: &[(usize, usize, f64)],
+    graph_placed: &[bool],
+) -> Vec<usize> {
+    if let Some(g) = std::env::var("SPECSLICE_LOUVAIN_RESOLUTION")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+    {
+        return detect_communities_with_resolution(n, edges, g);
+    }
+
+    let target = graph_placed.iter().filter(|&&p| p).count();
+    let base = detect_communities_with_resolution(n, edges, 1.0);
+    if target == 0 {
+        return base;
+    }
+    // A business module should not engulf the repo. Cap the largest module at
+    // ~1/12 of the graph-placed files, never below 40 (small repos cluster
+    // fine at γ=1 and should not be force-split).
+    let cap = (target / 12).max(40);
+    let mut next_label = base.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut labels = base;
+    refine_oversized(&mut labels, edges, graph_placed, cap, &mut next_label);
+    relabel_contiguous(labels)
+}
+
+/// Iteratively split any community whose graph-placed size exceeds `cap` by
+/// re-running Louvain on the subgraph induced by just that community's nodes.
+/// A community that exceeds the cap but does not split is a genuine monolith
+/// and is frozen so it is never reprocessed (guaranteeing termination).
+fn refine_oversized(
+    labels: &mut [usize],
+    edges: &[(usize, usize, f64)],
+    graph_placed: &[bool],
+    cap: usize,
+    next_label: &mut usize,
+) {
+    let mut frozen: HashSet<usize> = HashSet::new();
+    loop {
+        let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, &c) in labels.iter().enumerate() {
+            members.entry(c).or_default().push(i);
+        }
+        let mut changed = false;
+        for (label, nodes) in members {
+            if frozen.contains(&label) || nodes.len() < 2 {
+                continue;
+            }
+            if nodes.iter().filter(|&&i| graph_placed[i]).count() <= cap {
+                continue;
+            }
+            // Induce the subgraph: remap node ids to 0..k, keep only intra edges.
+            let local: HashMap<usize, usize> =
+                nodes.iter().enumerate().map(|(j, &i)| (i, j)).collect();
+            let sub_edges: Vec<(usize, usize, f64)> = edges
+                .iter()
+                .filter_map(|&(a, b, w)| match (local.get(&a), local.get(&b)) {
+                    (Some(&la), Some(&lb)) => Some((la, lb, w)),
+                    _ => None,
+                })
+                .collect();
+            let sub = detect_communities_with_resolution(nodes.len(), &sub_edges, 1.0);
+            if sub.iter().copied().collect::<BTreeSet<usize>>().len() < 2 {
+                frozen.insert(label); // a genuine monolith — leave it whole
+                continue;
+            }
+            // Assign fresh global labels to each sub-community.
+            let mut sub_to_global: HashMap<usize, usize> = HashMap::new();
+            for (j, &i) in nodes.iter().enumerate() {
+                let g = *sub_to_global.entry(sub[j]).or_insert_with(|| {
+                    let l = *next_label;
+                    *next_label += 1;
+                    l
+                });
+                labels[i] = g;
+            }
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Compress arbitrary labels to a contiguous `0..k`, ordered by first
+/// appearance — keeps downstream module ids stable and deterministic.
+fn relabel_contiguous(labels: Vec<usize>) -> Vec<usize> {
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    labels
+        .into_iter()
+        .map(|c| {
+            let next = remap.len();
+            *remap.entry(c).or_insert(next)
+        })
+        .collect()
+}
+
 /// Cluster every code/test file into a business module.
 ///
 /// The placement rule deliberately mixes two signals at *different*
@@ -761,7 +875,13 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
     }
 
     // ---- community detection -------------------------------------------
-    let comm = detect_communities(n, &edge_list);
+    // Files with an explicit feature marker are placed by that marker, not by
+    // the graph, so the resolution sweep should only judge granularity over
+    // the files whose community label actually drives placement.
+    let graph_placed: Vec<bool> = (0..n)
+        .map(|i| connected[i] && feature_marker_token(&files[i]).is_none())
+        .collect();
+    let comm = choose_communities(n, &edge_list, &graph_placed);
 
     // ---- business symbols per file (for central-symbol naming) ---------
     let mut file_symbols: HashMap<usize, Vec<&Node>> = HashMap::new();
@@ -788,10 +908,9 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
             } else if connected[i] {
                 format!("comm::{}", comm[i])
             } else {
-                let b = feature_key(&files[i])
-                    .map(|k| k.slug)
-                    .unwrap_or_else(|| "misc".to_string());
-                format!("path::{b}")
+                // Isolated file: bucket by its most specific *feature* dir.
+                let (disp, _) = fallback_feature_token(&files[i]);
+                format!("path::{}", slugify(&disp))
             }
         })
         .collect();
@@ -986,11 +1105,37 @@ fn name_module(
         }
     }
 
-    // (a) dominant feature-folder token
+    // path:: groups are isolated files already bucketed by their feature dir;
+    // name them after the dominant such token (skipping structural layers).
+    if key.starts_with("path::") {
+        let mut tok_count: BTreeMap<String, usize> = BTreeMap::new();
+        let mut tok_prefix: HashMap<String, String> = HashMap::new();
+        for &fi in file_idxs {
+            let (disp, pfx) = fallback_feature_token(&files[fi]);
+            *tok_count.entry(disp.clone()).or_insert(0) += 1;
+            tok_prefix.entry(disp).or_insert(pfx);
+        }
+        if let Some((disp, _)) = tok_count
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        {
+            let pfx = tok_prefix.get(disp).cloned().unwrap_or_default();
+            return (disp.clone(), pfx);
+        }
+    }
+
+    // (a) dominant feature-folder token — only from *trusted* tokens (real
+    //     markers / source-root children). The bare first-dir fallback (the
+    //     repo's own top folder) is excluded so a layer-then-feature app
+    //     (`Yolan/UI/<feature>`, `Yolan/ViewModel/…`) is named by its central
+    //     business symbol (step b), not collapsed into one "Yolan" module.
     let mut token_count: BTreeMap<String, usize> = BTreeMap::new();
     let mut token_prefix: HashMap<String, String> = HashMap::new();
     for &fi in file_idxs {
         if let Some(k) = feature_key(&files[fi]) {
+            if !k.trusted {
+                continue;
+            }
             *token_count.entry(k.display.clone()).or_insert(0) += 1;
             token_prefix.entry(k.display).or_insert(k.prefix);
         }
@@ -1006,9 +1151,13 @@ fn name_module(
         }
     }
 
-    // (b) most-referenced business symbol (types beat callables; generic
-    //     names are skipped so we never surface "load"/"default").
-    let mut best: Option<(usize, bool, String)> = None;
+    // (b) central business symbol. A *type* (class/struct/enum) names a
+    //     module far better than a method, so any referenced type outranks
+    //     every callable regardless of degree — otherwise a ubiquitous method
+    //     (`updateThemeSubviews`, `endEditing`) would name the feature.
+    //     Within the same type-ness, higher in-degree wins; ties break by
+    //     name. Generic names are skipped so we never surface "load"/"state".
+    let mut best: Option<(bool, usize, String)> = None; // (is_type, indegree, name)
     for &fi in file_idxs {
         if let Some(syms) = file_symbols.get(&fi) {
             for s in syms {
@@ -1020,31 +1169,40 @@ fn name_module(
                 }
                 let deg = sym_indegree.get(&s.id).copied().unwrap_or(0);
                 let is_ty = language_traits::is_type(s.kind);
+                let cand = (is_ty, deg, nm.to_string());
                 let better = match &best {
-                    Some((bd, bt, bn)) => {
-                        deg > *bd
-                            || (deg == *bd && is_ty && !*bt)
-                            || (deg == *bd && is_ty == *bt && nm < bn.as_str())
+                    Some((bt, bd, bn)) => {
+                        (is_ty && !*bt)
+                            || (is_ty == *bt && deg > *bd)
+                            || (is_ty == *bt && deg == *bd && nm < bn.as_str())
                     }
                     None => true,
                 };
                 if better {
-                    best = Some((deg, is_ty, nm.to_string()));
+                    best = Some(cand);
                 }
             }
         }
     }
-    if let Some((deg, _, nm)) = best {
-        if deg > 0 {
+    if let Some((is_ty, _deg, nm)) = best {
+        // Only a *type* may name a module. A callable (method / function /
+        // constructor), however highly referenced, title-cases into a
+        // pseudo-type (`findNodeById` → "FindNodeById") that masquerades as a
+        // business concept; such clusters — extension files, lone test files —
+        // are named by their directory in step (c) instead.
+        if is_ty {
             return (strip_role_suffix(&nm), common_dir_prefix(file_idxs, files));
         }
     }
 
-    // (c) fallback: last segment of the common directory prefix
+    // (c) fallback: deepest *non-layer* segment of the common directory prefix
+    //     (a structural layer like `viewmodel`/`ui` names *how* code is filed,
+    //     not the feature). Fall back to the last segment if all are layers.
     let pfx = common_dir_prefix(file_idxs, files);
     let disp = pfx
         .rsplit('/')
-        .find(|s| !s.is_empty())
+        .find(|s| !s.is_empty() && !LAYER_DIRS.contains(&s.to_ascii_lowercase().as_str()))
+        .or_else(|| pfx.rsplit('/').find(|s| !s.is_empty()))
         .unwrap_or("module")
         .to_string();
     (disp, pfx)
@@ -1128,6 +1286,108 @@ struct FeatureKey {
     slug: String,
     display: String,
     prefix: String,
+    /// `true` when the token came from an explicit feature marker
+    /// (`features/<x>`) or a recognised source root (`lib/<x>`, `src/<x>`);
+    /// `false` for the bare first-directory fallback (e.g. the repo's own
+    /// top folder `Yolan/`). Loose first-dir tokens must never *name* a graph
+    /// community, or every community collapses into one "repo-name" module.
+    trusted: bool,
+}
+
+/// Structural / architectural-layer directory names that say *how* code is
+/// filed, not *which feature* it serves. The path-only fallback skips these
+/// so an isolated `Yolan/UI/BuyAndAfter/Cell/Foo.swift` buckets under the
+/// feature `BuyAndAfter`, not the repo root or the `UI` / `Cell` layer.
+const LAYER_DIRS: &[&str] = &[
+    "ui",
+    "view",
+    "views",
+    "viewmodel",
+    "viewmodels",
+    "viewcontroller",
+    "viewcontrollers",
+    "controller",
+    "controllers",
+    "cell",
+    "cells",
+    "model",
+    "models",
+    "entity",
+    "entities",
+    "common",
+    "base",
+    "core",
+    "util",
+    "utils",
+    "helper",
+    "helpers",
+    "extension",
+    "extensions",
+    "category",
+    "categories",
+    "component",
+    "components",
+    "widget",
+    "widgets",
+    "class",
+    "classes",
+    "resource",
+    "resources",
+    "network",
+    "networking",
+    "service",
+    "services",
+    "manager",
+    "managers",
+    "tool",
+    "tools",
+    "protocol",
+    "protocols",
+    "config",
+    "configs",
+    "constant",
+    "constants",
+    "vendor",
+    "third",
+    "thirdparty",
+    "library",
+    "libraries",
+    "support",
+    "shared",
+    "general",
+    "custom",
+];
+
+/// Path-only fallback for an **isolated** file (no graph coupling): pick the
+/// most specific *feature* directory by dropping the repo-root segment and any
+/// structural [`LAYER_DIRS`]. Returns `(display, prefix)` where `prefix` is the
+/// path up to and including the chosen segment. Honest last resort — used only
+/// where the code graph offers no signal at all.
+fn fallback_feature_token(path: &str) -> (String, String) {
+    let norm = path.replace('\\', "/");
+    let raw: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs: &[&str] = if raw.last().map(|s| s.contains('.')).unwrap_or(false) {
+        &raw[..raw.len() - 1]
+    } else {
+        &raw[..]
+    };
+    if dirs.is_empty() {
+        return ("misc".to_string(), String::new());
+    }
+    if dirs.len() == 1 {
+        return (dirs[0].to_string(), dirs[0].to_string());
+    }
+    // Drop the repo-root segment, then take the first non-layer segment.
+    for (i, seg) in dirs.iter().enumerate().skip(1) {
+        if !LAYER_DIRS.contains(&seg.to_ascii_lowercase().as_str()) {
+            return (seg.to_string(), dirs[..=i].join("/"));
+        }
+    }
+    // Everything after the root is a structural layer (`Yolan/ViewModel/*`,
+    // `Yolan/UI/Foo.swift`): there is no feature signal at all, so group under
+    // the app/source root rather than leaking a layer name (`UI`, `ViewModel`)
+    // as if it were a feature.
+    (dirs[0].to_string(), dirs[0].to_string())
 }
 
 /// Derive the business module a code/test path belongs to. Returns `None`
@@ -1151,24 +1411,25 @@ fn feature_key(path: &str) -> Option<FeatureKey> {
     // 1) explicit feature markers win.
     for (i, seg) in dirs.iter().enumerate() {
         if FEATURE_MARKERS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
-            return Some(make_key(dirs[i + 1], &dirs[..=i + 1]));
+            return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
         }
     }
     // 2) segment after a source root.
     for (i, seg) in dirs.iter().enumerate() {
         if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
-            return Some(make_key(dirs[i + 1], &dirs[..=i + 1]));
+            return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
         }
     }
-    // 3) fallback: first directory segment.
-    Some(make_key(dirs[0], &dirs[..1]))
+    // 3) fallback: first directory segment (untrusted — only a path anchor).
+    Some(make_key(dirs[0], &dirs[..1], false))
 }
 
-fn make_key(name: &str, prefix_segments: &[&str]) -> FeatureKey {
+fn make_key(name: &str, prefix_segments: &[&str], trusted: bool) -> FeatureKey {
     FeatureKey {
         slug: slugify(name),
         display: name.to_string(),
         prefix: prefix_segments.join("/"),
+        trusted,
     }
 }
 
@@ -1452,6 +1713,94 @@ mod tests {
         let mut store = Store::open(dir.path().join("graph.db")).unwrap();
         store.migrate().unwrap();
         (store, dir)
+    }
+
+    fn distinct(labels: &[usize]) -> usize {
+        labels.iter().copied().collect::<BTreeSet<usize>>().len()
+    }
+
+    #[test]
+    fn refine_oversized_splits_a_blob_but_keeps_a_monolith() {
+        // Two triangles bridged, initially fused into one community (label 0).
+        // With a cap of 2 the community is oversized, so it is re-clustered on
+        // its induced subgraph and separates into the two triangles.
+        let edges = vec![
+            (0, 1, 1.0),
+            (1, 2, 1.0),
+            (0, 2, 1.0),
+            (3, 4, 1.0),
+            (4, 5, 1.0),
+            (3, 5, 1.0),
+            (2, 3, 1.0), // bridge
+        ];
+        let placed = vec![true; 6];
+        let mut labels = vec![0usize; 6];
+        let mut next = 1;
+        refine_oversized(&mut labels, &edges, &placed, 2, &mut next);
+        assert_eq!(
+            distinct(&labels),
+            2,
+            "an oversized two-triangle blob must split: {labels:?}"
+        );
+        assert_eq!(labels[0], labels[1], "triangle A stays together");
+        assert_eq!(labels[3], labels[5], "triangle B stays together");
+        assert_ne!(labels[0], labels[3], "the two triangles separate");
+
+        // A genuine clique cannot be split and must be left whole even when it
+        // exceeds the cap (no infinite recursion).
+        let mut kedges = Vec::new();
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                kedges.push((i, j, 1.0));
+            }
+        }
+        let mut klabels = vec![0usize; 5];
+        let mut knext = 1;
+        refine_oversized(&mut klabels, &kedges, &[true; 5], 2, &mut knext);
+        assert_eq!(distinct(&klabels), 1, "a clique is a monolith: {klabels:?}");
+    }
+
+    #[test]
+    fn fallback_feature_token_skips_layers_and_root() {
+        // Isolated file under repo-root + UI/Cell layers → the feature dir.
+        let (disp, pfx) = fallback_feature_token("Yolan/UI/BuyAndAfter/Cell/Foo.swift");
+        assert_eq!(disp, "BuyAndAfter");
+        assert_eq!(pfx, "Yolan/UI/BuyAndAfter");
+        // A flat layer-only path has no feature signal: a structural layer
+        // (`ui`, `viewmodel`) says *how* code is filed, not *which* feature, so
+        // we group under the app/source root, never the leaked layer name.
+        let (disp2, pfx2) = fallback_feature_token("Yolan/ViewModel/OrderVM.swift");
+        assert_eq!(disp2, "Yolan");
+        assert_eq!(pfx2, "Yolan");
+        // Files sitting directly in the `UI` layer likewise group under the
+        // app root, not a "UI" pseudo-feature.
+        let (disp3, _) = fallback_feature_token("Yolan/UI/Splash.swift");
+        assert_eq!(disp3, "Yolan");
+    }
+
+    #[test]
+    fn name_module_never_names_a_module_after_a_callable() {
+        // Regression (tailorx `FindNodeById`): a community whose only symbols are
+        // callables — a Dart extension file's methods, or a lone test file's
+        // helpers — must be named after its directory, never after a method like
+        // `findNodeById`, which title-cases into "FindNodeById" and masquerades
+        // as a business type. Only a *type* may name a module via the central
+        // symbol; otherwise we fall through to the path.
+        let files = vec!["test/core/render_schema/render_schema_compile_test.dart".to_string()];
+        let n_method = node("s1", NodeKind::DartMethod, &files[0], "findNodeById");
+        let n_fn = node("s2", NodeKind::DartFunction, &files[0], "buildDemoSchema");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_method, &n_fn]);
+        // Even with a very high in-degree the method must not win.
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_method.id, 30);
+        let (disp, _pfx) = name_module("comm::1", &[0], &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "render_schema",
+            "a callable must not name a module: got {disp}"
+        );
     }
 
     fn node(id: &str, kind: NodeKind, path: &str, name: &str) -> Node {
