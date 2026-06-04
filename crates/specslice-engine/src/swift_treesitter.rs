@@ -281,13 +281,46 @@ fn collect_swift_calls(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(name) = child
-                .named_child(0)
-                .and_then(|callee| swift_callee_name(callee, src))
-            {
-                out.push((name, RefKind::Call));
+        match child.kind() {
+            "call_expression" => {
+                if let Some(name) = child
+                    .named_child(0)
+                    .and_then(|callee| swift_callee_name(callee, src))
+                {
+                    out.push((name, RefKind::Call));
+                }
             }
+            // A type name used in a value position — a stored-property /
+            // local annotation, an `as?` cast, a generic argument, or the
+            // element of a `[T]` / `T?` type — is a *reference* to that type.
+            // This is the only link to models created by reflection
+            // (ObjectMapper / Codable) and to cells registered by metatype,
+            // which never appear as a construction call.
+            "type_identifier" => {
+                if let Some(name) = node_text(child, src).and_then(swift_bare) {
+                    out.push((name, RefKind::Reference));
+                }
+            }
+            // A navigation whose *base* is an upper-camel-case identifier is a
+            // reference to a type or enum: `FooCell.self` (metatype),
+            // `ScreenManager.shared` (singleton), `Status.active` (enum case),
+            // `Factory.make()` (static call). The base parses as an expression
+            // identifier, not a `type_identifier`, so it needs its own arm.
+            // Lower-camel bases (`obj.method`, `self.x`) are instance access
+            // and are skipped — the method side is already a `Call`.
+            "navigation_expression" => {
+                if let Some(name) = child
+                    .child_by_field_name("target")
+                    .filter(|t| t.kind() == "simple_identifier")
+                    .and_then(|t| node_text(t, src))
+                    .and_then(swift_bare)
+                {
+                    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        out.push((name, RefKind::Reference));
+                    }
+                }
+            }
+            _ => {}
         }
         collect_swift_calls(child, src, out, depth + 1);
     }
@@ -320,6 +353,56 @@ fn swift_callee_name(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> 
     }
 }
 
+/// Serialise a type declaration's inheritance clause — superclass plus
+/// adopted protocols — as `{"swift_inherits":["UIViewController","Foo"]}`.
+///
+/// This is the only static signal of *what instantiates a type*: UIKit /
+/// AppKit / SwiftUI create `UIViewController`, `UIView` and cell subclasses
+/// from storyboards, XIBs, `register(_:forCellReuseIdentifier:)`, segues and
+/// the `@UIApplicationMain` responder chain, none of which leave an in-repo
+/// call edge. The dead-code pass reads this list to keep framework-owned
+/// types reachable instead of flagging them as orphans (see
+/// `dead_code::swift_framework_instantiated_types`).
+///
+/// `enum` and `extension` declarations are skipped: an enum is never
+/// framework-instantiated through its raw-value/base, and an extension's
+/// conformances belong to a type that already carries its own clause.
+fn swift_metadata(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    if node.kind() != "class_declaration" {
+        return None;
+    }
+    match swift_decl_keyword(node) {
+        Some("class") | Some("struct") | Some("actor") => {}
+        _ => return None,
+    }
+    let mut inherits: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "inheritance_specifier" {
+            continue;
+        }
+        let from = child
+            .child_by_field_name("inherits_from")
+            .or_else(|| child.named_child(0));
+        if let Some(name) = from.and_then(|n| node_text(n, src)).and_then(swift_bare) {
+            if !inherits.contains(&name) {
+                inherits.push(name);
+            }
+        }
+    }
+    if inherits.is_empty() {
+        return None;
+    }
+    // Bare identifiers need no JSON escaping; emit by hand so the structural
+    // scanner stays free of a serde dependency.
+    let body = inherits
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{{\"swift_inherits\":[{body}]}}"))
+}
+
 pub(crate) static SWIFT_SPEC: LangSpec = LangSpec {
     language_id: "swift",
     grammar: swift_language,
@@ -346,13 +429,16 @@ pub(crate) static SWIFT_SPEC: LangSpec = LangSpec {
     name_of: swift_name_of,
     body_of: body_from_field,
     is_transparent_kind: crate::treesitter::never,
-    metadata_of: no_text,
+    metadata_of: swift_metadata,
     test_of: swift_test_of,
     call_test_of: no_call_test,
     src_roots_of: no_src_roots,
     resolve_import: swift_resolve_import,
     recurse_callables: false,
     call_idents_of: swift_call_idents,
+    // Swift has a flat per-module namespace and no file→file imports, so a
+    // bare type/constructor name resolves module-wide (unique-file only).
+    module_scoped_resolution: true,
 };
 
 #[cfg(test)]
@@ -474,6 +560,50 @@ protocol Walker { func walk() }
     }
 
     #[test]
+    fn type_declarations_capture_inheritance_clause_as_metadata() {
+        // The inheritance clause is the only structural signal of *what
+        // instantiates a type*. UIKit creates `UIViewController` / cell
+        // subclasses from storyboards & XIBs with no in-repo caller, so the
+        // dead-code pass needs the supertype list to keep them reachable.
+        let s = scan("class FooVC: UIViewController, FooProto {\n  func viewDidLoad() {}\n}\n");
+        let sym = s
+            .symbols
+            .iter()
+            .find(|x| x.kind == NodeKind::SwiftClass && x.qualified_name == "FooVC")
+            .expect("class node");
+        let meta = sym.metadata.as_deref().unwrap_or("");
+        assert!(meta.contains("swift_inherits"), "metadata: {meta:?}");
+        assert!(meta.contains("UIViewController"), "metadata: {meta:?}");
+        assert!(meta.contains("FooProto"), "metadata: {meta:?}");
+
+        // Generic / dotted bases reduce to their bare name.
+        let s2 = scan("final class Cell: UIKit.UITableViewCell {}\n");
+        let cell = s2
+            .symbols
+            .iter()
+            .find(|x| x.qualified_name == "Cell")
+            .unwrap();
+        assert!(
+            cell.metadata
+                .as_deref()
+                .unwrap_or("")
+                .contains("UITableViewCell"),
+            "dotted base bare name: {:?}",
+            cell.metadata
+        );
+
+        // A type with no inheritance clause carries no metadata (so the
+        // dead-code pass never treats a plain value type as framework-owned).
+        let s3 = scan("struct Plain { let x: Int }\n");
+        let plain = s3
+            .symbols
+            .iter()
+            .find(|x| x.qualified_name == "Plain")
+            .unwrap();
+        assert_eq!(plain.metadata, None, "plain struct has no supertypes");
+    }
+
+    #[test]
     fn free_functions_are_functions_not_methods() {
         let s = scan("func top() {}\nfunc add(a: Int, b: Int) -> Int { a + b }\n");
         let funcs = qnames(&s, NodeKind::SwiftFunction);
@@ -553,6 +683,50 @@ class FooTests: XCTestCase {
         assert_eq!(
             swift_resolve_import("Foundation", "Sources/App/main.swift", &[], &[]),
             None
+        );
+    }
+
+    #[test]
+    fn captures_type_references_in_annotations_metatypes_and_casts() {
+        // Models decoded by reflection (ObjectMapper / Codable) and cells
+        // registered by metatype have no construction call, so without
+        // type-position references they look dead. Capture type names used as
+        // annotations, `[T].self` metatypes, `T.self` and `as?` casts.
+        let src = r#"
+class Holder {
+    var items: [WeeksModel] = []
+}
+func decode(_ d: Decoder) {
+    let a = d.mapModels([ExpressCompany].self)
+    tableView.register(FooCell.self, forCellReuseIdentifier: "x")
+    let z = something as? BarCell
+    ScreenManager.shared.refresh()
+}
+"#;
+        let got = refs(&scan(src));
+        assert!(
+            got.contains(&("Holder".into(), "WeeksModel".into(), RefKind::Reference)),
+            "stored-property type annotation → reference on the owning type: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|(_, t, k)| t == "ExpressCompany" && *k == RefKind::Reference),
+            "metatype inside a generic mapping call: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|(_, t, k)| t == "FooCell" && *k == RefKind::Reference),
+            "`T.self` metatype argument: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|(_, t, k)| t == "BarCell" && *k == RefKind::Reference),
+            "`as?` cast target: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|(_, t, k)| t == "ScreenManager" && *k == RefKind::Reference),
+            "`Type.shared` static-member access references the type: {got:?}"
         );
     }
 

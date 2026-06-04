@@ -291,6 +291,48 @@ pub fn analyze_dead_code_with_store(
         }
     }
 
+    // Swift: types that derive (transitively) from a framework base are
+    // instantiated by UIKit / AppKit / SwiftUI through storyboards, XIBs,
+    // cell registration, segues and the `@UIApplicationMain` responder chain
+    // — none of which leave an in-repo edge. Seed those types *and* their
+    // members (which the framework invokes via lifecycle callbacks,
+    // target-action and data sources) so reachability does not mistake the
+    // whole UI layer for dead code. Driven by the `swift_inherits` metadata
+    // the structural scanner records on every class/struct declaration.
+    let swift_framework_types = swift_framework_instantiated_types(&nodes);
+    if !swift_framework_types.is_empty() {
+        let mut contains_children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &edges {
+            if edge.kind == EdgeKind::Contains {
+                contains_children
+                    .entry(edge.from_id.as_str())
+                    .or_default()
+                    .push(edge.to_id.as_str());
+            }
+        }
+        for n in &nodes {
+            if !matches!(n.kind, NodeKind::SwiftClass | NodeKind::SwiftStruct) {
+                continue;
+            }
+            if !n
+                .name
+                .as_deref()
+                .is_some_and(|nm| swift_framework_types.contains(nm))
+            {
+                continue;
+            }
+            // Seed the type and every symbol it transitively `Contains`.
+            let mut stack = vec![n.id.as_str()];
+            while let Some(id) = stack.pop() {
+                if entry_ids.insert(id.to_string()) {
+                    if let Some(children) = contains_children.get(id) {
+                        stack.extend(children.iter().copied());
+                    }
+                }
+            }
+        }
+    }
+
     // Reachability fixpoint: follow usage edges forward, and propagate
     // reachability *up* `Contains` edges onto module/file-family parents only
     // (so genuine dead types/functions keep their own verdict — nothing ever
@@ -611,6 +653,151 @@ fn is_go_entry_name(name: Option<&str>) -> bool {
     false
 }
 
+/// UIKit / AppKit / WatchKit / SwiftUI base types that the OS instantiates
+/// on the app's behalf — from storyboards, XIBs, `register(_:…)` cell
+/// registration, segues, the responder chain and the `@UIApplicationMain` /
+/// `@main` attribute. None of these leave an in-repo call edge, so a repo
+/// type that (transitively) derives from one is reachable *through the
+/// framework*, not dead. Kept deliberately to instantiable bases; `NSObject`
+/// is excluded because nearly everything descends from it.
+const SWIFT_FRAMEWORK_INSTANTIATED_BASES: &[&str] = &[
+    // App / scene entry points (responder chain + @UIApplicationMain).
+    "UIApplicationDelegate",
+    "UIResponder",
+    "UISceneDelegate",
+    "UIWindowSceneDelegate",
+    "NSApplicationDelegate",
+    "WKExtensionDelegate",
+    // View controllers.
+    "UIViewController",
+    "UITableViewController",
+    "UICollectionViewController",
+    "UINavigationController",
+    "UITabBarController",
+    "UISplitViewController",
+    "UIPageViewController",
+    "NSViewController",
+    "WKInterfaceController",
+    // Views, controls and reusable cells / supplementary views.
+    "UIView",
+    "UIControl",
+    "UIScrollView",
+    "UIStackView",
+    "UICollectionView",
+    "UITableView",
+    "UIImageView",
+    "UILabel",
+    "UIButton",
+    "UITextField",
+    "UITextView",
+    "UISwitch",
+    "UISlider",
+    "UISegmentedControl",
+    "UIPickerView",
+    "UIDatePicker",
+    "UIProgressView",
+    "UIActivityIndicatorView",
+    "UIVisualEffectView",
+    "UIRefreshControl",
+    "UIWindow",
+    "NSView",
+    "UITableViewCell",
+    "UICollectionViewCell",
+    "UICollectionReusableView",
+    "UITableViewHeaderFooterView",
+    // SwiftUI value-type entry points (instantiated by the SwiftUI runtime).
+    "View",
+    "App",
+    "Scene",
+    "ViewModifier",
+    "PreviewProvider",
+    // Test harnesses: XCTest / Quick instantiate the case class by reflection
+    // and invoke `setUp` / `tearDown` / `test*` with no in-repo caller.
+    "XCTestCase",
+    "XCTest",
+    "QuickSpec",
+];
+
+/// Parse the `swift_inherits` list the structural scanner records on a Swift
+/// type node (`{"swift_inherits":["UIViewController","Foo"]}`). Returns the
+/// bare supertype names. Non-Swift / unrelated metadata yields `None`.
+fn parse_swift_inherits(metadata_json: &str) -> Option<Vec<String>> {
+    if !metadata_json.contains("swift_inherits") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let arr = value.get("swift_inherits")?.as_array()?;
+    let names: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Compute the set of in-repo Swift type *names* that are framework
+/// instantiated — i.e. whose transitive supertype closure (following in-repo
+/// supers by name) reaches a [`SWIFT_FRAMEWORK_INSTANTIATED_BASES`] entry.
+fn swift_framework_instantiated_types(nodes: &[specslice_core::Node]) -> BTreeSet<String> {
+    // name -> direct supertype names, merged across (partial-class) decls.
+    let mut supers: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for n in nodes {
+        if !matches!(n.kind, NodeKind::SwiftClass | NodeKind::SwiftStruct) {
+            continue;
+        }
+        let (Some(name), Some(meta)) = (n.name.as_deref(), n.metadata_json.as_deref()) else {
+            continue;
+        };
+        if let Some(list) = parse_swift_inherits(meta) {
+            let entry = supers.entry(name.to_string()).or_default();
+            entry.extend(list);
+        }
+    }
+    let bases: BTreeSet<&str> = SWIFT_FRAMEWORK_INSTANTIATED_BASES.iter().copied().collect();
+
+    // Memoised DFS over the in-repo supertype graph, with a recursion stack
+    // guarding against cyclic / self-referential inheritance metadata.
+    fn reaches(
+        name: &str,
+        supers: &HashMap<String, BTreeSet<String>>,
+        bases: &BTreeSet<&str>,
+        memo: &mut HashMap<String, bool>,
+        stack: &mut BTreeSet<String>,
+    ) -> bool {
+        if bases.contains(name) {
+            return true;
+        }
+        if let Some(v) = memo.get(name) {
+            return *v;
+        }
+        if !stack.insert(name.to_string()) {
+            return false;
+        }
+        let mut hit = false;
+        if let Some(direct) = supers.get(name) {
+            for s in direct {
+                if reaches(s, supers, bases, memo, stack) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        stack.remove(name);
+        memo.insert(name.to_string(), hit);
+        hit
+    }
+
+    let mut memo: HashMap<String, bool> = HashMap::new();
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let names: Vec<String> = supers.keys().cloned().collect();
+    for name in names {
+        let mut stack = BTreeSet::new();
+        if reaches(&name, &supers, &bases, &mut memo, &mut stack) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
 fn is_swift_entry_name(name: Option<&str>) -> bool {
     let Some(raw) = name else {
         return false;
@@ -621,17 +808,44 @@ fn is_swift_entry_name(name: Option<&str>) -> bool {
     }
     // XCTest discovers `test*` instance methods by reflection, and
     // SwiftUI / UIKit lifecycle callbacks are likewise framework-invoked.
+    // Many UIKit callbacks share the *base* selector name the scanner records
+    // (`application(_:didFinishLaunchingWithOptions:)` → `application`,
+    // `scene(_:willConnectTo:)` → `scene`), so the bare heads are listed too.
     matches!(
         last,
+        // UIViewController lifecycle / layout overrides.
         "viewDidLoad"
             | "viewWillAppear"
             | "viewDidAppear"
             | "viewWillDisappear"
             | "viewDidDisappear"
+            | "viewWillLayoutSubviews"
+            | "viewDidLayoutSubviews"
+            | "viewSafeAreaInsetsDidChange"
+            | "updateViewConstraints"
+            | "didReceiveMemoryWarning"
+            | "loadView"
+            | "awakeFromNib"
+            | "prepareForReuse"
+            // UIApplicationDelegate (bare + SwiftUI-style heads).
+            | "application"
             | "applicationDidFinishLaunching"
             | "applicationDidBecomeActive"
             | "applicationWillResignActive"
+            | "applicationDidEnterBackground"
+            | "applicationWillEnterForeground"
+            | "applicationWillTerminate"
+            | "applicationDidReceiveMemoryWarning"
+            | "applicationProtectedDataDidBecomeAvailable"
+            | "applicationProtectedDataWillBecomeUnavailable"
+            // UISceneDelegate.
             | "scene"
+            | "sceneDidDisconnect"
+            | "sceneDidBecomeActive"
+            | "sceneWillResignActive"
+            | "sceneWillEnterForeground"
+            | "sceneDidEnterBackground"
+            // SwiftUI entry / body.
             | "body"
     ) || last.starts_with("test")
 }
@@ -1035,6 +1249,33 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_node_meta(
+        store: &mut Store,
+        id: &str,
+        kind: NodeKind,
+        file: &str,
+        name: &str,
+        metadata_json: Option<&str>,
+    ) {
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.to_string()),
+                kind,
+                path: Some(file.into()),
+                name: Some(name.into()),
+                start_line: Some(1),
+                end_line: Some(9),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("swift_treesitter".into()),
+                index_generation: None,
+                metadata_json: metadata_json.map(String::from),
+            })
+            .unwrap();
+    }
+
     fn insert_contains(store: &mut Store, from: &str, to: &str) {
         store
             .upsert_edge(&EdgeAssertion {
@@ -1054,6 +1295,97 @@ mod tests {
                 metadata_json: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn swift_framework_subclasses_and_their_members_are_reachable() {
+        // Regression (yunlan): UIKit instantiates `UIViewController` / `UIView`
+        // / cell subclasses from storyboards, XIBs and cell registration with
+        // no in-repo caller. Such types — and their members, which the
+        // framework invokes via the responder chain / target-action / data
+        // sources — must be seeded as reachable from their inheritance clause,
+        // never reported as dead. A pure value/logic type with no framework
+        // base and no caller stays dead, so the report keeps its signal.
+        let (mut store, _dir) = empty_store();
+        // FooCell -> BaseCell -> UITableViewCell (transitive, in-repo chain).
+        insert_node_meta(
+            &mut store,
+            "swift::A.swift::BaseCell",
+            NodeKind::SwiftClass,
+            "A.swift",
+            "BaseCell",
+            Some(r#"{"swift_inherits":["UITableViewCell"]}"#),
+        );
+        insert_node_meta(
+            &mut store,
+            "swift::A.swift::FooCell",
+            NodeKind::SwiftClass,
+            "A.swift",
+            "FooCell",
+            Some(r#"{"swift_inherits":["BaseCell"]}"#),
+        );
+        insert_node_kind(
+            &mut store,
+            "swift::A.swift::FooCell.configure",
+            NodeKind::SwiftMethod,
+            "A.swift",
+            "configure",
+        );
+        insert_contains(
+            &mut store,
+            "swift::A.swift::FooCell",
+            "swift::A.swift::FooCell.configure",
+        );
+        // App entry: AppDelegate conforms to UIApplicationDelegate.
+        insert_node_meta(
+            &mut store,
+            "swift::App.swift::AppDelegate",
+            NodeKind::SwiftClass,
+            "App.swift",
+            "AppDelegate",
+            Some(r#"{"swift_inherits":["UIResponder","UIApplicationDelegate"]}"#),
+        );
+        // A pure-logic type with no framework base and no caller: still dead.
+        insert_node_meta(
+            &mut store,
+            "swift::A.swift::DeadHelper",
+            NodeKind::SwiftClass,
+            "A.swift",
+            "DeadHelper",
+            None,
+        );
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&"swift::A.swift::FooCell"),
+            "a framework-instantiated subclass must be reachable: {dead:?}"
+        );
+        assert!(
+            !dead.contains(&"swift::A.swift::BaseCell"),
+            "a transitive framework base must be reachable: {dead:?}"
+        );
+        assert!(
+            !dead.contains(&"swift::A.swift::FooCell.configure"),
+            "members of a framework subclass are framework-invoked: {dead:?}"
+        );
+        assert!(
+            !dead.contains(&"swift::App.swift::AppDelegate"),
+            "the @UIApplicationMain delegate is the app entry, never dead: {dead:?}"
+        );
+        assert!(
+            dead.contains(&"swift::A.swift::DeadHelper"),
+            "a pure-logic type with no framework base / caller is still dead: {dead:?}"
+        );
     }
 
     #[test]

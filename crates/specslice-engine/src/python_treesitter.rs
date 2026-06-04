@@ -361,6 +361,7 @@ pub(crate) static PYTHON_SPEC: LangSpec = LangSpec {
     resolve_import: python_resolve_import,
     recurse_callables: false,
     call_idents_of: py_call_idents,
+    module_scoped_resolution: false,
 };
 
 #[cfg(test)]

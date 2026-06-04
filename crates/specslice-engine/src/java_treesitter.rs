@@ -264,6 +264,7 @@ pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     resolve_import: java_resolve_import,
     recurse_callables: false,
     call_idents_of: java_call_idents,
+    module_scoped_resolution: false,
 };
 
 #[cfg(test)]

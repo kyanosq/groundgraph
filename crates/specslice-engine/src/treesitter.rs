@@ -276,6 +276,19 @@ pub struct LangSpec {
     /// no behaviour change). Languages that opt in (Rust) emit
     /// medium-confidence `Calls` / `References` edges resolved by name.
     pub call_idents_of: CallIdentsFn,
+    /// Opt into **whole-module** name resolution for a flat-namespace
+    /// language. Default `false` (same-file → imported-file only).
+    ///
+    /// Swift `import`s a *module*, not a file, so there are no file→file
+    /// import edges to follow; without this, every cross-file call stays
+    /// unresolved and the file graph collapses into one blob. When `true`,
+    /// a bare name that resolves nowhere same-file/imported falls back to
+    /// the *single* definition site anywhere in the indexed module — and
+    /// only when that name maps to exactly one file, so ubiquitous method
+    /// names (`viewDidLoad`…) defined in many files never link unrelated
+    /// files together. Type/constructor names (usually unique) carry the
+    /// signal that drives [`crate::feature_cluster`].
+    pub module_scoped_resolution: bool,
 }
 
 /// Default [`LangSpec::call_idents_of`]: capture nothing. Languages that
@@ -1106,6 +1119,13 @@ fn index_repo_with_spec_impl(
 /// quadratically explode the edge set.
 const MAX_REF_TARGETS: usize = 16;
 
+/// Fan-in cap for [`LangSpec::module_scoped_resolution`]: a uniquely-named
+/// type referenced (module-wide) by more distinct files than this is treated
+/// as cross-cutting infrastructure (a base class / Theme / Router) rather
+/// than a feature boundary, and is *not* linked — otherwise every file would
+/// couple to it and the file graph would collapse into one community.
+pub(crate) const MODULE_HUB_FANIN_CAP: usize = 32;
+
 /// Resolve heuristic body identifiers (`pending`) to concrete symbol ids
 /// using only in-batch facts: a name → qualified-name index over the
 /// emitted symbols, and the per-file resolved import targets.
@@ -1138,6 +1158,42 @@ pub(crate) fn resolve_heuristic_refs(
             .or_default()
             .push(qualified);
     }
+
+    // Whole-module name index for flat-namespace languages (Swift): simple
+    // name → its definition sites `(file, qualified)`. Only consulted when
+    // same-file / imported-file resolution fails *and* the name maps to a
+    // single file, so unique types/constructors link across files while
+    // ubiquitous method names stay local.
+    let module_index: HashMap<&str, Vec<(&str, &str)>> = if spec.module_scoped_resolution {
+        let mut idx: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for (path, name, qualified) in symbols {
+            idx.entry(name).or_default().push((path, qualified));
+        }
+        idx
+    } else {
+        HashMap::new()
+    };
+    // Pre-pass: names whose module-wide fan-in (distinct referencing files)
+    // exceeds the cap are infrastructure hubs and excluded from module-wide
+    // resolution (see [`MODULE_HUB_FANIN_CAP`]).
+    let module_hubs: HashSet<&str> = if spec.module_scoped_resolution {
+        let mut fanin: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (file, r) in pending {
+            if !r.to_name.contains(spec.separator) {
+                fanin
+                    .entry(r.to_name.as_str())
+                    .or_default()
+                    .insert(file.as_str());
+            }
+        }
+        fanin
+            .into_iter()
+            .filter(|(_, files)| files.len() > MODULE_HUB_FANIN_CAP)
+            .map(|(name, _)| name)
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     let sep = spec.separator;
     let mut out: Vec<ReferenceEdge> = Vec::new();
@@ -1198,6 +1254,29 @@ pub(crate) fn resolve_heuristic_refs(
                         if let Some(q) = by_file.get(tf.as_str()).and_then(|m| m.get(name)) {
                             for qn in q {
                                 targets.push((tf.as_str(), (*qn).to_string(), r.kind.edge_kind()));
+                            }
+                        }
+                    }
+                }
+            }
+            // Flat-namespace fallback (Swift): resolve module-wide, but only
+            // for a name that is (1) PascalCase — a type/constructor by Swift
+            // convention, since lowercase method names collide with
+            // stdlib/UIKit; (2) defined in exactly one *other* file — unique;
+            // and (3) not a high fan-in hub. These together keep the edges
+            // feature-shaped instead of gluing every file to shared infra.
+            if targets.is_empty()
+                && spec.module_scoped_resolution
+                && name.chars().next().is_some_and(char::is_uppercase)
+                && !module_hubs.contains(name)
+            {
+                if let Some(defs) = module_index.get(name) {
+                    let distinct_files: HashSet<&str> = defs.iter().map(|(f, _)| *f).collect();
+                    if distinct_files.len() == 1 {
+                        let tf = *distinct_files.iter().next().unwrap();
+                        if tf != file.as_str() {
+                            for (_, qn) in defs {
+                                targets.push((tf, (*qn).to_string(), r.kind.edge_kind()));
                             }
                         }
                     }
@@ -1658,5 +1737,164 @@ describe('outer', () => {
             .find(|n| n.kind == NodeKind::PythonClass && n.name.as_deref() == Some("Service"))
             .expect("Service node present");
         assert_eq!(service.metadata_json.as_deref(), Some(r#"{"tag":"py"}"#));
+    }
+
+    // --- Module-scoped (flat-namespace) name resolution -------------------
+    // Languages whose `import`s name a *module*, not a file (Swift), have no
+    // file→file import edges, so same-file + imported-file resolution leaves
+    // every cross-file call unresolved and the file graph degenerates into one
+    // blob. Opting into `module_scoped_resolution` lets a bare name resolve
+    // against the *whole indexed module* — but only when the name maps to a
+    // single definition file, keeping ubiquitous method names (viewDidLoad…)
+    // from linking everything together.
+
+    use crate::rust_treesitter::RUST_SPEC;
+    use crate::swift_treesitter::SWIFT_SPEC;
+    use std::collections::HashMap;
+
+    fn pending(from: &str, to: &str) -> Vec<(String, ScannedRef)> {
+        vec![(
+            "ui/builder.swift".to_string(),
+            ScannedRef {
+                from_qualified: from.to_string(),
+                to_name: to.to_string(),
+                kind: RefKind::Call,
+            },
+        )]
+    }
+
+    #[test]
+    fn module_scoped_resolution_links_unique_name_across_files_without_imports() {
+        // `OrderViewModel` is constructed in ui/builder.swift but defined once,
+        // in model/order.swift, with no import edge between them.
+        let symbols = vec![
+            ("model/order.swift", "OrderViewModel", "OrderViewModel"),
+            ("ui/builder.swift", "build", "Builder.build"),
+        ];
+        let edges = resolve_heuristic_refs(
+            &SWIFT_SPEC,
+            &symbols,
+            &HashMap::new(),
+            &pending("Builder.build", "OrderViewModel"),
+        );
+        assert!(
+            edges.iter().any(|e| e
+                .from_symbol_id
+                .to_string()
+                .ends_with("ui/builder.swift::Builder.build")
+                && e.to_symbol_id
+                    .to_string()
+                    .ends_with("model/order.swift::OrderViewModel")),
+            "a uniquely-named type must resolve module-wide for Swift: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn module_scoped_resolution_skips_ambiguous_names() {
+        // `viewDidLoad` is defined in two files: linking it module-wide would
+        // glue unrelated screens together, so it must stay unresolved.
+        let symbols = vec![
+            ("a/screen.swift", "viewDidLoad", "AScreen.viewDidLoad"),
+            ("b/screen.swift", "viewDidLoad", "BScreen.viewDidLoad"),
+            ("ui/builder.swift", "build", "Builder.build"),
+        ];
+        let edges = resolve_heuristic_refs(
+            &SWIFT_SPEC,
+            &symbols,
+            &HashMap::new(),
+            &pending("Builder.build", "viewDidLoad"),
+        );
+        assert!(
+            !edges.iter().any(|e| e
+                .from_symbol_id
+                .to_string()
+                .ends_with("ui/builder.swift::Builder.build")),
+            "an ambiguous name (2 defs) must not link module-wide: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn module_scoped_resolution_only_links_type_like_names() {
+        // A *lowercase* unique name is a method/function (`append`,
+        // `pushViewController`…) that routinely collides with stdlib/UIKit;
+        // resolving it module-wide glues unrelated files together. Only
+        // PascalCase type/constructor names carry feature coupling.
+        let symbols = vec![
+            ("util/ext.swift", "append", "Array.append"),
+            ("ui/builder.swift", "build", "Builder.build"),
+        ];
+        let edges = resolve_heuristic_refs(
+            &SWIFT_SPEC,
+            &symbols,
+            &HashMap::new(),
+            &pending("Builder.build", "append"),
+        );
+        assert!(
+            edges.is_empty(),
+            "a lowercase method name must not resolve module-wide: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn module_scoped_resolution_drops_high_fanin_hubs() {
+        // A uniquely-defined PascalCase type referenced by *many* files is
+        // cross-cutting infrastructure (a base class / Theme / Router), not a
+        // feature boundary; linking every file to it collapses the graph.
+        let mut symbols = vec![("core/theme.swift", "Theme", "Theme")];
+        let mut pending: Vec<(String, ScannedRef)> = Vec::new();
+        for i in 0..(MODULE_HUB_FANIN_CAP + 5) {
+            let f = format!("f{i}.swift");
+            // leak each caller file into the symbol universe too
+            let name: &'static str = Box::leak(format!("use{i}").into_boxed_str());
+            let path: &'static str = Box::leak(f.clone().into_boxed_str());
+            symbols.push((path, name, name));
+            pending.push((
+                f,
+                ScannedRef {
+                    from_qualified: name.to_string(),
+                    to_name: "Theme".to_string(),
+                    kind: RefKind::Call,
+                },
+            ));
+        }
+        let edges = resolve_heuristic_refs(&SWIFT_SPEC, &symbols, &HashMap::new(), &pending);
+        assert!(
+            !edges.iter().any(|e| e
+                .to_symbol_id
+                .to_string()
+                .ends_with("core/theme.swift::Theme")),
+            "a high fan-in hub type must be dropped: {} edges",
+            edges.len()
+        );
+    }
+
+    #[test]
+    fn non_module_scoped_language_keeps_import_discipline() {
+        // Rust does NOT opt in: a unique name defined elsewhere must still need
+        // a use/import, so no cross-file edge appears from name alone.
+        let symbols = vec![
+            ("model/order.rs", "OrderViewModel", "OrderViewModel"),
+            ("ui/builder.rs", "build", "Builder::build"),
+        ];
+        let edges = resolve_heuristic_refs(
+            &RUST_SPEC,
+            &symbols,
+            &HashMap::new(),
+            &[(
+                "ui/builder.rs".to_string(),
+                ScannedRef {
+                    from_qualified: "Builder::build".to_string(),
+                    to_name: "OrderViewModel".to_string(),
+                    kind: RefKind::Call,
+                },
+            )],
+        );
+        assert!(
+            !edges.iter().any(|e| e
+                .to_symbol_id
+                .to_string()
+                .ends_with("model/order.rs::OrderViewModel")),
+            "Rust must not resolve a name across files without an import: {edges:?}"
+        );
     }
 }

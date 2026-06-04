@@ -408,6 +408,7 @@ pub(crate) static DART_SPEC: LangSpec = LangSpec {
     resolve_import: dart_resolve_import,
     recurse_callables: true,
     call_idents_of: no_call_idents,
+    module_scoped_resolution: false,
 };
 
 // ---------------------------------------------------------------------------

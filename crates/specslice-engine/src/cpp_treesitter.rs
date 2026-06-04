@@ -183,6 +183,7 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     resolve_import: resolve_c_include,
     recurse_callables: false,
     call_idents_of: cpp_call_idents,
+    module_scoped_resolution: false,
 };
 
 #[cfg(test)]
