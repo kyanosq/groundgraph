@@ -47,6 +47,9 @@ enum Commands {
     Candidate(CandidateArgs),
     /// 输出业务逻辑可信度报告（confirmed / candidate / stale / missing 等）。
     Logic(LogicArgs),
+    /// 业务模块证据包 — 把代码/文档/测试事实按业务模块聚合，产出供 AI
+    /// 生成 `business_logic.yaml` 候选的证据 + 中文提示词（非侵入，只读图）。
+    Propose(ProposeArgs),
     /// 代码图搜索 — `grep` 的代码图替代品。
     Search(SearchArgs),
     /// 死代码报告 — 标注无法从任何入口点可达的代码符号。
@@ -374,6 +377,43 @@ struct LogicArgs {
     /// 仅列出存在风险 (非 confirmed_link) 的条目。
     #[arg(long)]
     only_risks: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ProposeArgs {
+    /// 输出格式：`json`（默认，证据包，喂给 AI）/ `markdown`（可读业务文档草稿
+    /// + 内嵌提示词）/ `text`（人类速览）。
+    #[arg(long, value_enum, default_value_t = ProposeFormatArg::Json)]
+    format: ProposeFormatArg,
+    /// 写入文件而非 stdout（如 `.specslice/export/business-pack.md`）。
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// `--format json` 时美化输出。
+    #[arg(long)]
+    pretty: bool,
+    /// 最多报告多少个业务模块（按信号分降序，默认 40）。
+    #[arg(long, value_name = "N", default_value_t = 40)]
+    max_modules: usize,
+    /// 每个模块最多列出多少入口符号（默认 8）。
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    max_entry_points: usize,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ProposeFormatArg {
+    Json,
+    Markdown,
+    Text,
+}
+
+impl ProposeFormatArg {
+    fn into_command_format(self) -> commands::propose::ProposeFormat {
+        match self {
+            ProposeFormatArg::Json => commands::propose::ProposeFormat::Json,
+            ProposeFormatArg::Markdown => commands::propose::ProposeFormat::Markdown,
+            ProposeFormatArg::Text => commands::propose::ProposeFormat::Text,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -727,6 +767,14 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Propose(args) => commands::propose::run(commands::propose::ProposeRunArgs {
+            repo_root: cli.repo_root.clone(),
+            format: args.format.into_command_format(),
+            out: args.out,
+            pretty: args.pretty,
+            max_modules: args.max_modules,
+            max_entry_points: args.max_entry_points,
+        }),
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
             format: args.format.into(),
