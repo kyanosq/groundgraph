@@ -73,9 +73,22 @@ pub fn render_parts(nodes: &[MermaidNode], edges: &[MermaidEdge], notes: &[Strin
 }
 
 pub fn render_mermaid(view: &GraphViewModel) -> String {
+    // Honour the view's `default_visible` surface. `--view overview/business/code`
+    // only *toggle* per-node visibility — they do not prune `view.nodes` — so a
+    // raw dump would emit the entire graph (a real dogfood bug: `--view business`
+    // produced an 8k-line diagram with zero requirements in view). Mermaid is for
+    // docs/PR embeds, so render only the visible surface and the edges between
+    // visible nodes. `focus` already narrowed `nodes` and marks them all visible.
+    let visible: std::collections::HashSet<&str> = view
+        .nodes
+        .iter()
+        .filter(|n| n.default_visible)
+        .map(|n| n.id.as_str())
+        .collect();
     let nodes: Vec<MermaidNode> = view
         .nodes
         .iter()
+        .filter(|n| n.default_visible)
         .map(|n| MermaidNode {
             id: n.id.clone(),
             label: n.label.clone(),
@@ -86,6 +99,7 @@ pub fn render_mermaid(view: &GraphViewModel) -> String {
     let edges: Vec<MermaidEdge> = view
         .edges
         .iter()
+        .filter(|e| visible.contains(e.from.as_str()) && visible.contains(e.to.as_str()))
         .map(|e| MermaidEdge {
             from: e.from.clone(),
             to: e.to.clone(),
@@ -216,6 +230,32 @@ mod tests {
             "label quotes should be escaped: {out}"
         );
         assert!(!out.contains("docsec::"), "raw ids leaked: {out}");
+    }
+
+    #[test]
+    fn render_mermaid_only_emits_default_visible_nodes_and_their_edges() {
+        // Simulates `--view overview/business`: the engine keeps every node in
+        // the model but toggles `default_visible`. Mermaid must render only the
+        // visible surface, dropping hidden nodes and edges touching them.
+        let mut v = view();
+        v.nodes[0].default_visible = false; // hide the doc_section
+        v.nodes[1].default_visible = true; // keep the requirement
+        let out = render_mermaid(&v);
+        assert!(
+            !out.contains("Quote"),
+            "hidden doc_section must not render: {out}"
+        );
+        assert!(
+            out.contains("REQ-1"),
+            "visible requirement should render: {out}"
+        );
+        assert!(
+            !out.contains("|documents|"),
+            "edge touching a hidden node must be dropped: {out}"
+        );
+        // Exactly one node alias should exist.
+        assert!(out.contains("n0"), "{out}");
+        assert!(!out.contains("n1"), "only one visible node expected: {out}");
     }
 
     #[test]

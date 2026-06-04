@@ -62,6 +62,7 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
         }
         for entry in walkdir::WalkDir::new(&abs_root)
             .into_iter()
+            .filter_entry(|e| !is_pruned_dir(e))
             .filter_map(|e| e.ok())
         {
             if !entry.file_type().is_file() {
@@ -92,6 +93,40 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
         }
     }
     Ok(result)
+}
+
+/// Directories the docs walk must never descend into. Mirrors the tree-sitter
+/// drivers' `skip_dirs`: vendored dependencies, VCS, build output and our own
+/// `.specslice/` workspace would otherwise flood the graph with thousands of
+/// third-party `README.md` sections (real dogfood bug: a checked-in
+/// `node_modules` under a doc root produced 1.5k phantom doc sections).
+fn is_pruned_dir(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let Some(name) = entry.file_name().to_str() else {
+        return false;
+    };
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | ".hg"
+            | ".svn"
+            | "target"
+            | "build"
+            | "dist"
+            | "out"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".next"
+            | ".svelte-kit"
+            | ".specslice"
+            | "vendor"
+            | ".idea"
+            | ".tox"
+    )
 }
 
 fn matches_include_globs(patterns: &[String], rel_path: &str) -> Result<bool> {
@@ -285,5 +320,45 @@ mod tests {
         // The frontmatter is unterminated → must fall back gracefully.
         assert_eq!(parsed.headings.len(), 1);
         assert_eq!(parsed.headings[0].text, "Hello");
+    }
+
+    /// Dogfood fix: a checked-in `node_modules` (or `.git`/`target`/…) under a
+    /// doc root must not flood the graph with vendored `README.md` sections.
+    #[test]
+    fn docs_walk_prunes_vendor_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs/node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# Guide\n\nbody\n").unwrap();
+        std::fs::write(root.join("docs/sub/deep.md"), "# Deep\n\nbody\n").unwrap();
+        std::fs::write(
+            root.join("docs/node_modules/pkg/README.md"),
+            "# Vendor\n\nnoise\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec![],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        assert_eq!(
+            result.files, 2,
+            "only docs/guide.md + docs/sub/deep.md, not node_modules; got {result:?}"
+        );
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(nodes
+            .iter()
+            .any(|n| n.id.to_string() == "file::docs/guide.md"));
+        assert!(
+            nodes
+                .iter()
+                .all(|n| !n.id.to_string().contains("node_modules")),
+            "vendored node_modules markdown must be pruned"
+        );
     }
 }

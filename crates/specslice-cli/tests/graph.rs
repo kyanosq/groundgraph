@@ -128,22 +128,44 @@ fn graph_mermaid_prints_flowchart() {
     let tmp = tempfile::TempDir::new().unwrap();
     bootstrap(tmp.path());
 
-    let assert = Command::cargo_bin("specslice")
+    // Default (overview) mermaid honours the view's visible surface: a bounded
+    // set of top-level module boxes, not a dump of the whole graph. It must
+    // still be a valid flowchart with aliased ids (no raw artifact ids).
+    let overview = Command::cargo_bin("specslice")
         .unwrap()
         .current_dir(tmp.path())
         .args(["graph", "--format", "mermaid"])
         .assert()
         .success();
-    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    assert!(stdout.starts_with("flowchart LR"), "got: {stdout}");
-    assert!(stdout.contains("-->"), "no edges: {stdout}");
+    let overview = String::from_utf8(overview.get_output().stdout.clone()).unwrap();
+    assert!(overview.starts_with("flowchart LR"), "got: {overview}");
+    assert!(overview.contains("n0"), "no nodes rendered: {overview}");
+    assert!(
+        !overview.contains("dart_class::"),
+        "raw id leaked: {overview}"
+    );
+
+    // `--view business` is the relationship surface: requirements plus their
+    // one-hop evidence, so the diagram has labelled edges.
+    let business = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["graph", "--format", "mermaid", "--view", "business"])
+        .assert()
+        .success();
+    let business = String::from_utf8(business.get_output().stdout.clone()).unwrap();
+    assert!(business.starts_with("flowchart LR"), "got: {business}");
+    assert!(business.contains("-->"), "no edges: {business}");
     // Edge labels include the edge kind from the engine view.
     assert!(
-        stdout.contains("declares_implementation") || stdout.contains("documents"),
-        "no edge label: {stdout}"
+        business.contains("declares_implementation") || business.contains("documents"),
+        "no edge label: {business}"
     );
     // Aliases keep raw artifact ids out of the diagram body.
-    assert!(!stdout.contains("dart_class::"), "raw id leaked: {stdout}");
+    assert!(
+        !business.contains("dart_class::"),
+        "raw id leaked: {business}"
+    );
 }
 
 #[test]

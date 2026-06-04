@@ -16,11 +16,15 @@ library;
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
 import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
 import 'package:analyzer/dart/element/element2.dart';
+// ignore: implementation_imports — only the impl constructor accepts
+// `optionsFile`, which we need to override the target project's lint-time
+// `analyzer: exclude:` so graph coverage follows the code roots, not the
+// project's lint scope (see the collection construction below).
+import 'package:analyzer/src/dart/analysis/analysis_context_collection.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
@@ -31,6 +35,78 @@ class WalkerStats {
   int symbols = 0;
   int references = 0;
   int calls = 0;
+}
+
+/// True when [dir] is the root of a usable Dart SDK — i.e. it contains the
+/// `sdk_library_metadata/libraries.dart` file `package:analyzer` reads first
+/// when building its SDK model. This is exactly the file whose absence
+/// produced `PathNotFoundException(.../lib/_internal/.../libraries.dart)` when
+/// the sidecar ran as an AOT-compiled executable with a bogus default SDK
+/// path.
+bool isValidSdk(String dir) {
+  if (dir.isEmpty) return false;
+  return File(p.join(
+    dir,
+    'lib',
+    '_internal',
+    'sdk_library_metadata',
+    'lib',
+    'libraries.dart',
+  )).existsSync();
+}
+
+/// Resolve a Dart SDK root that works in *both* sidecar deployment modes:
+///
+/// - `dart run …` — `package:analyzer`'s own default
+///   (`dirname(dirname(Platform.resolvedExecutable))`) already points at the
+///   SDK, so we return `null` and let it auto-detect (no behaviour change).
+/// - AOT-compiled binary (`SPECSLICE_DART_ANALYZER_BIN=/path/to/exe`) —
+///   `resolvedExecutable` is the binary itself, so the default resolves to a
+///   bogus path (e.g. `/tmp/lib/_internal/…`) and analysis crashes. We then
+///   honour `SPECSLICE_DART_SDK` / `DART_SDK`, or locate `dart` on `PATH` and
+///   derive the SDK (handling a plain SDK at `<sdk>/bin/dart` and a Flutter
+///   checkout whose SDK lives at `<flutter>/bin/cache/dart-sdk`).
+///
+/// Returns `null` when the analyzer default already works or nothing better is
+/// found (in which case the analyzer keeps its current behaviour).
+///
+/// [resolvedExecutable] and [environment] are injectable for testing.
+String? resolveSdkPath({String? resolvedExecutable, Map<String, String>? environment}) {
+  final exe = resolvedExecutable ?? Platform.resolvedExecutable;
+  final env = environment ?? Platform.environment;
+
+  // The analyzer's own default. If it works, don't override it.
+  final fromExe = p.dirname(p.dirname(exe));
+  if (isValidSdk(fromExe)) return null;
+
+  // Explicit overrides win.
+  for (final key in const ['SPECSLICE_DART_SDK', 'DART_SDK']) {
+    final v = env[key];
+    if (v != null && isValidSdk(v)) return v;
+  }
+
+  // Locate `dart` on PATH and derive the SDK root.
+  final exeName = Platform.isWindows ? 'dart.exe' : 'dart';
+  final sep = Platform.isWindows ? ';' : ':';
+  for (final dir in (env['PATH'] ?? '').split(sep)) {
+    if (dir.isEmpty) continue;
+    final dart = p.join(dir, exeName);
+    if (!File(dart).existsSync()) continue;
+    var real = dart;
+    try {
+      real = File(dart).resolveSymbolicLinksSync();
+    } catch (_) {
+      // Keep the unresolved path; symlink resolution is best-effort.
+    }
+    final candidates = [
+      p.dirname(p.dirname(real)), // <sdk>/bin/dart        → <sdk>
+      p.join(p.dirname(real), 'cache', 'dart-sdk'), // <flutter>/bin/dart → cache/dart-sdk
+    ];
+    for (final c in candidates) {
+      if (isValidSdk(c)) return c;
+    }
+  }
+  return null;
 }
 
 /// Entry point. Returns the JSON-encodable batch.
@@ -71,6 +147,27 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
     );
   }
 
+  // Override the target project's analysis options with a minimal, empty
+  // one. The project's `analysis_options.yaml` frequently excludes generated
+  // code from the *linter*, e.g.
+  //   analyzer:
+  //     exclude:
+  //       - lib/l10n/generated/**
+  // `analyzedFiles()` (and `contextFor`) honour that exclude, so those files
+  // would resolve to *zero* symbols/edges here — while the tree-sitter
+  // structural pass still indexes them (they are real code that runs). That
+  // asymmetry strands generated classes with structural nodes but no semantic
+  // inbound edges, surfacing them as high-confidence dead code (dogfood: hama
+  // l10n `_AppLocalizationsDelegate`). Graph coverage must follow the code
+  // roots, not the project's lint scope — SpecSlice has its own exclude config
+  // for graph scoping (honoured below via `req.excludeGlobs`). Forcing an
+  // empty options file drops the lint-time excludes (and lints, which we never
+  // consume) while package resolution + language version still come from the
+  // project's package config.
+  final optionsDir = await Directory.systemTemp.createTemp('specslice_opts_');
+  final optionsFile = File(p.join(optionsDir.path, 'analysis_options.yaml'))
+    ..writeAsStringSync('analyzer:\n');
+
   // P2 — pass the repo root as a single included path so the analyzer
   // treats the whole repo as one context. Otherwise (without a
   // pubspec.yaml) it spawns a separate context per directory, and
@@ -79,9 +176,13 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   // returns null because the analyzer resynthesises the class under a
   // different Element2 instance per context. We still honour the
   // requested code roots when *enumerating* files to index.
-  final collection = AnalysisContextCollection(
+  final collection = AnalysisContextCollectionImpl(
     includedPaths: [repoRoot],
-    resourceProvider: null,
+    optionsFile: optionsFile.path,
+    // null → analyzer auto-detects (correct under `dart run`); non-null →
+    // an SDK we resolved for the AOT-compiled-binary deployment (see
+    // [resolveSdkPath]).
+    sdkPath: resolveSdkPath(),
   );
 
   // First pass: declarations. We build a "qualified-name → symbol id"
@@ -221,6 +322,13 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
     unit.unit.visitChildren(body);
   }
 
+  // The analyzer has read the override options file by now; drop the temp dir.
+  try {
+    optionsDir.deleteSync(recursive: true);
+  } catch (_) {
+    // Best-effort cleanup; a leftover temp file is harmless.
+  }
+
   return SidecarBatchResponse(
     files: files,
     symbols: symbols,
@@ -304,6 +412,21 @@ String _slugifyTestName(String value) {
   return slug.isEmpty ? 'unnamed' : slug;
 }
 
+/// The simple name of an extension's `on` type, matching the tree-sitter
+/// indexer's qualifier (generics + library prefixes stripped):
+/// `extension _X on Foo<T>` → `Foo`; `extension _X on a.B` → `B`.
+String? _extensionOnTypeName(ExtensionDeclaration node) {
+  final extended = node.onClause?.extendedType;
+  if (extended == null) return null;
+  var s = extended.toSource();
+  final lt = s.indexOf('<');
+  if (lt >= 0) s = s.substring(0, lt);
+  final dot = s.lastIndexOf('.');
+  if (dot >= 0) s = s.substring(dot + 1);
+  s = s.trim();
+  return s.isEmpty ? null : s;
+}
+
 /// Walks declarations and builds the symbol table + element → id map.
 class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   final String rel;
@@ -364,12 +487,88 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
   }
 
   @override
+  void visitMixinDeclaration(MixinDeclaration node) {
+    // Mixins (and enums below) collapse onto the `dart_class::` id scheme
+    // to mirror the tree-sitter structural pass. The declaration pass only
+    // needs to register their Element → id mapping (and descend so their
+    // members map too) — the *nodes* are owned by tree-sitter — so usage
+    // edges (e.g. a `with _Mixin` application) resolve to a real symbol.
+    final name = node.name.lexeme;
+    final id = 'dart_class::$rel#$name';
+    final el = node.declaredFragment?.element;
+    if (el != null) byElement[el] = id;
+    final prevName = currentClassName;
+    final prevId = currentClassId;
+    currentClassName = name;
+    currentClassId = id;
+    super.visitMixinDeclaration(node);
+    currentClassName = prevName;
+    currentClassId = prevId;
+  }
+
+  @override
+  void visitEnumDeclaration(EnumDeclaration node) {
+    final name = node.name.lexeme;
+    final id = 'dart_class::$rel#$name';
+    final el = node.declaredFragment?.element;
+    if (el != null) byElement[el] = id;
+    final prevName = currentClassName;
+    final prevId = currentClassId;
+    currentClassName = name;
+    currentClassId = id;
+    super.visitEnumDeclaration(node);
+    currentClassName = prevName;
+    currentClassId = prevId;
+  }
+
+  @override
+  void visitExtensionDeclaration(ExtensionDeclaration node) {
+    // `extension _X on _State { … }` — bind members to the `on` type so
+    // their ids match the tree-sitter pass (`dart_method::<file>#_State.m`).
+    // Without this, every private extension member is unreachable in the
+    // graph and surfaces as a high-confidence dead-code false positive
+    // (dogfood regression from tailorx's part-file extension helpers).
+    final onType = _extensionOnTypeName(node);
+    if (onType == null) {
+      super.visitExtensionDeclaration(node);
+      return;
+    }
+    final prevName = currentClassName;
+    final prevId = currentClassId;
+    currentClassName = onType;
+    // The `on` type may be declared in another file, so we cannot point at a
+    // real class node id. The synthetic `dart_extension::…` parent is enough:
+    // `visitMethodDeclaration` qualifies members under `onType` and the engine
+    // re-homes them onto the file when this parent is absent (see
+    // `reconcile_misparsed_callables` / `backfill_referenced_symbols`).
+    currentClassId = 'dart_extension::$rel#$onType';
+    super.visitExtensionDeclaration(node);
+    currentClassName = prevName;
+    currentClassId = prevId;
+  }
+
+  @override
   void visitMethodDeclaration(MethodDeclaration node) {
     final className = currentClassName;
     final classId = currentClassId;
     if (className == null || classId == null) return;
     final name = node.name.lexeme;
     final id = 'dart_method::$rel#$className.$name';
+    final el = node.declaredFragment?.element;
+    if (el != null) byElement[el] = id;
+    // Emit a symbol row for *every* method, including extension members.
+    //
+    // The tree-sitter structural pass normally owns these nodes, and when it
+    // parses cleanly the engine drops this duplicate (it only pulls an overlay
+    // symbol into the graph via `reconcile_misparsed_callables` /
+    // `backfill_referenced_symbols`, both of which skip ids already present —
+    // so no clobber). But when tree-sitter mis-parses a file (Dart 3 syntax it
+    // cannot handle yields a cascade of ERROR nodes — dogfood: turing's
+    // `game_screen_editor.dart`), the extension member degrades into a phantom
+    // top-level `dart_fn`, every analyzer usage edge targets the real
+    // `dart_method::<file>#OnType.member` id, and the member surfaces as a
+    // high-confidence dead-code false positive. Emitting it here lets the
+    // engine reconcile the phantom away and resolve those edges.
     final lines = _lineRange(node.offset, node.end);
     symbols.add({
       'id': id,
@@ -390,8 +589,6 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
       'qualified_name': '$className.$name',
       'parent_symbol_id': classId,
     });
-    final el = node.declaredFragment?.element;
-    if (el != null) byElement[el] = id;
     super.visitMethodDeclaration(node);
   }
 
@@ -400,15 +597,24 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
     final className = currentClassName;
     final classId = currentClassId;
     if (className == null || classId == null) return;
-    final name = node.name?.lexeme ?? '_default';
-    final id = 'dart_constructor::$rel#$className.$name';
+    // Address constructors with the canonical `dart_ctor::path#Class.<default>`
+    // id scheme — the same one the tree-sitter structural pass and
+    // `dart_constructor_id` use. The sidecar previously emitted
+    // `dart_constructor::path#Class._default`, which matched neither the
+    // structural node nor the backfill predicate, so every construction edge
+    // dangled and freshly-constructed classes looked dead (dogfood: hama).
+    final ctorName = node.name?.lexeme;
+    final suffix =
+        (ctorName == null || ctorName.isEmpty) ? '<default>' : ctorName;
+    final id = 'dart_ctor::$rel#$className.$suffix';
+    final qualifiedName = '$className.$suffix';
     final lines = _lineRange(node.offset, node.end);
     symbols.add({
       'id': id,
       'kind': NodeKindString.dartConstructor,
       'path': rel,
-      'name': name,
-      'qualified_name': '$className.$name',
+      'name': suffix,
+      'qualified_name': qualifiedName,
       'start_line': lines.start,
       'end_line': lines.end,
       'parent_symbol_id': classId,
@@ -419,7 +625,7 @@ class _DeclarationVisitor extends RecursiveAstVisitor<void> {
       'start_line': lines.start,
       'end_line': lines.end,
       'symbol_kind': NodeKindString.dartConstructor,
-      'qualified_name': '$className.$name',
+      'qualified_name': qualifiedName,
       'parent_symbol_id': classId,
     });
     final el = node.declaredFragment?.element;
@@ -697,6 +903,23 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     super.visitVariableDeclaration(node);
   }
 
+  @override
+  void visitTopLevelVariableDeclaration(TopLevelVariableDeclaration node) {
+    // Top-level (file-scope) initializers belong to no symbol — e.g. a
+    // registration list `final _scenes = [_Scene(capture: _captureHome), …]`
+    // or a tear-off table `const handlers = {0: _onZero};`. With no enclosing
+    // class or function, `_currentSymbolId` is null and every reference inside
+    // was dropped, so each registered callable looked like high-confidence
+    // dead code (dogfood regression: hama integration_test screenshot scenes).
+    // Anchor the initializer's references — tear-offs, constructions, calls —
+    // on the file node so dead-code reachability keeps the registered targets
+    // alive once the file itself is reachable.
+    final prev = _currentSymbolId;
+    _currentSymbolId = 'file::$rel';
+    super.visitTopLevelVariableDeclaration(node);
+    _currentSymbolId = prev;
+  }
+
   String? _hiveBoxNameFromExpression(Expression? expr) {
     if (expr == null) return null;
     Expression e = expr;
@@ -713,6 +936,70 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
       }
     }
     return null;
+  }
+
+  @override
+  void visitClassDeclaration(ClassDeclaration node) {
+    // Entering a class scope sets `_currentSymbolId` to the class so that
+    // expressions living *directly* at class scope — static / instance
+    // field initializers, in particular method tear-offs like
+    // `static ... imageExporter = _impl;` — attribute their references to
+    // the class instead of being dropped on the floor (dogfood regression:
+    // hama's `ExportService` static-field pipeline seams). It also lets us
+    // record `extends` / `with` / `implements` as type usages so a
+    // superclass / mixin / interface used only structurally stays alive.
+    final el = node.declaredFragment?.element;
+    final prev = _currentSymbolId;
+    _currentSymbolId = el == null ? null : byElement[el];
+    _emitTypeUsage(node.extendsClause?.superclass);
+    _emitTypeUsages(node.withClause?.mixinTypes);
+    _emitTypeUsages(node.implementsClause?.interfaces);
+    super.visitClassDeclaration(node);
+    _currentSymbolId = prev;
+  }
+
+  @override
+  void visitMixinDeclaration(MixinDeclaration node) {
+    final el = node.declaredFragment?.element;
+    final prev = _currentSymbolId;
+    _currentSymbolId = el == null ? null : byElement[el];
+    _emitTypeUsages(node.onClause?.superclassConstraints);
+    _emitTypeUsages(node.implementsClause?.interfaces);
+    super.visitMixinDeclaration(node);
+    _currentSymbolId = prev;
+  }
+
+  @override
+  void visitEnumDeclaration(EnumDeclaration node) {
+    final el = node.declaredFragment?.element;
+    final prev = _currentSymbolId;
+    _currentSymbolId = el == null ? null : byElement[el];
+    _emitTypeUsages(node.withClause?.mixinTypes);
+    _emitTypeUsages(node.implementsClause?.interfaces);
+    super.visitEnumDeclaration(node);
+    _currentSymbolId = prev;
+  }
+
+  void _emitTypeUsages(Iterable<NamedType>? types) {
+    if (types == null) return;
+    for (final t in types) {
+      _emitTypeUsage(t);
+    }
+  }
+
+  /// Emit a `references` edge from the current symbol to the element a
+  /// `NamedType` resolves to (a superclass / mixin / interface). Only
+  /// repo-local types that the declaration pass mapped into [byElement]
+  /// produce an edge; external SDK / package types are skipped.
+  void _emitTypeUsage(NamedType? type) {
+    if (type == null) return;
+    final from = _currentSymbolId;
+    if (from == null) return;
+    final el = type.element2;
+    if (el == null) return;
+    final to = byElement[el];
+    if (to == null) return;
+    _emit(from, to, EdgeKindString.references, type.offset, type.end);
   }
 
   @override

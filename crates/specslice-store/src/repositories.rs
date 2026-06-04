@@ -312,51 +312,10 @@ fn opt_i64(row: &Row<'_>, idx: usize) -> Result<Option<i64>, rusqlite::Error> {
 
 fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
     let kind_str: String = row.get(1)?;
-    let kind = match kind_str.as_str() {
-        "file" => NodeKind::File,
-        "requirement" => NodeKind::Requirement,
-        "acceptance_criterion" => NodeKind::AcceptanceCriterion,
-        "adr" => NodeKind::Adr,
-        "doc_section" => NodeKind::DocSection,
-        "dart_class" => NodeKind::DartClass,
-        "dart_method" => NodeKind::DartMethod,
-        "dart_function" => NodeKind::DartFunction,
-        "dart_constructor" => NodeKind::DartConstructor,
-        "test_case" => NodeKind::TestCase,
-        "test_group" => NodeKind::TestGroup,
-        "dart_provider" => NodeKind::DartProvider,
-        "route" => NodeKind::Route,
-        "storage" => NodeKind::Storage,
-        "business_candidate" => NodeKind::BusinessCandidate,
-        "swift_class" => NodeKind::SwiftClass,
-        "swift_struct" => NodeKind::SwiftStruct,
-        "swift_enum" => NodeKind::SwiftEnum,
-        "swift_protocol" => NodeKind::SwiftProtocol,
-        "swift_method" => NodeKind::SwiftMethod,
-        "swift_function" => NodeKind::SwiftFunction,
-        "swift_initializer" => NodeKind::SwiftInitializer,
-        "go_struct" => NodeKind::GoStruct,
-        "go_interface" => NodeKind::GoInterface,
-        "go_method" => NodeKind::GoMethod,
-        "go_function" => NodeKind::GoFunction,
-        "python_module" => NodeKind::PythonModule,
-        "python_class" => NodeKind::PythonClass,
-        "python_function" => NodeKind::PythonFunction,
-        "python_method" => NodeKind::PythonMethod,
-        "typescript_module" => NodeKind::TypescriptModule,
-        "typescript_class" => NodeKind::TypescriptClass,
-        "typescript_interface" => NodeKind::TypescriptInterface,
-        "typescript_enum" => NodeKind::TypescriptEnum,
-        "typescript_function" => NodeKind::TypescriptFunction,
-        "typescript_method" => NodeKind::TypescriptMethod,
-        "java_package" => NodeKind::JavaPackage,
-        "java_class" => NodeKind::JavaClass,
-        "java_interface" => NodeKind::JavaInterface,
-        "java_enum" => NodeKind::JavaEnum,
-        "java_method" => NodeKind::JavaMethod,
-        "java_constructor" => NodeKind::JavaConstructor,
-        other => return Err(decode_error(1, format!("unknown node kind {other}"))),
-    };
+    // Single source of truth lives in `specslice-core`; the store no longer
+    // keeps a parallel (drift-prone) text→kind table.
+    let kind = NodeKind::from_str(&kind_str)
+        .ok_or_else(|| decode_error(1, format!("unknown node kind {kind_str}")))?;
     Ok(Node {
         id: ArtifactId::new(row.get::<_, String>(0)?),
         kind,
@@ -422,32 +381,12 @@ fn evidence_from_row(row: &Row<'_>) -> Result<Evidence, rusqlite::Error> {
 
 fn symbol_range_from_row(row: &Row<'_>) -> Result<SymbolRange, rusqlite::Error> {
     let kind_str: String = row.get(4)?;
-    let symbol_kind = match kind_str.as_str() {
-        "dart_class" => NodeKind::DartClass,
-        "dart_method" => NodeKind::DartMethod,
-        "dart_function" => NodeKind::DartFunction,
-        "dart_constructor" => NodeKind::DartConstructor,
-        "swift_class" => NodeKind::SwiftClass,
-        "swift_struct" => NodeKind::SwiftStruct,
-        "swift_enum" => NodeKind::SwiftEnum,
-        "swift_protocol" => NodeKind::SwiftProtocol,
-        "swift_method" => NodeKind::SwiftMethod,
-        "swift_function" => NodeKind::SwiftFunction,
-        "swift_initializer" => NodeKind::SwiftInitializer,
-        "go_struct" => NodeKind::GoStruct,
-        "go_interface" => NodeKind::GoInterface,
-        "go_method" => NodeKind::GoMethod,
-        "go_function" => NodeKind::GoFunction,
-        "python_module" => NodeKind::PythonModule,
-        "python_class" => NodeKind::PythonClass,
-        "python_function" => NodeKind::PythonFunction,
-        "python_method" => NodeKind::PythonMethod,
-        "test_case" => NodeKind::TestCase,
-        "test_group" => NodeKind::TestGroup,
-        "doc_section" => NodeKind::DocSection,
-        "dart_provider" => NodeKind::DartProvider,
-        other => return Err(decode_error(4, format!("unsupported symbol kind {other}"))),
-    };
+    // Accept any valid node kind (previously this hand-rolled list silently
+    // omitted Rust / Java / TypeScript / C / C++, so their symbol ranges could
+    // be written but never read back — a real round-trip bug caught by the
+    // P23.8 corpus tests).
+    let symbol_kind = NodeKind::from_str(&kind_str)
+        .ok_or_else(|| decode_error(4, format!("unsupported symbol kind {kind_str}")))?;
     let parent: Option<String> = row.get(6)?;
     Ok(SymbolRange {
         file_path: row.get(0)?,
@@ -685,6 +624,21 @@ mod decode_tests {
             "go_interface",
             "go_method",
             "go_function",
+            "rust_module",
+            "rust_struct",
+            "rust_enum",
+            "rust_trait",
+            "rust_function",
+            "rust_method",
+            "c_function",
+            "c_struct",
+            "c_enum",
+            "cpp_namespace",
+            "cpp_class",
+            "cpp_struct",
+            "cpp_enum",
+            "cpp_function",
+            "cpp_method",
         ];
         for (i, k) in kinds.iter().enumerate() {
             store

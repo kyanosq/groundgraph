@@ -1,0 +1,23 @@
+# SpecSlice 对自身仓库的工作区配置（P23.10 中文 dogfood）。
+# 非侵入式：所有产物都写入 .specslice/，不修改任何源代码。
+repo:
+  root: .
+  default_branch: main
+
+storage:
+  path: .specslice/graph.db
+
+docs:
+  paths:
+    - docs
+
+# 统一 languages 配置（P23.7）：本仓库为 Rust 工作区，结构来源为
+# tree-sitter 内置 Rust 后端；不需要 LSP / analyzer 富化。
+languages:
+  - id: rust
+    paths:
+      - crates
+
+enrichment:
+  lsp: false
+  analyzer: false

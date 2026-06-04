@@ -9,6 +9,10 @@ dist/
 # Rust/editor local files.
 *.swp
 
+# 对标基准：CodeGraph 等第三方仓的 vendored 源码副本，仅作本地对标用，
+# 不纳入本仓库历史（体积大、属第三方代码）。
+docs/sourcecode/
+
 # Dart sidecar local build artefacts (we commit pubspec.yaml but not the
 # resolved pubspec.lock or the on-disk pub cache).
 tool/specslice_dart_analyzer/.dart_tool/

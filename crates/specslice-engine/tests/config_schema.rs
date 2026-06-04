@@ -476,6 +476,232 @@ fn index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing()
     assert!(go.sidecar_skip_reason.contains("PATH"));
 }
 
+#[test]
+fn p23_unified_languages_normalize_onto_legacy_switches() {
+    use specslice_engine::config::LanguageSelection;
+    let cfg = EngineConfig {
+        languages: vec![
+            LanguageSelection {
+                id: "dart".into(),
+                paths: vec!["sources".into()],
+                exclude: vec!["**/*.g.dart".into()],
+                lsp_command: None,
+            },
+            LanguageSelection {
+                id: "rust".into(),
+                paths: vec!["crates".into()],
+                ..Default::default()
+            },
+            LanguageSelection {
+                id: "swift".into(),
+                paths: vec!["Sources".into()],
+                lsp_command: Some("sklsp".into()),
+                ..Default::default()
+            },
+            LanguageSelection {
+                id: "ts".into(),
+                ..Default::default()
+            },
+            LanguageSelection {
+                id: "c++".into(),
+                paths: vec!["native".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let n = cfg.normalized();
+    // dart → code (canonical Dart structural/analyzer path).
+    assert_eq!(n.code.paths, vec!["sources".to_string()]);
+    assert_eq!(n.code.exclude, vec!["**/*.g.dart".to_string()]);
+    // rust → rust adapter (no LSP tier; always tree-sitter).
+    assert!(n.rust.enabled);
+    assert_eq!(n.rust.paths, vec!["crates".to_string()]);
+    // swift → Tier-3 adapter (enrichment.lsp defaults true).
+    assert!(n.swift.enabled);
+    assert_eq!(n.swift.lsp_command.as_deref(), Some("sklsp"));
+    // ts alias → typescript adapter.
+    assert!(n.typescript.enabled);
+    // c++ alias → generic tree-sitter structural driver.
+    assert!(n.treesitter.enabled);
+    assert!(n.treesitter.languages.contains(&"cpp".to_string()));
+    assert!(n.treesitter.paths.contains(&"native".to_string()));
+    // The canonical list is consumed; re-normalising is a no-op (idempotent).
+    assert!(n.languages.is_empty());
+    assert_eq!(n.clone().normalized(), n);
+}
+
+#[test]
+fn javascript_alias_routes_through_typescript_adapter() {
+    use specslice_engine::config::{canonical_language_id, EngineConfig, LanguageSelection};
+    // `javascript` / `js` are parsed by the JSX-aware TypeScript grammar, so
+    // they canonicalise to `typescript` and run through its adapter (which
+    // already indexes `.js` / `.jsx` / `.mjs` / `.cjs`).
+    assert_eq!(canonical_language_id("javascript"), Some("typescript"));
+    assert_eq!(canonical_language_id("js"), Some("typescript"));
+
+    let cfg = EngineConfig {
+        languages: vec![LanguageSelection {
+            id: "javascript".into(),
+            paths: vec!["web".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let n = cfg.normalized();
+    assert!(
+        n.typescript.enabled,
+        "javascript selection enables the typescript adapter"
+    );
+    assert_eq!(n.typescript.paths, vec!["web".to_string()]);
+}
+
+#[test]
+fn p23_enrichment_lsp_false_routes_lsp_languages_to_structure_only() {
+    use specslice_engine::config::{EnrichmentConfig, LanguageSelection};
+    let cfg = EngineConfig {
+        enrichment: EnrichmentConfig {
+            lsp: false,
+            analyzer: true,
+        },
+        languages: vec![
+            LanguageSelection {
+                id: "swift".into(),
+                paths: vec!["Sources".into()],
+                ..Default::default()
+            },
+            LanguageSelection {
+                id: "go".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let n = cfg.normalized();
+    // With LSP enrichment off, the Tier-3 adapters stay disabled and the
+    // languages are indexed structurally by the generic tree-sitter driver.
+    assert!(
+        !n.swift.enabled,
+        "swift LSP adapter off when enrichment.lsp=false"
+    );
+    assert!(
+        !n.go.enabled,
+        "go LSP adapter off when enrichment.lsp=false"
+    );
+    assert!(n.treesitter.enabled);
+    assert!(n.treesitter.languages.contains(&"swift".to_string()));
+    assert!(n.treesitter.languages.contains(&"go".to_string()));
+    // `languages` is authoritative: Dart was not listed, so it is excluded
+    // (empty code root scans nothing) even though it has no `enabled` flag.
+    assert!(
+        n.code.paths.is_empty(),
+        "dart must be excluded when not listed in `languages`"
+    );
+}
+
+#[test]
+fn p23_unified_languages_yaml_parses_and_indexes_dart() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    // Canonical unified selector: index Dart from `sources/` only.
+    write_config(
+        root,
+        concat!(
+            "repo:\n  root: .\n  default_branch: main\n",
+            "storage:\n  path: .specslice/graph.db\n",
+            "docs:\n  paths: []\n",
+            "languages:\n",
+            "  - id: dart\n",
+            "    paths: [sources]\n",
+            "    exclude: [\"**/*.g.dart\"]\n",
+        ),
+    );
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::write(root.join("sources/a.dart"), "class Keep {}\n").unwrap();
+    std::fs::write(root.join("sources/skip.g.dart"), "class GeneratedSkip {}\n").unwrap();
+    // A file under the default `lib/` must be ignored — `languages` is
+    // authoritative and points only at `sources/`.
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/ignored.dart"), "class Ignored {}\n").unwrap();
+
+    index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    let store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    let classes = store
+        .list_nodes_by_kind(specslice_core::NodeKind::DartClass)
+        .unwrap();
+    let names: Vec<_> = classes.iter().filter_map(|n| n.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "Keep"), "got {names:?}");
+    assert!(!names.iter().any(|n| n == "GeneratedSkip"));
+    assert!(!names.iter().any(|n| n == "Ignored"));
+}
+
+#[test]
+fn p23_unified_languages_excludes_unlisted_dart() {
+    // P23.10 dogfood regression: a unified config that lists only `rust` must
+    // NOT scan Dart at all, even though `.dart` files exist in the repo. The
+    // previous behaviour fell back to scanning `.` (the whole repo) when the
+    // Dart code root was emptied, indexing hundreds of fixture Dart files.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+    write_config(
+        root,
+        concat!(
+            "repo:\n  root: .\n  default_branch: main\n",
+            "storage:\n  path: .specslice/graph.db\n",
+            "docs:\n  paths: []\n",
+            "languages:\n",
+            "  - id: rust\n",
+            "    paths: [crates]\n",
+            "enrichment:\n  lsp: false\n  analyzer: false\n",
+        ),
+    );
+    // A Dart file that the default `lib/` root would have picked up.
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/widget.dart"), "class Widget {}\n").unwrap();
+    // A real Rust symbol to prove the listed language still indexes.
+    std::fs::create_dir_all(root.join("crates/demo/src")).unwrap();
+    std::fs::write(
+        root.join("crates/demo/src/lib.rs"),
+        "pub fn demo_entry() {}\n",
+    )
+    .unwrap();
+
+    let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    // Dart is unlisted → its pass is skipped entirely (no `code` result, and
+    // certainly zero scanned files).
+    assert_eq!(
+        result.code.map_or(0, |c| c.files),
+        0,
+        "no Dart files scanned"
+    );
+
+    let store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    assert!(
+        store
+            .list_nodes_by_kind(specslice_core::NodeKind::DartClass)
+            .unwrap()
+            .is_empty(),
+        "Dart must be fully excluded when unlisted"
+    );
+    let rust_fns = store
+        .list_nodes_by_kind(specslice_core::NodeKind::RustFunction)
+        .unwrap();
+    assert!(
+        rust_fns
+            .iter()
+            .any(|n| n.name.as_deref() == Some("demo_entry")),
+        "listed Rust language still indexed"
+    );
+}
+
 #[allow(dead_code)]
 fn make_pathbuf(s: &str) -> PathBuf {
     PathBuf::from(s)

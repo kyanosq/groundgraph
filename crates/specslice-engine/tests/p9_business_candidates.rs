@@ -182,6 +182,7 @@ fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();
@@ -309,6 +310,7 @@ fn p9_include_candidates_false_hides_business_candidates() {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();

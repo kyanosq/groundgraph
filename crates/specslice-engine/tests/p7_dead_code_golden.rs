@@ -122,6 +122,7 @@ fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();
@@ -223,6 +224,7 @@ fn p7_dead_code_respects_ignore_glob_for_codegen_files() {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();

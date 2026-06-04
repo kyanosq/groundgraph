@@ -1,27 +1,23 @@
-//! Swift language adapter (P11) — drives `sourcekit-lsp` over LSP.
+//! P11/P23.5 — Swift language adapter.
 //!
-//! `sourcekit-lsp` ships with every Swift toolchain (Xcode-bundled on
-//! macOS, `swift-lsp` on Linux). When it is on `PATH` the engine asks
-//! it for `textDocument/documentSymbol` on every `*.swift` file under
-//! the configured `code_paths`. The symbol tree is mapped onto the
-//! SpecSlice `NodeKind` variants added in P11:
+//! Since the P23 收敛, the in-process tree-sitter driver
+//! ([`crate::swift_treesitter`]) is the **sole structural source of truth**
+//! for Swift: classes / structs / enums / actors / protocols, their
+//! methods / initializers / deinitializers, free functions, XCTest &
+//! swift-testing cases, and `import` declarations. Output is tagged
+//! `indexer = swift_treesitter`.
 //!
-//! - `Class` → [`NodeKind::SwiftClass`]
-//! - `Struct` → [`NodeKind::SwiftStruct`]
-//! - `Enum` → [`NodeKind::SwiftEnum`]
-//! - `Interface` (Swift `protocol`) → [`NodeKind::SwiftProtocol`]
-//! - `Method` → [`NodeKind::SwiftMethod`]
-//! - `Function` → [`NodeKind::SwiftFunction`]
-//! - `Constructor` → [`NodeKind::SwiftInitializer`]
-//!
-//! Everything else (properties, fields, enum members, variables) is
-//! dropped to keep the graph focused on symbols that can plausibly own
-//! a `calls` / `references` edge. Properties / cases are still
-//! reachable via their parent type once we wire call hierarchy.
+//! `sourcekit-lsp` (Xcode-bundled on macOS, `swift-lsp` on Linux) is an
+//! **optional Tier-3 enrichment**: when discovered it contributes only the
+//! semantic `Calls` / `References` edges, overlaid onto the existing
+//! tree-sitter symbol ids — the LSP id scheme `swift::<file>::<qualified>`
+//! is identical to the tree-sitter one by construction (see
+//! [`swift_qualify`]). LSP edges are tagged `indexer = swift_lsp`. When no
+//! `sourcekit-lsp` is available the structural graph is already complete.
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use specslice_core::language_batch::LanguageIndexBatch;
 use specslice_core::NodeKind;
 use specslice_store::Store;
@@ -31,6 +27,7 @@ use crate::lsp_client::LspSymbolKind;
 use crate::lsp_indexer::{
     binary_on_path, run_profile, LspIndexOptions, LspIndexOutcome, LspProfile,
 };
+use crate::treesitter::{self, TsIndexOptions};
 
 pub const SWIFT_INDEXER_NAME: &str = "swift_lsp";
 pub const SWIFT_LANGUAGE_ID: &str = "swift";
@@ -48,55 +45,101 @@ pub struct SwiftIndexOptions {
 pub struct SwiftIndexResult {
     pub files: usize,
     pub symbols: usize,
+    #[serde(default)]
+    pub tests: usize,
+    #[serde(default)]
+    pub imports: usize,
+    /// Number of `Calls` / `References` edges contributed by the optional
+    /// Tier-3 LSP enrichment pass (0 when no `sourcekit-lsp` was available).
+    #[serde(default)]
+    pub references: usize,
+    /// `swift_treesitter` when the structural pass produced anything, empty
+    /// when no Swift files were found.
     pub resolver_used: String,
     pub sidecar_skip_reason: String,
 }
 
-/// Index a repository's Swift sources. Returns gracefully (with a
-/// skip reason) when `sourcekit-lsp` is not on PATH or no `*.swift`
-/// files are present — same UX as the Dart sidecar.
+/// Index a repository's Swift sources. The tree-sitter driver produces the
+/// entire structural graph; an optional `sourcekit-lsp` pass then overlays
+/// `Calls` / `References`. Returns gracefully (empty `resolver_used`) when
+/// no `*.swift` files are present.
 pub fn index_swift(store: &mut Store, options: &SwiftIndexOptions) -> Result<SwiftIndexResult> {
-    let profile = swift_profile();
-    let lsp_options = LspIndexOptions {
-        repo_root: options.repo_root.clone(),
-        code_roots: options.code_roots.clone(),
-        exclude_globs: options.exclude_globs.clone(),
-        lsp_command: options.lsp_command.clone(),
-    };
-    match run_profile(&profile, &lsp_options)? {
-        LspIndexOutcome::Skipped { reason, .. } => Ok(SwiftIndexResult {
-            sidecar_skip_reason: reason,
-            resolver_used: String::new(),
-            ..Default::default()
-        }),
-        LspIndexOutcome::Indexed(boxed) => {
-            let crate::lsp_indexer::LspIndexedBatch { batch, stats } = *boxed;
-            ingest_language_batch_minimal(store, &batch, SWIFT_INDEXER_NAME)?;
-            Ok(SwiftIndexResult {
-                files: stats.files,
-                symbols: stats.symbols,
-                resolver_used: SWIFT_INDEXER_NAME.into(),
-                sidecar_skip_reason: stats.skip_reason,
-            })
+    let spec = &crate::swift_treesitter::SWIFT_SPEC;
+    let ts_name = treesitter::indexer_name(spec);
+    store
+        .clear_indexer_outputs(&ts_name)
+        .context("clearing previous Swift tree-sitter outputs")?;
+    store
+        .clear_indexer_outputs(SWIFT_INDEXER_NAME)
+        .context("clearing previous Swift LSP outputs")?;
+
+    let ts = treesitter::index_repo_with_spec(
+        store,
+        spec,
+        &TsIndexOptions {
+            repo_root: options.repo_root.clone(),
+            code_roots: options.code_roots.clone(),
+            exclude_globs: options.exclude_globs.clone(),
+            resolution_paths: Vec::new(),
+        },
+    )
+    .context("indexing Swift structure via tree-sitter")?;
+
+    // Id set of structural nodes so the optional LSP pass attaches edges
+    // without dangling targets.
+    let mut known_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for node in store.list_all_nodes().context("listing nodes")? {
+        if node.indexer.as_deref() == Some(ts_name.as_str()) {
+            known_ids.insert(node.id.to_string());
         }
     }
-}
 
-/// Lower-level entry: build the [`LanguageIndexBatch`] without
-/// touching the store. Useful for unit tests and for the MCP
-/// `index_dry_run` tool we expect to add in the next iteration.
-pub fn build_swift_batch(options: &SwiftIndexOptions) -> Result<Option<LanguageIndexBatch>> {
+    // Tier 3 (optional): sourcekit-lsp `Calls` / `References` enrichment
+    // overlaid onto the tree-sitter symbol ids (identical id scheme). The
+    // shared LSP layer's skip reasons (PATH hints, warmup notes) carry
+    // through unchanged.
     let lsp_options = LspIndexOptions {
         repo_root: options.repo_root.clone(),
         code_roots: options.code_roots.clone(),
         exclude_globs: options.exclude_globs.clone(),
         lsp_command: options.lsp_command.clone(),
     };
-    let profile = swift_profile();
-    match run_profile(&profile, &lsp_options)? {
-        LspIndexOutcome::Indexed(boxed) => Ok(Some(boxed.batch)),
-        LspIndexOutcome::Skipped { .. } => Ok(None),
-    }
+    let mut references = 0usize;
+    let skip_reason = match run_profile(&swift_profile(), &lsp_options)? {
+        LspIndexOutcome::Indexed(boxed) => {
+            let crate::lsp_indexer::LspIndexedBatch { batch, stats } = *boxed;
+            let refs: Vec<_> = batch
+                .references
+                .into_iter()
+                .filter(|r| {
+                    known_ids.contains(r.from_symbol_id.as_str())
+                        && known_ids.contains(r.to_symbol_id.as_str())
+                })
+                .collect();
+            references = refs.len();
+            if !refs.is_empty() {
+                let refs_batch = LanguageIndexBatch {
+                    language: SWIFT_LANGUAGE_ID.into(),
+                    references: refs,
+                    ..Default::default()
+                };
+                ingest_language_batch_minimal(store, &refs_batch, SWIFT_INDEXER_NAME)
+                    .context("ingesting Swift LSP reference edges")?;
+            }
+            stats.skip_reason
+        }
+        LspIndexOutcome::Skipped { reason, .. } => reason,
+    };
+
+    Ok(SwiftIndexResult {
+        files: ts.files,
+        symbols: ts.symbols,
+        tests: ts.tests,
+        imports: ts.imports,
+        references,
+        resolver_used: ts.resolver_used,
+        sidecar_skip_reason: skip_reason,
+    })
 }
 
 /// True when `sourcekit-lsp` (or the override binary) is actually

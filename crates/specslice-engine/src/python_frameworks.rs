@@ -2,10 +2,10 @@
 //!
 //! Python projects rely heavily on decorators to register framework
 //! entry points (HTTP routes, background tasks, CLI commands).
-//! SpecSlice's AST scanner already captures those decorators
-//! verbatim ([`crate::python_ast::PythonSymbol::decorators`]); this
-//! module turns that raw text into a structured
-//! [`FrameworkRole`] so the rest of the engine can:
+//! SpecSlice's tree-sitter driver ([`crate::python_treesitter`])
+//! captures those decorators verbatim; this module turns that raw
+//! text into a structured [`FrameworkRole`] so the rest of the
+//! engine can:
 //!
 //! - flag the wrapped symbol as a framework entry point in dead-code
 //!   reachability,

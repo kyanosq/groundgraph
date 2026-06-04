@@ -510,6 +510,12 @@ struct ImpactArgs {
     /// Head git ref (default: `HEAD`).
     #[arg(long, default_value = "HEAD")]
     head: String,
+    /// Diff `--base` against the current working tree instead of a committed
+    /// head, so `impact` can run on uncommitted changes without a throwaway
+    /// commit. `--head` is ignored when set. Tracked (staged/unstaged) edits
+    /// are included; brand-new untracked files are not (git diff semantics).
+    #[arg(long)]
+    worktree: bool,
     /// Output a machine-readable JSON document. Equivalent to
     /// `--format json` and kept for back-compat.
     #[arg(long)]
@@ -584,6 +590,7 @@ impl From<ExportFormatArg> for specslice_engine::ExportFormat {
 }
 
 fn main() -> ExitCode {
+    reset_sigpipe();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -591,6 +598,20 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Restore the default `SIGPIPE` disposition so piping output into `head`,
+/// `less`, etc. terminates the process quietly instead of panicking on the
+/// next broken-pipe `stdout` write. Rust installs `SIG_IGN` for `SIGPIPE` at
+/// startup, which turns a closed reader into an `ErrorKind::BrokenPipe` panic
+/// deep inside `println!` (observed as a confusing exit code 101). A search /
+/// report tool that advertises itself as a `grep` replacement must compose
+/// cleanly in shell pipelines, so we opt back into the conventional behaviour.
+/// The `sigpipe` crate encapsulates the platform `unsafe`, keeping this crate
+/// within the workspace `unsafe_code = "forbid"` policy; it is a no-op on
+/// non-Unix targets.
+fn reset_sigpipe() {
+    sigpipe::reset();
 }
 
 fn run() -> Result<()> {
@@ -610,7 +631,14 @@ fn run() -> Result<()> {
             } else {
                 args.format.into_command_format()
             };
-            commands::impact::run(&cli.repo_root, &args.base, &args.head, format, args.output)
+            // Empty head ref tells the engine to diff `--base` against the
+            // working tree (uncommitted changes) rather than a committed range.
+            let head = if args.worktree {
+                ""
+            } else {
+                args.head.as_str()
+            };
+            commands::impact::run(&cli.repo_root, &args.base, head, format, args.output)
         }
         Commands::Check(args) => {
             let exit = commands::check::run(&cli.repo_root, args.json, args.fail_on_warning)?;

@@ -71,6 +71,39 @@ pub const DEFAULT_LIMIT: usize = 25;
 /// Default 1-hop subgraph expansion.
 pub const DEFAULT_DEPTH: usize = 1;
 
+/// Maximum total score a single hit can earn from the post-scoring boost
+/// passes ([`apply_evidence_boost`] = [`SCORE_EDGE_EVIDENCE`],
+/// [`apply_neighbor_boost`] = [`SCORE_NEIGHBOR`]). Used to reason about how
+/// wide the candidate window must be so a dropped node can't overtake a
+/// kept one after boosting.
+pub const MAX_POST_SCORE_BOOST: i32 = SCORE_EDGE_EVIDENCE + SCORE_NEIGHBOR;
+
+/// Floor on the boost window. Kept constant (not scaled by `limit`) so a
+/// hit's final score is independent of how many results the caller asked
+/// for: for any `limit <= BOOST_WINDOW_MIN` the window — and therefore the
+/// set of hits that get boosted — is identical.
+const BOOST_WINDOW_MIN: usize = 256;
+
+/// Number of top-by-base-score candidates the expensive per-hit boost
+/// passes run over.
+///
+/// Both [`apply_evidence_boost`] and [`apply_neighbor_boost`] issue a DB
+/// round-trip *per hit*. Running them over the entire (untruncated) match
+/// set is what made a common multi-token query explode — a two-token query
+/// matching thousands of nodes on a 28k-node repo issued thousands of
+/// queries and took ~230s. Bounding the passes to this window makes them
+/// O(window) regardless of how many nodes matched.
+///
+/// The window is `max(limit, 256)`. It is deliberately **not** scaled by
+/// `limit` (an earlier `limit * 8` made the window — and thus a hit's
+/// boosted score — change with `--limit`, so the same node scored 130 at
+/// `--limit 5` but 150 at `--limit 30`). A flat floor keeps scores stable
+/// for every `limit <= 256`. The window only grows past the floor when the
+/// caller explicitly asks for more than 256 results.
+pub(crate) fn boost_window(limit: usize) -> usize {
+    limit.max(BOOST_WINDOW_MIN)
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -344,6 +377,21 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         NodeKind::JavaEnum,
         NodeKind::JavaMethod,
         NodeKind::JavaConstructor,
+        NodeKind::RustModule,
+        NodeKind::RustStruct,
+        NodeKind::RustEnum,
+        NodeKind::RustTrait,
+        NodeKind::RustFunction,
+        NodeKind::RustMethod,
+        NodeKind::CFunction,
+        NodeKind::CStruct,
+        NodeKind::CEnum,
+        NodeKind::CppNamespace,
+        NodeKind::CppClass,
+        NodeKind::CppStruct,
+        NodeKind::CppEnum,
+        NodeKind::CppFunction,
+        NodeKind::CppMethod,
     ]
 }
 
@@ -410,8 +458,27 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
     };
 
     let mut warnings: Vec<String> = Vec::new();
+
+    // Bound the expensive per-hit boost passes to a top-by-base-score
+    // window. Each pass issues a DB round-trip per hit, so running them
+    // over the full (untruncated) match set is what made common
+    // multi-token queries explode (~230s on a 28k-node repo). Pre-rank by
+    // base score, keep a window wide enough that the ≤ MAX_POST_SCORE_BOOST
+    // boosts can't reorder across its boundary (see `boost_window`), then
+    // boost only the window.
+    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    // `hit_ids` is the FULL match set (cheap, in-memory). A hit's neighbour
+    // boost must reflect every other matching node — not just the windowed
+    // ones — so its score doesn't depend on the window or `--limit`. Only the
+    // per-hit DB calls are bounded (to the window below), not the membership
+    // test.
+    let hit_ids: HashSet<String> = matches.iter().map(|m| m.id.clone()).collect();
+    let window = boost_window(limit);
+    if matches.len() > window {
+        matches.truncate(window);
+    }
     apply_evidence_boost(store, &mut matches, &mut warnings);
-    apply_neighbor_boost(store, &mut matches, &mut warnings);
+    apply_neighbor_boost(store, &mut matches, &hit_ids, &mut warnings);
 
     matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     if matches.len() > limit {
@@ -462,11 +529,21 @@ fn apply_evidence_boost(store: &Store, matches: &mut [SearchMatch], warnings: &m
 /// one `SCORE_NEIGHBOR` increment, reason lists at most the first two
 /// adjacent hit names (suffix "等" when more), so this acts as a
 /// tie-breaker rather than dominating the ranking.
-fn apply_neighbor_boost(store: &Store, matches: &mut [SearchMatch], warnings: &mut Vec<String>) {
-    if matches.len() < 2 {
+///
+/// `hit_ids` is the full set of matching node ids (not just the ones in
+/// `matches`): a hit gets the boost when it is adjacent to *any* match,
+/// even one outside the bounded boost window, so the score is stable across
+/// `--limit`. Only the per-hit `neighbors_of` DB call is bounded — by the
+/// caller passing a windowed `matches` slice.
+fn apply_neighbor_boost(
+    store: &Store,
+    matches: &mut [SearchMatch],
+    hit_ids: &HashSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    if hit_ids.len() < 2 {
         return;
     }
-    let hit_ids: HashSet<String> = matches.iter().map(|m| m.id.clone()).collect();
     for hit in matches.iter_mut() {
         let neighbors = match crate::confidence_view::neighbors_of(store, &hit.id, 8) {
             Ok(ns) => ns,
@@ -2551,6 +2628,109 @@ candidates:
             neighbor_reason.contains("等"),
             "neighbor reason must end with `等` when more than 2 adjacent hits, got: {neighbor_reason}",
         );
+    }
+
+    /// The boost window scales with `limit` but never drops below the
+    /// floor, so small `--limit` values still consider a healthy spread of
+    /// candidates while large ones keep a proportional margin.
+    #[test]
+    fn boost_window_is_a_flat_floor_until_limit_exceeds_it() {
+        // Constant for every limit <= floor, so a hit's boosted score does
+        // not change with --limit (regression: limit*8 gave 64 vs 240).
+        assert_eq!(boost_window(0), BOOST_WINDOW_MIN);
+        assert_eq!(boost_window(5), BOOST_WINDOW_MIN);
+        assert_eq!(boost_window(25), BOOST_WINDOW_MIN);
+        assert_eq!(boost_window(256), BOOST_WINDOW_MIN);
+        // Only grows when the caller asks for more than the floor.
+        assert_eq!(boost_window(257), 257);
+        assert_eq!(boost_window(1000), 1000);
+        assert_eq!(boost_window(usize::MAX), usize::MAX);
+    }
+
+    /// The neighbour boost must reflect the *full* match set, not just the
+    /// windowed `matches` slice: a hit adjacent to a match that sits outside
+    /// the window (e.g. truncated by a small `--limit`) must still be
+    /// boosted, so its score is stable across limits. Pre-fix the pass built
+    /// `hit_ids` from the (windowed) `matches`, so the boost vanished when
+    /// the neighbour fell outside the window.
+    #[test]
+    fn neighbor_boost_counts_matches_outside_the_window() {
+        let (mut store, _dir) = empty_store();
+        let a = insert_method(&mut store, "lib/a.dart", "Svc.alpha", (1, 5));
+        let b = insert_method(&mut store, "lib/b.dart", "Svc.beta", (1, 5));
+        insert_calls_edge_with_indexer(&mut store, &a, &b, "dart_analyzer");
+        let node_a = store
+            .find_node(&ArtifactId::new(a.clone()))
+            .unwrap()
+            .unwrap();
+
+        // `matches` holds only A (as if B were truncated by the window), but
+        // hit_ids includes B (the full match set).
+        let mut matches = vec![make_match(&node_a, SCORE_NAME_TOKEN, Vec::new())];
+        let hit_ids: HashSet<String> = [a.clone(), b.clone()].into_iter().collect();
+        let mut warnings = Vec::new();
+        apply_neighbor_boost(&store, &mut matches, &hit_ids, &mut warnings);
+
+        assert_eq!(matches[0].score, SCORE_NAME_TOKEN + SCORE_NEIGHBOR);
+        assert!(
+            matches[0]
+                .match_reasons
+                .iter()
+                .any(|r| r.contains("邻接其他命中")),
+            "hit adjacent to an out-of-window match must still be boosted, got: {:?}",
+            matches[0].match_reasons,
+        );
+        assert!(warnings.is_empty());
+    }
+
+    /// Regression for the multi-token blow-up: even when far more nodes
+    /// match than the boost window, the strong adjacent cluster must still
+    /// be returned *and* keep its neighbour boost. Pre-fix the boost passes
+    /// ran over every match (thousands of DB round-trips); the window must
+    /// not break boosting for the top cluster.
+    #[test]
+    fn run_search_keeps_top_cluster_when_matches_exceed_boost_window() {
+        let (mut store, dir) = empty_store();
+        // Two strong hits match both query tokens (auth + core) and are
+        // adjacent, so they should top the ranking and earn neighbour boost.
+        let a = insert_method(&mut store, "lib/authcore.dart", "AuthCore.signIn", (1, 5));
+        let b = insert_method(&mut store, "lib/authcore.dart", "AuthCore.signOut", (6, 10));
+        insert_calls_edge_with_indexer(&mut store, &a, &b, "dart_analyzer");
+        // Flood the result set with weak single-token matches well past the
+        // window so the old code would have boosted all of them.
+        let weak_count = boost_window(2) + 16;
+        for i in 0..weak_count {
+            insert_method(
+                &mut store,
+                "lib/authhelper.dart",
+                &format!("AuthHelper.m{i}"),
+                (1, 2),
+            );
+        }
+
+        let mut opts = SearchOptions::keywords(dir.path(), "auth core");
+        opts.limit = 2;
+        let result = run_search_with_store(&store, opts).unwrap();
+
+        let top: BTreeSet<&str> = result.matches.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            top,
+            BTreeSet::from([a.as_str(), b.as_str()]),
+            "strong two-token cluster must outrank {weak_count} weak single-token matches, got {:?}",
+            result
+                .matches
+                .iter()
+                .map(|m| (&m.id, m.score))
+                .collect::<Vec<_>>(),
+        );
+        for hit in &result.matches {
+            assert!(
+                hit.match_reasons.iter().any(|r| r.contains("邻接其他命中")),
+                "in-window adjacent hit {} must still get the neighbour boost, got: {:?}",
+                hit.id,
+                hit.match_reasons,
+            );
+        }
     }
 
     /// SearchResult.warnings serialises with skip-if-empty for back-compat.

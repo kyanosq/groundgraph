@@ -37,6 +37,9 @@ pub enum Language {
     Python,
     Typescript,
     Java,
+    Rust,
+    C,
+    Cpp,
     /// Markdown / Requirement / ADR / DocSection / AcceptanceCriterion.
     Doc,
     /// Synthetic graph anchors not tied to a host language (Route, Storage,
@@ -103,6 +106,19 @@ pub fn language_of(kind: NodeKind) -> Language {
         | NodeKind::JavaEnum
         | NodeKind::JavaMethod
         | NodeKind::JavaConstructor => Language::Java,
+        NodeKind::RustModule
+        | NodeKind::RustStruct
+        | NodeKind::RustEnum
+        | NodeKind::RustTrait
+        | NodeKind::RustFunction
+        | NodeKind::RustMethod => Language::Rust,
+        NodeKind::CFunction | NodeKind::CStruct | NodeKind::CEnum => Language::C,
+        NodeKind::CppNamespace
+        | NodeKind::CppClass
+        | NodeKind::CppStruct
+        | NodeKind::CppEnum
+        | NodeKind::CppFunction
+        | NodeKind::CppMethod => Language::Cpp,
         NodeKind::Requirement
         | NodeKind::AcceptanceCriterion
         | NodeKind::Adr
@@ -124,7 +140,9 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         NodeKind::File
         | NodeKind::PythonModule
         | NodeKind::TypescriptModule
-        | NodeKind::JavaPackage => SymbolFamily::Module,
+        | NodeKind::JavaPackage
+        | NodeKind::RustModule
+        | NodeKind::CppNamespace => SymbolFamily::Module,
         // Types.
         NodeKind::DartClass
         | NodeKind::SwiftClass
@@ -139,7 +157,15 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::TypescriptEnum
         | NodeKind::JavaClass
         | NodeKind::JavaInterface
-        | NodeKind::JavaEnum => SymbolFamily::Type,
+        | NodeKind::JavaEnum
+        | NodeKind::RustStruct
+        | NodeKind::RustEnum
+        | NodeKind::RustTrait
+        | NodeKind::CStruct
+        | NodeKind::CEnum
+        | NodeKind::CppClass
+        | NodeKind::CppStruct
+        | NodeKind::CppEnum => SymbolFamily::Type,
         // Callables.
         NodeKind::DartMethod
         | NodeKind::DartFunction
@@ -154,7 +180,12 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::TypescriptFunction
         | NodeKind::TypescriptMethod
         | NodeKind::JavaMethod
-        | NodeKind::JavaConstructor => SymbolFamily::Callable,
+        | NodeKind::JavaConstructor
+        | NodeKind::RustFunction
+        | NodeKind::RustMethod
+        | NodeKind::CFunction
+        | NodeKind::CppFunction
+        | NodeKind::CppMethod => SymbolFamily::Callable,
         // Tests.
         NodeKind::TestCase | NodeKind::TestGroup => SymbolFamily::Test,
         // Docs.
@@ -177,7 +208,11 @@ pub fn is_code_symbol(kind: NodeKind) -> bool {
     matches!(family_of(kind), SymbolFamily::Type | SymbolFamily::Callable)
         || matches!(
             kind,
-            NodeKind::PythonModule | NodeKind::TypescriptModule | NodeKind::JavaPackage
+            NodeKind::PythonModule
+                | NodeKind::TypescriptModule
+                | NodeKind::JavaPackage
+                | NodeKind::RustModule
+                | NodeKind::CppNamespace
         )
 }
 
@@ -240,12 +275,19 @@ pub fn search_aliases(kind: NodeKind) -> &'static [&'static str] {
         | NodeKind::GoMethod
         | NodeKind::PythonMethod
         | NodeKind::TypescriptMethod
-        | NodeKind::JavaMethod => &["method", "fn"],
+        | NodeKind::JavaMethod
+        | NodeKind::RustMethod
+        | NodeKind::CppMethod => &["method", "fn"],
         NodeKind::DartFunction
         | NodeKind::SwiftFunction
         | NodeKind::GoFunction
         | NodeKind::PythonFunction
-        | NodeKind::TypescriptFunction => &["function", "fn"],
+        | NodeKind::TypescriptFunction
+        | NodeKind::RustFunction
+        | NodeKind::CFunction
+        | NodeKind::CppFunction => &["function", "fn"],
+        NodeKind::RustTrait => &["trait", "interface"],
+        NodeKind::CppNamespace => &["namespace", "module"],
         _ => &[],
     }
 }
@@ -299,6 +341,21 @@ mod tests {
         NodeKind::JavaEnum,
         NodeKind::JavaMethod,
         NodeKind::JavaConstructor,
+        NodeKind::RustModule,
+        NodeKind::RustStruct,
+        NodeKind::RustEnum,
+        NodeKind::RustTrait,
+        NodeKind::RustFunction,
+        NodeKind::RustMethod,
+        NodeKind::CFunction,
+        NodeKind::CStruct,
+        NodeKind::CEnum,
+        NodeKind::CppNamespace,
+        NodeKind::CppClass,
+        NodeKind::CppStruct,
+        NodeKind::CppEnum,
+        NodeKind::CppFunction,
+        NodeKind::CppMethod,
     ];
 
     #[test]
@@ -317,7 +374,7 @@ mod tests {
         // to update ALL_KINDS fails this test loudly.
         assert_eq!(
             ALL_KINDS.len(),
-            42,
+            57,
             "ALL_KINDS missing a NodeKind variant. Add it to the slice and to every predicate arm."
         );
     }
@@ -412,5 +469,59 @@ mod tests {
             assert!(is_module_or_file(kind));
             assert!(is_code_symbol(kind));
         }
+    }
+
+    #[test]
+    fn rust_kinds_are_routed() {
+        // P21 — Rust is the first tree-sitter breadth backend. Every
+        // structural predicate must light up so search / dead-code /
+        // similarity treat Rust symbols exactly like the LSP languages.
+        for kind in [NodeKind::RustFunction, NodeKind::RustMethod] {
+            assert_eq!(language_of(kind), Language::Rust);
+            assert!(is_callable(kind));
+            assert!(is_code_symbol(kind));
+            assert!(similarity_supported(kind));
+        }
+        for kind in [
+            NodeKind::RustStruct,
+            NodeKind::RustEnum,
+            NodeKind::RustTrait,
+        ] {
+            assert_eq!(language_of(kind), Language::Rust);
+            assert!(is_type(kind));
+            assert!(is_code_symbol(kind));
+            assert!(!similarity_supported(kind));
+        }
+        assert!(is_module_or_file(NodeKind::RustModule));
+        assert!(is_code_symbol(NodeKind::RustModule));
+    }
+
+    #[test]
+    fn c_and_cpp_are_routed() {
+        // P22 — C / C++ via the same tree-sitter breadth backend.
+        for kind in [
+            NodeKind::CFunction,
+            NodeKind::CppFunction,
+            NodeKind::CppMethod,
+        ] {
+            assert!(is_callable(kind));
+            assert!(is_code_symbol(kind));
+            assert!(similarity_supported(kind));
+        }
+        for kind in [
+            NodeKind::CStruct,
+            NodeKind::CEnum,
+            NodeKind::CppClass,
+            NodeKind::CppStruct,
+            NodeKind::CppEnum,
+        ] {
+            assert!(is_type(kind));
+            assert!(is_code_symbol(kind));
+            assert!(!similarity_supported(kind));
+        }
+        assert_eq!(language_of(NodeKind::CFunction), Language::C);
+        assert_eq!(language_of(NodeKind::CppMethod), Language::Cpp);
+        assert!(is_module_or_file(NodeKind::CppNamespace));
+        assert!(is_code_symbol(NodeKind::CppNamespace));
     }
 }

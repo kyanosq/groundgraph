@@ -1103,12 +1103,27 @@ search ranking**，并打通 engine → CLI / MCP / JSON 的结构化
 
 ### 已知遗留 bug（不属于 v0.3.0-A 引入）
 
-- `specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
+- ~~`specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
   只覆盖 Dart / Swift / Go / Python 别名，**TypeScript / Java
   NodeKind 别名缺失**，所以 `--kind typescript_function` /
   `--kind java_method` 会被 CLI 本地解析器以 `unknown --kind` 拒绝，
-  尽管 engine 的 `default_search_kinds()` 已经列为 valid。
-  → 处置：留给 v0.3.0-B 或 P20 follow-up 补 `parse_kind` 别名表。
+  尽管 engine 的 `default_search_kinds()` 已经列为 valid。~~
+  → **已修复（2026-05-31，CodeGraph 对标实测期间）**：`match_kind`
+  补齐 TS（`typescript_*` + `ts_*` 短别名 + `tsfunc`）与 Java
+  （`java_package/class/interface/enum/method/constructor`）全部别名；
+  回归测试 `commands::search::tests::match_kind_accepts_typescript_and_java_aliases`。
+
+### 已知遗留 bug（2026-05-31 CodeGraph 对标实测新发现并修复）
+
+- ~~LSP 调用链大面积失败时（如 sourcekit-lsp 在大型 Swift 仓上
+  callHierarchy/references 超时 + Broken pipe），`lsp_indexer.rs::
+  push_partial_warning` 把**每个符号**的失败用「；」无上限拼接进
+  `skip_reason`，最终 `specslice index` 把单行 **185 KB** 直接 `print!`
+  到 stdout，污染管道 / MCP 载荷。~~
+  → **已修复**：明细封顶 `MAX_PARTIAL_WARNING_DETAILS = 8` + 折叠计数
+  （`…（另有 N 条 LSP 警告已折叠）`）；实测 Panelly 索引 stdout
+  从 185 KB → 1 371 字节。回归测试
+  `lsp_indexer::tests::push_partial_warning_caps_runaway_failures`。
 
 ### 收口验收（v0.3.0-A 仍以分支态，不发版）
 
@@ -1116,6 +1131,201 @@ search ranking**，并打通 engine → CLI / MCP / JSON 的结构化
 - `cargo test --workspace -- --test-threads=4`：workspace 全绿（engine lib 272 测试、CLI 30 测试、MCP 6 测试，5 个 opt-in LSP smoke ignored）
 - `dart test`（`tool/specslice_dart_analyzer/`）：6 passed
 - 四个 scratch 副本 + raw JSON 已 gitignore，落库的只有人类可读的 `reports/release-v0.3.0a/README.md`
+
+## P21 — Rust tree-sitter 广度后端 + 自举（已落地，未发版）
+
+CodeGraph 对标实测暴露了一条**根本路径错误**：SpecSlice 的多语言全部押在
+LSP-first 上，结果（1）慢 4–50 倍（Morse Dart 22.9s vs CG 5.6s；Panelly Swift
+~80s vs CG 1.6s）、（2）强依赖外部二进制、（3）大仓 callHierarchy 超时、
+（4）**连自己的 Rust 工作区都索引不了**。CodeGraph 用进程内 tree-sitter 在广度
+与速度上完胜。P21 不再背历史包袱，引入 SpecSlice 的第一个 **tree-sitter 广度
+后端**，先把"能索引自身"这条最难堪的缺口堵上。
+
+**实现要点：**
+
+- **依赖**：`tree-sitter 0.26` + `tree-sitter-rust 0.24` 直接链入 `specslice-engine`
+  （C 语法在 build 期编译，运行期零外部依赖、完全确定性）。
+- **`crates/specslice-engine/src/rust_treesitter.rs`**：纯函数 `scan(&str) -> RustScan`
+  walk `source_file`，识别 `struct / union → RustStruct`、`enum → RustEnum`、
+  `trait → RustTrait`、`mod → RustModule`、自由 `fn → RustFunction`、
+  `impl`/`trait` 体内 `fn / function_signature → RustMethod`、`use → import`。
+  `impl Trait for Foo` 的方法挂到**被实现类型 `Foo`** 而非 trait 上；模块/类型
+  嵌套用 `outer::inner::name` 限定。语法树天然规避正则扫描器的字符串/注释误识别
+  （`string_literal_is_not_a_symbol` 钉死）。递归带 `MAX_NESTING_DEPTH=256` 上限，
+  对抗恶意深嵌套不爆栈。
+- **`crates/specslice-engine/src/rust_indexer.rs`**：`index_rust` 走 walkdir 发现
+  `.rs`（跳过 `target/.git/out/.idea`），逐文件 `scan` → `LanguageIndexBatch`
+  → `ingest_language_batch_minimal`。符号 id 用文件相对路径限定
+  （`rust::<file-rel>::<qualified>`），父链只在**同文件内确有该父符号**时才建，
+  杜绝 dangling `contains` 边。无 LSP 层。
+- **接线全链路**：`NodeKind` 追加 6 类（`rust_module/struct/enum/trait/function/method`）；
+  `language_traits` 矩阵从 42 增至 48（`Language::Rust` + family/predicate/alias 全分支）；
+  `store::node_from_row`、`search::default_search_kinds`、CLI `match_kind`（`rust_*` +
+  `rs_*` 短别名）、MCP `parse_node_kind`、CLI `index` 渲染（`Rust index:` 段）、
+  `config.rust`（`LanguageAdapterConfig`，默认 `enabled:false`，`init` 序列化默认配置
+  时自动出现）、`index_repository`（`rust.enabled` gate）全部打通。
+
+**SQLite 级测试标准（本轮起步）：**
+
+- **属性测试**（`proptest`，`rust_treesitter::property_tests`）：对任意输入 `.*`
+  ——（1）`scan` 永不 panic/abort/hang（全函数契约）；（2）`scan` 确定性
+  （`scan(s)==scan(s)`，重索引幂等的根基）；（3）每个符号良构（name 非空、
+  `1<=start_line<=end_line`、`qualified_name` 末段恒等于 `name`）；（4）import 恒被
+  trim 且不留 `;`。
+- **鲁棒性**：`pathologically_deep_nesting_does_not_overflow`（5000 层嵌套 mod 不爆栈）、
+  `empty_and_garbage_inputs_are_safe`（空/残缺/Unicode/emoji）。
+- **自举集成测试** `tests/p21_rust_self_host.rs`：索引**本仓库真实 `crates/` 树**，
+  断言 `files>=20`、`symbols>=300`、`resolver_used==rust_treesitter`，且命中
+  P21 自身定义的符号（`index_rust` / `scan` / `RustScan` / `RustIndexResult`）与各
+  family 下限。**自举回归即刻爆红。**
+- 单元/索引器测试：扫描器 7 项 + 索引器 3 项（端到端 + 重索引幂等 + `target/` 跳过）
+  + CLI `match_kind_accepts_rust_aliases` + CLI `render_includes_rust_section_*`。
+
+**实测自举（live dogfood，非侵入）：** 临时 `init`（仅生成 untracked 文件）→
+`rust.enabled=true, paths:[crates]` → `specslice index` →
+**125 个 .rs 文件 / 2023 符号 / 748 imports，`rust_treesitter`，整机 ~8s**，
+随后删除生成物恢复整洁工作树。`search RustIndexResult --kind rust_struct` 与
+`search index_rust --kind rs_fn` 均精确命中（带 file:line 与 `file→symbol`
+contains 子图）——这正是 LSP-first 从来做不到的自举检索。
+
+**非侵入式约束：** 不写入目标源码；tree-sitter 为 build 期依赖、运行期零外部
+进程；`rust.enabled` 默认 false，非 Rust 工作流零变化。
+
+### P21 验收
+
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets`：通过（含两处
+  `usize as u32` 截断告警以 `line_no` 安全转换消除）
+- `cargo test --workspace`：全绿（`specslice-engine` lib **288 passed**，含 15 项 Rust
+  单元/属性测试；`p21_rust_self_host` 1 passed；core 28 passed；CLI / MCP / store
+  全绿；5 个 opt-in LSP smoke ignored）
+- live dogfood：本仓自索引 125 文件 / 2023 符号，检索端到端命中后恢复整洁工作树
+
+## P22 — 通用 tree-sitter 广度后端（Rust/TS/Python/Go/C/C++ 六语言）（已落地，未发版）
+
+P21 用单语言（Rust）验证了「进程内 tree-sitter = Tier 2 广度后端」这条路可行，但实现是 Rust 专用的手写扫描器 + 索引器。如果每加一门语言都复制一份「scanner + indexer + 接线」，就是六份近乎相同的文件、六套要各自维护的递归遍历。P22 把这条路**收敛成一个数据驱动的通用驱动**：遍历器与索引器只写一次、测一次、所有语言共享；每门语言坍缩成一份静态 `LangSpec` 配置。一次性把 Tier 2 从 1 门语言推广到 **6 门**（Rust / TypeScript / Python / Go / C / C++），直接回应 §5.1 / §6 Phase B 的「把广度层推广到 TS/Go/Python/C/C++」目标。
+
+**架构：一个驱动，多种语言（`crates/specslice-engine/src/treesitter.rs`）**
+
+- **`LangSpec` 数据驱动**：每门语言只提供 `language_id` + `grammar`（编译期链入的 tree-sitter 语法）+ `extensions` / `skip_dirs` / `separator` + `func_kind` / `method_kind`，再加一把小函数指针钩子，把该语法的 node kind 映射到 SpecSlice `NodeKind`。用 `fn` 指针而非 trait object，`LangSpec` 是零分配的 `static`。
+- **通用 `extract(spec, source) -> Scan` + `walk(...)`**：嵌套限定名（`Outer::Inner::method`）从**真实 AST 祖先链**推导，跨语言统一，无需每语言维护「容器名单」。`walk` 的五步分派顺序固定：① import（一个节点可产出多个目标）→ ② impl-like 块（自身不是符号，体内 callable 挂到被实现类型）→ ③ type/module 容器 → ④ callable（函数/方法，按所在容器是否为 Type 决定 func/method）→ ⑤ transparent 包装（`export_statement` / `decorated_definition` 等，下钻但不发符号）。
+- **全函数、panic-free、深度受限**：parser 任何失败都返回空 `Scan` 而非中断整轮索引；递归带 `MAX_NESTING_DEPTH = 256` 上限，恶意深嵌套只会停止下钻，绝不爆栈。
+- **两处真正的语法不规则被隔离到钩子里**，主路径保持简单：Rust `impl` 块（方法挂到别处声明的类型）走 `impl_type_of`；Go 方法接收者（`func (r *T) m()`）走 `receiver_type_of`；其余语言这两个钩子返回 `None`。
+- **导入钩子升级为 `ImportsFn`（返回 `Vec<String>`）**：覆盖 Python `import a, b` / TS 多名导入这类「一条语句多个目标」。
+- **共享 helper**：`node_text` / `name_from_field` / `body_from_field` / `no_text` / `no_imports` / `no_container` / `never` / `simple_type_name`（`Vec<T>` → `Vec`、`crate::a::Foo<'x>` → `Foo`、`*T` → `T`）/ `normalise_ws`（折叠空白 + 去尾 `;`）/ `strip_quotes`（`"foo.h"` / `<stdio.h>` / `'pkg'` 各剥一层）/ `declarator_name`（沿 C/C++ `declarator` 指针/括号/引用链下钻到最内层标识符，`qualified_identifier` 取末段，64 步上限防畸形死循环）。
+- **通用索引器 `index_repo_with_spec`**：`discover_files`（walkdir 按扩展名 + `skip_dirs` + exclude glob 收集，相对路径去重排序）→ 逐文件 `extract` → 组 `LanguageIndexBatch` → 复用 P12 起就稳定的 `ingest_language_batch_minimal` 入库。符号 id 用 `<language_id>::<file-rel>::<qualified>` 文件作用域限定（同名跨文件不撞），父链只在**本文件内确有该父符号**时才建，杜绝 dangling `contains` 边。indexer 名统一 `<language_id>_treesitter`。
+- **语言注册表**：`SUPPORTED_LANGUAGES = [rust, typescript, python, go, c, cpp]`（即规范渲染/迭代顺序）；`spec_for_language(id)` 带常见别名（`rs / ts / py / golang / c++ / cxx`），未知 id 返回 `None` 让引擎跳过而非中断。
+
+**六门语言的 `LangSpec`（每门一个文件，纯配置 + 该语言的不规则钩子）**
+
+- **Rust（`rust_treesitter.rs`，`RUST_SPEC`）**：P21 的手写扫描器**重构为委托** `treesitter::extract(&RUST_SPEC, ...)`，`RustScan` / `RustImport` / `RustSymbol` 降为通用类型别名。`struct/union → RustStruct`、`enum → RustEnum`、`trait → RustTrait`、`mod → RustModule`、自由 `fn → RustFunction`、`impl`/trait 体内 `fn → RustMethod`；`impl Trait for Foo` 方法挂到 `Foo`。P21 的全部单元/属性/自举测试保持绿。
+- **TypeScript（`typescript_treesitter.rs`，`TYPESCRIPT_SPEC`）**：`tree-sitter-typescript`，扩展 `ts/mts/cts`；容器 class/interface/enum/module，callable 函数+方法，`import_of` 取 `source` 字段；`export_statement` / `ambient_declaration` / `expression_statement` 标 transparent（`namespace Geo {}` 实为 `expression_statement` 包 `internal_module`，必须下钻）。
+- **Python（`python_treesitter.rs`，`PYTHON_SPEC`）**：`tree-sitter-python`，扩展 `py/pyi`；容器 class、callable function、`import` / `from ... import ...`（多名展开）；`decorated_definition` 标 transparent。
+- **Go（`go_treesitter.rs`，`GO_SPEC`）**：`tree-sitter-go`；容器从 `type_spec` 取 struct/interface，callable function/method，`receiver_type_of` 抽接收者类型让方法挂到对应类型；`type_declaration` / `import_declaration` / `import_spec_list` 标 transparent。
+- **C（`c_treesitter.rs`，`C_SPEC`）**：`tree-sitter-c`，扩展 `c/h`；容器 struct/union/enum（带 body），callable function_definition，`name_of` 用 `declarator_name`，`import_of` 取 preproc include；`declaration` / `type_definition` / `linkage_specification` / `preproc_if*` 标 transparent。
+- **C++（`cpp_treesitter.rs`，`CPP_SPEC`）**：`tree-sitter-cpp`，扩展 `cpp/cc/cxx/hpp/hh/hxx/ipp`；容器具名 namespace/class/struct/union/enum（带 body），callable function_definition，`name_of` 用 `declarator_name`；匿名 `namespace_definition` / `declaration_list` / `template_declaration` / `declaration` / `type_definition` / `linkage_specification` / `export_declaration` / `preproc_if*` 标 transparent。
+
+**接线全链路（统一配置 + 引擎 pass + CLI/MCP）**
+
+- **`specslice-core`**：`NodeKind` 追加 9 类 C/C++ 节点（`CFunction / CStruct / CEnum`、`CppNamespace / CppClass / CppStruct / CppEnum / CppFunction / CppMethod`），沿 `language_prefix_kind` 约定打通 `as_str` / serde；`language_traits` 矩阵加 `Language::C` / `Language::Cpp`，`ALL_KINDS` 全枚举矩阵从 48 增至 **57**，`matrix_total_count_matches_known_kinds` 钉死总数——漏改任一 family/predicate/alias 立即爆红。
+- **`specslice-store`**：`node_from_row` 增补全部 C/C++ kind 字符串↔NodeKind 映射；round-trip 测试覆盖。
+- **配置（`config.rs`）**：新增 `treesitter: TreeSitterConfig { enabled, languages, paths, exclude, roots() }`，默认关闭。识别 id：`rust / typescript / python / go / c / cpp`（+ 别名）。这是「一个开关索引多门语言」的单一入口。
+- **引擎 pass（`index.rs`）**：`IndexResult` 增 `treesitter: Vec<TreeSitterLangResult>`（`skip_serializing_if = "Vec::is_empty"` 向后兼容）。`config.treesitter.enabled` 时遍历 `languages`，`spec_for_language` 解析（未知跳过、按 `language_id` 去重），**若 `rust.enabled` 旧开关本轮已索引 Rust 则跳过**避免双重索引；每语言先 `clear_indexer_outputs(<lang>_treesitter)` 再 `index_repo_with_spec`，幂等重索引。
+- **CLI / MCP / search**：`specslice index` 输出新增 `Tree-sitter index:` 段，逐语言打印 files / symbols / imports / resolver；CLI `match_kind` 与 MCP `parse_node_kind` 补齐 `c_*` / `cpp_*` 别名（`cfn` / `cpp_ns` 等）；`search::default_search_kinds` 纳入 C/C++ 变体。
+- **依赖（`Cargo.toml`）**：`tree-sitter-go` / `tree-sitter-typescript` / `tree-sitter-python` / `tree-sitter-c` / `tree-sitter-cpp` 直接链入 engine（全部编译期语法、运行期零外部进程、确定性）。
+
+**SQLite 级测试标准（逐 spec + 端到端）：**
+
+- **逐语言属性测试（`proptest`）**：对任意输入 `.*`，每门语言的 `scan` 都满足——① 永不 panic/abort/hang（全函数契约）；② 确定性（`scan(s)==scan(s)`，重索引幂等根基）；③ 每个符号良构（name 非空、`1<=start<=end`、`qualified_name` 末段恒等于 `name`）；④ import 恒 trim 且不留 `;`。这是「对标 SQLite——任意输入不崩、可重放」的落点。
+- **逐语言单元/fixture 测试**：每门语言验证 class/struct/enum/namespace/method/function/import 各旗舰 kind 落地，且字符串/注释里的关键字不被误识别（语法树天然规避正则扫描器的误判）。
+- **端到端多语言集成测试 `tests/p22_treesitter_multilang.rs`**：用**真实引擎 pass** `index_repository` 跑一个含六语言源文件的临时仓，仅靠单个 `treesitter:` 配置开关，断言六门语言都产出结构图（每门 `files>=1 && symbols>=2`、`resolver_used == <lang>_treesitter`），再开库逐一断言旗舰节点（`RustStruct/RustMethod`、`TypescriptClass/Function`、`PythonClass/Method`、`GoStruct/Method`、`CStruct/Function`、`CppNamespace/Class/Method`）确实入库；`unknown_languages_are_skipped_not_fatal` 锁住未知语言优雅跳过。
+- **Rust 自举回归 `tests/p21_rust_self_host.rs`**：因 `RustScan` 降为类型别名，断言改为命中实际结构体（`LangSpec` / `RustIndexResult`），自举链路保持绿。
+
+**实测 dogfood（live，非侵入）：** 用通用驱动直接对本仓 `crates/` 跑全部 `SUPPORTED_LANGUAGES`：Rust **133 文件 / 2129 符号 / 801 imports，约 2.8s**（其余语言 0，因本仓纯 Rust，符合预期），证明通用驱动在真实代码库上的吞吐与单语言手写版持平。
+
+**非侵入式约束（沿用前几期）：**
+
+- tree-sitter 全部是编译期依赖、运行期零外部进程、完全确定性；不写入目标源码。
+- `treesitter.enabled` 默认 false；非 tree-sitter 工作流（Dart-only / LSP 语言）行为零变化。Rust 双开关（legacy `rust:` 与新 `treesitter:`）显式去重，永不双索引。
+- 沿用现有 `EdgeKind`（`Contains` / `Imports`），不引入新事实通路；Tier 2 产出的是结构事实（结构 + import），高可信调用链仍留给 Tier 3 LSP。
+
+### P22 验收
+
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets`：通过（修掉 C/C++ spec 的 `needless_borrow`、`treesitter.rs` 的 `doc_lazy_continuation`）。
+- `cargo test --workspace`：全绿——`specslice-core` 30 passed；`specslice-engine` lib **313 passed**（含六语言单元 + 逐 spec 属性测试）；`p22_treesitter_multilang` 2 passed、`p21_rust_self_host` 1 passed；CLI / MCP / store 全绿；5 个 opt-in LSP smoke ignored。
+- `dart test`（`tool/specslice_dart_analyzer/`）：6 passed。
+- live dogfood：通用驱动对本仓 `crates/` 自索引 Rust 133 文件 / 2129 符号 / 801 imports（~2.8s）。
+
+## P23 — 收敛与成熟化 Epic（tree-sitter 成为唯一结构来源；已落地，未发版）
+
+P22 让通用 tree-sitter 驱动覆盖六语言，但仓库里仍**并存两条结构通路**：每门 LSP 语言既有手写 `*_ast.rs`（LSP 驱动）又有 `*_treesitter.rs`（通用驱动），且 **id 方案不同**。这违背「单一结构来源」，也是诉求 #2（去多套实现）的核心债。P23 回应五项诉求——#1 更严苛测试（对标 SQLite）、#2 去多套实现、#3 SCIP/stack-graphs 决策、#4 Java/Dart、#5 Markdown 需求映射（中文 dogfood）——确立**目标架构：tree-sitter 通用驱动是唯一结构来源；LSP / Dart analyzer 仅作可选 Tier-3 富化（按符号 id 叠加 `Calls`/`References`/语义边）**。
+
+**P23.0 通用驱动能力补齐（不删任何东西）：** 在 `LangSpec` 增可选 hook 并在 `index_repo_with_spec` 落地，把手写 AST「多做的四件事」补进通用驱动——① `symbol_ranges`（impact 依赖）；② `metadata_of(symbol)`（写 `SymbolArtifact.metadata_json`，承载框架语义）；③ `resolve_import` 索引后置 pass（模块名→仓库相对路径，外部依赖回退/丢弃）；④ `tests_of` 同时支持声明式（Python `test_*`/`Test*`、Go `TestXxx`、Java `@Test`）与调用式（JS `describe/it/test`、Dart `test()/group()`，靠 `recurse_callables` 下钻 callable 体）。现有语言全回归 + 新增 proptest 守护总性。
+
+**P23.1–P23.6 逐语言收敛（每语言独立 TDD、保持全绿）：**
+- **Python（P23.1，模板）**：pytest/装饰器分类/src-root import 迁入 `PYTHON_SPEC`；LSP 降为 Tier-3；统一 id（一符号一节点）；新增差分测试（tree-sitter 结构 vs LSP 结构集合一致）+ 重索引幂等；删除 `python_ast.rs`。
+- **TypeScript（P23.2）**：vitest/jest 测试 + ESM import 解析进 `TYPESCRIPT_SPEC`；删除 `typescript_ast.rs`。
+- **Java（P23.3，#4）**：新增 `tree-sitter-java`，新建 `java_treesitter.rs`（JUnit `@Test`、package→路径 import）；删除 `java_ast.rs`。
+- **Go（P23.4）**：补 `TestXxx`/import；`go_indexer.rs` 结构部分降级 Tier-3。
+- **Swift（P23.5）**：验证 `tree-sitter-swift` 兼容→新建 `swift_treesitter.rs`，`swift_indexer.rs` 降 Tier-3。
+- **Dart（P23.6，#4，最高风险）**：新增 `tree-sitter-dart`，`dart_treesitter.rs` 作结构来源；analyzer/sidecar 降为 Tier-3 语义/calls（`reads_provider`/`navigates_to`/… + Calls + `DartProvider` 框架节点），沿用 `dart_*::` 旧 id 方案使 overlay 零翻译绑定；退役 `specslice-lang-dart` 结构职责；**pixcraft 等 golden 保持全绿**。
+
+**P23.7 统一配置 + 单一 index pass + CLI/MCP 去重：** `config.rs` 引入统一 `languages:` + 可选 `enrichment:`(lsp/analyzer)，旧 per-language 键作**弃用别名**；`EngineConfig::normalized()` 把 `languages` 折叠为**唯一权威来源**（未列语言一律排除，Dart 含在内）。`index.rs` 合为单一结构 pass。CLI/MCP 的 NodeKind 别名解析与渲染统一收敛到 `NodeKind::from_str`（消除漂移）。
+
+**P23.8 SQLite 级测试（#1）：** ① store `proptest` round-trip——对**自由文本列**（id/path/hash/indexer/generation/JSON/confidence）灌任意安全文本，证明 write→read 无损、`upsert` 幂等（顺带修了一处潜伏 bug：`repositories.rs` 的 `node_from_row`/`symbol_range_from_row` 手写 match 不全，非 Dart/Swift/Go/Python 的 NodeKind 能写不能读，改用 `NodeKind::from_str` 根治）；② 全语言总性/确定性 proptest（截断 UTF-8、超大、深嵌套、任意字节均不 panic 且确定性）；③ 全流水线重索引幂等（统一配置跑两次 `index_repository`，图快照逐字节一致）；④ 语料总性——对自身仓库（Rust）与外部 Dart 仓（Morse/Penlly，`#[ignore]` 重测）两次索引图一致，全部写入临时 store（非侵入）。
+
+**P23.9 Markdown 需求格式（#5a）：** 新增 `requirements_md_indexer.rs` 解析 `.specslice/requirements/*.md`——每需求 H1 `<编号> <中文标题>` + 描述 + `## 文档/## 实现/## 测试`（中英标签皆可）的 `路径#片段` 引用列表 → `Requirement` 节点 + `Documents`/`DeclaresImplementation`/`DeclaresVerification` 边（复用与 links.yaml 相同的边类型，故 `slice`/`impact`/`checks`/`context` 与 MCP `context_pack` 自动 surfacing，无需改这些路径）。解析器**跳过围栏代码块**（```/~~~ 内的 `#`/`-` 不解析），索引器**跳过 `README.md`**（保留为格式说明文档）。引用解析语言无关：按「path + 片段」对既有节点做 exact-name / stable-key / slug / `类型.方法` 末段匹配；命不中时回退到 file 边并计入 `unresolved`，供 `checks` 标记。`init` 脚手架在 `.specslice/requirements/README.md` 写入中文格式说明（围栏示例、不污染图）；`links.yaml` 仍兼容。
+
+**P23.10 中文 dogfood 需求映射（#5b，含 dogfood 发现的真实 bug 修复）：** 为本仓写 `.specslice.yaml`（统一 `languages: [rust]`）+ 三份中文需求文件（18 条需求，覆盖 P0 非侵入式 / MVP-1..5 / P6 图浏览器 / P8 语义边 / P9 候选 / P10 死代码 / P11 MCP / P16 Python / P18 相似 / P19 选测 / P21 自举 / P22 通用驱动 / P23 收敛 + Markdown 需求）。实测 `specslice index`：18 需求、18 docs、27 implementations、21 tests、**0 unresolved**；`slice` 三类齐全（含 CJK 标题 section 级命中）；`impact`（跨 `index.rs` 改动的历史区间）正确命中 `REQ-P23-CONFIG` 并附「有链接测试但本次无测试改动」warning；`graph --view business` mermaid 渲染需求子图；`check` 仅报 2 条**故意留空**的 missing_linked_test。**dogfood 暴露并修复了一处 P23.7 缺陷**：`discover_files` 把空 `code_roots` 当作 `["."]` 扫全仓，导致「未列 Dart」时仍索引了 174 个 fixture Dart 文件；改为「`code.paths` 为空 = 显式排除，Dart pass 整体跳过且清理旧 Dart 行」（保留 legacy 默认 `[lib,test]` 行为），并补 `p23_unified_languages_excludes_unlisted_dart` 回归。
+
+**P23.11 SCIP / stack-graphs 决策（#3）：** 新增 `docs/adr/0001-scip-and-stack-graphs.md`。结论：**SCIP 是数据格式**，采纳「摄入优先 + 导出其次」——对有成熟 indexer 的语言（TS/Java/Python/Rust）以**读取离线 `.scip`** 替代实时 LSP 作首选精度层（正面回应诉求 #2），绑定方式复用 P23.0 的 `symbol_ranges` **按范围零翻译叠加**（与 Dart overlay 同范式，不引入第二套 id）；**stack-graphs** 是「无外部 LSP 的进程内跨文件解析」终极方向，以单语言（Python/TS）spike、特性开关隔离、默认关闭。**实际实现默认延后**，给出 R1–R5 路线与验收门槛；产物一律写 `.specslice/`（非侵入）。
+
+**P23.12 文档：** 本节即 P23 入档；并同步 `docs/codegraph-benchmark-and-roadmap.md`（§5.1 收敛事实 + §6 路线打勾 + ADR 链接）。
+
+**P23.13 第二轮 dogfood（逐命令自检 + TDD 修复 + stack-graphs 真实验证）：** 对本仓逐一跑 `search/logic/features/dead-code/similar/questions/context/candidate/export` 等命令，暴露并以 TDD 修复四处真实缺陷（均先写失败/更新测试，再以真实命令输出验收）：
+
+1. **Rust import 全部悬空（最严重，影响图正确性）：** `RUST_SPEC.resolve_import = keep_raw_import` 把每条 `use`（含 `std::`/外部 crate/未拆分的 `{..}` 组/未解析的 `crate::`/`super::`）原样落成 `file::<raw>` 悬空边——实测 **845 条 import 边几乎全是悬空**，污染 `questions`（20 条 dangling_import）与整图。新增 `rust_resolve_import` + `rust_src_roots`：按 crate 源根做**模块路径→文件**解析（`crate::`/`self::`/`super::super::`、按 crate 名跨 crate、最长模块前缀命中 `foo.rs`/`foo/mod.rs`、crate 根 re-export 回退 `lib.rs`/`main.rs`），外部/std 一律**丢弃**且不产生自环边。结果：**845→422 条 import 边，全部命中真实文件（0 悬空）**，`questions` 的 dangling_import **20→0**；新增 7 项单测 + 重写 `rust_indexer` 端到端断言（`use std::…` 被丢、`use crate::util::Thing` 解析到 `src/util.rs`）。
+2. **`features` 性能 75.7s→~0.1s：** 聚类的种子打分与 BFS 标签传播对**每个种子的每个节点**都发 SQLite `list_edges_from/to` 查询（O(种子×节点) 往返）。改为一次 `list_all_nodes`+`list_all_edges` 建内存邻接表与节点索引，邻居查询降为 O(1)；算法与（顺序无关的）输出不变，新增「跑两次 diff 一致」确定性核验。
+3. **`similar` 在 Rust 仓扫描 0 函数：** `Language` 枚举只有 Python/Dart，`node_language` 对 Rust 返回 None → 静默跳过。新增 `Language::Rust`（C 风格 `//`、`/* */` 注释 + Rust 关键字集），`RustFunction/RustMethod` 纳入扫描。结果：**扫描 0→1712 函数**，找到真实克隆簇（如 `index_go`≈`index_swift`、`setup_indexed_repo` 跨 3 个测试文件复制）；新增归一化/识别单测。
+4. **`dead-code` 在 Rust 仓的「全员死代码」假阳 + 静默：** 默认入口点是 Dart 化的 `lib/main.dart`，本仓 0 命中 → 2223 符号全标「可能死」却无任何提示。新增 Rust `fn main` 入口识别；并在「0 入口点」或「无 calls/references 精确层边」时输出**诚实告警**（建议配置入口 / 当前结果仅为候选，需 Tier-3 富化）。`DeclaresVerification` 不计入「精确层存在」判断（避免少量需求边掩盖代码无解析调用的事实）；新增 2 项告警单测。
+
+**stack-graphs 进程内 spike — 真实 cargo 可行性验证（回应诉求 #2 的「终极方向」）：** 在隔离临时 crate（非侵入，不动工作区依赖）实测：`tree-sitter-stack-graphs 0.10` 要求 `tree-sitter ^0.24`（`<0.25`）+ `tree-sitter-graph ^0.12`，与本仓 `tree-sitter 0.26.9` 因 `links = "tree-sitter"` 唯一性规则**硬冲突**（`cargo update` 直接失败）；且官方无 Rust 规则包。结论：R4 维持默认延后，记为**书面例外**（触发条件：上游支持 `tree-sitter >=0.26`），精度层以 SCIP 摄入（R1）为唯一推进路径。详见 `docs/adr/0001-scip-and-stack-graphs.md` §8（含完整命令输出与拒绝的绕过方案）。
+
+**P23.14 第三轮 dogfood（补跑命令矩阵 + 同类缺陷批量收口）：** 补齐上一轮未充分驱动的命令（`graph` 的 json/mermaid/overview/business/focus、`slice`、`impact`、`select-tests`、`graph-diff`、`connect propose`、`candidate list`），并把前两轮只在 Rust 上修过的「同类 bug」推广到全语言。四处真实缺陷均先写失败/更新测试再以真实命令输出验收：
+
+1. **doc 索引吞掉 `node_modules`（图体积虚高 2.4×）：** `index_docs` 的 `walkdir` **无目录剪枝**，会下钻 `node_modules`/`.git`/`target` 等——本仓 `docs/` 下 vendored 的 CodeGraph `node_modules` 让 DocSection 虚增到 **1518**（绝大多数是第三方 README）。新增 `is_pruned_dir`（对齐 tree-sitter 驱动的 `skip_dirs`：`node_modules`/`.git`/`target`/`dist`/`.venv`/`.specslice`/… 一律不下钻），DocSection **1518→620、node_modules 段 0**；新增 `docs_walk_prunes_vendor_directories` 回归。
+2. **`graph --format mermaid` 无视 `--view`（business 视图 8395 行、0 需求可见）：** `apply_view` 只切换每节点 `default_visible`，不删节点；HTML 端遵循该标志，但 `render_mermaid` 把**全部节点**直接铺出 → mermaid 把整图（含上面那些 vendored 文档）一次性 dump。改为只渲染 `default_visible` 的可见面及其之间的边：business **8395→142 行**（以需求节点为中心）、overview 收敛为顶层模块。新增 `render_mermaid_only_emits_default_visible_nodes_and_their_edges` 与对应 CLI 集成断言。
+3. **`similar` 仅覆盖 3 语言（同类静默跳过）：** 上一轮只给 Rust 补了 `Language` 臂，Go/Swift/TypeScript/Java/C/C++ 的函数/方法节点仍返回 None。一次补齐九语言（共享归一化器 + 各自结构关键字集 + C 系 `//`、`/* */` 注释），`node_language` 覆盖全部已产出函数/方法的语言；新增 Go/TS 归一化与全语言 `node_language` 识别单测。
+4. **C/C++ 仍用 `keep_raw_import`（同类悬空边）：** 仅剩 C/C++ 沿用原样落边，`#include <sys.h>` 必然悬空。新增共享 `resolve_c_include`（按存在性解析：相对 include 文件目录 → 仓库根相对 → 唯一后缀匹配 `-I` 根；系统头/歧义一律**丢弃**不留悬空），与 Rust/TS 同一正确性标准；新增相对/根/唯一后缀解析与歧义丢弃单测。
+
+**P23.15 第四轮 dogfood（Dart 大仓真实扫描 + 死代码假阳收口；analyzer 自洽化）：** 用发版二进制 + AOT 编译的 analyzer sidecar 对多个真实 Flutter 仓做非侵入扫描（图写入各仓 `.specslice/`，临时仓用毕即清理），以 `dead-code` 的 **high 置信候选数**为假阳指标，逐一 TDD 修复：
+
+1. **Dart extension 成员在 tree-sitter 误解析时沦为 phantom `dart_fn`（turing：16 条 high 假阳）：** turing 的 `game_screen_editor.dart` 含 `tree-sitter-dart` 无法消化的 Dart 3 语法，整文件解析失败（**103 个 ERROR/MISSING 节点**，根 `ERROR@1` 吞掉全文），`extension _GameScreenEditor on _GameScreenState { … }` 的私有成员（`_showSnackBar` 等）退化为顶层 `dart_fn::<file>#_showSnackBar`；而 analyzer overlay 的 ~20 条 `calls` 边正确指向 `dart_method::<file>#_GameScreenState._showSnackBar`，于是**全部悬空**、成员被判 high 死代码。根因：`walker.dart` 的 `visitMethodDeclaration` 对 `_inExtension` 成员**只登记 Element→id 映射、不产出 symbol 行**（假设 tree-sitter 必然产出该节点）。修复采用 **analyzer 自洽化**——extension 成员也产出 `dart_method` symbol 行：tree-sitter 正常解析时该行与结构节点 id 相同，`reconcile_misparsed_callables`/`backfill_referenced_symbols` 都按「id 已存在」跳过（零重复、不 clobber）；tree-sitter 误解析时 reconcile 据此**丢弃 phantom `dart_fn`、改挂 analyzer 的 `dart_method`**（合成父 `dart_extension::…` 不存在时 re-home 到 file，零悬空 `contains`）。新增回归 `dart_treesitter.rs::private_extension_on_private_type_attaches_members`、`dart_indexer.rs::reconcile_tests::drops_phantom_fn_for_extension_member_with_synthetic_parent`、`walker_test.dart` 的 extension 成员 symbol 断言。实测 turing：`_showSnackBar` 由 `dart_fn`→`dart_method`（20 条入边连通）、phantom 清零、**high 16→0**。
+2. **AOT 编译的 sidecar 找不到 Dart SDK（生产快路径不可用）：** 文档允许把 `SPECSLICE_DART_ANALYZER_BIN` 指向**编译后的二进制**（大仓比 `dart run` 显著快），但 analyzer 7.7.1 的 `getSdkPath()=dirname(dirname(Platform.resolvedExecutable))` 对 AOT exe 解析成 exe 自身目录（`/tmp/lib/_internal/…`），抛 `PathNotFoundException`，sidecar 整体 skip 回退 lightweight。修复：`walker.dart` 新增 `resolveSdkPath()`——`dart run` 下默认有效则返回 `null`（行为不变）；AOT 下依次用 `SPECSLICE_DART_SDK`/`DART_SDK`、再在 `PATH` 上定位 `dart` 推导 SDK（兼容纯 Dart SDK 的 `<sdk>/bin/dart` 与 Flutter 的 `<flutter>/bin/cache/dart-sdk`），以 `sdk_library_metadata/libraries.dart` 存在性校验。`resolvedExecutable`/`environment` 注入便于测试；新增 5 项 `resolveSdkPath` 单测（含「默认 bogus 时经 PATH 复原」「`SPECSLICE_DART_SDK` 覆盖优先」）。实测 AOT exe 对 turing：`ok:true`、20 456 symbols、stderr 空。
+
+并对齐前序轮次的 analyzer overlay 修复：sidecar 用**临时空 `analysis_options.yaml`** 覆盖目标仓的 `analyzer: exclude:`，使生成代码（如 `lib/l10n/generated/**`、`*.g.dart`）也产出语义边——图覆盖跟随 code roots 而非项目 lint 作用域（dogfood：hama `_AppLocalizationsDelegate`）；构造器边统一 `dart_ctor::path#Class.<default>` id；`DartConstructor` 与构造器形 `dart_method` phantom 默认从 high 降级，可达构造器反向点亮其 owning class。
+
+**真实扫描验收（非侵入；high =「可安全建议删除」假阳指标）：**
+
+| 仓 | dart 文件 | code 符号 | reachable | high 假阳 |
+|---|---|---|---|---|
+| turing | 543 | 19 969 | 19 730 | **16→0** |
+| tailorx（extension dogfood 源头，954+ lib） | 1 443 | 24 759 | 24 702 | **0** |
+| morse | 89 | 1 267 | 1 222 | **0** |
+| NeuronLab | 43 | 735 | 715 | **0** |
+| hama / Shift（前序轮次） | — | — | — | **0** |
+
+剩余 medium 候选以**具名/私有构造器**与**框架 override**（如 `_TimeoutHttpClient.close/send`）为主，符合保守预期；构造器形 phantom（如 `AppButton.AppButton`）正确停留 medium。
+
+### P23 验收
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets`：通过（含 `requirements_md_indexer` 行号 `u32::try_from` 收口）。
+- `cargo test --workspace`：全绿——**738 passed / 0 failed**；engine lib **352 passed**（在 P23.13 的 346 上 +6：docs 剪枝 1、similarity Go/TS/全语言识别 3、C 头解析 2）。
+- `cargo test -p specslice-cli`：全绿（init/index/slice/impact/graph/check + graph mermaid overview/business 集成断言）。
+- live dogfood（非侵入，写临时 `.specslice/`）：`index` 0 unresolved；`slice`/`impact`/`graph`/`check` 全部连通验证（见 P23.10）。
+- 第二轮 dogfood（P23.13，真实命令输出）：import 边 845→422（**0 悬空**，全部命中真实文件）；`questions` dangling_import 20→0；`features` 75.7s→~0.1s（两次 diff 一致）；`similar` 扫描 0→1712 函数；`dead-code` 输出诚实告警；stack-graphs 进程内方向经真实 cargo 验证记为书面例外（ADR §8）。
+- 第三轮 dogfood（P23.14，真实命令输出）：补跑 `graph(json/mermaid/focus)`/`slice`/`impact`/`select-tests`/`graph-diff`/`connect propose`/`candidate list` 全部连通；DocSection **1518→620**（node_modules 段 0）；business mermaid **8395→142 行**；`similar` 覆盖 **9 语言**；C/C++ 改用 `resolve_c_include`（系统头不再悬空）。集成后再次自索引：DocSection 620 / Imports 475 / **0 悬空**。
+- 第四轮 dogfood（P23.15，真实命令输出）：`cargo fmt`/`clippy` 通过；`cargo test --workspace` 全绿（**0 failed**，engine lib **389 passed**，含 extension/SDK 两类新增回归）；Dart sidecar `dart analyze` 无问题 + `dart test` **19 passed**（含 extension 成员 symbol 断言与 5 项 `resolveSdkPath`）。真实 Flutter 仓扫描 high 假阳：turing **16→0**、tailorx/morse/NeuronLab/hama/Shift 均 **0**；AOT sidecar 经 SDK 解析后对 turing 输出 `ok:true`、20 456 symbols（快路径可用）。
 
 ## 后续验收方式
 

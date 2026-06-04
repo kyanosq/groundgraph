@@ -271,37 +271,57 @@ fn match_kind(name: &str) -> Result<NodeKind> {
     // Operator-friendly short aliases (`method` for `dart_method`) so
     // `--kind method,class,test` works without the `dart_` prefix.
     let lower = name.to_ascii_lowercase();
+    // Canonical snake_case names resolve via the single source of truth in
+    // `specslice-core` (`dart_class`, `typescript_interface`, `cpp_method`,
+    // …) — no need to re-list all ~58 here. Below we only keep the *extra*
+    // short / legacy aliases the canonical scheme does not cover (kept in
+    // lockstep with the MCP `parse_node_kind` alias table).
+    if let Some(kind) = NodeKind::from_str(&lower) {
+        return Ok(kind);
+    }
     Ok(match lower.as_str() {
-        "file" => NodeKind::File,
-        "doc" | "doc_section" => NodeKind::DocSection,
-        "class" | "dart_class" => NodeKind::DartClass,
-        "method" | "dart_method" => NodeKind::DartMethod,
-        "function" | "dart_function" => NodeKind::DartFunction,
-        "constructor" | "dart_constructor" => NodeKind::DartConstructor,
-        "test" | "test_case" => NodeKind::TestCase,
-        "group" | "test_group" => NodeKind::TestGroup,
-        "provider" | "dart_provider" => NodeKind::DartProvider,
-        "route" => NodeKind::Route,
-        "storage" => NodeKind::Storage,
-        "candidate" | "business_candidate" => NodeKind::BusinessCandidate,
-        "requirement" => NodeKind::Requirement,
-        // P11 — Swift / Go kinds.
-        "swift_class" => NodeKind::SwiftClass,
-        "swift_struct" => NodeKind::SwiftStruct,
-        "swift_enum" => NodeKind::SwiftEnum,
-        "swift_protocol" => NodeKind::SwiftProtocol,
-        "swift_method" => NodeKind::SwiftMethod,
-        "swift_function" => NodeKind::SwiftFunction,
-        "swift_initializer" | "swift_init" => NodeKind::SwiftInitializer,
-        "go_struct" | "gostruct" => NodeKind::GoStruct,
-        "go_interface" | "gointerface" => NodeKind::GoInterface,
-        "go_method" => NodeKind::GoMethod,
-        "go_function" | "gofunc" => NodeKind::GoFunction,
-        // P16 — Python kinds (full names + short aliases).
-        "python_module" | "py_module" => NodeKind::PythonModule,
-        "python_class" | "py_class" => NodeKind::PythonClass,
-        "python_function" | "py_function" | "pyfunc" => NodeKind::PythonFunction,
-        "python_method" | "py_method" => NodeKind::PythonMethod,
+        // Bare aliases bound to Dart (`class`/`method` mean Dart unprefixed).
+        "doc" => NodeKind::DocSection,
+        "class" => NodeKind::DartClass,
+        "method" => NodeKind::DartMethod,
+        "function" => NodeKind::DartFunction,
+        "constructor" => NodeKind::DartConstructor,
+        "test" => NodeKind::TestCase,
+        "group" => NodeKind::TestGroup,
+        "provider" => NodeKind::DartProvider,
+        "candidate" => NodeKind::BusinessCandidate,
+        // Swift / Go short aliases.
+        "swift_init" => NodeKind::SwiftInitializer,
+        "gostruct" => NodeKind::GoStruct,
+        "gointerface" => NodeKind::GoInterface,
+        "gofunc" => NodeKind::GoFunction,
+        // Python `py_` aliases.
+        "py_module" => NodeKind::PythonModule,
+        "py_class" => NodeKind::PythonClass,
+        "py_function" | "pyfunc" => NodeKind::PythonFunction,
+        "py_method" => NodeKind::PythonMethod,
+        // TypeScript `ts_` aliases.
+        "ts_module" => NodeKind::TypescriptModule,
+        "ts_class" => NodeKind::TypescriptClass,
+        "ts_interface" => NodeKind::TypescriptInterface,
+        "ts_enum" => NodeKind::TypescriptEnum,
+        "ts_function" | "tsfunc" => NodeKind::TypescriptFunction,
+        "ts_method" => NodeKind::TypescriptMethod,
+        // Rust `rs_` aliases.
+        "rs_module" | "rs_mod" => NodeKind::RustModule,
+        "rs_struct" => NodeKind::RustStruct,
+        "rs_enum" => NodeKind::RustEnum,
+        "rs_trait" => NodeKind::RustTrait,
+        "rs_function" | "rs_fn" => NodeKind::RustFunction,
+        "rs_method" => NodeKind::RustMethod,
+        // C / C++ short + `cxx_` aliases.
+        "cfn" => NodeKind::CFunction,
+        "cxx_namespace" | "cpp_ns" => NodeKind::CppNamespace,
+        "cxx_class" => NodeKind::CppClass,
+        "cxx_struct" => NodeKind::CppStruct,
+        "cxx_enum" => NodeKind::CppEnum,
+        "cxx_function" | "cpp_fn" => NodeKind::CppFunction,
+        "cxx_method" => NodeKind::CppMethod,
         other => {
             bail!(
                 "unknown --kind `{other}`. valid: {}",
@@ -414,6 +434,65 @@ pub fn default_limit() -> usize {
 mod tests {
     use super::*;
     use specslice_engine::search::{SearchEdge, SearchMatch, SearchNode, SearchSubgraph};
+
+    /// Regression: `parse_kinds` shipped Dart/Swift/Go/Python kinds but
+    /// silently rejected every TypeScript/Java kind, so
+    /// `--kind typescript_function` / `--kind java_method` errored out
+    /// even though the P20 indexer emits exactly those node kinds.
+    #[test]
+    fn match_kind_accepts_typescript_and_java_aliases() {
+        assert_eq!(
+            match_kind("typescript_function").unwrap(),
+            NodeKind::TypescriptFunction
+        );
+        assert_eq!(match_kind("ts_class").unwrap(), NodeKind::TypescriptClass);
+        assert_eq!(
+            match_kind("ts_interface").unwrap(),
+            NodeKind::TypescriptInterface
+        );
+        assert_eq!(match_kind("ts_enum").unwrap(), NodeKind::TypescriptEnum);
+        assert_eq!(
+            match_kind("typescript_module").unwrap(),
+            NodeKind::TypescriptModule
+        );
+        assert_eq!(match_kind("java_method").unwrap(), NodeKind::JavaMethod);
+        assert_eq!(match_kind("java_class").unwrap(), NodeKind::JavaClass);
+        assert_eq!(
+            match_kind("java_constructor").unwrap(),
+            NodeKind::JavaConstructor
+        );
+        assert_eq!(match_kind("java_package").unwrap(), NodeKind::JavaPackage);
+    }
+
+    /// P21 regression — `default_search_kinds()` advertises the Rust
+    /// kinds, so the parser must accept both their full names and the
+    /// `rs_` short aliases.
+    #[test]
+    fn match_kind_accepts_rust_aliases() {
+        assert_eq!(match_kind("rust_struct").unwrap(), NodeKind::RustStruct);
+        assert_eq!(match_kind("rs_struct").unwrap(), NodeKind::RustStruct);
+        assert_eq!(match_kind("rust_enum").unwrap(), NodeKind::RustEnum);
+        assert_eq!(match_kind("rust_trait").unwrap(), NodeKind::RustTrait);
+        assert_eq!(match_kind("rs_trait").unwrap(), NodeKind::RustTrait);
+        assert_eq!(match_kind("rust_function").unwrap(), NodeKind::RustFunction);
+        assert_eq!(match_kind("rs_fn").unwrap(), NodeKind::RustFunction);
+        assert_eq!(match_kind("rust_method").unwrap(), NodeKind::RustMethod);
+        assert_eq!(match_kind("rust_module").unwrap(), NodeKind::RustModule);
+        assert_eq!(match_kind("rs_mod").unwrap(), NodeKind::RustModule);
+    }
+
+    #[test]
+    fn match_kind_accepts_c_and_cpp_aliases() {
+        assert_eq!(match_kind("c_function").unwrap(), NodeKind::CFunction);
+        assert_eq!(match_kind("c_struct").unwrap(), NodeKind::CStruct);
+        assert_eq!(match_kind("c_enum").unwrap(), NodeKind::CEnum);
+        assert_eq!(match_kind("cpp_namespace").unwrap(), NodeKind::CppNamespace);
+        assert_eq!(match_kind("cxx_class").unwrap(), NodeKind::CppClass);
+        assert_eq!(match_kind("cpp_struct").unwrap(), NodeKind::CppStruct);
+        assert_eq!(match_kind("cpp_enum").unwrap(), NodeKind::CppEnum);
+        assert_eq!(match_kind("cpp_fn").unwrap(), NodeKind::CppFunction);
+        assert_eq!(match_kind("cpp_method").unwrap(), NodeKind::CppMethod);
+    }
 
     fn mk_result() -> SearchResult {
         SearchResult {

@@ -96,3 +96,54 @@ impl Store {
         &self.conn
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migrated_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        (store, dir)
+    }
+
+    /// Adjacency lookups (`list_edges_from/to`, `list_edges_by_kind`) and
+    /// per-artifact evidence lookups must be index-backed; without these the
+    /// search neighbour-boost / slice / impact fan-out degrade to full table
+    /// scans of `edge_assertions` (the 230s multi-token `search` blow-up).
+    #[test]
+    fn migrate_creates_edge_and_evidence_adjacency_indexes() {
+        let (store, _dir) = migrated_store();
+        let names: Vec<String> = {
+            let mut stmt = store
+                .connection()
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        for expected in [
+            "idx_edge_assertions_from",
+            "idx_edge_assertions_to",
+            "idx_edge_assertions_kind",
+            "idx_evidence_artifact",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing adjacency index `{expected}`; have {names:?}",
+            );
+        }
+    }
+
+    /// Migrations are idempotent: applying twice is a no-op, not an error.
+    #[test]
+    fn migrate_is_idempotent() {
+        let (mut store, _dir) = migrated_store();
+        store.migrate().unwrap();
+    }
+}

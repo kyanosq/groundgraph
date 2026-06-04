@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use specslice_core::{ArtifactId, EdgeKind, NodeKind};
+use specslice_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
 use specslice_store::Store;
 
 use crate::python_frameworks::FrameworkRole;
@@ -123,6 +123,20 @@ pub fn analyze_feature_map_with_store(
     options: &FeatureMapOptions,
 ) -> Result<FeatureMap> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
+    let edges = store.list_all_edges().context("listing edges")?;
+
+    // Load the whole graph into memory once. Previously the seed scoring and
+    // BFS issued a SQLite query per node *per seed* (O(seeds × nodes) round
+    // trips), which made `features` take >60s on a ~2k-symbol repo. The maps
+    // below turn every neighbour lookup into an O(1) hashmap hit; the algorithm
+    // and its (order-independent) output are unchanged.
+    let nodes_by_id: HashMap<&ArtifactId, &Node> = nodes.iter().map(|n| (&n.id, n)).collect();
+    let mut out_edges: HashMap<&ArtifactId, Vec<&EdgeAssertion>> = HashMap::new();
+    let mut in_edges: HashMap<&ArtifactId, Vec<&EdgeAssertion>> = HashMap::new();
+    for edge in &edges {
+        out_edges.entry(&edge.from_id).or_default().push(edge);
+        in_edges.entry(&edge.to_id).or_default().push(edge);
+    }
 
     // ---- score every potential seed ---------------------------
     let mut seeds: Vec<(ArtifactId, u32, String, Vec<String>)> = Vec::new();
@@ -137,25 +151,27 @@ pub fn analyze_feature_map_with_store(
         let Some(path) = node.path.clone() else {
             continue;
         };
-        // Each file's score = sum of framework roles inside it.
-        let descendants = collect_descendants(store, &node.id);
+        // Each file's score = sum of framework roles inside it, plus a small
+        // bump per test (a file with 10 tests probably represents a coherent
+        // feature surface). Both come from one descendant walk.
+        let descendants = collect_descendants(&out_edges, &node.id);
         let mut score: u32 = 1;
         let mut roles: BTreeSet<String> = BTreeSet::new();
-        for d in &descendants {
-            if let Some(metadata) = lookup_metadata_json(&nodes, d) {
-                if let Some(family) = framework_family(&metadata) {
+        let mut test_count: usize = 0;
+        for &d in &descendants {
+            let Some(desc) = nodes_by_id.get(d).copied() else {
+                continue;
+            };
+            if let Some(metadata) = &desc.metadata_json {
+                if let Some(family) = framework_family(metadata) {
                     score += 5;
                     roles.insert(family);
                 }
             }
+            if matches!(desc.kind, NodeKind::TestCase | NodeKind::TestGroup) {
+                test_count += 1;
+            }
         }
-        // Tests count as a small bump — a file with 10 tests
-        // probably represents a coherent feature surface.
-        let test_count = descendants
-            .iter()
-            .filter_map(|id| find_node(&nodes, id))
-            .filter(|n| matches!(n.kind, NodeKind::TestCase | NodeKind::TestGroup))
-            .count();
         score += u32::try_from(test_count.min(20)).unwrap_or(20);
         seeds.push((node.id.clone(), score, path, roles.into_iter().collect()));
     }
@@ -199,29 +215,30 @@ pub fn analyze_feature_map_with_store(
             // Walk outgoing Contains / Imports / Calls / References
             // edges; reverse Contains so the seed pulls in its
             // ancestors' file too.
-            let out = store
-                .list_edges_from(&cur)
-                .with_context(|| format!("listing edges from {cur}"))?;
-            for edge in out {
-                if !matches!(
-                    edge.kind,
-                    EdgeKind::Contains | EdgeKind::Imports | EdgeKind::Calls | EdgeKind::References
-                ) {
-                    continue;
-                }
-                if visited.insert(edge.to_id.clone()) {
-                    queue.push_back((edge.to_id, depth + 1));
+            if let Some(out) = out_edges.get(&cur) {
+                for edge in out {
+                    if !matches!(
+                        edge.kind,
+                        EdgeKind::Contains
+                            | EdgeKind::Imports
+                            | EdgeKind::Calls
+                            | EdgeKind::References
+                    ) {
+                        continue;
+                    }
+                    if visited.insert(edge.to_id.clone()) {
+                        queue.push_back((edge.to_id.clone(), depth + 1));
+                    }
                 }
             }
-            let inc = store
-                .list_edges_to(&cur)
-                .with_context(|| format!("listing edges to {cur}"))?;
-            for edge in inc {
-                if !matches!(edge.kind, EdgeKind::Contains) {
-                    continue;
-                }
-                if visited.insert(edge.from_id.clone()) {
-                    queue.push_back((edge.from_id, depth + 1));
+            if let Some(inc) = in_edges.get(&cur) {
+                for edge in inc {
+                    if edge.kind != EdgeKind::Contains {
+                        continue;
+                    }
+                    if visited.insert(edge.from_id.clone()) {
+                        queue.push_back((edge.from_id.clone(), depth + 1));
+                    }
                 }
             }
         }
@@ -247,7 +264,7 @@ pub fn analyze_feature_map_with_store(
         members.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.to_string().cmp(&b.0.to_string())));
         let mut representative_symbols: Vec<FeatureClusterMember> = Vec::new();
         for (id, distance) in members.iter().take(12) {
-            let Some(node) = find_node(&nodes, id) else {
+            let Some(node) = nodes_by_id.get(id).copied() else {
                 continue;
             };
             // Skip the seed itself in the representative list —
@@ -312,42 +329,31 @@ pub fn analyze_feature_map_with_store(
     })
 }
 
-fn collect_descendants(store: &Store, root: &ArtifactId) -> Vec<ArtifactId> {
+/// In-memory Contains-only descendant walk over the prebuilt adjacency map.
+fn collect_descendants<'a>(
+    out_edges: &HashMap<&'a ArtifactId, Vec<&'a EdgeAssertion>>,
+    root: &'a ArtifactId,
+) -> Vec<&'a ArtifactId> {
     let mut out = Vec::new();
-    let mut queue: VecDeque<ArtifactId> = VecDeque::new();
-    queue.push_back(root.clone());
-    let mut seen: BTreeSet<ArtifactId> = BTreeSet::new();
-    seen.insert(root.clone());
+    let mut queue: VecDeque<&ArtifactId> = VecDeque::new();
+    queue.push_back(root);
+    let mut seen: BTreeSet<&ArtifactId> = BTreeSet::new();
+    seen.insert(root);
     while let Some(cur) = queue.pop_front() {
-        let edges = match store.list_edges_from(&cur) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Some(edges) = out_edges.get(cur) else {
+            continue;
         };
         for edge in edges {
-            if !matches!(edge.kind, EdgeKind::Contains) {
+            if edge.kind != EdgeKind::Contains {
                 continue;
             }
-            if seen.insert(edge.to_id.clone()) {
-                out.push(edge.to_id.clone());
-                queue.push_back(edge.to_id);
+            if seen.insert(&edge.to_id) {
+                out.push(&edge.to_id);
+                queue.push_back(&edge.to_id);
             }
         }
     }
     out
-}
-
-fn lookup_metadata_json(nodes: &[specslice_core::Node], id: &ArtifactId) -> Option<String> {
-    nodes
-        .iter()
-        .find(|n| &n.id == id)
-        .and_then(|n| n.metadata_json.clone())
-}
-
-fn find_node<'a>(
-    nodes: &'a [specslice_core::Node],
-    id: &ArtifactId,
-) -> Option<&'a specslice_core::Node> {
-    nodes.iter().find(|n| &n.id == id)
 }
 
 fn framework_family(metadata_json: &str) -> Option<String> {

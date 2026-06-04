@@ -87,6 +87,7 @@ fn p7_fallback_path_still_indexes_when_sidecar_disabled() {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();
@@ -155,6 +156,7 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();

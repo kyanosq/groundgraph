@@ -1,23 +1,40 @@
-//! Bridge between the Dart lightweight adapter and the SpecSlice store.
+//! Dart indexing orchestrator (P23.6 — consolidated on tree-sitter).
 //!
-//! MVP-2 scope (PRD §3.1 / implementation plan §MVP-2):
-//! - Walk `lib/` and `test/` via [`specslice_lang_dart::index_dart_paths`].
-//! - Ingest the [`LanguageIndexBatch`] into the store:
-//!   - File / class / method / function / constructor / test-case nodes.
-//!   - `File --contains--> Symbol` (Fact) edges and Class -> Method `contains` edges.
-//!   - `File --imports--> File` (Fact) edges when the target file resolves locally.
-//!   - Symbol ranges and parent-child hierarchy.
+//! Two tiers feed one [`LanguageIndexBatch`]:
+//! - **Tier-2 (structure, authoritative):** [`build_dart_structure`] runs the
+//!   generic tree-sitter driver ([`crate::dart_treesitter`]) over every
+//!   `.dart` file and produces the file / class / method / function /
+//!   constructor / test nodes, `contains` hierarchy, resolved `imports`
+//!   edges and symbol ranges — all under the legacy `dart_*::` id scheme.
+//! - **Tier-3 (semantics, overlay):** the Dart analyzer sidecar
+//!   ([`crate::dart_sidecar`]) — or, when no Dart SDK is present, the
+//!   heuristic [`specslice_lang_dart::index_dart_paths`] fallback — only
+//!   contributes `Calls` / `References` / framework edges, the synthetic
+//!   `route` / `storage` nodes, and the framework-semantic `DartProvider`
+//!   symbols. Its *plain* structural output is discarded in favour of the
+//!   tree-sitter tier; [`backfill_referenced_symbols`] re-homes any symbol an
+//!   overlay edge references but the structural pass did not emit, so no
+//!   semantic edge dangles.
+//!
+//! Because both tiers share the legacy id scheme, the overlay binds to the
+//! tree-sitter structure with zero translation and the pixcraft golden stays
+//! byte-stable.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use specslice_core::language_batch::LanguageIndexBatch;
+use sha2::Digest;
+use specslice_core::artifact_id::file_id;
+use specslice_core::language_batch::{FileArtifact, ImportEdge, LanguageIndexBatch};
 use specslice_core::{EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind};
 use specslice_lang_dart::index_dart_paths;
 use specslice_store::Store;
 
 use crate::dart_sidecar::{self, SidecarOutcome};
+use crate::dart_treesitter::{dart_extract_structure, dart_resolve_import, DART_SPEC};
+use crate::treesitter::discover_relative_paths;
 
 pub const DART_INDEXER_NAME: &str = "dart_lightweight";
 
@@ -37,6 +54,13 @@ pub struct DartIndexOptions {
     /// [`crate::dart_indexer::path_matches_glob`] — only `**`, `*`, `?`, `.`
     /// and `/` are honoured.
     pub exclude_globs: Vec<String>,
+    /// P23.7 — when `true`, skip the Dart analyzer (Tier-3 semantic) overlay
+    /// and index Dart with the tree-sitter structure + the heuristic
+    /// lightweight reference scanner only. Maps from `enrichment.analyzer:
+    /// false`. Defaults to `false` (analyzer enabled), preserving historical
+    /// behaviour; the `SPECSLICE_DART_ANALYZER=0` env override is still
+    /// honoured independently.
+    pub disable_analyzer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,17 +84,33 @@ pub struct DartIndexResult {
 }
 
 pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartIndexResult> {
-    // P7+P2: the Dart analyzer sidecar is now the default high-precision
-    // path. It runs whenever a `dart` binary is on PATH and the
-    // workspace ships `tool/specslice_dart_analyzer/`. Users without a
-    // Dart SDK silently fall back to the lightweight heuristic adapter
-    // (resolver_used = "dart_lightweight"). Opt out with
-    // `SPECSLICE_DART_ANALYZER=0`.
-    let (mut batch, resolver_used, skip_reason) = match dart_sidecar::try_run(
-        &options.repo_root,
-        &options.code_roots,
-        &options.exclude_globs,
-    ) {
+    // P23.6 — tree-sitter is the sole *structural* backend for Dart. The
+    // analyzer sidecar (or, without a Dart SDK, the heuristic lightweight
+    // reference scanner) is demoted to a Tier-3 *semantic* overlay that only
+    // contributes `Calls` / `References` / framework edges and the synthetic
+    // `route` / `storage` / provider nodes. Both tiers share the legacy
+    // `dart_*::` id scheme, so the overlay binds to the tree-sitter structure
+    // with zero translation.
+
+    // ---- Tier-2: structural pass (tree-sitter) -----------------------------
+    let mut batch = build_dart_structure(options)?;
+
+    // ---- Tier-3: semantic overlay (analyzer or lightweight) ---------------
+    // Opt out of the sidecar with `enrichment.analyzer: false`
+    // (`options.disable_analyzer`) or `SPECSLICE_DART_ANALYZER=0`; it also
+    // self-skips when no `dart` binary / sidecar source is available.
+    let outcome = if options.disable_analyzer {
+        SidecarOutcome::Skipped {
+            reason: "dart analyzer disabled by config (enrichment.analyzer=false)".to_string(),
+        }
+    } else {
+        dart_sidecar::try_run(
+            &options.repo_root,
+            &options.code_roots,
+            &options.exclude_globs,
+        )
+    };
+    let (mut overlay, resolver_used, skip_reason) = match outcome {
         SidecarOutcome::Used(b) => (b, RESOLVER_DART_ANALYZER.to_string(), String::new()),
         SidecarOutcome::Skipped { reason } => (
             index_dart_paths(&options.repo_root, &options.code_roots)
@@ -79,33 +119,306 @@ pub fn index_dart(store: &mut Store, options: &DartIndexOptions) -> Result<DartI
             reason,
         ),
     };
+
+    // Carry only the *semantic* facts forward — the overlay's own *plain*
+    // structural symbols / files / tests / imports / ranges are discarded in
+    // favour of the tree-sitter ones.
+    batch.synthetic_nodes = std::mem::take(&mut overlay.synthetic_nodes);
+    batch.references = std::mem::take(&mut overlay.references);
+    batch.diagnostics = std::mem::take(&mut overlay.diagnostics);
+
+    // Riverpod providers are a *framework-semantic* concept the analyzer
+    // tier owns (the same way it owns routes / storage); tree-sitter only
+    // produces plain structure. Carry `DartProvider` symbols across so
+    // `reads_provider` edges and candidate evidence keep an anchor.
+    for sym in &overlay.symbols {
+        if sym.kind == NodeKind::DartProvider {
+            batch.symbol_ranges.push(specslice_core::SymbolRange {
+                file_path: sym.path.clone(),
+                symbol_id: sym.id.clone(),
+                start_line: sym.start_line,
+                end_line: sym.end_line,
+                symbol_kind: sym.kind,
+                qualified_name: sym.qualified_name.clone(),
+                parent_symbol_id: sym.parent_symbol_id.clone(),
+            });
+            batch.symbols.push(sym.clone());
+        }
+    }
+
+    // Repair tree-sitter structural misparses (function-typed static
+    // fields degrade a class's static methods into phantom top-level
+    // `dart_fn` nodes) using the overlay's classification as ground truth,
+    // *before* backfill so the cleaned id set is consistent.
+    reconcile_misparsed_callables(&mut batch, &overlay.symbols);
+
+    // Safety net: if the overlay references a structural symbol the
+    // tree-sitter pass did not emit (a construct it parses more precisely),
+    // re-home that symbol from the overlay so no semantic edge dangles.
+    backfill_referenced_symbols(&mut batch, &overlay.symbols);
+
     if !options.exclude_globs.is_empty() {
         let exclude = options.exclude_globs.clone();
         let drop_file = |path: &str| exclude.iter().any(|g| path_matches_glob(g, path));
         batch.files.retain(|f| !drop_file(&f.path));
         batch.symbols.retain(|s| !drop_file(&s.path));
         batch.tests.retain(|t| !drop_file(&t.path));
-        batch.imports.retain(|i| {
-            // Imports are keyed by the *file id* they came from, not by path,
-            // so we conservatively keep them all. They will become dangling
-            // for excluded files but Impact already handles missing nodes.
-            let _ = i;
-            true
-        });
         batch.symbol_ranges.retain(|r| !drop_file(&r.file_path));
     }
+
     let mut result = ingest(store, &batch, &resolver_used)?;
     result.resolver_used = resolver_used;
     result.sidecar_skip_reason = skip_reason;
     Ok(result)
 }
 
-/// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`
-/// (within a single segment). Implemented locally so we do not have to pull
-/// in a heavier dependency for what is essentially `path.ends_with(".g.dart")`.
+/// Tier-2 structural pass: discover every `.dart` file under the configured
+/// roots, run the generic tree-sitter driver over each, and lower the result
+/// into a [`LanguageIndexBatch`] addressed with the legacy `dart_*::` id
+/// scheme. Imports are resolved to repo-relative file ids against the full
+/// discovered file set.
+fn build_dart_structure(options: &DartIndexOptions) -> Result<LanguageIndexBatch> {
+    let mut batch = LanguageIndexBatch {
+        language: "dart".into(),
+        ..Default::default()
+    };
+    let files = discover_relative_paths(
+        &options.repo_root,
+        &options.code_roots,
+        &[],
+        DART_SPEC.extensions,
+        DART_SPEC.skip_dirs,
+    )
+    .context("discovering Dart sources")?;
+    let all_files = files.clone();
+
+    for rel in &files {
+        let abs = options.repo_root.join(rel);
+        let Ok(source) = std::fs::read_to_string(&abs) else {
+            continue; // unreadable / non-UTF-8: skip, never abort.
+        };
+        let hash = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        batch.files.push(FileArtifact {
+            id: file_id(rel),
+            path: rel.clone(),
+            language: "dart".into(),
+            content_hash: hash,
+        });
+
+        let structure = dart_extract_structure(rel, &source);
+        batch.symbols.extend(structure.symbols);
+        batch.tests.extend(structure.tests);
+        batch.symbol_ranges.extend(structure.ranges);
+        for raw in &structure.raw_imports {
+            if let Some(target) = dart_resolve_import(raw, rel, &all_files, &[]) {
+                batch.imports.push(ImportEdge {
+                    from_file: file_id(rel),
+                    to_path: target,
+                });
+            }
+        }
+    }
+    Ok(batch)
+}
+
+/// Re-home structural symbols referenced by overlay edges but missing from
+/// the tree-sitter structure, so the Tier-3 semantic edges never dangle.
+/// Only `dart_class/method/fn/ctor` endpoints qualify; synthetic
+/// (`route`/`storage`/provider) and test endpoints are left alone.
+fn backfill_referenced_symbols(
+    batch: &mut LanguageIndexBatch,
+    overlay_symbols: &[specslice_core::language_batch::SymbolArtifact],
+) {
+    let mut present: BTreeSet<String> = batch
+        .symbols
+        .iter()
+        .map(|s| s.id.to_string())
+        .chain(batch.tests.iter().map(|t| t.id.to_string()))
+        .collect();
+
+    for reference in &batch.references {
+        for endpoint in [&reference.from_symbol_id, &reference.to_symbol_id] {
+            let id = endpoint.to_string();
+            if present.contains(&id) || !is_structural_dart_id(&id) {
+                continue;
+            }
+            if let Some(sym) = overlay_symbols.iter().find(|s| s.id == *endpoint) {
+                // Attach to the file (not a possibly-missing parent) so the
+                // gap-fill never introduces a dangling `contains` edge.
+                let mut sym = sym.clone();
+                sym.parent_symbol_id = None;
+                batch.symbol_ranges.push(specslice_core::SymbolRange {
+                    file_path: sym.path.clone(),
+                    symbol_id: sym.id.clone(),
+                    start_line: sym.start_line,
+                    end_line: sym.end_line,
+                    symbol_kind: sym.kind,
+                    qualified_name: sym.qualified_name.clone(),
+                    parent_symbol_id: None,
+                });
+                present.insert(id);
+                batch.symbols.push(sym);
+            }
+        }
+    }
+}
+
+fn is_structural_dart_id(id: &str) -> bool {
+    id.starts_with("dart_class::")
+        || id.starts_with("dart_method::")
+        || id.starts_with("dart_fn::")
+        || id.starts_with("dart_ctor::")
+}
+
+/// Repair tree-sitter structural misparses using the analyzer overlay as
+/// ground truth. The vendored Dart grammar (lukepighetti) occasionally
+/// fails to recognise a class body that contains function-typed static
+/// fields (`static T Function(...) f = _impl;`): the class node is dropped
+/// and every static method *after* the offending field degrades into a
+/// bogus top-level `dart_fn::<file>#<name>`. Those phantoms have no
+/// incoming edges — the real edges bind to the analyzer's correct
+/// `dart_method::<file>#<Class>.<name>` id — so they surface as
+/// high-confidence dead-code false positives (dogfood regression on
+/// hama's `ExportService`).
+///
+/// When the analyzer (or lightweight) overlay is present and reclassifies
+/// such a `dart_fn` as a method / constructor, drop the phantom and
+/// substitute the overlay's node, re-homing its parent class when the
+/// structural pass missed that too. We only ever drop a `dart_fn` the
+/// overlay does **not** also emit as a top-level function, so a file that
+/// legitimately has both a top-level `foo()` and a `Class.foo()` keeps
+/// both.
+fn reconcile_misparsed_callables(
+    batch: &mut LanguageIndexBatch,
+    overlay_symbols: &[specslice_core::language_batch::SymbolArtifact],
+) {
+    if overlay_symbols.is_empty() {
+        return;
+    }
+
+    // The overlay's authoritative set of *top-level function* ids. A
+    // tree-sitter `dart_fn` whose id is in here is a genuine top-level
+    // function and must never be reclassified.
+    let analyzer_fn_ids: BTreeSet<String> = overlay_symbols
+        .iter()
+        .filter(|s| s.kind == NodeKind::DartFunction)
+        .map(|s| s.id.to_string())
+        .collect();
+
+    let present_ids: BTreeSet<String> = batch.symbols.iter().map(|s| s.id.to_string()).collect();
+
+    let mut phantom_ids: BTreeSet<String> = BTreeSet::new();
+    let mut substitutes: Vec<specslice_core::language_batch::SymbolArtifact> = Vec::new();
+    let mut substitute_ids: BTreeSet<String> = BTreeSet::new();
+
+    for s in &batch.symbols {
+        if s.kind != NodeKind::DartFunction {
+            continue;
+        }
+        if analyzer_fn_ids.contains(&s.id.to_string()) {
+            continue; // overlay agrees: real top-level function.
+        }
+        // Does the overlay reclassify this (path, name) as a method/ctor?
+        let replacements: Vec<&specslice_core::language_batch::SymbolArtifact> = overlay_symbols
+            .iter()
+            .filter(|a| {
+                matches!(a.kind, NodeKind::DartMethod | NodeKind::DartConstructor)
+                    && a.path == s.path
+                    && a.name == s.name
+            })
+            .collect();
+        if replacements.is_empty() {
+            continue;
+        }
+        phantom_ids.insert(s.id.to_string());
+        for a in replacements {
+            let aid = a.id.to_string();
+            if !present_ids.contains(&aid) && substitute_ids.insert(aid) {
+                substitutes.push((*a).clone());
+            }
+        }
+    }
+
+    if phantom_ids.is_empty() {
+        return;
+    }
+
+    // Re-home any parent class the structural pass missed (the misparse
+    // usually drops the enclosing class node entirely).
+    let mut parent_adds: Vec<specslice_core::language_batch::SymbolArtifact> = Vec::new();
+    let mut parent_ids: BTreeSet<String> = BTreeSet::new();
+    for sub in &substitutes {
+        let Some(parent) = &sub.parent_symbol_id else {
+            continue;
+        };
+        let pid = parent.to_string();
+        if present_ids.contains(&pid) || substitute_ids.contains(&pid) || parent_ids.contains(&pid)
+        {
+            continue;
+        }
+        if let Some(cls) = overlay_symbols
+            .iter()
+            .find(|a| a.kind == NodeKind::DartClass && a.id.to_string() == pid)
+        {
+            parent_ids.insert(pid);
+            parent_adds.push(cls.clone());
+        }
+    }
+
+    // Drop the phantoms (and their ranges).
+    batch
+        .symbols
+        .retain(|s| !phantom_ids.contains(&s.id.to_string()));
+    batch
+        .symbol_ranges
+        .retain(|r| !phantom_ids.contains(&r.symbol_id.to_string()));
+
+    // Add re-homed parent classes first so the substituted methods can
+    // keep their `contains` parent without dangling.
+    let mut now_present: BTreeSet<String> =
+        batch.symbols.iter().map(|s| s.id.to_string()).collect();
+    for cls in parent_adds {
+        let cid = cls.id.to_string();
+        if now_present.insert(cid) {
+            batch.symbol_ranges.push(specslice_core::SymbolRange {
+                file_path: cls.path.clone(),
+                symbol_id: cls.id.clone(),
+                start_line: cls.start_line,
+                end_line: cls.end_line,
+                symbol_kind: cls.kind,
+                qualified_name: cls.qualified_name.clone(),
+                parent_symbol_id: cls.parent_symbol_id.clone(),
+            });
+            batch.symbols.push(cls);
+        }
+    }
+
+    for mut sub in substitutes {
+        // Only keep the parent link when the parent node is actually
+        // present; otherwise parent under the file (avoids a dangling
+        // `contains` edge), mirroring `backfill_referenced_symbols`.
+        if let Some(parent) = &sub.parent_symbol_id {
+            if !now_present.contains(&parent.to_string()) {
+                sub.parent_symbol_id = None;
+            }
+        }
+        batch.symbol_ranges.push(specslice_core::SymbolRange {
+            file_path: sub.path.clone(),
+            symbol_id: sub.id.clone(),
+            start_line: sub.start_line,
+            end_line: sub.end_line,
+            symbol_kind: sub.kind,
+            qualified_name: sub.qualified_name.clone(),
+            parent_symbol_id: sub.parent_symbol_id.clone(),
+        });
+        now_present.insert(sub.id.to_string());
+        batch.symbols.push(sub);
+    }
+}
+
 /// Build the `evidence_json` payload stored on each Dart `calls` /
 /// `references` edge. The shape is deliberately tiny so the engine and
-/// the future analyzer sidecar can both populate / parse it without a
+/// the analyzer sidecar can both populate / parse it without a
 /// dedicated schema crate.
 ///
 /// ```json
@@ -129,6 +442,9 @@ fn build_reference_evidence_json(line: u32, snippet: &str, resolver: &str) -> St
     Value::Object(obj).to_string()
 }
 
+/// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`
+/// (within a single segment). Implemented locally so we do not have to pull
+/// in a heavier dependency for what is essentially `path.ends_with(".g.dart")`.
 fn path_matches_glob(pattern: &str, path: &str) -> bool {
     let pat = pattern.replace('\\', "/");
     let p = path.replace('\\', "/");
@@ -529,6 +845,243 @@ pub fn ingest_language_batch_minimal(
 }
 
 #[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use specslice_core::artifact_id::{dart_class_id, dart_function_id, dart_method_id};
+    use specslice_core::language_batch::{SymbolArtifact, SymbolRange};
+    use specslice_core::NodeKind;
+
+    fn sym(
+        id: specslice_core::ArtifactId,
+        kind: NodeKind,
+        path: &str,
+        name: &str,
+    ) -> SymbolArtifact {
+        SymbolArtifact {
+            id,
+            kind,
+            path: path.into(),
+            name: name.into(),
+            qualified_name: name.into(),
+            start_line: 100,
+            end_line: 120,
+            parent_symbol_id: None,
+            metadata_json: None,
+        }
+    }
+
+    fn range_for(s: &SymbolArtifact) -> SymbolRange {
+        SymbolRange {
+            file_path: s.path.clone(),
+            symbol_id: s.id.clone(),
+            start_line: s.start_line,
+            end_line: s.end_line,
+            symbol_kind: s.kind,
+            qualified_name: s.qualified_name.clone(),
+            parent_symbol_id: s.parent_symbol_id.clone(),
+        }
+    }
+
+    fn ids(batch: &LanguageIndexBatch) -> Vec<String> {
+        batch.symbols.iter().map(|s| s.id.to_string()).collect()
+    }
+
+    #[test]
+    fn drops_treesitter_phantom_fn_the_analyzer_calls_a_method() {
+        // Tree-sitter misparsed a static method as a top-level function
+        // (the function-typed-static-field grammar bug). The phantom has
+        // no incoming edges and surfaces as a dead-code false positive.
+        let phantom = sym(
+            dart_function_id("lib/x.dart", "_shareXFiles"),
+            NodeKind::DartFunction,
+            "lib/x.dart",
+            "_shareXFiles",
+        );
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.symbol_ranges.push(range_for(&phantom));
+        batch.symbols.push(phantom);
+
+        // Analyzer ground truth: it is a method of ExportService.
+        let cls = sym(
+            dart_class_id("lib/x.dart", "ExportService"),
+            NodeKind::DartClass,
+            "lib/x.dart",
+            "ExportService",
+        );
+        let mut method = sym(
+            dart_method_id("lib/x.dart", "ExportService", "_shareXFiles"),
+            NodeKind::DartMethod,
+            "lib/x.dart",
+            "_shareXFiles",
+        );
+        method.qualified_name = "ExportService._shareXFiles".into();
+        method.parent_symbol_id = Some(cls.id.clone());
+        let overlay = vec![cls.clone(), method.clone()];
+
+        reconcile_misparsed_callables(&mut batch, &overlay);
+
+        let got = ids(&batch);
+        assert!(
+            !got.contains(&"dart_fn::lib/x.dart#_shareXFiles".to_string()),
+            "phantom dart_fn must be dropped: {got:?}"
+        );
+        assert!(
+            got.contains(&"dart_method::lib/x.dart#ExportService._shareXFiles".to_string()),
+            "analyzer method must be substituted: {got:?}"
+        );
+        assert!(
+            got.contains(&"dart_class::lib/x.dart#ExportService".to_string()),
+            "missing parent class must be backfilled: {got:?}"
+        );
+        // The phantom's range is gone; the method's range is present.
+        assert!(
+            !batch
+                .symbol_ranges
+                .iter()
+                .any(|r| r.symbol_id.to_string() == "dart_fn::lib/x.dart#_shareXFiles"),
+            "phantom range must be dropped"
+        );
+        assert!(batch.symbol_ranges.iter().any(|r| r.symbol_id == method.id));
+    }
+
+    #[test]
+    fn drops_phantom_fn_for_extension_member_with_synthetic_parent() {
+        // Dogfood (turing `game_screen_editor.dart`): tree-sitter cannot parse
+        // a Dart-3 file (ERROR-node cascade), so an `extension _X on _State`
+        // member degrades into a phantom top-level `dart_fn`. The analyzer
+        // overlay carries the real `dart_method::<file>#_State.member` whose
+        // parent is the *synthetic* `dart_extension::<file>#_State` id (the
+        // `on` type may live in another part file). Reconcile must drop the
+        // phantom, substitute the method, and — since the synthetic parent is
+        // absent — re-home it under the file (parent → None) rather than
+        // leave a dangling `contains` edge.
+        let phantom = sym(
+            dart_function_id("lib/game_screen_editor.dart", "_showSnackBar"),
+            NodeKind::DartFunction,
+            "lib/game_screen_editor.dart",
+            "_showSnackBar",
+        );
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.symbol_ranges.push(range_for(&phantom));
+        batch.symbols.push(phantom);
+
+        let mut method = sym(
+            dart_method_id(
+                "lib/game_screen_editor.dart",
+                "_GameScreenState",
+                "_showSnackBar",
+            ),
+            NodeKind::DartMethod,
+            "lib/game_screen_editor.dart",
+            "_showSnackBar",
+        );
+        method.qualified_name = "_GameScreenState._showSnackBar".into();
+        method.parent_symbol_id = Some(specslice_core::ArtifactId::new(
+            "dart_extension::lib/game_screen_editor.dart#_GameScreenState".to_string(),
+        ));
+        let overlay = vec![method.clone()];
+
+        reconcile_misparsed_callables(&mut batch, &overlay);
+
+        let got = ids(&batch);
+        assert!(
+            !got.contains(&"dart_fn::lib/game_screen_editor.dart#_showSnackBar".to_string()),
+            "phantom dart_fn must be dropped: {got:?}"
+        );
+        assert!(
+            got.contains(
+                &"dart_method::lib/game_screen_editor.dart#_GameScreenState._showSnackBar"
+                    .to_string()
+            ),
+            "extension method must be substituted: {got:?}"
+        );
+        // The synthetic extension parent is absent, so the method is re-homed
+        // under the file (no dangling `contains`).
+        let substituted = batch
+            .symbols
+            .iter()
+            .find(|s| s.id == method.id)
+            .expect("substituted method present");
+        assert!(
+            substituted.parent_symbol_id.is_none(),
+            "synthetic dart_extension parent must be nulled: {:?}",
+            substituted.parent_symbol_id
+        );
+        // No phantom `dart_extension::…` node is fabricated.
+        assert!(
+            !got.iter().any(|i| i.starts_with("dart_extension::")),
+            "must not fabricate a dart_extension node: {got:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_real_top_level_fn_even_when_a_same_named_method_exists() {
+        // A genuine top-level function `helper` that the analyzer also
+        // classifies as a top-level fn must survive, even if some class
+        // happens to declare a method named `helper` too.
+        let real_fn = sym(
+            dart_function_id("lib/y.dart", "helper"),
+            NodeKind::DartFunction,
+            "lib/y.dart",
+            "helper",
+        );
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.symbol_ranges.push(range_for(&real_fn));
+        batch.symbols.push(real_fn);
+
+        let analyzer_fn = sym(
+            dart_function_id("lib/y.dart", "helper"),
+            NodeKind::DartFunction,
+            "lib/y.dart",
+            "helper",
+        );
+        let mut method = sym(
+            dart_method_id("lib/y.dart", "C", "helper"),
+            NodeKind::DartMethod,
+            "lib/y.dart",
+            "helper",
+        );
+        method.qualified_name = "C.helper".into();
+        let overlay = vec![analyzer_fn, method];
+
+        reconcile_misparsed_callables(&mut batch, &overlay);
+
+        assert!(
+            ids(&batch).contains(&"dart_fn::lib/y.dart#helper".to_string()),
+            "real top-level fn confirmed by the analyzer must be kept"
+        );
+    }
+
+    #[test]
+    fn no_op_when_overlay_has_no_symbols() {
+        // Lightweight/analyzer produced no structural symbols (or failed):
+        // never touch the tree-sitter structure.
+        let f = sym(
+            dart_function_id("lib/z.dart", "top"),
+            NodeKind::DartFunction,
+            "lib/z.dart",
+            "top",
+        );
+        let mut batch = LanguageIndexBatch {
+            language: "dart".into(),
+            ..Default::default()
+        };
+        batch.symbols.push(f);
+        reconcile_misparsed_callables(&mut batch, &[]);
+        assert_eq!(batch.symbols.len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod glob_tests {
     use super::path_matches_glob;
 
@@ -772,6 +1325,7 @@ mod ingest_tests {
                 repo_root: tmp.path().to_path_buf(),
                 code_roots: vec!["lib".into()],
                 exclude_globs: vec!["**/*.g.dart".into()],
+                disable_analyzer: false,
             },
         )
         .unwrap();

@@ -1,35 +1,33 @@
-//! P20 — Java language adapter.
+//! P20/P23.3 — Java language adapter.
 //!
-//! Mirrors the TypeScript / Python adapters: LSP-first via `jdtls`,
-//! with a tolerant AST scanner always running alongside so package
-//! declarations, imports and JUnit `@Test` methods are captured even
-//! when LSP is unavailable.
+//! Since the P23 收敛, the in-process tree-sitter driver
+//! ([`crate::java_treesitter`]) is the **sole structural source of truth**
+//! for Java: classes / interfaces / enums / records, methods + constructors,
+//! JUnit `@Test` cases, and `import x.y.Z;` resolved to repo-relative file
+//! ids. Output is tagged `indexer = java_treesitter`.
 //!
-//! Confidence:
-//! - Symbols + references from the LSP pass are tagged
-//!   `indexer = java_lsp`.
-//! - Symbols + imports + JUnit cases from the AST pass are tagged
-//!   `indexer = java_ast`.
+//! `jdtls` is an **optional Tier-3 enrichment**: when discovered it
+//! contributes only the semantic `Calls` / `References` edges, overlaid onto
+//! the existing tree-sitter symbol ids (the two id schemes are identical by
+//! construction). LSP edges are tagged `indexer = java_lsp`. When no LSP is
+//! present the structural graph is already complete; there is no longer any
+//! second structural pass.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use specslice_core::artifact_id::{file_id, slugify, ArtifactId};
-use specslice_core::language_batch::{
-    FileArtifact, ImportEdge, LanguageIndexBatch, SymbolArtifact, TestArtifact,
-};
+use specslice_core::language_batch::LanguageIndexBatch;
 use specslice_core::NodeKind;
 use specslice_store::Store;
 
 use crate::dart_indexer::ingest_language_batch_minimal;
-use crate::java_ast::{scan, JavaScan};
 use crate::lsp_client::LspSymbolKind;
 use crate::lsp_indexer::{
     binary_on_path, run_profile, LspIndexOptions, LspIndexOutcome, LspProfile,
 };
+use crate::treesitter::{self, TsIndexOptions};
 
 pub const JAVA_INDEXER_NAME: &str = "java_lsp";
-pub const JAVA_AST_INDEXER_NAME: &str = "java_ast";
 pub const JAVA_LANGUAGE_ID: &str = "java";
 pub const JAVA_LSP_COMMAND_ENV: &str = "SPECSLICE_JAVA_LSP_BIN";
 
@@ -47,304 +45,108 @@ pub struct JavaIndexResult {
     pub symbols: usize,
     pub tests: usize,
     pub imports: usize,
+    /// Number of `Calls` / `References` edges contributed by the optional
+    /// Tier-3 LSP enrichment pass (0 when no LSP was available).
+    #[serde(default)]
+    pub references: usize,
+    /// `java_treesitter` when the structural pass produced anything, empty
+    /// when no Java files were found.
     pub resolver_used: String,
     pub sidecar_skip_reason: String,
 }
 
+/// Top-level entrypoint. The tree-sitter driver produces the entire
+/// structural graph (symbols + JUnit tests + resolved imports); an optional
+/// LSP pass then overlays `Calls` / `References`.
 pub fn index_java(store: &mut Store, options: &JavaIndexOptions) -> Result<JavaIndexResult> {
-    let probe = ProbeOutcome::from_options(options);
+    let spec = &crate::java_treesitter::JAVA_SPEC;
+    let ts_name = treesitter::indexer_name(spec);
+    store
+        .clear_indexer_outputs(&ts_name)
+        .context("clearing previous Java tree-sitter outputs")?;
+    store
+        .clear_indexer_outputs(JAVA_INDEXER_NAME)
+        .context("clearing previous Java LSP outputs")?;
 
-    let mut lsp_batch: Option<LanguageIndexBatch> = None;
-    let mut lsp_files = 0usize;
-    let mut lsp_symbols = 0usize;
-    let mut skip_reason = String::new();
-    let mut resolver_used = String::new();
-
-    if let Some(cmd) = probe.command.clone() {
-        let profile = java_profile();
-        let lsp_options = LspIndexOptions {
+    let ts = treesitter::index_repo_with_spec(
+        store,
+        spec,
+        &TsIndexOptions {
             repo_root: options.repo_root.clone(),
             code_roots: options.code_roots.clone(),
             exclude_globs: options.exclude_globs.clone(),
-            lsp_command: Some(cmd),
-        };
-        match run_profile(&profile, &lsp_options)? {
-            LspIndexOutcome::Indexed(boxed) => {
-                let crate::lsp_indexer::LspIndexedBatch { batch, stats } = *boxed;
-                lsp_files = stats.files;
-                lsp_symbols = stats.symbols;
-                if !stats.skip_reason.is_empty() {
-                    skip_reason = stats.skip_reason;
+            resolution_paths: Vec::new(),
+        },
+    )
+    .context("indexing Java structure via tree-sitter")?;
+
+    // Id set of structural nodes so the optional LSP pass attaches edges
+    // without dangling targets.
+    let mut known_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for node in store.list_all_nodes().context("listing nodes")? {
+        if node.indexer.as_deref() == Some(ts_name.as_str()) {
+            known_ids.insert(node.id.to_string());
+        }
+    }
+
+    // Tier 3 (optional): LSP `Calls` / `References` enrichment overlaid onto
+    // the tree-sitter symbol ids (identical id scheme).
+    let probe = ProbeOutcome::from_options(options);
+    let mut references = 0usize;
+    let skip_reason = match probe.command.clone() {
+        Some(cmd) => {
+            let profile = java_profile();
+            let lsp_options = LspIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: options.code_roots.clone(),
+                exclude_globs: options.exclude_globs.clone(),
+                lsp_command: Some(cmd),
+            };
+            match run_profile(&profile, &lsp_options)? {
+                LspIndexOutcome::Indexed(boxed) => {
+                    let crate::lsp_indexer::LspIndexedBatch { batch, stats } = *boxed;
+                    let refs: Vec<_> = batch
+                        .references
+                        .into_iter()
+                        .filter(|r| {
+                            known_ids.contains(r.from_symbol_id.as_str())
+                                && known_ids.contains(r.to_symbol_id.as_str())
+                        })
+                        .collect();
+                    references = refs.len();
+                    if !refs.is_empty() {
+                        let refs_batch = LanguageIndexBatch {
+                            language: JAVA_LANGUAGE_ID.into(),
+                            references: refs,
+                            ..Default::default()
+                        };
+                        ingest_language_batch_minimal(store, &refs_batch, JAVA_INDEXER_NAME)
+                            .context("ingesting Java LSP reference edges")?;
+                    }
+                    stats.skip_reason
                 }
-                ingest_language_batch_minimal(store, &batch, JAVA_INDEXER_NAME)
-                    .context("ingesting Java LSP batch")?;
-                lsp_batch = Some(batch);
-                resolver_used = JAVA_INDEXER_NAME.into();
-            }
-            LspIndexOutcome::Skipped { reason, .. } => {
-                skip_reason = reason;
+                LspIndexOutcome::Skipped { reason, .. } => reason,
             }
         }
-    } else {
-        skip_reason = probe.skip_reason;
-    }
-
-    let ast_outcome =
-        run_ast_pass(store, options, lsp_batch.as_ref()).context("running Java AST pass")?;
-
-    if resolver_used.is_empty() && ast_outcome.symbols + ast_outcome.tests > 0 {
-        resolver_used = JAVA_AST_INDEXER_NAME.into();
-    }
-
-    let total_files = if lsp_files > 0 {
-        lsp_files
-    } else {
-        ast_outcome.files
+        None => probe.skip_reason,
     };
-    let total_symbols = lsp_symbols + ast_outcome.symbols;
 
     Ok(JavaIndexResult {
-        files: total_files,
-        symbols: total_symbols,
-        tests: ast_outcome.tests,
-        imports: ast_outcome.imports,
-        resolver_used,
+        files: ts.files,
+        symbols: ts.symbols,
+        tests: ts.tests,
+        imports: ts.imports,
+        references,
+        resolver_used: ts.resolver_used,
         sidecar_skip_reason: skip_reason,
     })
 }
 
+/// True when an optional Java LSP enrichment server is discoverable.
+/// Structural indexing no longer depends on it — this only gates the Tier-3
+/// `Calls` / `References` overlay.
 pub fn java_lsp_available(options: &JavaIndexOptions) -> bool {
     ProbeOutcome::from_options(options).command.is_some()
-}
-
-#[derive(Debug, Default)]
-struct AstOutcome {
-    files: usize,
-    symbols: usize,
-    tests: usize,
-    imports: usize,
-}
-
-fn run_ast_pass(
-    store: &mut Store,
-    options: &JavaIndexOptions,
-    lsp_batch: Option<&LanguageIndexBatch>,
-) -> Result<AstOutcome> {
-    let files = discover_java_files(
-        &options.repo_root,
-        &options.code_roots,
-        &options.exclude_globs,
-    )?;
-    if files.is_empty() {
-        return Ok(AstOutcome::default());
-    }
-
-    let mut outcome = AstOutcome::default();
-    let mut batch = LanguageIndexBatch {
-        language: JAVA_LANGUAGE_ID.into(),
-        ..Default::default()
-    };
-
-    let lsp_symbol_ids: std::collections::BTreeSet<String> = lsp_batch
-        .map(|b| b.symbols.iter().map(|s| s.id.to_string()).collect())
-        .unwrap_or_default();
-
-    // Group files by package so we can emit one JavaPackage per
-    // distinct package name (and tie file-level symbols to it).
-    let mut seen_packages: std::collections::BTreeMap<String, ArtifactId> =
-        std::collections::BTreeMap::new();
-
-    for file in &files {
-        let source = std::fs::read_to_string(&file.absolute)
-            .with_context(|| format!("reading {}", file.absolute.display()))?;
-        let scan_result: JavaScan = scan(&source);
-        outcome.files += 1;
-
-        let file_artifact_id = file_id(&file.relative);
-        let total_lines = u32::try_from(source.lines().count().max(1)).unwrap_or(u32::MAX);
-        batch.files.push(FileArtifact {
-            id: file_artifact_id.clone(),
-            path: file.relative.clone(),
-            language: JAVA_LANGUAGE_ID.into(),
-            content_hash: sha256_hex(source.as_bytes()),
-        });
-
-        // JavaPackage node — one per distinct package across the
-        // index. We use `java_package::<dotted>` so the id is stable
-        // across files.
-        let pkg = scan_result
-            .package_name
-            .clone()
-            .unwrap_or_else(|| "<default>".to_string());
-        let pkg_id = seen_packages
-            .entry(pkg.clone())
-            .or_insert_with(|| ArtifactId::new(format!("java_package::{pkg}")))
-            .clone();
-        if !batch
-            .symbols
-            .iter()
-            .any(|s| s.id.to_string() == pkg_id.to_string())
-        {
-            batch.symbols.push(SymbolArtifact {
-                id: pkg_id.clone(),
-                kind: NodeKind::JavaPackage,
-                path: file.relative.clone(),
-                name: pkg.clone(),
-                qualified_name: pkg.clone(),
-                start_line: 1,
-                end_line: total_lines,
-                parent_symbol_id: None,
-                metadata_json: None,
-            });
-        }
-
-        for sym in &scan_result.symbols {
-            if matches!(sym.kind, NodeKind::TestCase | NodeKind::TestGroup) {
-                batch.tests.push(TestArtifact {
-                    id: ArtifactId::new(format!(
-                        "test::{file}::{slug}",
-                        file = file.relative,
-                        slug = slugify(&sym.name)
-                    )),
-                    kind: sym.kind,
-                    path: file.relative.clone(),
-                    name: sym.name.clone(),
-                    start_line: sym.start_line,
-                    end_line: sym.end_line,
-                    parent_symbol_id: None,
-                });
-                outcome.tests += 1;
-                continue;
-            }
-            let qualified_with_pkg = format!("{pkg}.{}", sym.qualified_name);
-            let id = symbol_id(&qualified_with_pkg);
-            if lsp_symbol_ids.contains(&id.to_string()) {
-                continue;
-            }
-            let parent_id = match sym.parent_qualified_name.as_ref() {
-                Some(p) => Some(symbol_id(&format!("{pkg}.{p}"))),
-                None => Some(pkg_id.clone()),
-            };
-            batch.symbols.push(SymbolArtifact {
-                id,
-                kind: sym.kind,
-                path: file.relative.clone(),
-                name: sym.name.clone(),
-                qualified_name: qualified_with_pkg,
-                start_line: sym.start_line,
-                end_line: sym.end_line,
-                parent_symbol_id: parent_id,
-                metadata_json: None,
-            });
-            outcome.symbols += 1;
-        }
-
-        for imp in &scan_result.imports {
-            batch.imports.push(ImportEdge {
-                from_file: file_artifact_id.clone(),
-                to_path: imp.module_specifier.clone(),
-            });
-            outcome.imports += 1;
-        }
-    }
-
-    if outcome.files > 0 {
-        ingest_language_batch_minimal(store, &batch, JAVA_AST_INDEXER_NAME)
-            .context("ingesting Java AST batch")?;
-    }
-    Ok(outcome)
-}
-
-fn symbol_id(qualified: &str) -> ArtifactId {
-    ArtifactId::new(format!("java::{qualified}"))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(bytes);
-    let out = hasher.finalize();
-    let mut hex = String::with_capacity(out.len() * 2);
-    for b in out {
-        use std::fmt::Write;
-        let _ = write!(&mut hex, "{b:02x}");
-    }
-    hex
-}
-
-#[derive(Debug, Clone)]
-struct DiscoveredJavaFile {
-    relative: String,
-    absolute: PathBuf,
-}
-
-fn discover_java_files(
-    repo_root: &Path,
-    code_roots: &[PathBuf],
-    exclude_globs: &[String],
-) -> Result<Vec<DiscoveredJavaFile>> {
-    let mut out: Vec<DiscoveredJavaFile> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let roots: Vec<PathBuf> = if code_roots.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        code_roots.to_vec()
-    };
-    for root in &roots {
-        let abs = repo_root.join(root);
-        if !abs.exists() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(&abs)
-            .into_iter()
-            .filter_entry(|e| !is_java_skip_dir(e))
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if ext != "java" {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(repo_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if exclude_globs
-                .iter()
-                .any(|g| crate::lsp_indexer::simple_glob_match(g, &rel))
-            {
-                continue;
-            }
-            if !seen.insert(rel.clone()) {
-                continue;
-            }
-            out.push(DiscoveredJavaFile {
-                relative: rel,
-                absolute: repo_root.join(path.strip_prefix(repo_root).unwrap_or(path)),
-            });
-        }
-    }
-    out.sort_by(|a, b| a.relative.cmp(&b.relative));
-    Ok(out)
-}
-
-fn is_java_skip_dir(entry: &walkdir::DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
-        return false;
-    }
-    let Some(name) = entry.file_name().to_str() else {
-        return false;
-    };
-    matches!(
-        name,
-        ".git" | "target" | "build" | "out" | ".idea" | ".gradle" | "bin"
-    )
 }
 
 fn java_profile() -> LspProfile {
@@ -374,10 +176,13 @@ fn java_map_kind(kind: LspSymbolKind, _parent: Option<NodeKind>) -> Option<NodeK
     }
 }
 
-fn java_qualify(_file_rel: &str, parent: Option<&str>, name: &str) -> String {
+/// Mirror the tree-sitter id scheme so LSP overlay edges land on the same
+/// nodes: nested members join with `.`, top-level types are file-scoped
+/// (`<file>::<name>`), exactly like [`treesitter::index_repo_with_spec`].
+fn java_qualify(file_rel: &str, parent: Option<&str>, name: &str) -> String {
     match parent {
         Some(p) => format!("{p}.{name}"),
-        None => name.to_string(),
+        None => format!("{file_rel}::{name}"),
     }
 }
 
@@ -399,7 +204,7 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "{JAVA_LSP_COMMAND_ENV}=`{env_cmd}` smoke launch 未通过，已退化为 AST fallback"
+                    "{JAVA_LSP_COMMAND_ENV}=`{env_cmd}` smoke launch 未通过，跳过 Calls/References 富化"
                 ),
             };
         }
@@ -413,7 +218,7 @@ impl ProbeOutcome {
             return Self {
                 command: None,
                 skip_reason: format!(
-                    "`java.lsp_command = {cmd}` smoke launch 未通过，已退化为 AST fallback"
+                    "`java.lsp_command = {cmd}` smoke launch 未通过，跳过 Calls/References 富化"
                 ),
             };
         }
@@ -425,15 +230,15 @@ impl ProbeOutcome {
         }
         Self {
             command: None,
-            skip_reason: "未在 PATH 找到可启动的 jdtls，已退化为 AST fallback".into(),
+            skip_reason: "未在 PATH 找到可启动的 jdtls，跳过 Calls/References 富化".into(),
         }
     }
 }
 
-/// Java probe gate: a binary is "available" only when it both
-/// resolves on PATH and survives the shared `lsp_probe` smoke launch.
-/// `jdtls` is a Python launcher that bootstraps a JVM; smoke catches
-/// the common failure of `java` not being on PATH at all.
+/// Java probe gate: a binary is "available" only when it both resolves on
+/// PATH and survives the shared `lsp_probe` smoke launch. `jdtls` is a
+/// Python launcher that bootstraps a JVM; smoke catches the common failure
+/// of `java` not being on PATH at all.
 fn java_binary_runnable(cmd: &str) -> bool {
     if !binary_on_path(cmd) {
         return false;
@@ -449,6 +254,7 @@ fn java_binary_runnable(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn write_fixture(root: &Path) {
@@ -464,6 +270,7 @@ mod tests {
                 "src/test/java/com/example/GreeterTest.java",
                 "package com.example;\n\
                  import org.junit.jupiter.api.Test;\n\
+                 import com.example.Greeter;\n\
                  class GreeterTest {\n  \
                    @Test\n  \
                    void greetsByName() {}\n\
@@ -484,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn ast_pass_runs_against_java_hello_fixture_without_lsp() {
+    fn treesitter_pass_runs_against_java_hello_fixture_without_lsp() {
         let tmp = tempdir().unwrap();
         write_fixture(tmp.path());
         let (mut store, _db) = open_temp_store(tmp.path());
@@ -496,52 +303,84 @@ mod tests {
             lsp_command: Some("/nonexistent/jdtls".into()),
         };
         let result = index_java(&mut store, &opts).unwrap();
-        assert!(result.files >= 2, "should have indexed both Java files");
+        assert_eq!(
+            result.resolver_used,
+            treesitter::indexer_name(&crate::java_treesitter::JAVA_SPEC),
+            "structure now comes from the tree-sitter driver: {result:?}"
+        );
+        assert!(result.files >= 2, "both Java files indexed: {result:?}");
+        assert!(result.symbols >= 2, "class + method counted: {result:?}");
+        assert!(result.tests >= 1, "JUnit @Test recovered: {result:?}");
         assert!(
-            result.symbols >= 2,
-            "should have at least 1 package + 1 class (got {})",
-            result.symbols
+            !result.sidecar_skip_reason.is_empty(),
+            "skip reason recorded when no LSP available"
+        );
+
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::JavaClass && n.name.as_deref() == Some("Greeter")),
+            "Greeter class present; got {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.kind, n.name.clone()))
+                .collect::<Vec<_>>()
         );
         assert!(
-            result.tests >= 1,
-            "JUnit @Test should be recovered (got {})",
-            result.tests
+            nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::TestCase && n.name.as_deref() == Some("greetsByName")),
+            "JUnit test case present"
         );
+
+        // The intra-repo import resolves file → file.
+        let edges = store.list_all_edges().unwrap();
         assert!(
-            result.resolver_used == JAVA_AST_INDEXER_NAME || result.resolver_used.is_empty(),
-            "expected AST fallback resolver, got {:?}",
-            result.resolver_used
+            edges.iter().any(|e| {
+                e.kind == specslice_core::EdgeKind::Imports
+                    && e.from_id.as_str() == "file::src/test/java/com/example/GreeterTest.java"
+                    && e.to_id.as_str() == "file::src/main/java/com/example/Greeter.java"
+            }),
+            "GreeterTest should import Greeter across the source tree"
         );
     }
 
     #[test]
-    fn package_qualification_is_applied_to_classes() {
+    fn reindexing_is_idempotent() {
         let tmp = tempdir().unwrap();
         write_fixture(tmp.path());
         let (mut store, _db) = open_temp_store(tmp.path());
-
         let opts = JavaIndexOptions {
             repo_root: tmp.path().to_path_buf(),
             code_roots: vec![PathBuf::from("src")],
             exclude_globs: vec![],
             lsp_command: Some("/nonexistent/jdtls".into()),
         };
-        index_java(&mut store, &opts).unwrap();
-        let nodes = store.list_all_nodes().unwrap();
-        // Greeter qualified by package must appear.
-        assert!(
-            nodes.iter().any(|n| n.kind == NodeKind::JavaClass
-                && n.id.to_string() == "java::com.example.Greeter"),
-            "expected JavaClass `com.example.Greeter` in store; got {:?}",
-            nodes
-                .iter()
-                .filter(|n| matches!(n.kind, NodeKind::JavaClass | NodeKind::JavaPackage))
-                .map(|n| (n.kind, n.id.to_string()))
-                .collect::<Vec<_>>()
+        let first = index_java(&mut store, &opts).expect("first index ok");
+        let nodes_1 = store.list_all_nodes().unwrap().len();
+        let edges_1 = store.list_all_edges().unwrap().len();
+        let second = index_java(&mut store, &opts).expect("second index ok");
+        let nodes_2 = store.list_all_nodes().unwrap().len();
+        let edges_2 = store.list_all_edges().unwrap().len();
+        assert_eq!(first, second, "result counts stable across re-index");
+        assert_eq!(nodes_1, nodes_2, "node count stable across re-index");
+        assert_eq!(edges_1, edges_2, "edge count stable across re-index");
+    }
+
+    #[test]
+    fn java_qualify_is_file_scoped_at_top_level() {
+        assert_eq!(
+            java_qualify("src/Greeter.java", None, "Greeter"),
+            "src/Greeter.java::Greeter"
         );
-        assert!(nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::JavaPackage
-                && n.id.to_string() == "java_package::com.example"));
+        assert_eq!(
+            java_qualify(
+                "src/Greeter.java",
+                Some("src/Greeter.java::Greeter"),
+                "greet"
+            ),
+            "src/Greeter.java::Greeter.greet"
+        );
     }
 }

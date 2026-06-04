@@ -5,13 +5,16 @@
 //! - [`init_repository`] — generate the config file and graph database.
 
 pub mod business_candidates;
+pub mod c_treesitter;
 pub mod checks;
 pub mod confidence_view;
 pub mod config;
 pub mod connect;
 pub mod context_pack;
+pub mod cpp_treesitter;
 pub mod dart_indexer;
 pub mod dart_sidecar;
+pub mod dart_treesitter;
 pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
@@ -19,29 +22,35 @@ pub mod export;
 pub mod feature_map;
 pub mod git_diff;
 pub mod go_indexer;
+pub mod go_treesitter;
 pub mod graph;
 pub mod graph_diff;
 pub mod impact;
 pub mod index;
 pub mod init;
-pub mod java_ast;
 pub mod java_indexer;
+pub mod java_treesitter;
 pub mod links_indexer;
 pub mod logic_confidence;
 pub mod lsp_client;
 pub mod lsp_indexer;
 pub mod lsp_probe;
-pub mod python_ast;
 pub mod python_frameworks;
 pub mod python_indexer;
+pub mod python_treesitter;
 pub mod questions;
+pub mod requirements_md_indexer;
+pub mod rust_indexer;
+pub mod rust_treesitter;
 pub mod search;
 pub mod similarity;
 pub mod slice;
 pub mod swift_indexer;
+pub mod swift_treesitter;
 pub mod test_selection;
-pub mod typescript_ast;
+pub mod treesitter;
 pub mod typescript_indexer;
+pub mod typescript_treesitter;
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,
@@ -85,7 +94,7 @@ pub use impact::{
     compute_impact, compute_impact_with_policy, merge_confirmed_candidates, run_impact,
     ImpactOptions, ImpactReport,
 };
-pub use index::{index_repository, IndexOptions, IndexResult};
+pub use index::{index_repository, IndexOptions, IndexResult, TreeSitterLangResult};
 pub use init::{init_repository, InitOptions, InitOutcome};
 pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 pub use logic_confidence::{
@@ -116,22 +125,24 @@ pub use test_selection::{
 };
 
 pub use go_indexer::{
-    build_go_batch, go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME,
-    GO_LSP_COMMAND_ENV,
+    go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
 };
 pub use java_indexer::{
-    index_java, java_lsp_available, JavaIndexOptions, JavaIndexResult, JAVA_AST_INDEXER_NAME,
-    JAVA_INDEXER_NAME, JAVA_LSP_COMMAND_ENV,
+    index_java, java_lsp_available, JavaIndexOptions, JavaIndexResult, JAVA_INDEXER_NAME,
+    JAVA_LSP_COMMAND_ENV,
 };
 pub use python_indexer::{
-    index_python, python_lsp_available, PythonIndexOptions, PythonIndexResult,
-    PYTHON_AST_INDEXER_NAME, PYTHON_INDEXER_NAME, PYTHON_LSP_COMMAND_ENV,
+    index_python, python_lsp_available, PythonIndexOptions, PythonIndexResult, PYTHON_INDEXER_NAME,
+    PYTHON_LSP_COMMAND_ENV,
+};
+pub use rust_indexer::{
+    index_rust, RustIndexOptions, RustIndexResult, RUST_INDEXER_NAME, RUST_LANGUAGE_ID,
 };
 pub use swift_indexer::{
-    build_swift_batch, index_swift, swift_lsp_available, SwiftIndexOptions, SwiftIndexResult,
-    SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+    index_swift, swift_lsp_available, SwiftIndexOptions, SwiftIndexResult, SWIFT_INDEXER_NAME,
+    SWIFT_LSP_COMMAND_ENV,
 };
 pub use typescript_indexer::{
     index_typescript, typescript_lsp_available, TypescriptIndexOptions, TypescriptIndexResult,
-    TYPESCRIPT_AST_INDEXER_NAME, TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
+    TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
 };

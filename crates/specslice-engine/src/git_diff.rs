@@ -26,15 +26,35 @@ pub struct Hunk {
     pub new_end: u32,
 }
 
-/// Run `git diff --unified=0 <base>..<head>` inside `repo_root` and return raw text.
+/// Build the argument list for `git diff`.
+///
+/// * `head` non-empty → committed range `git diff <base>..<head>`.
+/// * `head` empty → diff `<base>` against the **working tree**
+///   (`git diff <base>`), so `impact` can run on uncommitted edits without a
+///   throwaway commit. Note: this picks up tracked modifications (staged and
+///   unstaged); brand-new *untracked* files are not part of `git diff` until
+///   they are added.
+fn diff_args(base: &str, head: &str) -> Vec<String> {
+    let mut args = vec![
+        "diff".to_string(),
+        "--unified=0".to_string(),
+        "--no-color".to_string(),
+    ];
+    if head.is_empty() {
+        args.push(base.to_string());
+    } else {
+        args.push(format!("{base}..{head}"));
+    }
+    args
+}
+
+/// Run `git diff --unified=0` for the given refs inside `repo_root` and return
+/// raw text. See [`diff_args`] for the committed-range vs working-tree modes.
 pub fn git_diff(repo_root: &std::path::Path, base: &str, head: &str) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .arg("diff")
-        .arg("--unified=0")
-        .arg("--no-color")
-        .arg(format!("{base}..{head}"))
+        .args(diff_args(base, head))
         .output()
         .context("invoking `git diff`")?;
     if !output.status.success() {
@@ -159,5 +179,23 @@ mod tests {
     #[test]
     fn empty_diff_yields_empty_vec() {
         assert!(parse_unified_diff("").is_empty());
+    }
+
+    #[test]
+    fn diff_args_use_committed_range_when_head_present() {
+        assert_eq!(
+            diff_args("origin/main", "HEAD"),
+            vec!["diff", "--unified=0", "--no-color", "origin/main..HEAD"],
+        );
+    }
+
+    #[test]
+    fn diff_args_target_working_tree_when_head_empty() {
+        // `git diff <base>` (no `..head`) compares base against the working
+        // tree, so `impact` can run on uncommitted changes.
+        assert_eq!(
+            diff_args("HEAD", ""),
+            vec!["diff", "--unified=0", "--no-color", "HEAD"],
+        );
     }
 }

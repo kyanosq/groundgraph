@@ -97,6 +97,77 @@ fn impact_reports_changed_method_and_affected_requirement() {
 }
 
 #[test]
+fn impact_worktree_reports_uncommitted_changes_without_a_commit() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    init_repo(tmp.path());
+
+    Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    // Edit the implementation but DO NOT commit — this is the scenario
+    // `--worktree` exists for.
+    let impl_path = tmp
+        .path()
+        .join("lib/domain/watermark/auto_placement_service.dart");
+    let original = std::fs::read_to_string(&impl_path).unwrap();
+    let edited = original.replace(
+        "candidates.sort((a, b) => b.score.compareTo(a.score));",
+        "candidates.sort((a, b) => b.score.compareTo(a.score) * -1 * -1);",
+    );
+    assert_ne!(original, edited, "fixture anchor for the edit not found");
+    std::fs::write(&impl_path, edited).unwrap();
+
+    // Committed-range diff against HEAD sees nothing (the change isn't
+    // committed) — this is the throwaway-commit pain point `--worktree` fixes.
+    let committed = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["impact", "--base", "HEAD", "--head", "HEAD", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let committed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(committed).unwrap()).unwrap();
+    assert!(
+        committed["changed_files"].as_array().unwrap().is_empty(),
+        "HEAD..HEAD must see no changes, got {committed:#}"
+    );
+
+    // `--worktree` diffs HEAD against the working tree and finds the edit.
+    let output = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["impact", "--base", "HEAD", "--worktree", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
+
+    let changed = parsed["changed_files"].as_array().unwrap();
+    assert!(
+        changed.iter().any(|f| f
+            .as_str()
+            .map(|p| p.ends_with("auto_placement_service.dart"))
+            .unwrap_or(false)),
+        "worktree impact must report the uncommitted file, got {parsed:#}"
+    );
+    let reqs = parsed["affected_requirements"].as_array().unwrap();
+    assert!(
+        reqs.iter().any(|r| r["id"] == "req::REQ-WATERMARK-001"),
+        "worktree impact must reach the linked requirement, got {parsed:#}"
+    );
+}
+
+#[test]
 fn impact_reports_changed_doc_section_and_linked_implementation() {
     let tmp = tempfile::TempDir::new().unwrap();
     init_repo(tmp.path());

@@ -240,6 +240,16 @@ pub fn analyze_dead_code_with_store(
                     entry_ids.insert(n.id.to_string());
                 }
             }
+            // Rust: `fn main` is the binary entry point. `#[test]`
+            // functions are tagged as `TestCase` by the Rust spec (so they
+            // are seeded above), and the in-process heuristic resolver emits
+            // `Calls` / `References` edges, so reachability now flows through
+            // the real call graph instead of stopping at `main`.
+            NodeKind::RustFunction => {
+                if n.name.as_deref() == Some("main") {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
             _ => {}
         }
         // P17: any symbol whose `metadata_json` carries a framework
@@ -263,18 +273,62 @@ pub fn analyze_dead_code_with_store(
         }
     }
 
-    // BFS forward.
+    // Build the `Contains` parent map up-front so up-propagation can be
+    // interleaved with the forward search. A module / file container is alive
+    // once it transitively owns a reachable symbol — you never delete a `mod`
+    // (or file) that still holds live code — and, crucially, a freshly
+    // reachable file may itself *anchor* module-level references (e.g. a
+    // top-level `FACTORS = [_amihud(20)]` registration). Following those
+    // requires the file node to be expanded by the same worklist, so the two
+    // phases share one queue rather than running back-to-back.
+    let mut contains_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &edges {
+        if edge.kind == EdgeKind::Contains {
+            contains_parents
+                .entry(edge.to_id.as_str())
+                .or_default()
+                .push(edge.from_id.as_str());
+        }
+    }
+
+    // Reachability fixpoint: follow usage edges forward, and propagate
+    // reachability *up* `Contains` edges onto module/file-family parents only
+    // (so genuine dead types/functions keep their own verdict — nothing ever
+    // "calls" a module). The set only grows, so this can never flip a
+    // reachable symbol back into a candidate.
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut queue: std::collections::VecDeque<String> = entry_ids.iter().cloned().collect();
     while let Some(id) = queue.pop_front() {
         if !reachable.insert(id.clone()) {
             continue;
         }
+        // Forward: follow usage edges out of this node.
         if let Some(out) = outbound.get(id.as_str()) {
             for e in out {
                 let to = e.to_id.to_string();
                 if !reachable.contains(&to) {
                     queue.push_back(to);
+                }
+            }
+        }
+        // Up: this node keeps its module/file containers alive, and a newly
+        // reachable container must be expanded too so any module-level
+        // references it anchors get followed. Additionally, a reachable
+        // *constructor* keeps its owning class alive: constructing a type is
+        // using it, even when the class is referenced only through its ctor
+        // (e.g. a private `_AppLocalizationsDelegate` named solely by
+        // `static const delegate = _AppLocalizationsDelegate()` — the
+        // construction edge lands on the ctor, never the class node).
+        let current_is_ctor = node_index.get(id.as_str()).is_some_and(|n| {
+            n.kind == NodeKind::DartConstructor || is_dart_constructor_shaped_method(n)
+        });
+        if let Some(parents) = contains_parents.get(id.as_str()) {
+            for parent in parents {
+                let parent_is_container = node_index
+                    .get(*parent)
+                    .is_some_and(|n| specslice_core::language_traits::is_module_or_file(n.kind));
+                if (parent_is_container || current_is_ctor) && !reachable.contains(*parent) {
+                    queue.push_back((*parent).to_string());
                 }
             }
         }
@@ -384,11 +438,64 @@ pub fn analyze_dead_code_with_store(
     });
 
     let possibly_dead = candidates.len();
+    // Count reachable nodes over the *same* universe as `total_code` so the
+    // header reconciles (`可达 ≤ 总符号`). Test cases / groups are production
+    // roots but not code symbols (unless `--include-tests`), and test-file
+    // helpers are scaffolding — neither counts here, exactly as in the
+    // classification loop above.
     let reachable_count = reachable
         .iter()
-        .filter(|id| node_index.contains_key(id.as_str()))
+        .filter_map(|id| node_index.get(id.as_str()))
+        .filter(|n| {
+            if !is_code_kind(n.kind) {
+                return false;
+            }
+            if matches!(n.kind, NodeKind::TestCase | NodeKind::TestGroup) {
+                return opts.include_tests;
+            }
+            !n.path.as_deref().is_some_and(is_test_path)
+        })
         .count();
     let entrypoints = entry_ids.len();
+
+    // Honest self-assessment: the analysis is only meaningful when it has both
+    // entry points to start the walk from and precision-tier edges to walk
+    // along. Without them every symbol looks unreachable — say so loudly rather
+    // than emit thousands of false positives silently.
+    let mut warnings: Vec<String> = Vec::new();
+    if total_code > 0 && entry_ids.is_empty() {
+        warnings.push(
+            "未匹配到任何入口点：dead_code.entrypoints 未命中本仓库的任何文件，\
+             也没有发现语言内置入口（main / 测试 / 框架路由）。没有入口点时，\
+             所有符号都会被判为“可能死代码”，本报告不可用。\
+             请在 .specslice.yaml 的 dead_code.entrypoints 配置真实入口文件。"
+                .to_string(),
+        );
+    }
+    // Precision = an actual code call/usage graph. `DeclaresVerification`
+    // (requirement → test) and `Contains` are deliberately excluded: a handful
+    // of requirement edges must not mask the fact that the code itself has no
+    // resolved calls to walk.
+    let has_precision_edges = edges.iter().any(|e| {
+        matches!(
+            e.kind,
+            EdgeKind::Calls
+                | EdgeKind::References
+                | EdgeKind::ReadsProvider
+                | EdgeKind::PersistsTo
+                | EdgeKind::NavigatesTo
+                | EdgeKind::SubscribesStream
+        )
+    });
+    if total_code > 0 && !has_precision_edges {
+        warnings.push(
+            "代码图中没有 calls/references 等精确层边（当前语言未启用 Tier-3 富化：\
+             LSP / analyzer / SCIP）。可达性仅能依赖结构边（contains/imports），\
+             会显著高估死代码。请将结果当作“候选”而非结论。"
+                .to_string(),
+        );
+    }
+
     Ok(DeadCodeReport {
         schema_version: DEAD_CODE_SCHEMA_VERSION,
         min_confidence: opts.min_confidence.as_str().into(),
@@ -400,7 +507,7 @@ pub fn analyze_dead_code_with_store(
             ignored_by_pattern: ignored_count,
         },
         candidates,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -718,6 +825,29 @@ fn reason_unreached(node: &specslice_core::Node) -> String {
     }
 }
 
+/// A `DartMethod` whose qualified name is `Class.Class` (its trailing two
+/// segments are identical) is really a *constructor*: the vendored Dart
+/// grammar lowers a constructor that carries a body (or a `factory`) into a
+/// method-shaped node and mis-extracts the class name as the member name. In
+/// valid Dart a method can never share its class's simple name (that slot is
+/// the constructor), so this shape is an unambiguous constructor twin. The
+/// analyzer's precise `dart_ctor::` node carries the real construction edges,
+/// leaving this twin without inbound — so it must never be a *high*-confidence
+/// deletion candidate, mirroring the explicit `DartConstructor` demotion.
+fn is_dart_constructor_shaped_method(node: &specslice_core::Node) -> bool {
+    if node.kind != NodeKind::DartMethod {
+        return false;
+    }
+    let Some(qualified) = node.stable_key.as_deref() else {
+        return false;
+    };
+    let mut segments = qualified.rsplit('.');
+    match (segments.next(), segments.next()) {
+        (Some(leaf), Some(parent)) => !leaf.is_empty() && leaf == parent,
+        _ => false,
+    }
+}
+
 fn collect_mitigating_factors(node: &specslice_core::Node, public_set: &GlobSet) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(p) = node.path.as_deref() {
@@ -727,7 +857,7 @@ fn collect_mitigating_factors(node: &specslice_core::Node, public_set: &GlobSet)
             ));
         }
     }
-    if node.kind == NodeKind::DartConstructor {
+    if node.kind == NodeKind::DartConstructor || is_dart_constructor_shaped_method(node) {
         out.push(
             "构造器调用可能由类实例化、const 构造或框架创建触发，默认不作为 high 置信删除候选"
                 .into(),
@@ -885,6 +1015,212 @@ mod tests {
         }
     }
 
+    fn insert_node_kind(store: &mut Store, id: &str, kind: NodeKind, file: &str, name: &str) {
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(id.to_string()),
+                kind,
+                path: Some(file.into()),
+                name: Some(name.into()),
+                start_line: Some(1),
+                end_line: Some(9),
+                content_hash: None,
+                stable_key: None,
+                source_file: Some(file.into()),
+                source_hash: None,
+                indexer: Some("rust_treesitter".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+    }
+
+    fn insert_contains(store: &mut Store, from: &str, to: &str) {
+        store
+            .upsert_edge(&EdgeAssertion {
+                id: ArtifactId::new(format!("contains::{from}->{to}")),
+                from_id: ArtifactId::new(from.to_string()),
+                to_id: ArtifactId::new(to.to_string()),
+                kind: EdgeKind::Contains,
+                source: EdgeSource::LanguageAdapter,
+                certainty: EdgeCertainty::Fact,
+                status: EdgeStatus::Confirmed,
+                confidence: 1.0,
+                evidence_json: None,
+                source_file: None,
+                source_hash: None,
+                indexer: Some("rust_treesitter".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn module_containing_a_reachable_symbol_is_not_dead() {
+        let (mut store, _dir) = empty_store();
+        // entry → calls feature::do_work, which lives inside module `feature`.
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        let module_id = "rust::crates/x/src/feature.rs::feature";
+        insert_node_kind(
+            &mut store,
+            module_id,
+            NodeKind::RustModule,
+            "crates/x/src/feature.rs",
+            "feature",
+        );
+        let work_id = "rust::crates/x/src/feature.rs::feature::do_work";
+        insert_node_kind(
+            &mut store,
+            work_id,
+            NodeKind::RustFunction,
+            "crates/x/src/feature.rs",
+            "do_work",
+        );
+        insert_contains(&mut store, module_id, work_id);
+        insert_calls(&mut store, &main_id, work_id);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            // Entry points are *files*: seed the file that declares `main`.
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let _ = &main_id;
+
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&module_id),
+            "a module holding live code must not be dead, got {dead:?}"
+        );
+        assert!(
+            !dead.contains(&work_id),
+            "the reachable function must not be dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn module_level_reference_from_reachable_file_keeps_target_alive() {
+        // Mirrors the Python `FACTORS = [_amihud(20)]` registration pattern:
+        // a private helper is only ever named by a *module-level* statement,
+        // which the heuristic resolver anchors on the file node. The helper
+        // must stay alive once that file is proven reachable (it owns another
+        // symbol that an entrypoint calls), instead of being a false positive.
+        let (mut store, _dir) = empty_store();
+
+        // app.py (entrypoint file) declares `main`, which calls registry.register.
+        let main_id = "python::lib/app.py::main";
+        insert_node_kind(
+            &mut store,
+            main_id,
+            NodeKind::PythonFunction,
+            "lib/app.py",
+            "main",
+        );
+
+        // registry.py is NOT an entrypoint. It is only reachable transitively
+        // because `register` is called from `main`.
+        let registry_file = "file::lib/registry.py";
+        insert_node_kind(
+            &mut store,
+            registry_file,
+            NodeKind::File,
+            "lib/registry.py",
+            "registry.py",
+        );
+        let register_id = "python::lib/registry.py::register";
+        insert_node_kind(
+            &mut store,
+            register_id,
+            NodeKind::PythonFunction,
+            "lib/registry.py",
+            "register",
+        );
+        let amihud_id = "python::lib/registry.py::_amihud";
+        insert_node_kind(
+            &mut store,
+            amihud_id,
+            NodeKind::PythonFunction,
+            "lib/registry.py",
+            "_amihud",
+        );
+
+        // File owns both top-level functions.
+        insert_contains(&mut store, registry_file, register_id);
+        insert_contains(&mut store, registry_file, amihud_id);
+        // main → register makes the file (transitively) reachable.
+        insert_calls(&mut store, main_id, register_id);
+        // Module-level `_amihud(20)` registration: anchored on the file node.
+        insert_calls(&mut store, registry_file, amihud_id);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/app.py"]),
+        )
+        .unwrap();
+
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&amihud_id),
+            "a helper referenced only by a module-level statement on a reachable \
+             file must not be dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn reachable_count_counts_code_symbols_not_test_nodes() {
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+        let helper = insert_function(&mut store, "lib/util.dart", "helper");
+        insert_calls(&mut store, &main_id, &helper);
+        // A reachable TestCase node (auto-seeded as a production root) must not
+        // inflate the reachable *code-symbol* count past the total — otherwise
+        // the header reads `可达 > 总符号`, which is nonsensical.
+        insert_node_kind(
+            &mut store,
+            "test::test/util_test.dart::checks_helper",
+            NodeKind::TestCase,
+            "test/util_test.dart",
+            "checks_helper",
+        );
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.stats.total_code_symbols, 2,
+            "main + helper are the only counted code symbols"
+        );
+        assert!(
+            report.stats.reachable <= report.stats.total_code_symbols,
+            "reachable code symbols ({}) must never exceed total ({})",
+            report.stats.reachable,
+            report.stats.total_code_symbols,
+        );
+        assert_eq!(
+            report.stats.reachable, 2,
+            "main + helper are reachable; the seeded test-case node is not a code symbol"
+        );
+    }
+
     #[test]
     fn high_confidence_dead_when_private_unreferenced_unreached() {
         let (mut store, _dir) = empty_store();
@@ -999,6 +1335,175 @@ mod tests {
             "constructor demotion reason must be explicit: {:?}",
             candidate.reasons
         );
+    }
+
+    #[test]
+    fn constructor_shaped_dart_method_phantom_is_demoted_from_high() {
+        // The vendored Dart grammar lowers a constructor *with a body* (or a
+        // `factory`) into a method-shaped node whose qualified name is
+        // `Class.Class`. The analyzer's precise `dart_ctor::` node owns the
+        // real construction edges, so this twin has no inbound — but it is a
+        // constructor, never a deletable method, and must not be high.
+        let (mut store, _dir) = empty_store();
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        let phantom_id = "dart_method::lib/color.dart#_LabColor._LabColor";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(phantom_id.to_string()),
+                kind: NodeKind::DartMethod,
+                path: Some("lib/color.dart".into()),
+                name: Some("_LabColor".into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: Some("_LabColor._LabColor".into()),
+                source_file: Some("lib/color.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|c| c.id == phantom_id)
+            .expect("unreached constructor twin should still be surfaced");
+        assert_eq!(
+            candidate.confidence,
+            DeadCodeConfidence::Medium,
+            "constructor-shaped method must be demoted: {:?}",
+            candidate.reasons
+        );
+        assert!(
+            candidate.reasons.iter().any(|r| r.contains("构造器调用")),
+            "demotion reason must be explicit: {:?}",
+            candidate.reasons
+        );
+    }
+
+    #[test]
+    fn reachable_constructor_keeps_its_owning_class_alive() {
+        // l10n delegate shape: a private class is named *only* by a construction
+        // `delegate = _AppLocalizationsDelegate()`. The construction edge lands
+        // on the ctor node, so without ctor→class up-propagation the class node
+        // has no inbound and looks like high-confidence dead code.
+        let (mut store, _dir) = empty_store();
+        let main_id = insert_function(&mut store, "lib/main.dart", "main");
+
+        // The private delegate class + its const ctor.
+        let class_id = "dart_class::lib/l10n.dart#_Delegate";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(class_id.to_string()),
+                kind: NodeKind::DartClass,
+                path: Some("lib/l10n.dart".into()),
+                name: Some("_Delegate".into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: Some("_Delegate".into()),
+                source_file: Some("lib/l10n.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        let ctor_id = "dart_ctor::lib/l10n.dart#_Delegate.<default>";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(ctor_id.to_string()),
+                kind: NodeKind::DartConstructor,
+                path: Some("lib/l10n.dart".into()),
+                name: Some("<default>".into()),
+                start_line: Some(2),
+                end_line: Some(2),
+                content_hash: None,
+                stable_key: Some("_Delegate.<default>".into()),
+                source_file: Some("lib/l10n.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+        // Class contains its ctor; an entrypoint constructs the class.
+        insert_contains(&mut store, class_id, ctor_id);
+        insert_calls(&mut store, &main_id, ctor_id);
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !dead.contains(&class_id),
+            "a class kept alive only through its constructed ctor must not be \
+             dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_dart_method_is_not_treated_as_a_constructor() {
+        // Guard against over-demotion: a normal method whose name differs from
+        // its class must keep its high-confidence verdict.
+        let (mut store, _dir) = empty_store();
+        let _ = insert_function(&mut store, "lib/main.dart", "main");
+        // Private member name so the public-symbol demotion does not interfere;
+        // this isolates the constructor-shape guard.
+        let method_id = "dart_method::lib/color.dart#_LabColor._distance";
+        store
+            .upsert_node(&Node {
+                id: ArtifactId::new(method_id.to_string()),
+                kind: NodeKind::DartMethod,
+                path: Some("lib/color.dart".into()),
+                name: Some("_distance".into()),
+                start_line: Some(1),
+                end_line: Some(3),
+                content_hash: None,
+                stable_key: Some("_LabColor._distance".into()),
+                source_file: Some("lib/color.dart".into()),
+                source_hash: None,
+                indexer: Some("dart_analyzer".into()),
+                index_generation: None,
+                metadata_json: None,
+            })
+            .unwrap();
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec!["lib/main.dart"]),
+        )
+        .unwrap();
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|c| c.id == method_id)
+            .expect("unreached private method should be surfaced");
+        assert_eq!(candidate.confidence, DeadCodeConfidence::High);
     }
 
     #[test]
@@ -1613,5 +2118,52 @@ mod tests {
         assert!(json.contains("\"warnings\""));
         let back: DeadCodeReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.warnings, vec!["warn: synthetic".to_string()]);
+    }
+
+    /// Dogfood fix: a structural-only graph (no `Calls`/`References` edges,
+    /// e.g. a Rust repo without the precision tier) would silently flag almost
+    /// everything as dead. The report must warn that the result is candidate
+    /// only.
+    #[test]
+    fn warns_when_no_precision_edges_present() {
+        let (mut store, _dir) = empty_store();
+        let _entry = insert_function(&mut store, "lib/main.dart", "main");
+        let _other = insert_function(&mut store, "lib/util.dart", "_helper");
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        // Entry matches, so this is specifically the *precision* warning.
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["lib/main.dart"]))
+                .unwrap();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("精确层")),
+            "expected a precision-tier warning, got {:?}",
+            report.warnings
+        );
+    }
+
+    /// Dogfood fix: when no entry point matches the graph, reachability is
+    /// empty and every symbol looks dead. The report must say so instead of
+    /// emitting thousands of false positives.
+    #[test]
+    fn warns_when_no_entrypoints_match() {
+        let (mut store, _dir) = empty_store();
+        let _f = insert_function(&mut store, "lib/util.dart", "_helper");
+        let opts = DeadCodeOptions {
+            repo_root: ".".into(),
+            min_confidence: DeadCodeConfidence::Low,
+            include_tests: false,
+        };
+        let report =
+            analyze_dead_code_with_store(&store, opts, &config_with(vec!["does/not/exist.dart"]))
+                .unwrap();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("入口点")),
+            "expected a no-entrypoint warning, got {:?}",
+            report.warnings
+        );
     }
 }

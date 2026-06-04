@@ -8,24 +8,23 @@ use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
-use crate::go_indexer::{
-    index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
-};
-use crate::java_indexer::{
-    index_java, JavaIndexOptions, JavaIndexResult, JAVA_AST_INDEXER_NAME, JAVA_INDEXER_NAME,
-    JAVA_LSP_COMMAND_ENV,
-};
+use crate::go_indexer::{index_go, GoIndexOptions, GoIndexResult, GO_LSP_COMMAND_ENV};
+use crate::java_indexer::{index_java, JavaIndexOptions, JavaIndexResult, JAVA_LSP_COMMAND_ENV};
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 use crate::python_indexer::{
-    index_python, PythonIndexOptions, PythonIndexResult, PYTHON_AST_INDEXER_NAME,
-    PYTHON_INDEXER_NAME, PYTHON_LSP_COMMAND_ENV,
+    index_python, PythonIndexOptions, PythonIndexResult, PYTHON_LSP_COMMAND_ENV,
 };
+use crate::requirements_md_indexer::{
+    index_requirements_md, RequirementsMdIndexOptions, RequirementsMdIndexResult,
+    DEFAULT_REQUIREMENTS_DIR, REQUIREMENTS_MD_INDEXER_NAME,
+};
+use crate::rust_indexer::{index_rust, RustIndexOptions, RustIndexResult, RUST_INDEXER_NAME};
 use crate::swift_indexer::{
-    index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_INDEXER_NAME, SWIFT_LSP_COMMAND_ENV,
+    index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_LSP_COMMAND_ENV,
 };
+use crate::treesitter::{self, TsIndexOptions};
 use crate::typescript_indexer::{
-    index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_AST_INDEXER_NAME,
-    TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
+    index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_LSP_COMMAND_ENV,
 };
 
 #[derive(Debug, Clone)]
@@ -61,6 +60,10 @@ pub struct IndexResult {
     pub docs: Option<DocsIndexResult>,
     pub code: Option<crate::dart_indexer::DartIndexResult>,
     pub links: Option<LinksIndexResult>,
+    /// P23.9 — Markdown requirements (`.specslice/requirements/*.md`). `None`
+    /// when the links phase was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements_md: Option<RequirementsMdIndexResult>,
     /// P11 — when the Swift adapter is enabled in `.specslice.yaml`,
     /// this holds the stats from the LSP-driven indexer. `None` when
     /// the adapter is disabled.
@@ -81,6 +84,24 @@ pub struct IndexResult {
     /// adapter is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub java: Option<JavaIndexResult>,
+    /// P21 — Rust adapter (tree-sitter, in-process). `None` when the
+    /// adapter is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust: Option<RustIndexResult>,
+    /// P22 — unified tree-sitter breadth backend results, one entry per
+    /// language that produced output (in `treesitter.languages` order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub treesitter: Vec<TreeSitterLangResult>,
+}
+
+/// Per-language outcome of the unified tree-sitter pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TreeSitterLangResult {
+    pub language: String,
+    pub files: usize,
+    pub symbols: usize,
+    pub imports: usize,
+    pub resolver_used: String,
 }
 
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
@@ -108,32 +129,41 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     }
 
     if options.include_code {
+        // Always clear prior Dart rows so toggling Dart off (empty `code.paths`)
+        // purges stale structure instead of leaving orphans behind.
         store
             .clear_indexer_outputs(crate::dart_indexer::DART_INDEXER_NAME)
             .context("clearing previous dart index outputs")?;
         store
             .clear_indexer_outputs(crate::dart_indexer::RESOLVER_DART_ANALYZER)
             .context("clearing previous dart analyzer index outputs")?;
-        let code = crate::dart_indexer::index_dart(
-            &mut store,
-            &crate::dart_indexer::DartIndexOptions {
-                repo_root: options.repo_root.clone(),
-                code_roots: config.code.paths.iter().map(PathBuf::from).collect(),
-                exclude_globs: config.code.exclude.clone(),
-            },
-        )
-        .context("indexing Dart sources")?;
-        result.code = Some(code);
+        // The Dart structural pass only runs when a code root is configured. An
+        // empty `code.paths` is an *explicit exclusion* (Dart absent from the
+        // unified `languages:` list, or `code.paths: []`) and must scan nothing
+        // — never fall back to the whole repo. Legacy configs keep the default
+        // `[lib, test]` roots, so their behaviour is unchanged.
+        if !config.code.paths.is_empty() {
+            let code = crate::dart_indexer::index_dart(
+                &mut store,
+                &crate::dart_indexer::DartIndexOptions {
+                    repo_root: options.repo_root.clone(),
+                    code_roots: config.code.paths.iter().map(PathBuf::from).collect(),
+                    exclude_globs: config.code.exclude.clone(),
+                    disable_analyzer: !config.enrichment.analyzer,
+                },
+            )
+            .context("indexing Dart sources")?;
+            result.code = Some(code);
+        }
 
-        // P11 — opt-in Swift / Go adapters. Both are gated behind the
+        // P11/P23.5 — opt-in Swift / Go adapters. Both are gated behind the
         // `swift.enabled` / `go.enabled` keys so existing Dart-only
-        // workspaces keep their current behaviour. The adapters also
-        // honour `SPECSLICE_SWIFT_LSP_BIN` / `SPECSLICE_GO_LSP_BIN`
-        // env vars for ad-hoc binary overrides.
+        // workspaces keep their current behaviour. Structure comes from the
+        // tree-sitter driver; an optional LSP server overlays only
+        // `Calls` / `References`. The adapters clear their own prior
+        // `*_treesitter` + `*_lsp` rows and honour
+        // `SPECSLICE_SWIFT_LSP_BIN` / `SPECSLICE_GO_LSP_BIN` overrides.
         if config.swift.enabled {
-            store
-                .clear_indexer_outputs(SWIFT_INDEXER_NAME)
-                .context("clearing previous Swift LSP outputs")?;
             let swift_paths = config.swift.paths_or(&["Sources", "Tests"]);
             let swift_options = SwiftIndexOptions {
                 repo_root: options.repo_root.clone(),
@@ -148,10 +178,10 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             result.swift = Some(swift);
         }
 
+        // P11/P23.4 — Go adapter. The tree-sitter driver owns structure; an
+        // optional `gopls` server overlays only `Calls` / `References`.
+        // `index_go` clears its own prior `go_treesitter` + `go_lsp` rows.
         if config.go.enabled {
-            store
-                .clear_indexer_outputs(GO_INDEXER_NAME)
-                .context("clearing previous Go LSP outputs")?;
             let go_paths = config.go.paths_or(&["."]);
             let go_options = GoIndexOptions {
                 repo_root: options.repo_root.clone(),
@@ -165,16 +195,11 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             result.go = Some(go);
         }
 
-        // P16 — Python adapter (LSP first, AST always). Both
-        // contributors share a `clear_indexer_outputs` reset so we do
-        // not leave stale rows from a previous resolver.
+        // P16/P23.1 — Python adapter. The in-process tree-sitter driver
+        // owns the structural graph; an optional LSP server overlays only
+        // `Calls` / `References`. `index_python` clears its own prior
+        // `python_treesitter` + `python_lsp` rows, so no pre-clear here.
         if config.python.enabled {
-            store
-                .clear_indexer_outputs(PYTHON_INDEXER_NAME)
-                .context("clearing previous Python LSP outputs")?;
-            store
-                .clear_indexer_outputs(PYTHON_AST_INDEXER_NAME)
-                .context("clearing previous Python AST outputs")?;
             let python_paths = config.python.paths_or(&["."]);
             let python_options = PythonIndexOptions {
                 repo_root: options.repo_root.clone(),
@@ -190,14 +215,11 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             result.python = Some(python);
         }
 
-        // P20 — TypeScript adapter (LSP first, AST always).
+        // P20/P23.2 — TypeScript adapter. The tree-sitter driver (`.ts` +
+        // `.tsx`) owns structure; an optional LSP server overlays only
+        // `Calls` / `References`. `index_typescript` clears its own prior
+        // `typescript_treesitter` + `typescript_lsp` rows.
         if config.typescript.enabled {
-            store
-                .clear_indexer_outputs(TYPESCRIPT_INDEXER_NAME)
-                .context("clearing previous TypeScript LSP outputs")?;
-            store
-                .clear_indexer_outputs(TYPESCRIPT_AST_INDEXER_NAME)
-                .context("clearing previous TypeScript AST outputs")?;
             let ts_paths = config.typescript.paths_or(&["src", "tests", "test"]);
             let ts_options = TypescriptIndexOptions {
                 repo_root: options.repo_root.clone(),
@@ -212,14 +234,11 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             result.typescript = Some(ts);
         }
 
-        // P20 — Java adapter (LSP first, AST always).
+        // P20/P23.3 — Java adapter. The tree-sitter driver owns structure;
+        // an optional `jdtls` server overlays only `Calls` / `References`.
+        // `index_java` clears its own prior `java_treesitter` + `java_lsp`
+        // rows.
         if config.java.enabled {
-            store
-                .clear_indexer_outputs(JAVA_INDEXER_NAME)
-                .context("clearing previous Java LSP outputs")?;
-            store
-                .clear_indexer_outputs(JAVA_AST_INDEXER_NAME)
-                .context("clearing previous Java AST outputs")?;
             let java_paths = config.java.paths_or(&["src"]);
             let java_options = JavaIndexOptions {
                 repo_root: options.repo_root.clone(),
@@ -231,6 +250,86 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             };
             let java = index_java(&mut store, &java_options).context("indexing Java sources")?;
             result.java = Some(java);
+        }
+
+        // P21 — Rust adapter. No LSP tier: the tree-sitter grammar is
+        // linked in, so this is always deterministic and fast. Gated by
+        // `rust.enabled` to keep non-Rust workspaces untouched.
+        if config.rust.enabled {
+            store
+                .clear_indexer_outputs(RUST_INDEXER_NAME)
+                .context("clearing previous Rust tree-sitter outputs")?;
+            let rust_paths = config.rust.paths_or(&["crates", "src"]);
+            let rust_options = RustIndexOptions {
+                repo_root: options.repo_root.clone(),
+                code_roots: rust_paths.iter().map(PathBuf::from).collect(),
+                exclude_globs: config.rust.exclude.clone(),
+            };
+            let rust = index_rust(&mut store, &rust_options).context("indexing Rust sources")?;
+            result.rust = Some(rust);
+        }
+
+        // P22 — unified tree-sitter breadth backend. One pass drives the
+        // in-process generic driver for every configured language. Rust
+        // is skipped here when the legacy `rust:` switch already ran it,
+        // so the two paths never double-index.
+        if config.treesitter.enabled {
+            let roots: Vec<PathBuf> = config
+                .treesitter
+                .roots()
+                .iter()
+                .map(PathBuf::from)
+                .collect();
+            let mut seen: std::collections::BTreeSet<&'static str> =
+                std::collections::BTreeSet::new();
+            for lang in &config.treesitter.languages {
+                let Some(spec) = treesitter::spec_for_language(lang) else {
+                    continue; // unknown language id: skip, never abort.
+                };
+                if !seen.insert(spec.language_id) {
+                    continue; // duplicate entry / alias.
+                }
+                if spec.language_id == "rust" && config.rust.enabled {
+                    continue; // legacy rust switch owns Rust this run.
+                }
+                if spec.language_id == "python" && config.python.enabled {
+                    continue; // Python adapter (tree-sitter + optional LSP) owns Python.
+                }
+                if spec.language_id == "typescript" && config.typescript.enabled {
+                    continue; // TypeScript adapter (tree-sitter + optional LSP) owns TS/TSX.
+                }
+                if spec.language_id == "java" && config.java.enabled {
+                    continue; // Java adapter (tree-sitter + optional LSP) owns Java.
+                }
+                if spec.language_id == "go" && config.go.enabled {
+                    continue; // Go adapter (tree-sitter + optional LSP) owns Go.
+                }
+                if spec.language_id == "swift" && config.swift.enabled {
+                    continue; // Swift adapter (tree-sitter + optional LSP) owns Swift.
+                }
+                let name = treesitter::indexer_name(spec);
+                store
+                    .clear_indexer_outputs(&name)
+                    .with_context(|| format!("clearing previous {name} outputs"))?;
+                let ts = treesitter::index_repo_with_spec(
+                    &mut store,
+                    spec,
+                    &TsIndexOptions {
+                        repo_root: options.repo_root.clone(),
+                        code_roots: roots.clone(),
+                        exclude_globs: config.treesitter.exclude.clone(),
+                        resolution_paths: Vec::new(),
+                    },
+                )
+                .with_context(|| format!("indexing {} sources", spec.language_id))?;
+                result.treesitter.push(TreeSitterLangResult {
+                    language: spec.language_id.to_string(),
+                    files: ts.files,
+                    symbols: ts.symbols,
+                    imports: ts.imports,
+                    resolver_used: ts.resolver_used,
+                });
+            }
         }
     }
 
@@ -247,6 +346,23 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing external links manifest")?;
         result.links = Some(links);
+
+        // P23.9 — Markdown requirements. Runs after the manifest so both
+        // sources contribute requirement→artifact edges into the same graph;
+        // `links.yaml` stays supported but `.specslice/requirements/*.md` is
+        // the recommended, human-friendly format.
+        store
+            .clear_indexer_outputs(REQUIREMENTS_MD_INDEXER_NAME)
+            .context("clearing previous requirements markdown outputs")?;
+        let requirements_md = index_requirements_md(
+            &mut store,
+            &RequirementsMdIndexOptions {
+                repo_root: options.repo_root.clone(),
+                requirements_dir: PathBuf::from(DEFAULT_REQUIREMENTS_DIR),
+            },
+        )
+        .context("indexing markdown requirements")?;
+        result.requirements_md = Some(requirements_md);
     }
 
     Ok(result)
@@ -264,7 +380,9 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
         .with_context(|| format!("reading config {}", path.display()))?;
     let cfg: EngineConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
-    Ok(cfg)
+    // P23.7 — fold the unified `languages:` selector onto the legacy
+    // per-language switches so the index pass below has a single source.
+    Ok(cfg.normalized())
 }
 
 fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {

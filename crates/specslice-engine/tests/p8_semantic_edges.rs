@@ -131,6 +131,7 @@ fn analyze_pixcraft_with_sidecar() -> Option<specslice_engine::graph::GraphViewM
             repo_root: tmp.path().into(),
             code_roots: vec!["lib".into(), "test".into()],
             exclude_globs: vec![],
+            disable_analyzer: false,
         },
     )
     .unwrap();

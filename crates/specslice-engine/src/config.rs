@@ -62,6 +62,243 @@ pub struct EngineConfig {
     /// of LSP state.
     #[serde(default)]
     pub java: LanguageAdapterConfig,
+    /// P21 — Rust adapter, the first **tree-sitter breadth backend**.
+    /// Has no LSP tier: the grammar is linked into the engine so the
+    /// adapter is always available, deterministic, and fast. The shared
+    /// `lsp_command` field is ignored. Enabled by default for `.rs`
+    /// workspaces is *not* assumed; operators flip `rust.enabled: true`.
+    #[serde(default)]
+    pub rust: LanguageAdapterConfig,
+    /// P22 — the unified **tree-sitter breadth backend**. One switch that
+    /// runs the in-process generic driver for any supported language
+    /// (`rust`, `typescript`, `python`, `go`, `c`, `cpp`). Deliberately
+    /// separate from the per-language LSP sections (`go` / `typescript` /
+    /// `python`): those drive the Tier 3 precision adapters, while this is
+    /// the always-available, zero-config Tier 2 structural layer. Rust is
+    /// also reachable via the legacy `rust:` switch; when both name Rust
+    /// the legacy one wins so we never double-index.
+    #[serde(default)]
+    pub treesitter: TreeSitterConfig,
+    /// P23.7 — **unified language selection** (canonical). Lists the
+    /// languages to index, each with its own `paths` / `exclude` /
+    /// `lsp_command`. This replaces the per-language switches (`code` for
+    /// Dart, `swift`/`go`/`python`/`typescript`/`java`/`rust`, and
+    /// `treesitter.languages`), which remain supported as **deprecated
+    /// aliases** and are used only when `languages` is empty. See
+    /// [`EngineConfig::normalized`].
+    #[serde(default)]
+    pub languages: Vec<LanguageSelection>,
+    /// P23.7 — how the structural graph is *enriched*. Applies only when
+    /// `languages` is set. `lsp` (default `true`) routes LSP-capable
+    /// languages through their Tier-3 adapter (tree-sitter structure +
+    /// optional `Calls`/`References` overlay); when `false` they index via
+    /// the structure-only generic driver. `analyzer` (default `true`)
+    /// controls the Dart analyzer overlay.
+    #[serde(default)]
+    pub enrichment: EnrichmentConfig,
+}
+
+/// One entry in the unified [`EngineConfig::languages`] list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LanguageSelection {
+    /// Canonical language id (`dart`, `rust`, `typescript`, `python`,
+    /// `go`, `java`, `swift`, `c`, `cpp`); common aliases (`ts`, `py`,
+    /// `rs`, `c++`) are accepted.
+    pub id: String,
+    /// Roots under `repo.root` to scan for this language. Empty falls back
+    /// to the language's conventional default.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Glob excludes for this language.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Optional LSP binary override (LSP-capable languages only).
+    #[serde(default)]
+    pub lsp_command: Option<String>,
+}
+
+/// See [`EngineConfig::enrichment`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrichmentConfig {
+    #[serde(default = "default_true")]
+    pub lsp: bool,
+    #[serde(default = "default_true")]
+    pub analyzer: bool,
+}
+
+impl Default for EnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            lsp: true,
+            analyzer: true,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Fold the canonical [`EngineConfig::languages`] list down onto the
+    /// legacy per-language switches so the single index pass has exactly one
+    /// authoritative source. A no-op when `languages` is empty (pure legacy
+    /// config). Idempotent.
+    ///
+    /// Routing per entry:
+    /// - `dart` → `code` (Dart is always the analyzer/tree-sitter path).
+    /// - `rust` → `rust` (no LSP tier; always tree-sitter).
+    /// - `swift`/`go`/`python`/`typescript`/`java` → their Tier-3 adapter
+    ///   when `enrichment.lsp`, else the structure-only generic driver.
+    /// - `c`/`cpp` (and any lsp-disabled language) → the generic
+    ///   `treesitter` driver.
+    pub fn normalized(mut self) -> Self {
+        if self.languages.is_empty() {
+            return self;
+        }
+        let lsp = self.enrichment.lsp;
+        let selections = std::mem::take(&mut self.languages);
+
+        // `languages` is *authoritative*: clear every structural switch first
+        // (legacy per-language keys are deprecated aliases honoured only when
+        // `languages` is absent), then re-enable exactly what was selected so
+        // an unlisted language — Dart included — is excluded from the run.
+        let dart_default_paths = if self.code.paths.is_empty() {
+            vec!["lib".to_string(), "test".to_string()]
+        } else {
+            self.code.paths.clone()
+        };
+        self.rust.enabled = false;
+        self.swift.enabled = false;
+        self.go.enabled = false;
+        self.python.enabled = false;
+        self.typescript.enabled = false;
+        self.java.enabled = false;
+        self.treesitter.enabled = false;
+        self.treesitter.languages.clear();
+
+        let mut dart_selected = false;
+        let mut ts_langs: Vec<String> = Vec::new();
+        let mut ts_paths: Vec<String> = Vec::new();
+        let mut ts_exclude: Vec<String> = Vec::new();
+
+        let mut into_generic = |sel: &LanguageSelection, canon: &str| {
+            if !ts_langs.iter().any(|l| l == canon) {
+                ts_langs.push(canon.to_string());
+            }
+            for p in &sel.paths {
+                if !ts_paths.contains(p) {
+                    ts_paths.push(p.clone());
+                }
+            }
+            for e in &sel.exclude {
+                if !ts_exclude.contains(e) {
+                    ts_exclude.push(e.clone());
+                }
+            }
+        };
+
+        for sel in &selections {
+            let Some(canon) = canonical_language_id(&sel.id) else {
+                continue; // unknown id: skip, never abort.
+            };
+            match canon {
+                "dart" => {
+                    dart_selected = true;
+                    self.code.paths = if sel.paths.is_empty() {
+                        dart_default_paths.clone()
+                    } else {
+                        sel.paths.clone()
+                    };
+                    if !sel.exclude.is_empty() {
+                        self.code.exclude = sel.exclude.clone();
+                    }
+                    self.code.language = "dart".into();
+                }
+                "rust" => self.rust = adapter_from(sel),
+                "swift" if lsp => self.swift = adapter_from(sel),
+                "go" if lsp => self.go = adapter_from(sel),
+                "python" if lsp => self.python = adapter_from(sel),
+                "typescript" if lsp => self.typescript = adapter_from(sel),
+                "java" if lsp => self.java = adapter_from(sel),
+                // c / cpp always, and any lsp-capable language when
+                // `enrichment.lsp == false`: structure-only generic driver.
+                other => into_generic(sel, other),
+            }
+        }
+
+        if !dart_selected {
+            // Dart was not listed: an empty code root scans nothing.
+            self.code.paths = Vec::new();
+        }
+        if !ts_langs.is_empty() {
+            self.treesitter.enabled = true;
+            self.treesitter.languages = ts_langs;
+            if !ts_paths.is_empty() {
+                self.treesitter.paths = ts_paths;
+            }
+            self.treesitter.exclude = ts_exclude;
+        }
+        self
+    }
+}
+
+/// Build a [`LanguageAdapterConfig`] (enabled) from a unified selection.
+fn adapter_from(sel: &LanguageSelection) -> LanguageAdapterConfig {
+    LanguageAdapterConfig {
+        enabled: true,
+        paths: sel.paths.clone(),
+        exclude: sel.exclude.clone(),
+        lsp_command: sel.lsp_command.clone(),
+    }
+}
+
+/// Resolve a (possibly aliased) language id to its canonical spec id, or
+/// `None` if unrecognised. Single source of truth for the accepted aliases,
+/// shared by the unified config and the tree-sitter registry.
+pub fn canonical_language_id(id: &str) -> Option<&'static str> {
+    match id.trim().to_ascii_lowercase().as_str() {
+        "dart" => Some("dart"),
+        "rust" | "rs" => Some("rust"),
+        // JavaScript is parsed by the JSX-aware TypeScript grammar, so it
+        // routes through the same `typescript` adapter (which indexes
+        // `.js` / `.jsx` / `.mjs` / `.cjs` alongside `.ts` / `.tsx`).
+        "typescript" | "ts" | "javascript" | "js" => Some("typescript"),
+        "python" | "py" => Some("python"),
+        "go" | "golang" => Some("go"),
+        "java" => Some("java"),
+        "swift" => Some("swift"),
+        "c" => Some("c"),
+        "cpp" | "c++" | "cxx" => Some("cpp"),
+        _ => None,
+    }
+}
+
+/// Config for the unified tree-sitter breadth backend. See
+/// [`EngineConfig::treesitter`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TreeSitterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Languages to index. Recognised ids: `rust`, `typescript`,
+    /// `python`, `go`, `c`, `cpp` (a few aliases like `ts`/`py`/`c++`
+    /// are accepted). Unknown entries are skipped.
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// Roots under `repo.root` to scan, shared across the listed
+    /// languages. Empty means the repo root.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Glob excludes applied to every language in this section.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl TreeSitterConfig {
+    /// Scan roots, falling back to the repo root when none are set.
+    pub fn roots(&self) -> Vec<String> {
+        if self.paths.is_empty() {
+            vec![".".to_string()]
+        } else {
+            self.paths.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

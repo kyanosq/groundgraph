@@ -176,20 +176,11 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
             return;
         }
     };
-    if result.resolver_used != "swift_lsp" {
-        eprintln!(
-            "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
-            module_path!(),
-            result.resolver_used,
-            result.sidecar_skip_reason
-        );
-        return;
-    }
-    assert!(
-        result.sidecar_skip_reason.is_empty()
-            || result.sidecar_skip_reason.starts_with("LSP shutdown 警告"),
-        "unexpected skip reason: {}",
-        result.sidecar_skip_reason
+    // Structure always comes from the tree-sitter driver now; sourcekit-lsp
+    // only overlays Calls/References on top of those same ids.
+    assert_eq!(
+        result.resolver_used, "swift_treesitter",
+        "structure is owned by the tree-sitter driver: {result:?}"
     );
     assert!(
         result.files >= 2,
@@ -315,10 +306,11 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
 }
 
 #[test]
-fn python_indexer_ast_pass_runs_against_python_hello_fixture_without_lsp() {
-    // The AST fallback must work without any toolchain installed. We
-    // point `lsp_command` at a bogus binary and disable venv discovery
-    // so this test is fully deterministic in sandboxed CI.
+fn python_indexer_treesitter_pass_runs_against_python_hello_fixture_without_lsp() {
+    // The in-process tree-sitter driver must produce the full structural
+    // graph without any toolchain installed. We point `lsp_command` at a
+    // bogus binary and disable venv discovery so the optional LSP overlay
+    // is skipped and the test is fully deterministic in sandboxed CI.
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/python_hello");
     copy_dir(&fixture, tmp.path());
@@ -331,7 +323,7 @@ fn python_indexer_ast_pass_runs_against_python_hello_fixture_without_lsp() {
         disable_venv_discovery: true,
     };
     let result = index_python(&mut store, &opts).expect("python indexer ran");
-    assert_eq!(result.resolver_used, "python_ast");
+    assert_eq!(result.resolver_used, "python_treesitter");
     assert!(
         result.files >= 4,
         "expected >=4 python files in fixture, got {}",
@@ -524,20 +516,11 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
             return;
         }
     };
-    if result.resolver_used != "go_lsp" {
-        eprintln!(
-            "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
-            module_path!(),
-            result.resolver_used,
-            result.sidecar_skip_reason
-        );
-        return;
-    }
-    assert!(
-        result.sidecar_skip_reason.is_empty()
-            || result.sidecar_skip_reason.starts_with("LSP shutdown 警告"),
-        "unexpected skip reason: {}",
-        result.sidecar_skip_reason
+    // Structure always comes from the tree-sitter driver now; gopls only
+    // overlays Calls/References on top of those same ids.
+    assert_eq!(
+        result.resolver_used, "go_treesitter",
+        "structure is owned by the tree-sitter driver: {result:?}"
     );
     assert!(
         result.files >= 2,
@@ -606,7 +589,7 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn typescript_indexer_skips_when_tsserver_unavailable_but_still_runs_ast() {
+fn typescript_indexer_uses_treesitter_structure_when_tsserver_unavailable() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/typescript_hello");
     copy_dir(&fixture, tmp.path());
@@ -619,7 +602,8 @@ fn typescript_indexer_skips_when_tsserver_unavailable_but_still_runs_ast() {
         lsp_command: Some("specslice_nonexistent_tsserver_xyz".into()),
     };
     let result = index_typescript(&mut store, &opts).expect("ts indexer ran");
-    // AST pass must still fire.
+    // The tree-sitter driver is the sole structural backend now; it must
+    // fully populate the graph without any LSP.
     assert!(
         result.files >= 3,
         "expected >=3 .ts files (src/index, src/greeter, src/utils + tests), got {}",
@@ -627,7 +611,7 @@ fn typescript_indexer_skips_when_tsserver_unavailable_but_still_runs_ast() {
     );
     assert!(
         result.symbols >= 2,
-        "expected at least the TypescriptModule + class/function symbols, got {}",
+        "expected at least the class/function/method symbols, got {}",
         result.symbols
     );
     assert!(
@@ -635,9 +619,9 @@ fn typescript_indexer_skips_when_tsserver_unavailable_but_still_runs_ast() {
         "vitest `describe`/`it` cases should be recovered (got {})",
         result.tests
     );
-    assert!(
-        result.resolver_used == "typescript_ast" || result.resolver_used.is_empty(),
-        "expected AST fallback, got `{}`",
+    assert_eq!(
+        result.resolver_used, "typescript_treesitter",
+        "structure now comes from the tree-sitter driver, got `{}`",
         result.resolver_used
     );
     assert!(
@@ -647,11 +631,7 @@ fn typescript_indexer_skips_when_tsserver_unavailable_but_still_runs_ast() {
 
     let nodes = store.list_all_nodes().unwrap();
     let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in [
-        "typescript_module",
-        "typescript_class",
-        "typescript_function",
-    ] {
+    for required in ["typescript_class", "typescript_function"] {
         assert!(
             kinds.contains(required),
             "expected `{required}` in {:?}",
@@ -760,7 +740,7 @@ fn typescript_indexer_emits_class_function_method_nodes_when_lsp_present() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn java_indexer_skips_when_jdtls_unavailable_but_still_runs_ast() {
+fn java_indexer_uses_treesitter_structure_when_jdtls_unavailable() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/java_hello");
     copy_dir(&fixture, tmp.path());
@@ -780,7 +760,7 @@ fn java_indexer_skips_when_jdtls_unavailable_but_still_runs_ast() {
     );
     assert!(
         result.symbols >= 3,
-        "expected JavaPackage + JavaClass + members, got {}",
+        "expected JavaClass + members, got {}",
         result.symbols
     );
     assert!(
@@ -788,15 +768,15 @@ fn java_indexer_skips_when_jdtls_unavailable_but_still_runs_ast() {
         "JUnit @Test methods should be recovered (got {})",
         result.tests
     );
-    assert!(
-        result.resolver_used == "java_ast" || result.resolver_used.is_empty(),
-        "expected AST fallback, got `{}`",
+    assert_eq!(
+        result.resolver_used, "java_treesitter",
+        "structure now comes from the tree-sitter driver, got `{}`",
         result.resolver_used
     );
 
     let nodes = store.list_all_nodes().unwrap();
     let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in ["java_package", "java_class", "java_method"] {
+    for required in ["java_class", "java_method"] {
         assert!(
             kinds.contains(required),
             "expected `{required}` in {:?}",
@@ -810,19 +790,11 @@ fn java_indexer_skips_when_jdtls_unavailable_but_still_runs_ast() {
         "Greeter class missing; saw {:?}",
         debug_kinds(&nodes)
     );
-    assert!(
-        nodes
-            .iter()
-            .any(|n| n.kind.as_str() == "java_package"
-                && n.name.as_deref() == Some("com.example.hello")),
-        "com.example.hello package missing; saw {:?}",
-        debug_kinds(&nodes)
-    );
 }
 
 #[test]
 #[ignore = "requires jdtls installed; run with --include-ignored"]
-fn java_indexer_emits_class_method_nodes_when_lsp_present() {
+fn java_indexer_overlays_lsp_references_when_jdtls_present() {
     let lsp_override = std::env::var(JAVA_LSP_COMMAND_ENV).ok();
     let probe = JavaIndexOptions {
         repo_root: workspace_root(),
@@ -859,15 +831,12 @@ fn java_indexer_emits_class_method_nodes_when_lsp_present() {
             return;
         }
     };
-    if result.resolver_used != "java_lsp" {
-        eprintln!(
-            "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
-            module_path!(),
-            result.resolver_used,
-            result.sidecar_skip_reason
-        );
-        return;
-    }
+    // Structure always comes from the tree-sitter driver now; the LSP only
+    // overlays Calls/References on top of those same ids.
+    assert_eq!(
+        result.resolver_used, "java_treesitter",
+        "structure is owned by the tree-sitter driver: {result:?}"
+    );
     assert!(result.symbols >= 3, "got {}", result.symbols);
 
     let nodes = store.list_all_nodes().unwrap();

@@ -129,57 +129,57 @@ pub(crate) fn parse_node_kinds(values: &Value) -> Result<Vec<NodeKind>> {
 
 pub(crate) fn parse_node_kind(raw: &str) -> Result<NodeKind> {
     let lower = raw.to_ascii_lowercase();
+    // Canonical snake_case names resolve via the single source of truth in
+    // `specslice-core` (`dart_class`, `typescript_interface`, `cpp_method`,
+    // …) — no need to re-list all ~58 here. Below we only keep the *extra*
+    // short / legacy aliases the canonical scheme does not cover.
+    if let Some(kind) = NodeKind::from_str(&lower) {
+        return Ok(kind);
+    }
     Ok(match lower.as_str() {
-        "file" => NodeKind::File,
-        "doc" | "doc_section" => NodeKind::DocSection,
-        "class" | "dart_class" => NodeKind::DartClass,
-        "method" | "dart_method" => NodeKind::DartMethod,
-        "function" | "dart_function" => NodeKind::DartFunction,
-        "constructor" | "dart_constructor" => NodeKind::DartConstructor,
-        "test" | "test_case" => NodeKind::TestCase,
-        "group" | "test_group" => NodeKind::TestGroup,
-        "provider" | "dart_provider" => NodeKind::DartProvider,
-        "route" => NodeKind::Route,
-        "storage" => NodeKind::Storage,
-        "candidate" | "business_candidate" => NodeKind::BusinessCandidate,
-        "requirement" => NodeKind::Requirement,
-        // P11 — Swift / Go kinds (full names + short aliases). Short
-        // aliases let agents say `swift_method` *or* `swift.method`;
-        // the bare `class` / `method` aliases above remain bound to
-        // Dart for backward compatibility with existing skills.
-        "swift_class" => NodeKind::SwiftClass,
-        "swift_struct" => NodeKind::SwiftStruct,
-        "swift_enum" => NodeKind::SwiftEnum,
-        "swift_protocol" => NodeKind::SwiftProtocol,
-        "swift_method" => NodeKind::SwiftMethod,
-        "swift_function" => NodeKind::SwiftFunction,
-        "swift_initializer" | "swift_init" => NodeKind::SwiftInitializer,
-        "go_struct" | "gostruct" => NodeKind::GoStruct,
-        "go_interface" | "gointerface" => NodeKind::GoInterface,
-        "go_method" => NodeKind::GoMethod,
-        "go_function" | "gofunc" => NodeKind::GoFunction,
-        // P16 — Python kinds. Modules surface here too so agents can
-        // search `kinds: ["python_module"]` for higher-level filtering.
-        "python_module" | "py_module" => NodeKind::PythonModule,
-        "python_class" | "py_class" => NodeKind::PythonClass,
-        "python_function" | "py_function" | "pyfunc" => NodeKind::PythonFunction,
-        "python_method" | "py_method" => NodeKind::PythonMethod,
-        // P20 — TypeScript / Java kinds. We accept the canonical name
-        // plus a single short alias each (matching the Dart/Swift/Go/Python
-        // convention) so MCP filters work with whatever the agent already
-        // knows.
-        "typescript_module" | "ts_module" => NodeKind::TypescriptModule,
-        "typescript_class" | "ts_class" => NodeKind::TypescriptClass,
-        "typescript_interface" | "ts_interface" => NodeKind::TypescriptInterface,
-        "typescript_enum" | "ts_enum" => NodeKind::TypescriptEnum,
-        "typescript_function" | "ts_function" | "tsfunc" => NodeKind::TypescriptFunction,
-        "typescript_method" | "ts_method" => NodeKind::TypescriptMethod,
-        "java_package" => NodeKind::JavaPackage,
-        "java_class" => NodeKind::JavaClass,
-        "java_interface" => NodeKind::JavaInterface,
-        "java_enum" => NodeKind::JavaEnum,
-        "java_method" => NodeKind::JavaMethod,
-        "java_constructor" | "java_init" => NodeKind::JavaConstructor,
+        // Bare aliases bound to Dart for backward compatibility with
+        // existing skills (`class`/`method` mean Dart unless prefixed).
+        "doc" => NodeKind::DocSection,
+        "class" => NodeKind::DartClass,
+        "method" => NodeKind::DartMethod,
+        "function" => NodeKind::DartFunction,
+        "constructor" => NodeKind::DartConstructor,
+        "test" => NodeKind::TestCase,
+        "group" => NodeKind::TestGroup,
+        "provider" => NodeKind::DartProvider,
+        "candidate" => NodeKind::BusinessCandidate,
+        // Swift / Go short aliases.
+        "swift_init" => NodeKind::SwiftInitializer,
+        "gostruct" => NodeKind::GoStruct,
+        "gointerface" => NodeKind::GoInterface,
+        "gofunc" => NodeKind::GoFunction,
+        // Python `py_` aliases.
+        "py_module" => NodeKind::PythonModule,
+        "py_class" => NodeKind::PythonClass,
+        "py_function" | "pyfunc" => NodeKind::PythonFunction,
+        "py_method" => NodeKind::PythonMethod,
+        // TypeScript `ts_` aliases.
+        "ts_module" => NodeKind::TypescriptModule,
+        "ts_class" => NodeKind::TypescriptClass,
+        "ts_interface" => NodeKind::TypescriptInterface,
+        "ts_enum" => NodeKind::TypescriptEnum,
+        "ts_function" | "tsfunc" => NodeKind::TypescriptFunction,
+        "ts_method" => NodeKind::TypescriptMethod,
+        // Java / Rust / C / C++ short + `cxx_` aliases.
+        "java_init" => NodeKind::JavaConstructor,
+        "rs_module" | "rs_mod" => NodeKind::RustModule,
+        "rs_struct" => NodeKind::RustStruct,
+        "rs_enum" => NodeKind::RustEnum,
+        "rs_trait" => NodeKind::RustTrait,
+        "rs_function" | "rs_fn" => NodeKind::RustFunction,
+        "rs_method" => NodeKind::RustMethod,
+        "cfn" => NodeKind::CFunction,
+        "cxx_namespace" | "cpp_ns" => NodeKind::CppNamespace,
+        "cxx_class" => NodeKind::CppClass,
+        "cxx_struct" => NodeKind::CppStruct,
+        "cxx_enum" => NodeKind::CppEnum,
+        "cxx_function" | "cpp_fn" => NodeKind::CppFunction,
+        "cxx_method" => NodeKind::CppMethod,
         other => bail!(
             "unknown node kind `{other}`. valid: {}",
             default_search_kinds()

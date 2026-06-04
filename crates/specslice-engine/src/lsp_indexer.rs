@@ -326,15 +326,62 @@ fn flatten_error_message(err: &anyhow::Error) -> String {
     out
 }
 
+/// Maximum number of detailed partial-warning segments kept in
+/// `skip_reason`. A flapping LSP (e.g. sourcekit-lsp timing out on
+/// every symbol of a large Swift repo) used to push one per-symbol
+/// failure each into `skip_reason`, joined by `；`, with no cap —
+/// ballooning the field to hundreds of KB and flooding stdout / the
+/// MCP payload. We keep the first few details and fold the rest into a
+/// running count.
+const MAX_PARTIAL_WARNING_DETAILS: usize = 8;
+const PARTIAL_WARNING_FOLD_PREFIX: &str = "…（另有 ";
+const PARTIAL_WARNING_FOLD_SUFFIX: &str = " 条 LSP 警告已折叠）";
+
 /// Append a partial-run warning into `stats.skip_reason`, joining
-/// existing entries with `；` so the CLI can print them on one line.
+/// existing entries with `；`. Detail is capped at
+/// [`MAX_PARTIAL_WARNING_DETAILS`]; further warnings only bump a
+/// trailing "(folded N more)" counter so a flapping LSP cannot balloon
+/// the field into a multi-hundred-KB single line.
 fn push_partial_warning(stats: &mut LspIndexStats, msg: &str) {
+    // Already folding: just bump the trailing counter and return. This
+    // keeps the field at a fixed size no matter how many failures flap.
+    if let Some((head, count)) = take_fold_count(&stats.skip_reason) {
+        stats.skip_reason = format!(
+            "{head}；{PARTIAL_WARNING_FOLD_PREFIX}{}{PARTIAL_WARNING_FOLD_SUFFIX}",
+            count + 1
+        );
+        return;
+    }
     if stats.skip_reason.is_empty() {
         stats.skip_reason = msg.to_string();
-    } else {
+        return;
+    }
+    if stats.skip_reason.split('；').count() < MAX_PARTIAL_WARNING_DETAILS {
         stats.skip_reason.push('；');
         stats.skip_reason.push_str(msg);
+    } else {
+        // Cap reached: start folding with this overflow message as #1.
+        stats.skip_reason = format!(
+            "{}；{PARTIAL_WARNING_FOLD_PREFIX}1{PARTIAL_WARNING_FOLD_SUFFIX}",
+            stats.skip_reason
+        );
     }
+}
+
+/// If `s` ends with a fold marker (`…（另有 N 条 LSP 警告已折叠）`),
+/// return the head (without the trailing `；` + marker) and the folded
+/// count `N`. Returns `None` when no marker is present.
+fn take_fold_count(s: &str) -> Option<(&str, usize)> {
+    let marker_start = s.rfind(PARTIAL_WARNING_FOLD_PREFIX)?;
+    let after_prefix = &s[marker_start + PARTIAL_WARNING_FOLD_PREFIX.len()..];
+    let count: usize = after_prefix
+        .strip_suffix(PARTIAL_WARNING_FOLD_SUFFIX)?
+        .parse()
+        .ok()?;
+    let head = s[..marker_start]
+        .strip_suffix('；')
+        .unwrap_or(&s[..marker_start]);
+    Some((head, count))
 }
 
 /// Index built once per `run_profile` invocation that turns an LSP
@@ -1157,6 +1204,38 @@ mod tests {
         assert!(
             !binary_on_path("specslice_nonexistent_tool_12345"),
             "made-up binary should not resolve"
+        );
+    }
+
+    /// Regression: a flapping LSP (e.g. sourcekit-lsp timing out on
+    /// every symbol of a large Swift repo) used to push one per-symbol
+    /// failure each into `skip_reason`, joined by `；`, with no cap —
+    /// ballooning the field to hundreds of KB and flooding stdout / the
+    /// MCP payload. `push_partial_warning` must keep the field bounded
+    /// and fold the overflow into an accurate count.
+    #[test]
+    fn push_partial_warning_caps_runaway_failures() {
+        let mut stats = LspIndexStats::default();
+        for i in 0..200 {
+            push_partial_warning(
+                &mut stats,
+                &format!("swift LSP callHierarchy(f{i}.swift:1) 失败：timed out"),
+            );
+        }
+        assert!(
+            stats.skip_reason.len() < 2000,
+            "skip_reason ballooned to {} bytes",
+            stats.skip_reason.len()
+        );
+        assert!(
+            stats.skip_reason.contains("f0.swift"),
+            "first detail dropped: {}",
+            stats.skip_reason
+        );
+        assert!(
+            stats.skip_reason.contains("192 条 LSP 警告已折叠"),
+            "expected accurate fold count, got: {}",
+            stats.skip_reason
         );
     }
 

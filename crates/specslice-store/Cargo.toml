@@ -16,6 +16,7 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = "1.11.0"
 
 [lints]
 workspace = true

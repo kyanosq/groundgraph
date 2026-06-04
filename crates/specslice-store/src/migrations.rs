@@ -17,10 +17,16 @@ pub(crate) struct Migration {
 /// Full migration list for MVP-0. New schema changes append a new entry; do
 /// not edit or remove existing entries — that would break already-initialised
 /// repositories.
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("./migrations_sql/001_initial.sql"),
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("./migrations_sql/001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("./migrations_sql/002_edge_indexes.sql"),
+    },
+];
 
 pub(crate) fn apply_all(conn: &mut Connection) -> StoreResult<()> {
     conn.execute_batch(

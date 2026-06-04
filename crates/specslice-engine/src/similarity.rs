@@ -22,12 +22,15 @@
 //!
 //! - **Python** (`python_function`, `python_method`): full lexer
 //!   pass with docstring stripping and operator preservation.
-//! - **Dart** (`dart_function`, `dart_method`, `dart_constructor`):
-//!   same shared normalizer but with `//` and `/* */` comment
-//!   handling instead of `#`.
+//! - **C-family** — Dart, Rust, Go, Swift, TypeScript, Java, C and
+//!   C++ all share the same normalizer with `//` and `/* */` comment
+//!   handling (instead of Python's `#`). Each contributes its own
+//!   structural-keyword set so control-flow / declaration shape is
+//!   preserved while identifiers collapse to `ID`.
 //!
-//! Other languages can opt in by adding a `Language` arm — the
-//! normalizer is shared.
+//! Every language whose function/method nodes are emitted by an
+//! indexer is mapped in [`node_language`]; adding a new one is a
+//! `Language` arm plus a keyword set — the lexer is shared.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -70,6 +73,13 @@ pub const DEFAULT_MAX_PAIRWISE_SYMBOLS: usize = 20_000;
 pub enum Language {
     Python,
     Dart,
+    Rust,
+    Go,
+    Swift,
+    TypeScript,
+    Java,
+    C,
+    Cpp,
 }
 
 /// Which duplicate tiers to run. `All` is the default in the CLI;
@@ -512,6 +522,15 @@ fn node_language(kind: NodeKind) -> Option<Language> {
         NodeKind::DartFunction | NodeKind::DartMethod | NodeKind::DartConstructor => {
             Some(Language::Dart)
         }
+        NodeKind::RustFunction | NodeKind::RustMethod => Some(Language::Rust),
+        NodeKind::GoFunction | NodeKind::GoMethod => Some(Language::Go),
+        NodeKind::SwiftFunction | NodeKind::SwiftMethod | NodeKind::SwiftInitializer => {
+            Some(Language::Swift)
+        }
+        NodeKind::TypescriptFunction | NodeKind::TypescriptMethod => Some(Language::TypeScript),
+        NodeKind::JavaMethod | NodeKind::JavaConstructor => Some(Language::Java),
+        NodeKind::CFunction => Some(Language::C),
+        NodeKind::CppFunction | NodeKind::CppMethod => Some(Language::Cpp),
         _ => None,
     }
 }
@@ -569,7 +588,18 @@ pub fn normalize(language: Language, source: &str) -> Vec<String> {
             }
             continue;
         }
-        if matches!(language, Language::Dart) && c == '/' {
+        if matches!(
+            language,
+            Language::Dart
+                | Language::Rust
+                | Language::Go
+                | Language::Swift
+                | Language::TypeScript
+                | Language::Java
+                | Language::C
+                | Language::Cpp
+        ) && c == '/'
+        {
             chars.next();
             match chars.peek().copied() {
                 Some('/') => {
@@ -808,6 +838,287 @@ fn is_structural_keyword(language: Language, ident: &str) -> bool {
                 | "extends"
                 | "implements"
         ),
+        Language::Rust => matches!(
+            ident,
+            "if" | "else"
+                | "match"
+                | "for"
+                | "while"
+                | "loop"
+                | "return"
+                | "break"
+                | "continue"
+                | "let"
+                | "mut"
+                | "fn"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "impl"
+                | "mod"
+                | "use"
+                | "pub"
+                | "const"
+                | "static"
+                | "type"
+                | "where"
+                | "as"
+                | "in"
+                | "ref"
+                | "move"
+                | "dyn"
+                | "async"
+                | "await"
+                | "unsafe"
+                | "extern"
+                | "self"
+                | "Self"
+                | "super"
+                | "crate"
+                | "true"
+                | "false"
+        ),
+        Language::Go => matches!(
+            ident,
+            "if" | "else"
+                | "for"
+                | "range"
+                | "switch"
+                | "case"
+                | "default"
+                | "select"
+                | "return"
+                | "break"
+                | "continue"
+                | "goto"
+                | "fallthrough"
+                | "defer"
+                | "go"
+                | "func"
+                | "var"
+                | "const"
+                | "type"
+                | "struct"
+                | "interface"
+                | "map"
+                | "chan"
+                | "package"
+                | "import"
+                | "nil"
+                | "true"
+                | "false"
+                | "iota"
+        ),
+        Language::Swift => matches!(
+            ident,
+            "if" | "else"
+                | "guard"
+                | "for"
+                | "while"
+                | "repeat"
+                | "switch"
+                | "case"
+                | "default"
+                | "fallthrough"
+                | "return"
+                | "break"
+                | "continue"
+                | "func"
+                | "var"
+                | "let"
+                | "class"
+                | "struct"
+                | "enum"
+                | "protocol"
+                | "extension"
+                | "init"
+                | "deinit"
+                | "self"
+                | "Self"
+                | "super"
+                | "nil"
+                | "true"
+                | "false"
+                | "throw"
+                | "throws"
+                | "try"
+                | "catch"
+                | "do"
+                | "defer"
+                | "in"
+                | "where"
+                | "as"
+                | "is"
+                | "async"
+                | "await"
+                | "static"
+                | "override"
+                | "final"
+                | "import"
+        ),
+        Language::TypeScript => matches!(
+            ident,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "default"
+                | "return"
+                | "break"
+                | "continue"
+                | "function"
+                | "var"
+                | "let"
+                | "const"
+                | "class"
+                | "interface"
+                | "enum"
+                | "extends"
+                | "implements"
+                | "new"
+                | "this"
+                | "super"
+                | "typeof"
+                | "instanceof"
+                | "in"
+                | "of"
+                | "void"
+                | "null"
+                | "undefined"
+                | "true"
+                | "false"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "async"
+                | "await"
+                | "yield"
+                | "import"
+                | "export"
+                | "from"
+                | "as"
+                | "type"
+                | "public"
+                | "private"
+                | "protected"
+                | "static"
+                | "readonly"
+                | "abstract"
+        ),
+        Language::Java => matches!(
+            ident,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "default"
+                | "return"
+                | "break"
+                | "continue"
+                | "class"
+                | "interface"
+                | "enum"
+                | "extends"
+                | "implements"
+                | "new"
+                | "this"
+                | "super"
+                | "instanceof"
+                | "void"
+                | "null"
+                | "true"
+                | "false"
+                | "throw"
+                | "throws"
+                | "try"
+                | "catch"
+                | "finally"
+                | "synchronized"
+                | "import"
+                | "package"
+                | "public"
+                | "private"
+                | "protected"
+                | "static"
+                | "final"
+                | "abstract"
+        ),
+        Language::C => matches!(
+            ident,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "default"
+                | "return"
+                | "break"
+                | "continue"
+                | "goto"
+                | "struct"
+                | "enum"
+                | "union"
+                | "typedef"
+                | "const"
+                | "static"
+                | "extern"
+                | "sizeof"
+                | "void"
+                | "NULL"
+        ),
+        Language::Cpp => matches!(
+            ident,
+            "if" | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "default"
+                | "return"
+                | "break"
+                | "continue"
+                | "goto"
+                | "struct"
+                | "enum"
+                | "union"
+                | "class"
+                | "namespace"
+                | "template"
+                | "typename"
+                | "typedef"
+                | "using"
+                | "const"
+                | "constexpr"
+                | "static"
+                | "extern"
+                | "virtual"
+                | "override"
+                | "final"
+                | "friend"
+                | "operator"
+                | "new"
+                | "delete"
+                | "this"
+                | "public"
+                | "private"
+                | "protected"
+                | "sizeof"
+                | "void"
+                | "auto"
+                | "try"
+                | "catch"
+                | "throw"
+                | "true"
+                | "false"
+                | "nullptr"
+        ),
     }
 }
 
@@ -940,6 +1251,147 @@ int total(int x, int y) {
 }
 "#;
         assert_eq!(normalize(Language::Dart, a), normalize(Language::Dart, b));
+    }
+
+    #[test]
+    fn normalize_rust_abstracts_identifiers_but_keeps_keywords() {
+        // Same control-flow skeleton, different identifier names + comments:
+        // these must normalize to the *same* token stream so structural
+        // clones cluster regardless of naming.
+        let a = r#"
+fn handle(input: &str) -> usize {
+    // count something
+    let mut total = 0;
+    for ch in input.chars() {
+        if ch == 'x' {
+            total += 1;
+        }
+    }
+    return total;
+}
+"#;
+        let b = r#"
+fn process(text: &str) -> usize {
+    /* doc */
+    let mut acc = 0;
+    for c in text.chars() {
+        if c == 'x' {
+            acc += 1;
+        }
+    }
+    return acc;
+}
+"#;
+        assert_eq!(normalize(Language::Rust, a), normalize(Language::Rust, b));
+        // Keywords survive; identifiers collapse to ID.
+        let toks = normalize(Language::Rust, a);
+        assert!(toks.iter().any(|t| t == "fn"), "fn kept: {toks:?}");
+        assert!(toks.iter().any(|t| t == "for"), "for kept: {toks:?}");
+        assert!(toks.iter().any(|t| t == "return"), "return kept: {toks:?}");
+        assert!(
+            toks.iter().any(|t| t == "ID"),
+            "identifiers abstracted: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn rust_node_kinds_are_recognised_as_scannable() {
+        assert_eq!(node_language(NodeKind::RustFunction), Some(Language::Rust));
+        assert_eq!(node_language(NodeKind::RustMethod), Some(Language::Rust));
+    }
+
+    #[test]
+    fn normalize_go_abstracts_identifiers_but_keeps_keywords() {
+        let a = r#"
+func handle(input string) int {
+    // count something
+    total := 0
+    for _, ch := range input {
+        if ch == 'x' {
+            total++
+        }
+    }
+    return total
+}
+"#;
+        let b = r#"
+func process(text string) int {
+    /* doc */
+    acc := 0
+    for _, c := range text {
+        if c == 'x' {
+            acc++
+        }
+    }
+    return acc
+}
+"#;
+        assert_eq!(normalize(Language::Go, a), normalize(Language::Go, b));
+        let toks = normalize(Language::Go, a);
+        assert!(toks.iter().any(|t| t == "func"), "func kept: {toks:?}");
+        assert!(toks.iter().any(|t| t == "range"), "range kept: {toks:?}");
+        assert!(
+            toks.iter().any(|t| t == "ID"),
+            "idents abstracted: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_typescript_handles_comments_and_keeps_keywords() {
+        let a = r#"
+function handle(input: string): number {
+    // count
+    let total = 0;
+    for (const ch of input) { if (ch === "x") { total += 1; } }
+    return total;
+}
+"#;
+        let b = r#"
+function process(text: string): number {
+    /* doc */
+    let acc = 0;
+    for (const c of text) { if (c === "x") { acc += 1; } }
+    return acc;
+}
+"#;
+        assert_eq!(
+            normalize(Language::TypeScript, a),
+            normalize(Language::TypeScript, b)
+        );
+        let toks = normalize(Language::TypeScript, a);
+        assert!(toks.iter().any(|t| t == "function"), "kw kept: {toks:?}");
+        assert!(toks.iter().any(|t| t == "for"), "for kept: {toks:?}");
+    }
+
+    #[test]
+    fn extended_node_kinds_are_recognised_as_scannable() {
+        assert_eq!(node_language(NodeKind::GoFunction), Some(Language::Go));
+        assert_eq!(node_language(NodeKind::GoMethod), Some(Language::Go));
+        assert_eq!(
+            node_language(NodeKind::SwiftFunction),
+            Some(Language::Swift)
+        );
+        assert_eq!(node_language(NodeKind::SwiftMethod), Some(Language::Swift));
+        assert_eq!(
+            node_language(NodeKind::SwiftInitializer),
+            Some(Language::Swift)
+        );
+        assert_eq!(
+            node_language(NodeKind::TypescriptFunction),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            node_language(NodeKind::TypescriptMethod),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(node_language(NodeKind::JavaMethod), Some(Language::Java));
+        assert_eq!(
+            node_language(NodeKind::JavaConstructor),
+            Some(Language::Java)
+        );
+        assert_eq!(node_language(NodeKind::CFunction), Some(Language::C));
+        assert_eq!(node_language(NodeKind::CppFunction), Some(Language::Cpp));
+        assert_eq!(node_language(NodeKind::CppMethod), Some(Language::Cpp));
     }
 
     #[test]

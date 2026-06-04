@@ -1245,23 +1245,15 @@ fn compare_business_priority(a: &GraphNode, b: &GraphNode) -> std::cmp::Ordering
 
 fn business_rank(node: &GraphNode) -> u8 {
     // Noise demotion runs first: a method named `dispose` should sink to
-    // the tail even when it lives in a business-named file. The noise
-    // list is Dart-centric but the same names (`build` / `dispose` /
-    // `toString`) recur in Swift / Go heuristics; sharing the rank
-    // across languages keeps the graph readable.
-    if matches!(
-        node.kind.as_str(),
-        "dart_method"
-            | "dart_function"
-            | "swift_method"
-            | "swift_function"
-            | "go_method"
-            | "go_function"
-    ) {
-        let method_name = node.label.as_str();
-        if NOISE_TARGET_METHODS.contains(&method_name) {
-            return 2;
-        }
+    // the tail even when it lives in a business-named file. The noise list
+    // is Dart-centric but the same names (`build` / `dispose` / `toString`)
+    // recur across languages, so this applies to any callable (method or
+    // free function) regardless of language.
+    let is_callable = NodeKind::from_str(node.kind.as_str())
+        .map(|k| k.is_method() || k.is_free_function())
+        .unwrap_or(false);
+    if is_callable && NOISE_TARGET_METHODS.contains(&node.label.as_str()) {
+        return 2;
     }
     let label_lower = node.label.to_ascii_lowercase();
     let path_lower = node.path.as_deref().unwrap_or("").to_ascii_lowercase();
@@ -1322,23 +1314,28 @@ fn column_rank(c: GraphColumn) -> u8 {
 }
 
 /// Aggregator kinds sort first within a column so module ancestors land
-/// before their descendants in deterministic outputs.
+/// before their descendants in deterministic outputs. Code kinds are
+/// categorised via the central [`NodeKind`] predicates so **every** language
+/// (Dart / Swift / Go / Python / TypeScript / Java / Rust / C / C++) sorts
+/// "container → function → method → constructor" identically — the previous
+/// hand-written list silently bucketed Java/Rust/C/C++/TS as "other".
 fn kind_rank(kind: &str) -> u8 {
+    // Graph-only aggregator + doc-column kinds first (`module` is a synthetic
+    // graph kind, not a `NodeKind`).
     match kind {
-        "module" => 0,
-        "requirement" => 1,
-        "file" => 2,
-        "doc_section" | "acceptance_criterion" | "adr" => 3,
-        // Container-shaped declarations sort with `dart_class` so the
-        // graph reader keeps "container first, members later" order
-        // regardless of language.
-        "dart_class" | "swift_class" | "swift_struct" | "swift_enum" | "swift_protocol"
-        | "go_struct" | "go_interface" | "python_class" | "python_module" => 4,
-        "dart_function" | "swift_function" | "go_function" | "python_function" => 5,
-        "dart_method" | "swift_method" | "go_method" | "python_method" => 6,
-        "dart_constructor" | "swift_initializer" => 7,
-        "test_group" => 8,
-        "test_case" => 9,
+        "module" => return 0,
+        "requirement" => return 1,
+        "file" => return 2,
+        "doc_section" | "acceptance_criterion" | "adr" => return 3,
+        _ => {}
+    }
+    match NodeKind::from_str(kind) {
+        Some(k) if k.is_type_container() => 4,
+        Some(k) if k.is_free_function() => 5,
+        Some(k) if k.is_method() => 6,
+        Some(k) if k.is_constructor() => 7,
+        Some(NodeKind::TestGroup) => 8,
+        Some(NodeKind::TestCase) => 9,
         _ => 10,
     }
 }
