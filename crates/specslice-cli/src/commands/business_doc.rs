@@ -99,7 +99,9 @@ fn render_markdown(doc: &BusinessDoc) -> String {
     let mut s = String::new();
     s.push_str("# 业务逻辑文档（SpecSlice）\n\n");
     s.push_str("> 由 `specslice business-doc` 基于**已确认**的业务候选（`.specslice/candidates/business_logic.yaml`）生成。\n");
-    s.push_str("> 每条业务能力都引用代码图中的真实证据（代码 / 文档 / 测试 / 框架信号），可逐条审计。\n\n");
+    s.push_str(
+        "> 每条业务能力都引用代码图中的真实证据（代码 / 文档 / 测试 / 框架信号），可逐条审计。\n\n",
+    );
     let st = &doc.stats;
     s.push_str(&format!(
         "> 已确认 {} · 草稿(未确认) {} · 已拒绝 {} · 证据漂移 {}（候选共 {}）\n\n",
@@ -208,7 +210,9 @@ fn render_entry_md(s: &mut String, e: &BusinessDocEntry) {
         }
     }
     if !e.unresolved_evidence.is_empty() {
-        s.push_str("> ⚠ **证据漂移**：以下被引用的符号已不在代码图中（可能已重命名/删除），请复核：\n>\n");
+        s.push_str(
+            "> ⚠ **证据漂移**：以下被引用的符号已不在代码图中（可能已重命名/删除），请复核：\n>\n",
+        );
         for id in &e.unresolved_evidence {
             s.push_str(&format!("> - `{id}`\n"));
         }
@@ -252,7 +256,9 @@ fn render_text(doc: &BusinessDoc) -> String {
         st.total_candidates,
     ));
     if doc.entries.is_empty() {
-        s.push_str("（无已确认业务能力；先 `specslice candidate review`，或加 --include-proposed 预览）\n");
+        s.push_str(
+            "（无已确认业务能力；先 `specslice candidate review`，或加 --include-proposed 预览）\n",
+        );
         return s;
     }
     for e in &doc.entries {
@@ -286,7 +292,9 @@ fn escape_pipe(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use specslice_engine::business_doc::{BusinessDoc, BusinessDocStats, BUSINESS_DOC_SCHEMA_VERSION};
+    use specslice_engine::business_doc::{
+        BusinessDoc, BusinessDocStats, BUSINESS_DOC_SCHEMA_VERSION,
+    };
 
     fn sample_doc() -> BusinessDoc {
         BusinessDoc {
@@ -349,7 +357,10 @@ mod tests {
             "code evidence cites path + line range"
         );
         assert!(md.contains("证据漂移"), "drift section present");
-        assert!(md.contains("库存校验是否在服务端？"), "open question rendered");
+        assert!(
+            md.contains("库存校验是否在服务端？"),
+            "open question rendered"
+        );
         assert!(md.contains("缺少并发下单测试"), "risk rendered");
     }
 

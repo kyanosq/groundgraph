@@ -105,7 +105,11 @@ fn render_markdown(pack: &BusinessPack) -> String {
     ));
     s.push_str("```mermaid\nflowchart LR\n");
     for m in &pack.modules {
-        s.push_str(&format!("  {}[\"{}\"]\n", mermaid_id(&m.id), escape_mermaid(&m.name)));
+        s.push_str(&format!(
+            "  {}[\"{}\"]\n",
+            mermaid_id(&m.id),
+            escape_mermaid(&m.name)
+        ));
     }
     let reported: std::collections::HashSet<&str> =
         pack.modules.iter().map(|m| m.id.as_str()).collect();
@@ -120,7 +124,11 @@ fn render_markdown(pack: &BusinessPack) -> String {
         s.push_str("  %% （未发现跨模块依赖边 — 可能尚无 calls/imports 精确层）\n");
     }
     for d in drawable.iter().take(MAX_MERMAID_EDGES) {
-        s.push_str(&format!("  {} --> {}\n", mermaid_id(&d.from), mermaid_id(&d.to)));
+        s.push_str(&format!(
+            "  {} --> {}\n",
+            mermaid_id(&d.from),
+            mermaid_id(&d.to)
+        ));
     }
     if drawable.len() > MAX_MERMAID_EDGES {
         s.push_str(&format!(
@@ -172,8 +180,12 @@ fn render_module_md(s: &mut String, m: &ModuleEvidence) {
     ));
     s.push_str(&format!("- 路径: `{}`\n", m.path_prefix));
     s.push_str(&format!(
-        "- 规模: {} 文件 · {} 符号 · {} 测试\n",
-        m.file_count, m.symbol_count, m.test_count
+        "- 规模: {} 文件 · {} 符号 · {} 测试 · 内聚 {:.0}%（{}）\n",
+        m.file_count,
+        m.symbol_count,
+        m.test_count,
+        m.cohesion * 100.0,
+        cohesion_hint(m.cohesion),
     ));
     if !m.framework_roles.is_empty() {
         s.push_str(&format!("- 框架角色: {}\n", m.framework_roles.join(", ")));
@@ -185,13 +197,19 @@ fn render_module_md(s: &mut String, m: &ModuleEvidence) {
         s.push_str(&format!("- 路由 (navigates_to): {}\n", m.routes.join(", ")));
     }
     if !m.providers.is_empty() {
-        s.push_str(&format!("- Provider (reads_provider): {}\n", m.providers.join(", ")));
+        s.push_str(&format!(
+            "- Provider (reads_provider): {}\n",
+            m.providers.join(", ")
+        ));
     }
     if !m.storage.is_empty() {
         s.push_str(&format!("- 存储 (persists_to): {}\n", m.storage.join(", ")));
     }
     if m.stream_subscriptions > 0 {
-        s.push_str(&format!("- 流订阅 (subscribes_stream): {}\n", m.stream_subscriptions));
+        s.push_str(&format!(
+            "- 流订阅 (subscribes_stream): {}\n",
+            m.stream_subscriptions
+        ));
     }
     if !m.entry_points.is_empty() {
         s.push_str("- 入口符号:\n");
@@ -254,12 +272,13 @@ fn render_text(pack: &BusinessPack) -> String {
             m.name, m.id, m.signal_score
         ));
         s.push_str(&format!(
-            "   {} 文件 · {} 符号 · {} 测试 · {} 文档 · 入口 {}\n",
+            "   {} 文件 · {} 符号 · {} 测试 · {} 文档 · 入口 {} · 内聚 {:.0}%\n",
             m.file_count,
             m.symbol_count,
             m.test_count,
             m.docs.len(),
             m.entry_points.len(),
+            m.cohesion * 100.0,
         ));
         if !m.routes.is_empty() {
             s.push_str(&format!("   路由: {}\n", m.routes.join(", ")));
@@ -282,6 +301,19 @@ fn render_text(pack: &BusinessPack) -> String {
 // mermaid / markdown escaping
 // ---------------------------------------------------------------------------
 
+/// A plain-language read of the graph cohesion: how self-contained the
+/// module is. High = a clean business boundary; low = entangled with the
+/// rest of the codebase (a refactor smell worth flagging to the AI).
+fn cohesion_hint(cohesion: f64) -> &'static str {
+    if cohesion >= 0.7 {
+        "高内聚，边界清晰"
+    } else if cohesion >= 0.4 {
+        "中等内聚"
+    } else {
+        "低内聚，与其他模块耦合较多"
+    }
+}
+
 fn mermaid_id(slug: &str) -> String {
     // mermaid node ids must be identifier-ish; slugs are already
     // `[a-z0-9_-]` but `-` is safest replaced with `_`.
@@ -298,13 +330,13 @@ fn escape_pipe(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use super::MAX_MERMAID_EDGES;
     use super::*;
     use specslice_engine::business_pack::{
         BusinessPack, BusinessPackStats, EvidenceRef, EvidenceSymbol, ModuleDependency,
         ModuleEvidence, BUSINESS_PACK_SCHEMA_VERSION,
     };
-    #[allow(unused_imports)]
-    use super::MAX_MERMAID_EDGES;
 
     fn sample_pack() -> BusinessPack {
         BusinessPack {
@@ -328,6 +360,7 @@ mod tests {
                     symbol_count: 5,
                     test_count: 1,
                     signal_score: 42,
+                    cohesion: 0.82,
                     entry_points: vec![EvidenceSymbol {
                         id: "dart_class::lib/features/auth/auth_bloc.dart#AuthBloc".into(),
                         kind: "dart_class".into(),
@@ -348,9 +381,7 @@ mod tests {
                     }],
                     tests: vec![],
                     depends_on: vec![],
-                    evidence: vec![
-                        "dart_class::lib/features/auth/auth_bloc.dart#AuthBloc".into(),
-                    ],
+                    evidence: vec!["dart_class::lib/features/auth/auth_bloc.dart#AuthBloc".into()],
                 },
                 ModuleEvidence {
                     id: "products".into(),
@@ -360,6 +391,7 @@ mod tests {
                     symbol_count: 4,
                     test_count: 0,
                     signal_score: 30,
+                    cohesion: 0.35,
                     entry_points: vec![],
                     routes: vec![],
                     providers: vec![],
@@ -414,7 +446,8 @@ mod tests {
                 file_count: 1,
                 symbol_count: 1,
                 test_count: 0,
-                signal_score: (modules - i) as u32,
+                signal_score: u32::try_from(modules - i).unwrap(),
+                cohesion: 0.5,
                 entry_points: vec![],
                 routes: vec![],
                 providers: vec![],

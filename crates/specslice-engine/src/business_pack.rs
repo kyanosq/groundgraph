@@ -12,11 +12,14 @@
 //! This module closes that gap. [`propose_business_pack`] reads the
 //! indexed graph and produces a **per-business-module evidence pack**:
 //!
-//! - It segments code/test symbols into *business modules* using the
-//!   repository's own feature-folder convention (`lib/features/<x>`,
-//!   `src/<x>`, ...). This is path-aware and deterministic, matching how
-//!   humans think about business modules, rather than the call-coupling
-//!   clusters of `specslice features`.
+//! - It segments code/test symbols into *business modules* from the
+//!   **code graph itself** — deterministic Louvain community detection
+//!   over the call/import coupling (see [`crate::feature_cluster`]). The
+//!   target repo is *not* assumed to be tidily foldered: a feature whose
+//!   files are scattered across `lib/models`, `lib/services`, `lib/ui`
+//!   still clusters together because its symbols call each other densely.
+//!   Directory convention (`lib/features/<x>`) is used only to *name* a
+//!   community and as a fallback bucket for files with no edges.
 //! - For each module it rolls up the **business signals** already on the
 //!   graph: framework roles (routes/tasks/CLI), Riverpod providers read,
 //!   storage written, navigation routes, stream subscriptions, the
@@ -50,6 +53,7 @@ use specslice_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
 use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
+use crate::feature_cluster::detect_communities;
 
 pub const BUSINESS_PACK_SCHEMA_VERSION: u32 = 1;
 
@@ -207,6 +211,11 @@ pub struct ModuleEvidence {
     /// Heuristic "this module looks like a coherent business surface"
     /// score; drives ordering. Higher = stronger signal.
     pub signal_score: u32,
+    /// Graph cohesion in `0.0..=1.0`: share of this module's structural
+    /// coupling that stays *inside* the module (internal / (internal +
+    /// external)). High = self-contained feature; low = leaky / entangled.
+    /// Derived from the call/import community, not the directory layout.
+    pub cohesion: f64,
     /// Representative business symbols (blocs / use cases / repositories
     /// / screens / framework entry points), strongest first.
     pub entry_points: Vec<EvidenceSymbol>,
@@ -274,13 +283,26 @@ pub fn propose_business_pack_with_store(
     Ok(build_pack(&nodes, &edges, options))
 }
 
-fn build_pack(nodes: &[Node], edges: &[EdgeAssertion], options: &BusinessPackOptions) -> BusinessPack {
+fn build_pack(
+    nodes: &[Node],
+    edges: &[EdgeAssertion],
+    options: &BusinessPackOptions,
+) -> BusinessPack {
     let nodes_by_id: HashMap<&ArtifactId, &Node> = nodes.iter().map(|n| (&n.id, n)).collect();
 
-    // ---- 1. assign every code symbol / test / file to a module ----------
-    // Code + tests are assigned by their own path. Docs are matched to a
-    // module separately (normalised segment match) because doc trees often
-    // sit under `docs/feature-docs/<x>` rather than the source layout.
+    // ---- 0. partition files into business modules FROM THE CODE GRAPH ----
+    // Communities are detected on the call/import coupling, not the folder
+    // layout (see `partition_modules`). This is the key correctness change:
+    // a repo organised by layer (`lib/models`, `lib/services`) or one that
+    // is simply messy still yields feature-shaped modules, because a
+    // feature's symbols call each other far more than they call other
+    // features'. Paths are consulted only to *name* a community.
+    let partition = partition_modules(nodes, edges);
+
+    // ---- 1. assign every code symbol / test / file to its module --------
+    // Docs are matched to a module separately (normalised segment match)
+    // because doc trees often sit under `docs/feature-docs/<x>` rather than
+    // the source layout.
     let mut module_of_node: HashMap<&ArtifactId, String> = HashMap::new();
     let mut modules: BTreeMap<String, ModuleAcc> = BTreeMap::new();
 
@@ -290,7 +312,8 @@ fn build_pack(nodes: &[Node], edges: &[EdgeAssertion], options: &BusinessPackOpt
     let mut total_docs = 0usize;
 
     for node in nodes {
-        let is_symbol = language_traits::is_callable(node.kind) || language_traits::is_type(node.kind);
+        let is_symbol =
+            language_traits::is_callable(node.kind) || language_traits::is_type(node.kind);
         let is_test = node.kind.is_test();
         if is_symbol {
             total_symbols += 1;
@@ -305,20 +328,18 @@ fn build_pack(nodes: &[Node], edges: &[EdgeAssertion], options: &BusinessPackOpt
         let Some(path) = node.path.as_deref() else {
             continue;
         };
-        let Some(key) = feature_key(path) else {
+        let Some(cidx) = partition.community_of(path) else {
             continue;
         };
-        let acc = modules.entry(key.slug.clone()).or_insert_with(|| ModuleAcc {
-            slug: key.slug.clone(),
-            name: prettify(&key.display),
-            path_prefix: key.prefix.clone(),
+        let slug = partition.slug[cidx].clone();
+        let acc = modules.entry(slug.clone()).or_insert_with(|| ModuleAcc {
+            slug: slug.clone(),
+            name: partition.name[cidx].clone(),
+            path_prefix: partition.prefix[cidx].clone(),
+            cohesion: partition.cohesion[cidx],
             ..Default::default()
         });
-        // Prefer the shortest prefix as the canonical anchor.
-        if key.prefix.len() < acc.path_prefix.len() {
-            acc.path_prefix = key.prefix.clone();
-        }
-        module_of_node.insert(&node.id, key.slug.clone());
+        module_of_node.insert(&node.id, slug);
 
         if node.kind == NodeKind::File {
             acc.files.insert(path.to_string());
@@ -430,6 +451,7 @@ fn build_pack(nodes: &[Node], edges: &[EdgeAssertion], options: &BusinessPackOpt
             symbol_count: acc.symbols.len(),
             test_count: acc.tests.len(),
             signal_score,
+            cohesion: acc.cohesion,
             entry_points,
             routes: capped_sorted(&acc.routes, options.max_signal_samples),
             providers: capped_sorted(&acc.providers, options.max_signal_samples),
@@ -529,6 +551,7 @@ struct ModuleAcc<'a> {
     slug: String,
     name: String,
     path_prefix: String,
+    cohesion: f64,
     files: BTreeSet<String>,
     symbols: Vec<&'a Node>,
     tests: Vec<&'a Node>,
@@ -584,6 +607,11 @@ impl ModuleAcc<'_> {
             .clone()
             .or_else(|| node.stable_key.clone())
             .unwrap_or_default();
+        // Synthetic / unnamed symbols (e.g. Dart's `<default>` constructor)
+        // are not business entry points.
+        if name.is_empty() || name.contains('<') {
+            return 0;
+        }
         let name_lower = name.to_ascii_lowercase();
         // Strip a leading container (`Foo.bar` -> `bar`) for the noise check.
         let leaf = name_lower.rsplit('.').next().unwrap_or(&name_lower);
@@ -622,6 +650,473 @@ impl ModuleAcc<'_> {
         score += u32::try_from(self.symbols.len().min(200)).unwrap_or(200) / 10;
         score
     }
+}
+
+// ---------------------------------------------------------------------------
+// Graph-driven module partition (code graph is the source of truth)
+// ---------------------------------------------------------------------------
+
+/// The result of clustering files into business modules from the call /
+/// import graph. Maps each file path to a contiguous module index, with a
+/// parallel-indexed slug / name / prefix / cohesion for each module.
+struct ModulePartition {
+    by_file: HashMap<String, usize>,
+    slug: Vec<String>,
+    name: Vec<String>,
+    prefix: Vec<String>,
+    cohesion: Vec<f64>,
+}
+
+impl ModulePartition {
+    fn community_of(&self, path: &str) -> Option<usize> {
+        self.by_file.get(path).copied()
+    }
+}
+
+/// Cluster every code/test file into a business module.
+///
+/// The placement rule deliberately mixes two signals at *different*
+/// confidence levels, which is what makes it robust to both tidy and
+/// chaotic repos:
+///
+/// * **Explicit feature folders win.** A file under an unambiguous feature
+///   marker (`.../features/<x>/...`, `.../modules/<x>/...`) is placed in
+///   module `<x>`. This is a deliberate, business-level boundary the repo
+///   author drew, and the graph invariably agrees (high cohesion). It also
+///   *dissolves* the cross-feature "infrastructure blobs" community
+///   detection would otherwise form (a feature's repository couples to
+///   every other feature's repository), keeping modules feature-shaped.
+/// * **Everything else follows the code graph.** Files with no explicit
+///   feature marker — a flat `lib/`, a layer split (`lib/models`,
+///   `lib/services`), an outright mess — are placed by Louvain community
+///   over their call/import coupling. Loose path conventions
+///   (`lib/<x>`, first-directory) are *never* trusted for placement,
+///   because that is exactly where "the repo is managed chaotically"
+///   bites; the graph is the source of truth there.
+///
+/// So a feature is recovered whether the author filed it under
+/// `features/auth/` or smeared it across `models/`, `services/`, `ui/`.
+fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition {
+    // ---- file universe: every file that holds code / tests -------------
+    let mut file_idx: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut node_file: HashMap<&ArtifactId, usize> = HashMap::new();
+    for node in nodes {
+        let relevant = node.kind == NodeKind::File
+            || language_traits::is_callable(node.kind)
+            || language_traits::is_type(node.kind)
+            || node.kind.is_test();
+        if !relevant {
+            continue;
+        }
+        let Some(path) = node.path.as_deref() else {
+            continue;
+        };
+        let idx = *file_idx.entry(path.to_string()).or_insert_with(|| {
+            files.push(path.to_string());
+            files.len() - 1
+        });
+        node_file.insert(&node.id, idx);
+    }
+    let n = files.len();
+    if n == 0 {
+        return ModulePartition {
+            by_file: HashMap::new(),
+            slug: Vec::new(),
+            name: Vec::new(),
+            prefix: Vec::new(),
+            cohesion: Vec::new(),
+        };
+    }
+
+    // ---- lift symbol coupling onto a weighted file graph ---------------
+    // Calls / References (behavioural coupling) weigh more than Imports
+    // (structural). Self-edges (same file) are skipped — we want *cross*-
+    // file cohesion to define a module boundary.
+    let mut sym_indegree: HashMap<&ArtifactId, usize> = HashMap::new();
+    let mut weights: HashMap<(usize, usize), f64> = HashMap::new();
+    for edge in edges {
+        let w = match edge.kind {
+            EdgeKind::Calls | EdgeKind::References => 2.0,
+            EdgeKind::Imports => 1.0,
+            _ => continue,
+        };
+        *sym_indegree.entry(&edge.to_id).or_insert(0) += 1;
+        let (Some(&a), Some(&b)) = (node_file.get(&edge.from_id), node_file.get(&edge.to_id))
+        else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let key = if a < b { (a, b) } else { (b, a) };
+        *weights.entry(key).or_insert(0.0) += w;
+    }
+    let edge_list: Vec<(usize, usize, f64)> =
+        weights.iter().map(|(&(a, b), &w)| (a, b, w)).collect();
+    let mut connected = vec![false; n];
+    for &(a, b, _) in &edge_list {
+        connected[a] = true;
+        connected[b] = true;
+    }
+
+    // ---- community detection -------------------------------------------
+    let comm = detect_communities(n, &edge_list);
+
+    // ---- business symbols per file (for central-symbol naming) ---------
+    let mut file_symbols: HashMap<usize, Vec<&Node>> = HashMap::new();
+    for node in nodes {
+        if !(language_traits::is_callable(node.kind) || language_traits::is_type(node.kind)) {
+            continue;
+        }
+        if let Some(path) = node.path.as_deref() {
+            if let Some(&fi) = file_idx.get(path) {
+                file_symbols.entry(fi).or_default().push(node);
+            }
+        }
+    }
+
+    // ---- placement key per file ----------------------------------------
+    // `feat::<slug>` for files under an explicit feature marker (trusted
+    // business boundary), else `comm::<id>` for graph-clustered files, else
+    // `path::<slug>` for isolated files with no graph signal. This single
+    // key space is what later groups files into modules.
+    let group_key: Vec<String> = (0..n)
+        .map(|i| {
+            if let Some(tok) = feature_marker_token(&files[i]) {
+                format!("feat::{}", slugify(&tok))
+            } else if connected[i] {
+                format!("comm::{}", comm[i])
+            } else {
+                let b = feature_key(&files[i])
+                    .map(|k| k.slug)
+                    .unwrap_or_else(|| "misc".to_string());
+                format!("path::{b}")
+            }
+        })
+        .collect();
+
+    // ---- group files by placement key, deterministic by key order ------
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, key) in group_key.iter().enumerate() {
+        groups.entry(key.as_str()).or_default().push(i);
+    }
+
+    // ---- name each group, MERGING groups that derive the same slug -----
+    // Distinct graph communities that resolve to the same identity *are*
+    // the same module: e.g. a `lib/core` with no feature marker splits into
+    // several loosely-coupled communities that all name themselves "core";
+    // collapsing them avoids `core / core_2 / …` noise. Two genuinely
+    // different features never collide because they get distinct names
+    // (a dominant token or a distinct central symbol).
+    let mut slug: Vec<String> = Vec::new();
+    let mut name: Vec<String> = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    let mut slug_index: HashMap<String, usize> = HashMap::new();
+    // placement key -> final module index
+    let mut key_module: HashMap<&str, usize> = HashMap::new();
+
+    for (&key, file_idxs) in &groups {
+        let (disp, pfx) = name_module(key, file_idxs, &files, &file_symbols, &sym_indegree);
+        let mut base = slugify(&disp);
+        if base.is_empty() {
+            base = format!("module_{}", slug.len() + 1);
+        }
+        let mi = match slug_index.get(&base) {
+            Some(&existing) => {
+                // merge: keep the shorter (more general) path anchor
+                if !pfx.is_empty()
+                    && (prefix[existing].is_empty() || pfx.len() < prefix[existing].len())
+                {
+                    prefix[existing] = pfx;
+                }
+                existing
+            }
+            None => {
+                let idx = slug.len();
+                slug_index.insert(base.clone(), idx);
+                slug.push(base);
+                name.push(prettify(&disp));
+                prefix.push(pfx);
+                idx
+            }
+        };
+        key_module.insert(key, mi);
+    }
+
+    // ---- final file -> module index ------------------------------------
+    let mut by_file: HashMap<String, usize> = HashMap::new();
+    let mut module_of_file: Vec<usize> = vec![usize::MAX; n];
+    for (i, path) in files.iter().enumerate() {
+        if let Some(&mi) = key_module.get(group_key[i].as_str()) {
+            by_file.insert(path.clone(), mi);
+            module_of_file[i] = mi;
+        }
+    }
+
+    // ---- cohesion per *final module* (internal / total coupling) -------
+    let mut internal = vec![0.0f64; slug.len()];
+    let mut external = vec![0.0f64; slug.len()];
+    for &(a, b, w) in &edge_list {
+        let (ma, mb) = (module_of_file[a], module_of_file[b]);
+        if ma == usize::MAX || mb == usize::MAX {
+            continue;
+        }
+        if ma == mb {
+            internal[ma] += w;
+        } else {
+            external[ma] += w;
+            external[mb] += w;
+        }
+    }
+    let cohesion: Vec<f64> = (0..slug.len())
+        .map(|i| {
+            let total = internal[i] + external[i];
+            if total > 0.0 {
+                internal[i] / total
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    ModulePartition {
+        by_file,
+        slug,
+        name,
+        prefix,
+        cohesion,
+    }
+}
+
+/// Return the feature token for a path **only** when it sits under an
+/// explicit, unambiguous feature marker (`.../features/<x>/...`). Loose
+/// conventions (`lib/<x>`, first directory) deliberately return `None` —
+/// they are not trusted as business boundaries.
+fn feature_marker_token(path: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let raw: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if raw.is_empty() {
+        return None;
+    }
+    let dirs: &[&str] = if raw.last().map(|s| s.contains('.')).unwrap_or(false) {
+        &raw[..raw.len() - 1]
+    } else {
+        &raw[..]
+    };
+    for (i, seg) in dirs.iter().enumerate() {
+        if FEATURE_MARKERS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
+            return Some(dirs[i + 1].to_string());
+        }
+    }
+    None
+}
+
+/// Generic identifiers that carry no business meaning — never use one as a
+/// module name even if it is the most-referenced symbol in a cluster.
+const GENERIC_NAMES: &[&str] = &[
+    "default",
+    "load",
+    "build",
+    "get",
+    "set",
+    "init",
+    "main",
+    "run",
+    "call",
+    "create",
+    "update",
+    "delete",
+    "fromjson",
+    "tojson",
+    "copywith",
+    "tostring",
+    "of",
+    "instance",
+    "value",
+    "data",
+    "state",
+    "model",
+    "result",
+    "response",
+    "request",
+    "client",
+    "service",
+    "base",
+    "common",
+    "utils",
+    "util",
+    "helper",
+    "helpers",
+    "constants",
+    "config",
+];
+
+/// Name a module group. `feat::` groups are named directly after their
+/// feature marker; otherwise we try a dominant feature-folder token, then
+/// the most-referenced *business* symbol (preferring types), and finally
+/// the longest common directory.
+fn name_module(
+    key: &str,
+    file_idxs: &[usize],
+    files: &[String],
+    file_symbols: &HashMap<usize, Vec<&Node>>,
+    sym_indegree: &HashMap<&ArtifactId, usize>,
+) -> (String, String) {
+    // (0) explicit feature marker — authoritative. Anchor the path to a
+    //     non-test source file so a feature spanning `lib/features/<x>` and
+    //     `test/features/<x>` reports `lib/features/<x>`, not an empty
+    //     prefix (their common directory diverges at the top level).
+    if key.starts_with("feat::") {
+        if let Some(tok) = file_idxs
+            .iter()
+            .find_map(|&fi| feature_marker_token(&files[fi]))
+        {
+            let pfx = file_idxs
+                .iter()
+                .filter(|&&fi| !is_test_path(&files[fi]))
+                .find_map(|&fi| feature_key(&files[fi]).map(|k| k.prefix))
+                .or_else(|| {
+                    file_idxs
+                        .iter()
+                        .find_map(|&fi| feature_key(&files[fi]).map(|k| k.prefix))
+                })
+                .unwrap_or_default();
+            return (tok, pfx);
+        }
+    }
+
+    // (a) dominant feature-folder token
+    let mut token_count: BTreeMap<String, usize> = BTreeMap::new();
+    let mut token_prefix: HashMap<String, String> = HashMap::new();
+    for &fi in file_idxs {
+        if let Some(k) = feature_key(&files[fi]) {
+            *token_count.entry(k.display.clone()).or_insert(0) += 1;
+            token_prefix.entry(k.display).or_insert(k.prefix);
+        }
+    }
+    let dominant = token_count
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(d, c)| (d.clone(), *c));
+    if let Some((disp, cnt)) = dominant {
+        if cnt * 2 >= file_idxs.len() || token_count.len() == 1 {
+            let pfx = token_prefix.get(&disp).cloned().unwrap_or_default();
+            return (disp, pfx);
+        }
+    }
+
+    // (b) most-referenced business symbol (types beat callables; generic
+    //     names are skipped so we never surface "load"/"default").
+    let mut best: Option<(usize, bool, String)> = None;
+    for &fi in file_idxs {
+        if let Some(syms) = file_symbols.get(&fi) {
+            for s in syms {
+                let Some(nm) = s.name.as_deref() else {
+                    continue;
+                };
+                if nm.is_empty() || GENERIC_NAMES.contains(&nm.to_ascii_lowercase().as_str()) {
+                    continue;
+                }
+                let deg = sym_indegree.get(&s.id).copied().unwrap_or(0);
+                let is_ty = language_traits::is_type(s.kind);
+                let better = match &best {
+                    Some((bd, bt, bn)) => {
+                        deg > *bd
+                            || (deg == *bd && is_ty && !*bt)
+                            || (deg == *bd && is_ty == *bt && nm < bn.as_str())
+                    }
+                    None => true,
+                };
+                if better {
+                    best = Some((deg, is_ty, nm.to_string()));
+                }
+            }
+        }
+    }
+    if let Some((deg, _, nm)) = best {
+        if deg > 0 {
+            return (strip_role_suffix(&nm), common_dir_prefix(file_idxs, files));
+        }
+    }
+
+    // (c) fallback: last segment of the common directory prefix
+    let pfx = common_dir_prefix(file_idxs, files);
+    let disp = pfx
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("module")
+        .to_string();
+    (disp, pfx)
+}
+
+/// Strip a single trailing architectural-role word so a community
+/// centred on `CheckoutController` is named "Checkout", not "Checkout
+/// Controller". Only one suffix is removed and never the whole name.
+fn strip_role_suffix(name: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        "Controller",
+        "Repository",
+        "UseCase",
+        "Usecase",
+        "Service",
+        "Provider",
+        "Notifier",
+        "Manager",
+        "Handler",
+        "Bloc",
+        "Cubit",
+        "ViewModel",
+        "Screen",
+        "Widget",
+        "Page",
+        "View",
+        "Model",
+        "State",
+        "Store",
+        "Client",
+        "Impl",
+    ];
+    for suf in SUFFIXES {
+        if name.len() > suf.len() && name.ends_with(suf) {
+            return name[..name.len() - suf.len()].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Longest common directory prefix (filename dropped) across files.
+fn common_dir_prefix(file_idxs: &[usize], files: &[String]) -> String {
+    let mut split: Vec<Vec<String>> = Vec::new();
+    for &fi in file_idxs {
+        let norm = files[fi].replace('\\', "/");
+        let mut parts: Vec<String> = norm
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if parts.last().map(|s| s.contains('.')).unwrap_or(false) {
+            parts.pop();
+        }
+        if !parts.is_empty() {
+            split.push(parts);
+        }
+    }
+    if split.is_empty() {
+        return String::new();
+    }
+    let mut prefix = split[0].clone();
+    for s in &split[1..] {
+        let mut i = 0;
+        while i < prefix.len() && i < s.len() && prefix[i] == s[i] {
+            i += 1;
+        }
+        prefix.truncate(i);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.join("/")
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +1180,7 @@ fn match_doc_to_module(path: &str, known: &BTreeSet<String>) -> Option<String> {
     let segments: Vec<String> = norm
         .split('/')
         .filter(|s| !s.is_empty())
-        .map(|s| normalise_token(s))
+        .map(normalise_token)
         .collect();
     let mut best: Option<&String> = None;
     for slug in known {
@@ -718,8 +1213,6 @@ fn slugify(name: &str) -> String {
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
-        } else if matches!(ch, '_' | '-') {
-            out.push('_');
         } else {
             out.push('_');
         }
@@ -740,7 +1233,7 @@ fn slugify(name: &str) -> String {
 /// Prettify a folder name for display: `customer_edit` -> `Customer Edit`.
 fn prettify(name: &str) -> String {
     let words: Vec<String> = name
-        .split(|c: char| c == '_' || c == '-' || c == ' ')
+        .split(['_', '-', ' '])
         .filter(|s| !s.is_empty())
         .map(|w| {
             let mut chars = w.chars();
@@ -1051,10 +1544,17 @@ mod tests {
     #[test]
     fn build_pack_groups_modules_and_rolls_up_signals() {
         let (mut store, _dir) = empty_store();
-        // auth module: a bloc + repository + a test + a doc
+        // ---- auth module: bloc + repository + service (densely coupled),
+        //      plus a test that exercises the bloc and a doc. The modules
+        //      are detected from the call graph, so each feature needs real
+        //      intra-feature coupling (mirroring how a real feature reads).
+        let ab = "dart_class::lib/features/auth/presentation/auth_bloc.dart#AuthBloc";
+        let ar = "dart_class::lib/features/auth/data/auth_repository.dart#AuthRepository";
+        let as_ = "dart_class::lib/features/auth/domain/auth_service.dart#AuthService";
+        let auth_test = "test_case::test/features/auth/auth_bloc_test.dart#login works";
         store
             .upsert_node(&node(
-                "dart_class::lib/features/auth/presentation/auth_bloc.dart#AuthBloc",
+                ab,
                 NodeKind::DartClass,
                 "lib/features/auth/presentation/auth_bloc.dart",
                 "AuthBloc",
@@ -1062,7 +1562,7 @@ mod tests {
             .unwrap();
         store
             .upsert_node(&node(
-                "dart_class::lib/features/auth/data/auth_repository.dart#AuthRepository",
+                ar,
                 NodeKind::DartClass,
                 "lib/features/auth/data/auth_repository.dart",
                 "AuthRepository",
@@ -1070,7 +1570,15 @@ mod tests {
             .unwrap();
         store
             .upsert_node(&node(
-                "test_case::test/features/auth/auth_bloc_test.dart#login works",
+                as_,
+                NodeKind::DartClass,
+                "lib/features/auth/domain/auth_service.dart",
+                "AuthService",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                auth_test,
                 NodeKind::TestCase,
                 "test/features/auth/auth_bloc_test.dart",
                 "login works",
@@ -1084,13 +1592,25 @@ mod tests {
                 "Auth",
             ))
             .unwrap();
-        // products module: a class that navigates to a route + reads a provider
+        // ---- products module: screen + repository (coupled), navigates to
+        //      a route and reads a provider.
+        let ps = "dart_class::lib/features/products/products_screen.dart#ProductsScreen";
+        let pr =
+            "dart_class::lib/features/products/data/products_repository.dart#ProductsRepository";
         store
             .upsert_node(&node(
-                "dart_class::lib/features/products/products_screen.dart#ProductsScreen",
+                ps,
                 NodeKind::DartClass,
                 "lib/features/products/products_screen.dart",
                 "ProductsScreen",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                pr,
+                NodeKind::DartClass,
+                "lib/features/products/data/products_repository.dart",
+                "ProductsRepository",
             ))
             .unwrap();
         store
@@ -1110,33 +1630,34 @@ mod tests {
             ))
             .unwrap();
 
-        // edges
+        // intra-auth coupling (clique) + the test exercising the bloc
+        for (f, t) in [(ab, ar), (ab, as_), (as_, ar), (auth_test, ab)] {
+            store.upsert_edge(&edge(f, t, EdgeKind::Calls)).unwrap();
+        }
+        // intra-products coupling
+        store.upsert_edge(&edge(ps, pr, EdgeKind::Calls)).unwrap();
+        // semantic signals on the products screen
         store
-            .upsert_edge(&edge(
-                "dart_class::lib/features/products/products_screen.dart#ProductsScreen",
-                "route::/design",
-                EdgeKind::NavigatesTo,
-            ))
+            .upsert_edge(&edge(ps, "route::/design", EdgeKind::NavigatesTo))
             .unwrap();
         store
             .upsert_edge(&edge(
-                "dart_class::lib/features/products/products_screen.dart#ProductsScreen",
+                ps,
                 "dart_provider::lib/core/cart_provider.dart#cartProvider",
                 EdgeKind::ReadsProvider,
             ))
             .unwrap();
-        // cross-module dependency: products -> auth
-        store
-            .upsert_edge(&edge(
-                "dart_class::lib/features/products/products_screen.dart#ProductsScreen",
-                "dart_class::lib/features/auth/data/auth_repository.dart#AuthRepository",
-                EdgeKind::Calls,
-            ))
-            .unwrap();
+        // single cross-module dependency: products -> auth
+        store.upsert_edge(&edge(ps, ar, EdgeKind::Calls)).unwrap();
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
 
-        let auth = pack.modules.iter().find(|m| m.id == "auth").expect("auth module");
+        let auth = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "auth")
+            .expect("auth module");
         assert_eq!(auth.name, "Auth");
         assert_eq!(auth.test_count, 1);
         assert_eq!(auth.docs.len(), 1, "doc associated by normalised segment");
@@ -1161,11 +1682,30 @@ mod tests {
             .iter()
             .any(|d| d.from == "products" && d.to == "auth"));
 
+        // cohesion is reported and bounded; auth (a clique) is highly
+        // self-contained, so its cohesion beats the leaky products module.
+        let auth_coh = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "auth")
+            .unwrap()
+            .cohesion;
+        assert!(
+            auth_coh > 0.5,
+            "auth is a clique -> high cohesion, got {auth_coh}"
+        );
+        for m in &pack.modules {
+            assert!((0.0..=1.0).contains(&m.cohesion));
+        }
+
         // evidence list references only real node ids
         for m in &pack.modules {
             for ev in &m.evidence {
                 assert!(
-                    store.find_node(&ArtifactId::new(ev.clone())).unwrap().is_some(),
+                    store
+                        .find_node(&ArtifactId::new(ev.clone()))
+                        .unwrap()
+                        .is_some(),
                     "evidence id {ev} must resolve to a real node"
                 );
             }
@@ -1174,6 +1714,114 @@ mod tests {
         // prompt is Chinese + mentions the target file
         assert!(pack.prompt.contains("business_logic.yaml"));
         assert!(pack.prompt.contains("业务逻辑"));
+    }
+
+    #[test]
+    fn layer_organised_repo_still_aggregates_by_business_feature() {
+        // The repo is organised by *layer* (`lib/models`, `lib/services`,
+        // `lib/widgets`), not by feature — exactly the "messy"/conventional
+        // case the user warned about. A naive path split would report
+        // "Models / Services / Widgets" (architecture, not business). The
+        // call graph, however, couples each feature across the layers, so
+        // graph-driven detection must recover the *business* modules
+        // ("User", "Order") and name them after their central symbol.
+        let (mut store, _dir) = empty_store();
+        let nodes = [
+            (
+                "dart_class::lib/models/user.dart#User",
+                "lib/models/user.dart",
+                "User",
+            ),
+            (
+                "dart_class::lib/services/user_service.dart#UserService",
+                "lib/services/user_service.dart",
+                "UserService",
+            ),
+            (
+                "dart_class::lib/widgets/user_page.dart#UserPage",
+                "lib/widgets/user_page.dart",
+                "UserPage",
+            ),
+            (
+                "dart_class::lib/models/order.dart#Order",
+                "lib/models/order.dart",
+                "Order",
+            ),
+            (
+                "dart_class::lib/services/order_service.dart#OrderService",
+                "lib/services/order_service.dart",
+                "OrderService",
+            ),
+            (
+                "dart_class::lib/widgets/order_page.dart#OrderPage",
+                "lib/widgets/order_page.dart",
+                "OrderPage",
+            ),
+        ];
+        for (id, path, name) in nodes {
+            store
+                .upsert_node(&node(id, NodeKind::DartClass, path, name))
+                .unwrap();
+        }
+        let user = "dart_class::lib/models/user.dart#User";
+        let user_svc = "dart_class::lib/services/user_service.dart#UserService";
+        let user_page = "dart_class::lib/widgets/user_page.dart#UserPage";
+        let order = "dart_class::lib/models/order.dart#Order";
+        let order_svc = "dart_class::lib/services/order_service.dart#OrderService";
+        let order_page = "dart_class::lib/widgets/order_page.dart#OrderPage";
+        // each feature is a triangle across the three layers
+        for (f, t) in [
+            (user_page, user_svc),
+            (user_svc, user),
+            (user_page, user),
+            (order_page, order_svc),
+            (order_svc, order),
+            (order_page, order),
+        ] {
+            store.upsert_edge(&edge(f, t, EdgeKind::Calls)).unwrap();
+        }
+        // single weak cross-feature link: order references user
+        store
+            .upsert_edge(&edge(order_svc, user, EdgeKind::Calls))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+
+        // Exactly two business modules, by *feature*, not by layer.
+        let ids: BTreeSet<&str> = pack.modules.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.contains("models") && !ids.contains("services") && !ids.contains("widgets"),
+            "must not segment by architectural layer, got {ids:?}"
+        );
+        assert!(
+            ids.contains("user"),
+            "expected a graph-derived `user` module, got {ids:?}"
+        );
+        assert!(
+            ids.contains("order"),
+            "expected a graph-derived `order` module, got {ids:?}"
+        );
+
+        // the user module pulled in all three layer files (proof it
+        // followed the graph, not the directory): its 3 symbols live under
+        // models/, services/ and widgets/ respectively.
+        let user_mod = pack.modules.iter().find(|m| m.id == "user").unwrap();
+        assert_eq!(
+            user_mod.symbol_count, 3,
+            "user feature spans models+services+widgets"
+        );
+        let dirs: BTreeSet<String> = user_mod
+            .entry_points
+            .iter()
+            .filter_map(|e| e.path.rsplit_once('/').map(|(d, _)| d.to_string()))
+            .collect();
+        assert!(
+            dirs.contains("lib/models")
+                && dirs.contains("lib/services")
+                && dirs.contains("lib/widgets"),
+            "user module entry points should span all three layers, got {dirs:?}"
+        );
     }
 
     #[test]
@@ -1272,7 +1920,10 @@ mod tests {
             .find(|m| m.id == "checkout")
             .expect("checkout module");
         assert!(
-            checkout.entry_points.iter().any(|e| e.name == "CheckoutBloc"),
+            checkout
+                .entry_points
+                .iter()
+                .any(|e| e.name == "CheckoutBloc"),
             "production bloc is an entry point"
         );
         assert!(

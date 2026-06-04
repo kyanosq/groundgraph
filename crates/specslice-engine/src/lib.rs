@@ -5,8 +5,8 @@
 //! - [`init_repository`] — generate the config file and graph database.
 
 pub mod business_candidates;
-pub mod business_pack;
 pub mod business_doc;
+pub mod business_pack;
 pub mod c_treesitter;
 pub mod checks;
 pub mod confidence_view;
@@ -21,6 +21,7 @@ pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
 pub mod export;
+pub mod feature_cluster;
 pub mod feature_map;
 pub mod git_diff;
 pub mod go_indexer;
@@ -61,14 +62,15 @@ pub use business_candidates::{
     BUSINESS_CANDIDATES_REL_PATH, BUSINESS_CANDIDATES_SCHEMA_VERSION,
 };
 
-pub use business_pack::{
-    propose_business_pack, propose_business_pack_with_store, BusinessPack, BusinessPackOptions,
-    BusinessPackStats, EvidenceRef as BusinessEvidenceRef, EvidenceSymbol as BusinessEvidenceSymbol,
-    ModuleDependency, ModuleEvidence, BUSINESS_PACK_SCHEMA_VERSION,
-};
 pub use business_doc::{
     build_business_doc, BusinessDoc, BusinessDocEntry, BusinessDocOptions, BusinessDocStats,
     DocEvidence, BUSINESS_DOC_SCHEMA_VERSION,
+};
+pub use business_pack::{
+    propose_business_pack, propose_business_pack_with_store, BusinessPack, BusinessPackOptions,
+    BusinessPackStats, EvidenceRef as BusinessEvidenceRef,
+    EvidenceSymbol as BusinessEvidenceSymbol, ModuleDependency, ModuleEvidence,
+    BUSINESS_PACK_SCHEMA_VERSION,
 };
 pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,

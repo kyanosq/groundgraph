@@ -214,6 +214,46 @@ specslice propose        代码/文档/测试事实  → 业务模块证据包 +
 
 ---
 
+## 0.13 第七轮（2026-06-04 · 业务模块改为「以代码图为准」+ 对标 GitNexus 的社区检测，可视化回归业务视角）
+
+第六轮的 `propose` 用**路径约定**（`lib/features/<x>`）切业务模块——这隐含了「目标仓自身是规整分模块的」假设。真实仓往往**管理混乱**（扁平 `lib/`、按层切的 `lib/models`+`lib/services`+`lib/widgets`、或纯粹一团乱）。本轮把模块划分**改为以代码图为准**，并据此校准可视化方向。
+
+**核心算法变更（全程 TDD）：**
+
+1. **确定性 Louvain 社区发现（新 `feature_cluster.rs`）。** 在「文件级」加权无向图上跑模块度最大化的社区发现：把符号级 `calls`/`references`（权 2）/`imports`（权 1）耦合上提到文件对。一个业务特性内部 bloc→usecase→repository→api-client 互相调用稠密、跨特性稀疏，所以社区天然对齐业务特性——**与目录怎么摆无关**。纯函数、无依赖、节点序遍历 + 模块度增益平手偏向低社区号 + 末位按最小成员重排，**跑两次字节一致**（6 个单测：空图/无边/两三角桥接/团/带权覆盖稀疏目录/确定性）。
+
+2. **`business_pack` 改为图驱动划分（路径降级为「命名/兜底」）。** 放置规则按置信度分两档：
+   - **显式 feature 目录优先**：落在 `.../features/<x>/...`、`.../modules/<x>/...` 下的文件直接归到模块 `<x>`——这是作者**亲手画的业务边界**，图也总是认同（高内聚）。它还**溶解了社区检测会产生的跨特性「基础设施大团」**（每个特性的 repository 都互相耦合，否则会黏成一坨）。
+   - **其余一律跟代码图**：没有显式 feature 标记的文件（扁平 `lib/`、按层切、乱放）按 Louvain 社区落位。**松散路径约定（`lib/<x>`、首层目录）一律不信**——「仓库管理混乱」正是栽在这里，此处以图为准。
+   - **同名归并**：派生出同一 slug 的多个社区合并为一个模块（如无 feature 标记的 `lib/core` 会裂成几个松耦合社区、都自命名 "core"，归并后避免 `core / core_2 / …` 噪声）；两个真特性永不相撞（名字不同）。
+   - **命名**：feature 标记直接用标记名；否则取主导 feature 目录 token；再否则取**最被引用的业务符号**（类型优先、滤掉 `load/default/fromJson` 等无业务含义词）；最后退化到公共目录。
+
+3. **新增「内聚度」业务信号。** 每个模块给出 `内部耦合 / (内部+外部)` 的内聚度（GitNexus 也有 cohesion）：高=自洽的业务边界，低=与其它模块纠缠（重构信号，提示给 AI/人）。`propose` 文本/markdown 直接以「内聚 90%（高内聚，边界清晰）」呈现。
+
+**对标 GitNexus（本轮新参考，`docs/sourcecode/gitnexus`）：** GitNexus 的管线是 **Leiden 社区检测 → 启发式标签 → LLM 直接写 name/description 落库**（`cluster-enricher.ts`），可视化是 Sigma.js/WebGL 的通用符号图。它印证了「**社区检测 = 以代码图为准**」这一方向（Leiden 是 Louvain 的后继）。但其业务理解是**未经核验的 LLM 猜测**、无证据约束、无人工确认、无漂移检测；图也正是用户说的「酷炫但无意义」。SpecSlice 的差异化因此更清晰：
+
+| 维度 | GitNexus | SpecSlice |
+|---|---|---|
+| 模块来源 | Leiden 社区（图驱动） | Louvain 社区（图驱动）**+ 显式 feature 边界优先**——乱仓/规整仓都稳 |
+| 业务名称/描述 | LLM 直接写、落库即终态 | AI 仅基于**证据 id** 提议 → **人工确认** → 落库；带审阅留痕 |
+| 可信度 | 无核验 | 证据回解析到 `path:line` + **doc-code 漂移检测** |
+| 可视化 | 通用符号知识图（WebGL，炫但泛） | **业务模块依赖图**（节点=业务模块、边=跨模块依赖）+ 内聚度 |
+
+**验收（两类仓，全部以真实命令输出为准）：**
+
+| 仓 | 形态 | 结果 |
+|---|---|---|
+| tailorx（27,368 符号，规整 `lib/features/`） | 规整 | **24 个业务模块**全部为真实特性（design 内聚 90%/order_measure/customer_edit/auth/ai_tryon 74%/measure_core/cart 66%/fabric 71%/settings/order 73%/customer_detail/products 73%/photo_measure/…），`lib/core` 归并为**单个**低内聚 infra 模块（内聚 12%，诚实标注为跨切面胶水，也确实是依赖图的中心枢纽），无碎裂/无脚手架泄漏 |
+| `/tmp/messyshop`（**按层切**：`lib/models`+`lib/services`+`lib/pages`，无 `features/`） | 混乱 | `init→index→propose` 端到端：还原出 **`user` / `order` 两个业务模块**（各跨三层、各 3 文件），业务依赖图 `order --> user`——路径切分只会给出 "models/services/pages" 三个**架构桶** |
+
+**性能（release `propose`，tailorx 27,368 符号 / 144MB graph.db，三跑）：** 冷 1.58s → 0.72s → 暖 **0.21s**（`connect propose` 旧链路曾 6 分钟未结束）。可视化是 **24 节点 / ≤24 边的业务模块依赖图**（Mermaid `flowchart`），节点=业务模块、边=跨模块依赖，`core` 作为枢纽一眼可辨——对照 GitNexus 是把上万符号铺成 WebGL 力导图。
+
+**质量修复（均失败测试先行）：** 入口符号排除 Dart `<default>` 合成构造器等无名/合成符号；脚手架 denylist 不再被 `_2` 后缀绕过（同名归并后 `test` 桶直接命中 denylist）。
+
+> 本轮代码改动：新增 `crates/specslice-engine/src/feature_cluster.rs`（Louvain）；重写 `business_pack.rs` 的模块划分为图驱动 + feature 标记优先 + 同名归并 + 内聚度；`commands/propose.rs` 呈现内聚度。`fmt`/`clippy` 零告警，workspace 全绿（engine lib **411 测试**，CLI bin **42 测试**）。
+
+---
+
 ## 1. 两个项目的画像
 
 ### 1.1 SpecSlice 现状画像
@@ -231,7 +271,7 @@ specslice propose        代码/文档/测试事实  → 业务模块证据包 +
 | CLI 命令面 | `init/index/slice/impact/check/context/connect/export/graph/candidate/logic/`**`propose`**`/`**`business-doc`**`/search/dead-code/similar/select-tests/features/graph-diff/questions`（`propose`+`business-doc` 为业务文档流水线两端） |
 | MCP 工具 | 6 个：`search_graph` / `context_pack` / `explain_symbol` / `get_subgraph` / `impact` / `dead_code`（独立 `specslice-mcp` 二进制） |
 | 可视化 | 自包含、离线、零 CDN 的 HTML 代码图浏览器（Documents / Business / Code / Tests / Risks 五泳道，fact/confirmed/candidate/risk 四图层） |
-| 成熟度 | v0.2.0 已收口发版，v0.3.0-A（置信度贯通）+ P21/P22（tree-sitter 广度后端）+ P23（9 语言启发式调用解析全覆盖）+ P24（业务文档流水线 `propose`/`business-doc`）已落地未发版；workspace 全绿（engine lib **404 测试**，含逐语言属性测试 + 9 语言调用解析 scan 测试 + 业务证据包/文档导出测试） |
+| 成熟度 | v0.2.0 已收口发版，v0.3.0-A（置信度贯通）+ P21/P22（tree-sitter 广度后端）+ P23（9 语言启发式调用解析全覆盖）+ P24（业务文档流水线 `propose`/`business-doc`，**模块划分以代码图为准**：Louvain 社区 + 显式 feature 边界优先）已落地未发版；workspace 全绿（engine lib **411 测试** + CLI bin **42 测试**，含逐语言属性测试 + 9 语言调用解析 scan 测试 + 业务证据包/文档导出测试 + Louvain 社区发现测试） |
 
 **核心价值链（产品主线）：**
 

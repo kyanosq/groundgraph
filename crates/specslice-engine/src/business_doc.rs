@@ -126,8 +126,7 @@ pub fn build_business_doc(options: BusinessDocOptions) -> Result<BusinessDoc> {
     let store = Store::open(&db_path)
         .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
     let nodes = store.list_all_nodes().context("listing nodes")?;
-    let nodes_by_id: HashMap<String, &Node> =
-        nodes.iter().map(|n| (n.id.to_string(), n)).collect();
+    let nodes_by_id: HashMap<String, &Node> = nodes.iter().map(|n| (n.id.to_string(), n)).collect();
     let mut doc = assemble_doc(
         &options.repo_root.to_string_lossy(),
         &loaded.document.candidates,
@@ -375,7 +374,7 @@ mod tests {
         }
     }
 
-    fn nodes_map<'a>(nodes: &'a [Node]) -> HashMap<String, &'a Node> {
+    fn nodes_map(nodes: &[Node]) -> HashMap<String, &Node> {
         nodes.iter().map(|n| (n.id.to_string(), n)).collect()
     }
 
