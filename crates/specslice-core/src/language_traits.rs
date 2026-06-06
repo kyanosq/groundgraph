@@ -70,6 +70,9 @@ pub enum SymbolFamily {
     Framework,
     /// AI-authored business candidate.
     Candidate,
+    /// Persistence-layer artifact (DB table / schema), carried in the graph
+    /// so a rewrite can be checked for data-contract parity.
+    Schema,
 }
 
 /// Language each `NodeKind` belongs to.
@@ -129,7 +132,10 @@ pub fn language_of(kind: NodeKind) -> Language {
         // actual host language must look at the file path; here we mark
         // them generic to make `is_test` symmetric across languages.
         NodeKind::TestCase | NodeKind::TestGroup => Language::Generic,
-        NodeKind::File | NodeKind::BusinessCandidate => Language::Generic,
+        NodeKind::File
+        | NodeKind::BusinessCandidate
+        | NodeKind::DbTable
+        | NodeKind::SqlMapperStmt => Language::Generic,
     }
 }
 
@@ -197,6 +203,8 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         NodeKind::DartProvider | NodeKind::Route | NodeKind::Storage => SymbolFamily::Framework,
         // Candidates.
         NodeKind::BusinessCandidate => SymbolFamily::Candidate,
+        // Schema (persistence layer): tables + mapper SQL statements.
+        NodeKind::DbTable | NodeKind::SqlMapperStmt => SymbolFamily::Schema,
     }
 }
 
@@ -257,6 +265,7 @@ pub fn default_dead_code_reason(kind: NodeKind) -> &'static str {
         SymbolFamily::Doc => "doc artifact has no implementations/verifications",
         SymbolFamily::Framework => "framework anchor has no incoming reads/navigations",
         SymbolFamily::Candidate => "candidate has no DeclaresImplementation edges",
+        SymbolFamily::Schema => "schema table has no incoming code edges",
     }
 }
 

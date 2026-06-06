@@ -38,6 +38,14 @@ fn pixcraft_iap_workspace() -> TempDir {
         repo_root: tmp.path().into(),
     })
     .unwrap();
+    // Pin the lightweight Dart body parser so this P6.2 acceptance gate is
+    // hermetic w.r.t. whether a Dart analyzer sidecar is installed on the host.
+    let cfg_path = tmp.path().join(".specslice.yaml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg
+        .replace("analyzer: true", "analyzer: false")
+        .replace("lsp: true", "lsp: false");
+    std::fs::write(&cfg_path, cfg).unwrap();
     write(
         &tmp.path().join("lib/core/iap/iap_constants.dart"),
         "class IapProductIds {\n  static const String monthly = 'pro_monthly';\n  static const String yearly = 'pro_yearly';\n  static const String lifetime = 'pro_lifetime';\n  static const List<String> all = <String>[monthly, yearly, lifetime];\n}\n",

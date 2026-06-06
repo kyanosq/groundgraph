@@ -579,6 +579,16 @@ fn map_node(node: &Node) -> GraphNode {
             badges.push(key.clone());
         }
     }
+    // P25: surface a DB table's column count as evidence in the viz.
+    if node.kind == NodeKind::DbTable {
+        if let Some(meta) = node
+            .metadata_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<crate::schema_indexer::DbTableMeta>(j).ok())
+        {
+            badges.push(format!("{} cols", meta.columns.len()));
+        }
+    }
     GraphNode {
         id: node.id.to_string(),
         kind: node.kind.as_str().into(),
@@ -898,7 +908,8 @@ fn column_for(kind: NodeKind) -> GraphColumn {
         SymbolFamily::Module
         | SymbolFamily::Type
         | SymbolFamily::Callable
-        | SymbolFamily::Framework => GraphColumn::Code,
+        | SymbolFamily::Framework
+        | SymbolFamily::Schema => GraphColumn::Code,
     }
     .merge_requirement(kind)
 }
@@ -1455,6 +1466,25 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_node_adds_column_count_badge_for_db_table() {
+        use specslice_core::ArtifactId;
+        let mut node = Node::new(ArtifactId::new("db_table::craft_conflict"), NodeKind::DbTable);
+        node.name = Some("craft_conflict".into());
+        node.path = Some("internal/db/schema.sql".into());
+        node.metadata_json = Some(
+            r#"{"columns":[{"name":"id","definition":"BIGINT"},{"name":"status","definition":"INT"}],"source":"sql"}"#
+                .into(),
+        );
+        let g = map_node(&node);
+        assert_eq!(g.kind, "db_table");
+        assert!(
+            g.badges.iter().any(|b| b == "2 cols"),
+            "expected a column-count badge, got {:?}",
+            g.badges
+        );
+    }
 
     #[test]
     fn parent_dir_handles_root_and_nested() {

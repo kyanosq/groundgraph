@@ -91,7 +91,36 @@ fn swift_is_callable(kind: &str) -> bool {
             | "protocol_function_declaration"
             | "init_declaration"
             | "deinit_declaration"
+            // A *computed* property is an accessor; we treat it as a callable
+            // and let `swift_name_of` return `None` for stored properties so
+            // they are skipped (the driver drops nameless callables).
+            | "property_declaration"
     )
+}
+
+/// The bare name of a *computed* property (`var x: T { … }` / `var x: T { get … }`),
+/// or `None` for a stored property. Computed properties carry a
+/// `computed_value` field (a `computed_property` node); stored properties —
+/// including `didSet`/`willSet`-observed ones — do not.
+fn swift_computed_property_name(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    node.child_by_field_name("computed_value")?;
+    let pattern = node.child_by_field_name("name")?;
+    let ident = first_simple_identifier(pattern, src)?;
+    swift_bare(&ident)
+}
+
+/// First `simple_identifier` text within a (small) pattern subtree.
+fn first_simple_identifier(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    if node.kind() == "simple_identifier" {
+        return node_text(node, src).map(str::to_string);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_simple_identifier(child, src) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Initializers keep their own [`NodeKind`]; `deinit` and ordinary
@@ -110,6 +139,7 @@ fn swift_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
     match node.kind() {
         "init_declaration" => Some("init".to_string()),
         "deinit_declaration" => Some("deinit".to_string()),
+        "property_declaration" => swift_computed_property_name(node, src),
         _ => name_from_field(node, src).and_then(|n| swift_bare(&n)),
     }
 }
@@ -171,6 +201,11 @@ fn swift_test_of(
     name: &str,
     parent_qualified: Option<&str>,
 ) -> Option<TestKind> {
+    // Computed properties are accessors, never test cases — even if named
+    // `testFoo` (which would otherwise match the XCTest prefix heuristic).
+    if node.kind() == "property_declaration" {
+        return None;
+    }
     let attrs = swift_attribute_heads(node, src);
     if matches!(
         kind,
@@ -544,6 +579,53 @@ protocol Walker { func walk() }
             qnames(&s, NodeKind::SwiftInitializer),
             vec!["Greeter.init".to_string()]
         );
+    }
+
+    #[test]
+    fn computed_properties_are_methods_stored_are_not() {
+        // A computed property is an accessor (a getter), so it is emitted as a
+        // method — this is what lets a Dart `String get displayName` getter
+        // match its Swift `var displayName: String { … }` port. Stored
+        // properties (incl. `didSet`-observed ones) are data, not symbols.
+        let src = r#"
+struct Shift {
+    let id: Int
+    var name: String = "x"
+    var counter: Int = 0 { didSet { } }
+    var displayName: String { "Shift \(name)" }
+    var durationSeconds: Double {
+        get { 3600 }
+    }
+    func mag() -> Int { id }
+}
+
+var globalComputed: Int { 42 }
+let globalStored = 7
+"#;
+        let s = scan(src);
+        let methods = qnames(&s, NodeKind::SwiftMethod);
+        let funcs = qnames(&s, NodeKind::SwiftFunction);
+        assert!(
+            methods.contains(&"Shift.displayName".to_string()),
+            "expression-bodied computed property is a method: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"Shift.durationSeconds".to_string()),
+            "getter-block computed property is a method: {methods:?}"
+        );
+        // Stored properties (plain + observed) must never become callables.
+        for stored in ["Shift.id", "Shift.name", "Shift.counter"] {
+            assert!(
+                !methods.contains(&stored.to_string()),
+                "stored property must not be a method: {stored} in {methods:?}"
+            );
+        }
+        // A global computed var is a free accessor → function; stored → nothing.
+        assert!(
+            funcs.contains(&"globalComputed".to_string()),
+            "global computed var: {funcs:?}"
+        );
+        assert!(!funcs.contains(&"globalStored".to_string()), "{funcs:?}");
     }
 
     #[test]

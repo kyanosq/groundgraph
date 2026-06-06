@@ -392,6 +392,12 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         NodeKind::CppEnum,
         NodeKind::CppFunction,
         NodeKind::CppMethod,
+        // P25 — persistence schema is first-class graph evidence; surface tables
+        // in the default `search` surface so `grep`-style lookups find them.
+        NodeKind::DbTable,
+        // MyBatis mapper SQL is searchable evidence too: a query for a mapper
+        // method name returns the actual `<select>` body.
+        NodeKind::SqlMapperStmt,
     ]
 }
 

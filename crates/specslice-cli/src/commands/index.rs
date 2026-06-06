@@ -12,7 +12,85 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
     };
     let result = index_repository(options)?;
     print!("{}", format_result(&result));
+    record_index_metrics(&result);
+    // P25: fold the persistence contract into the same graph. Best-effort —
+    // a schema scan failure must not abort a successful code/docs index.
+    if !docs_only {
+        match specslice_engine::schema_indexer::index_schema(repo_root) {
+            Ok(s) => {
+                println!("Schema index:");
+                println!("  Tables (SQL {} + ORM {})", s.sql_tables, s.orm_tables);
+                println!("  Columns: {}", s.columns);
+                println!("  Mapper statements: {}", s.mapper_stmts);
+                println!(
+                    "  Data-layer edges: method→SQL {} + SQL→table {} + interface→impl {} + inline-SQL→table {}",
+                    s.stmt_method_edges,
+                    s.stmt_table_edges,
+                    s.iface_impl_edges,
+                    s.inline_sql_table_edges
+                );
+                specslice_engine::stats::set_metric("tables", (s.sql_tables + s.orm_tables) as i64);
+                specslice_engine::stats::set_metric("columns", s.columns as i64);
+                specslice_engine::stats::set_metric("mapper_stmts", s.mapper_stmts as i64);
+                specslice_engine::stats::set_metric(
+                    "data_layer_edges",
+                    (s.stmt_method_edges + s.stmt_table_edges) as i64,
+                );
+                specslice_engine::stats::set_metric("iface_impl_edges", s.iface_impl_edges as i64);
+                specslice_engine::stats::set_metric(
+                    "inline_sql_table_edges",
+                    s.inline_sql_table_edges as i64,
+                );
+            }
+            Err(e) => eprintln!("Schema index skipped: {e:#}"),
+        }
+    }
     Ok(())
+}
+
+/// Push aggregate index counts into the per-command stats collector so
+/// `specslice stats` can report how much each `index` run produced.
+fn record_index_metrics(result: &IndexResult) {
+    use specslice_engine::stats::set_metric;
+    let mut files = 0i64;
+    let mut symbols = 0i64;
+    if let Some(d) = &result.docs {
+        set_metric("doc_sections", d.doc_sections as i64);
+    }
+    if let Some(c) = &result.code {
+        files += c.files as i64;
+        symbols += c.symbols as i64;
+    }
+    if let Some(s) = &result.swift {
+        files += s.files as i64;
+        symbols += s.symbols as i64;
+    }
+    if let Some(s) = &result.go {
+        files += s.files as i64;
+        symbols += s.symbols as i64;
+    }
+    if let Some(s) = &result.python {
+        files += s.files as i64;
+        symbols += s.symbols as i64;
+    }
+    if let Some(s) = &result.typescript {
+        files += s.files as i64;
+        symbols += s.symbols as i64;
+    }
+    if let Some(s) = &result.java {
+        files += s.files as i64;
+        symbols += s.symbols as i64;
+    }
+    if let Some(r) = &result.rust {
+        files += r.files as i64;
+        symbols += r.symbols as i64;
+    }
+    for lang in &result.treesitter {
+        files += lang.files as i64;
+        symbols += lang.symbols as i64;
+    }
+    set_metric("files", files);
+    set_metric("symbols", symbols);
 }
 
 /// Render the human-readable summary for `specslice index`. Factored

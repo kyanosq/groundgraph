@@ -44,6 +44,17 @@ fn rich_fixture() -> TempDir {
         repo_root: tmp.path().into(),
     })
     .unwrap();
+    // Pin the lightweight Dart body parser: this whole file is the acceptance
+    // gate for the *heuristic* adapter (see module doc), so it must be hermetic
+    // w.r.t. whether a Dart analyzer sidecar is installed on the host. With the
+    // sidecar enabled the resolution path differs and field-typed-access edges
+    // are emitted differently.
+    let cfg_path = tmp.path().join(".specslice.yaml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg
+        .replace("analyzer: true", "analyzer: false")
+        .replace("lsp: true", "lsp: false");
+    std::fs::write(&cfg_path, cfg).unwrap();
     write(
         &tmp.path().join("lib/iap/iap_constants.dart"),
         "class IapProductIds {\n  static const String monthly = 'pro_monthly';\n  static const String yearly = 'pro_yearly';\n  static const List<String> all = <String>[monthly, yearly];\n}\n",

@@ -432,6 +432,73 @@ go:
 }
 
 #[test]
+fn init_autodetects_swift_repo_and_writes_treesitter_config() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("App/Views")).unwrap();
+    std::fs::create_dir_all(root.join("Sources/Core")).unwrap();
+    std::fs::write(root.join("Package.swift"), "// swift-tools-version:5.9\n").unwrap();
+    std::fs::write(root.join("App/Views/HomeView.swift"), "struct HomeView {}\n").unwrap();
+    std::fs::write(root.join("Sources/Core/Engine.swift"), "struct Engine {}\n").unwrap();
+
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+
+    let cfg: EngineConfig = serde_yaml::from_str(
+        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg.languages.len(), 1, "exactly one detected language");
+    assert_eq!(cfg.languages[0].id, "swift");
+    assert!(
+        cfg.languages[0].paths.contains(&"App".to_string()),
+        "detected source dir App: {:?}",
+        cfg.languages[0].paths
+    );
+    assert!(
+        cfg.languages[0].paths.contains(&"Sources".to_string()),
+        "detected source dir Sources: {:?}",
+        cfg.languages[0].paths
+    );
+    assert!(
+        !cfg.enrichment.lsp,
+        "zero-config init uses the always-available tree-sitter backend"
+    );
+    // The unified `languages` list must route Swift through the generic
+    // tree-sitter driver (no external sourcekit-lsp needed to get a graph).
+    let norm = cfg.normalized();
+    assert!(norm.treesitter.enabled, "tree-sitter backend enabled");
+    assert!(norm.treesitter.languages.contains(&"swift".to_string()));
+}
+
+#[test]
+fn init_on_dart_repo_keeps_legacy_default() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("pubspec.yaml"), "name: x\n").unwrap();
+    std::fs::write(root.join("lib/main.dart"), "void main() {}\n").unwrap();
+
+    init_repository(InitOptions {
+        repo_root: root.into(),
+    })
+    .unwrap();
+
+    let cfg: EngineConfig = serde_yaml::from_str(
+        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        cfg.languages.is_empty(),
+        "Dart keeps the legacy code-section default, not a languages list"
+    );
+    assert_eq!(cfg.code.language, "dart");
+    assert_eq!(cfg.code.paths, vec!["lib".to_string(), "test".to_string()]);
+}
+
+#[test]
 fn index_repository_skips_swift_adapter_when_disabled() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();

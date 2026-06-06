@@ -76,6 +76,276 @@ enum Commands {
     GraphDiff(GraphDiffArgs),
     /// AI 澄清问题包 — 列出代码图里需要人 / Agent 确认的事实 (P19)。
     Questions(QuestionsArgs),
+    /// 行为事实抽取 (P24) — 从每个代码符号体里确定性地抽出分支 / 循环 /
+    /// return / 比较 / 空值 / 抛出 / await 计数与「决策证据行」，并标注纯度。
+    /// 重构 / 移植时用来补足「图里没有的行为」。
+    Facts(FactsArgs),
+    /// 节点纯度普查 (P24) — pure / impure / unknown 计数 + 副作用原因
+    /// (io / async / ui / time / randomness / global_mutation)。
+    Purity(PurityArgs),
+    /// 常量 / 字面量目录 (P24) — 把代码体里的 int / float / string / bool /
+    /// char 字面量按值聚合（出现次数降序），定位每个魔法值的所有出现点。
+    /// 移植 / 重构时用来「一个不漏地」复刻关键常量。
+    Constants(ConstantsArgs),
+    /// 数据契约视图 (P24) — 抽取 `CREATE TABLE` 持久化 schema（位于字符串里）
+    /// 与 `obj['key'] ?? default` 形式的序列化键映射。移植时用来对齐
+    /// DB 结构与 JSON 线格式 / 默认值。
+    Contract(ContractArgs),
+    /// 移植覆盖率账本 (P24) — 按符号名对比「源」与「目标」两份 graph.db，
+    /// 报告已移植 / 缺失 / 目标独有，以及按源文件的覆盖率。用于重写时
+    /// 跟踪「还差哪些没移植」。
+    #[command(name = "port-coverage")]
+    PortCoverage(PortCoverageArgs),
+    /// 业务图等价 (P24+) — 把「同一业务切片」在源/目标两份 graph.db 中按
+    /// 路径 glob 圈定，量化对比节点数(按种类/家族)、内部边数、名称覆盖率。
+    /// JSON 输出可喂给 AI 逐子图遍历、逐项审查差异，用数字证明「Go 等价替代
+    /// Java」。
+    #[command(name = "graph-equiv")]
+    GraphEquiv(GraphEquivArgs),
+    /// 索引数据库表结构 (P25) — 扫描 .sql 的 CREATE TABLE 与 Java 实体的
+    /// @TableName/@Table，把「表(含列)」写入 graph.db 作为 DbTable 节点，
+    /// 让数据契约成为业务图等价的证据(graph-equiv 会对比表/列)。
+    #[command(name = "schema-index")]
+    SchemaIndex(SchemaIndexArgs),
+    /// 从事实生成测试建议 (P24) — 基于分支 / 比较 / 空值 / 抛出 / 纯度 +
+    /// 常量边界，给出每个符号的确定性单测清单（分支多者优先）。不会写测试。
+    #[command(name = "suggest-tests")]
+    SuggestTests(SuggestTestsArgs),
+    /// 一键切片导出 (P24) — 把某个特性（按路径前缀或需求 ID 选定）所需的
+    /// 全部上下文（符号+行为事实、内部/外部依赖边、常量、数据契约、测试建议）
+    /// 打成一个自包含 JSON 包，交给智能体直接重写，无需再读整库。
+    #[command(name = "feature-pack")]
+    FeaturePack(FeaturePackArgs),
+    /// 命令使用统计 (P26) — 汇总 `.specslice/stats.jsonl`：每命令调用次数 /
+    /// 总+平均+最大耗时 / 失败数 / 累计指标（节点/返回/覆盖）。每次任意命令
+    /// 运行都会自动追加一条记录。
+    Stats(StatsArgs),
+    /// 接口 → 整张图 (P27) — 从一个端点/符号出发，沿调用/引用/持久化边做前向
+    /// 传递闭包，输出 controller→service→impl→mapper→SQL→table 的完整下游链路，
+    /// 并汇总最终触达的表。`search` 只给 1 跳、`graph --view focus` 也偏浅；
+    /// `trace` 才回答「这个接口背后牵动了图里的哪些东西」。
+    Trace(TraceArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct TraceArgs {
+    /// 端点 / 符号名（与 `search` 同款匹配），如 `selectCraftTree`。
+    query: String,
+    /// 最大遍历深度（跳数），默认 12。
+    #[arg(long, value_name = "N", default_value_t = 12)]
+    depth: usize,
+    /// 闭包节点上限，超出即截断，默认 400。
+    #[arg(long, value_name = "N", default_value_t = 400)]
+    max_nodes: usize,
+    /// 作为起点的 search 命中数上限，默认 6。
+    #[arg(long, value_name = "N", default_value_t = 6)]
+    seeds: usize,
+    /// 保留框架噪声调用（toString/build…），默认过滤。
+    #[arg(long)]
+    include_noise: bool,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct StatsArgs {
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+    /// 清空统计账本（删除 `.specslice/stats.jsonl`）。
+    #[arg(long)]
+    reset: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct FeaturePackArgs {
+    /// 以文件路径前缀选定范围（如 `lib/alarm`）。
+    #[arg(long, value_name = "PREFIX")]
+    path: Option<String>,
+    /// 以需求 ID 选定范围（复用切片找出其触及的文件）。
+    #[arg(long, value_name = "REQ")]
+    requirement: Option<String>,
+    /// 每个符号最多保留多少行「决策证据」。
+    #[arg(long, value_name = "N", default_value_t = 12)]
+    max_evidence: usize,
+    /// 输出人类可读摘要（默认输出 JSON）。
+    #[arg(long)]
+    text: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SuggestTestsArgs {
+    /// 同时为类型容器生成建议。
+    #[arg(long)]
+    include_types: bool,
+    /// 只针对纯函数（最便宜、最确定的用例）。
+    #[arg(long)]
+    only_pure: bool,
+    /// 优先级阈值，低于此值不输出（默认 1）。
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    min_priority: u32,
+    /// 最多输出多少个符号（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct PortCoverageArgs {
+    /// 源项目的 graph.db 路径（被移植方）。
+    #[arg(long, value_name = "PATH")]
+    source_db: PathBuf,
+    /// 目标项目的 graph.db 路径（重写方）。
+    #[arg(long, value_name = "PATH")]
+    target_db: PathBuf,
+    /// 不匹配类型容器，只比较可调用符号。
+    #[arg(long)]
+    callables_only: bool,
+    /// 额外列出目标独有（源中没有）的名字。
+    #[arg(long)]
+    include_extra: bool,
+    /// 不要过滤代码生成文件（freezed/.g.dart/l10n 等，默认会过滤）。
+    #[arg(long)]
+    include_generated: bool,
+    /// 不要过滤测试/spec 文件（默认会过滤）。
+    #[arg(long)]
+    include_tests: bool,
+    /// 不要过滤合成/匿名名字（如 `<default>` 构造器，默认会过滤）。
+    #[arg(long)]
+    include_synthetic: bool,
+    /// 归一化标识符匹配：去掉前导 `_` 私有前缀，使 Dart `_foo` 命中 Swift `foo`。
+    #[arg(long)]
+    normalize_names: bool,
+    /// 大小写不敏感匹配：Java `selectCraftTree` 命中 Go `SelectCraftTree`
+    /// （C#/Pascal 同理）。跨语言移植（Java→Go）必备。
+    #[arg(long)]
+    ignore_case: bool,
+    /// 移植映射 YAML（aliases: 源名 -> 目标名），把改名移植计入覆盖。
+    #[arg(long, value_name = "PATH")]
+    port_map: Option<PathBuf>,
+    /// 额外排除的源/目标路径 glob（可重复，如 `**/l10n/**`）。
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+    /// 列表长度上限（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct GraphEquivArgs {
+    /// 源项目的 graph.db 路径（被移植方，如 Java）。
+    #[arg(long, value_name = "PATH")]
+    source_db: PathBuf,
+    /// 目标项目的 graph.db 路径（重写方，如 Go）。
+    #[arg(long, value_name = "PATH")]
+    target_db: PathBuf,
+    /// 源切片路径 glob（可重复，如 `rcmtm-cloud-craft/**`）。留空=整图。
+    #[arg(long, value_name = "GLOB")]
+    source_scope: Vec<String>,
+    /// 目标切片路径 glob（可重复，如 `internal/craft/**`）。留空=整图。
+    #[arg(long, value_name = "GLOB")]
+    target_scope: Vec<String>,
+    /// 只比较可调用符号，不计入类型容器。
+    #[arg(long)]
+    callables_only: bool,
+    /// 大小写不敏感匹配：Java `selectCraftTree` 命中 Go `SelectCraftTree`。
+    #[arg(long)]
+    ignore_case: bool,
+    /// 归一化名字：去掉非字母数字（snake_case ↔ camelCase 对齐）。
+    #[arg(long)]
+    normalize_names: bool,
+    /// 不过滤代码生成文件（默认过滤）。
+    #[arg(long)]
+    include_generated: bool,
+    /// 不过滤测试/spec 文件（默认过滤）。
+    #[arg(long)]
+    include_tests: bool,
+    /// 缺失/独有名单长度上限（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SchemaIndexArgs {
+    /// 输出 JSON 统计。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ContractArgs {
+    /// 仅输出 CREATE TABLE schema。
+    #[arg(long)]
+    tables_only: bool,
+    /// 仅输出序列化键映射。
+    #[arg(long)]
+    keys_only: bool,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct ConstantsArgs {
+    /// 同时分析类型容器的体（默认只分析可调用符号）。
+    #[arg(long)]
+    include_types: bool,
+    /// 保留 0 / 1 / 空串 / bool / char 等平凡值（默认过滤）。
+    #[arg(long)]
+    include_trivial: bool,
+    /// 仅报告出现次数 ≥ N 的值（默认 1）。
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    min_occurrences: usize,
+    /// 仅某类字面量：`int` / `float` / `str` / `bool` / `char`。
+    #[arg(long, value_name = "KIND")]
+    kind: Option<String>,
+    /// 最多输出多少个去重值（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct FactsArgs {
+    /// 同时分析类型容器（class / struct / enum）的体，默认只分析可调用符号。
+    #[arg(long)]
+    include_types: bool,
+    /// 只输出指定纯度的符号：`pure` / `impure` / `unknown`。
+    #[arg(long, value_name = "PURITY")]
+    purity: Option<String>,
+    /// 最多输出多少个符号（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 每个符号最多展示多少条证据行。
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    max_evidence: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct PurityArgs {
+    /// 同时分析类型容器（class / struct / enum）的体。
+    #[arg(long)]
+    include_types: bool,
+    /// 只列出指定纯度：`pure` / `impure` / `unknown`。
+    #[arg(long, value_name = "PURITY")]
+    only: Option<String>,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -674,7 +944,7 @@ impl From<ExportFormatArg> for specslice_engine::ExportFormat {
 fn main() -> ExitCode {
     reset_sigpipe();
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("specslice: {err:#}");
             ExitCode::from(1)
@@ -696,17 +966,84 @@ fn reset_sigpipe() {
     sigpipe::reset();
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<u8> {
     let cli = Cli::parse();
+    let cmd_name = command_name(&cli.command);
+    let repo_root = cli.repo_root.clone();
+    let start = std::time::Instant::now();
+    let outcome: Result<u8> = dispatch(cli);
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let ok = matches!(&outcome, Ok(0));
+    let metrics = specslice_engine::stats::take_metrics();
+    let stat = specslice_engine::stats::make_stat(cmd_name, duration_ms, ok, metrics);
+    let _ = specslice_engine::stats::append_stat(&repo_root.join(".specslice"), &stat);
+    outcome
+}
+
+/// Clamp a runner's `i32` exit code into the `u8` the process returns. Negative
+/// or oversized codes (none are expected — they are 0/1/2) collapse to 1.
+fn exit_code(exit: i32) -> u8 {
+    u8::try_from(exit).unwrap_or(1)
+}
+
+/// Stable kebab-case name for a command, used as the stats ledger key.
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Init => "init",
+        Commands::Index(_) => "index",
+        Commands::Slice(_) => "slice",
+        Commands::Impact(_) => "impact",
+        Commands::Check(_) => "check",
+        Commands::Context(_) => "context",
+        Commands::Connect(args) => match &args.sub {
+            ConnectSub::Propose(_) => "connect-propose",
+            ConnectSub::Apply(_) => "connect-apply",
+        },
+        Commands::Export(_) => "export",
+        Commands::Graph(_) => "graph",
+        Commands::Candidate(args) => match &args.sub {
+            CandidateSub::List(_) => "candidate-list",
+            CandidateSub::Show(_) => "candidate-show",
+            CandidateSub::Review(_) => "candidate-review",
+        },
+        Commands::Logic(_) => "logic",
+        Commands::Propose(_) => "propose",
+        Commands::BusinessDoc(_) => "business-doc",
+        Commands::Search(_) => "search",
+        Commands::DeadCode(_) => "dead-code",
+        Commands::Similar(_) => "similar",
+        Commands::SelectTests(_) => "select-tests",
+        Commands::Features(_) => "features",
+        Commands::GraphDiff(_) => "graph-diff",
+        Commands::Questions(_) => "questions",
+        Commands::Facts(_) => "facts",
+        Commands::Purity(_) => "purity",
+        Commands::Constants(_) => "constants",
+        Commands::Contract(_) => "contract",
+        Commands::PortCoverage(_) => "port-coverage",
+        Commands::GraphEquiv(_) => "graph-equiv",
+        Commands::SchemaIndex(_) => "schema-index",
+        Commands::SuggestTests(_) => "suggest-tests",
+        Commands::FeaturePack(_) => "feature-pack",
+        Commands::Stats(_) => "stats",
+        Commands::Trace(_) => "trace",
+    }
+}
+
+/// Dispatch a parsed command to its runner, returning the process exit code.
+/// Takes the whole `Cli` by value: the match consumes `cli.command` while the
+/// arms read the disjoint `cli.repo_root` field (allowed within one function).
+fn dispatch(cli: Cli) -> Result<u8> {
     match cli.command {
-        Commands::Init => commands::init::run(&cli.repo_root),
-        Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only),
+        Commands::Init => commands::init::run(&cli.repo_root).map(|()| 0),
+        Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only).map(|()| 0),
         Commands::Slice(args) => commands::slice::run(
             &cli.repo_root,
             &args.requirement,
             args.json,
             args.call_depth,
-        ),
+        )
+        .map(|()| 0),
         Commands::Impact(args) => {
             let format = if args.json {
                 commands::impact::ImpactFormat::Json
@@ -720,35 +1057,33 @@ fn run() -> Result<()> {
             } else {
                 args.head.as_str()
             };
-            commands::impact::run(&cli.repo_root, &args.base, head, format, args.output)
+            commands::impact::run(&cli.repo_root, &args.base, head, format, args.output).map(|()| 0)
         }
         Commands::Check(args) => {
             let exit = commands::check::run(&cli.repo_root, args.json, args.fail_on_warning)?;
-            if exit != 0 {
-                std::process::exit(exit);
-            }
-            Ok(())
+            Ok(exit_code(exit))
         }
         Commands::Context(args) => commands::context::run(
             &cli.repo_root,
             &args.requirement,
             !args.no_snippets,
             args.json,
-        ),
+        )
+        .map(|()| 0),
         Commands::Connect(args) => match args.sub {
             ConnectSub::Propose(p) => {
                 commands::connect::run_propose(&cli.repo_root, p.out.as_deref(), p.pretty)
+                    .map(|()| 0)
             }
             ConnectSub::Apply(a) => {
                 let exit =
                     commands::connect::run_apply(&cli.repo_root, a.candidates, a.dry_run, a.json)?;
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
-                Ok(())
+                Ok(exit_code(exit))
             }
         },
-        Commands::Export(args) => commands::export::run(&cli.repo_root, args.format.into()),
+        Commands::Export(args) => {
+            commands::export::run(&cli.repo_root, args.format.into()).map(|()| 0)
+        }
         Commands::Candidate(args) => match args.sub {
             CandidateSub::List(a) => {
                 let mode = if a.all {
@@ -756,7 +1091,7 @@ fn run() -> Result<()> {
                 } else {
                     commands::candidate::ListMode::Pending
                 };
-                commands::candidate::run_list(&cli.repo_root, mode, a.json)
+                commands::candidate::run_list(&cli.repo_root, mode, a.json).map(|()| 0)
             }
             CandidateSub::Show(a) => {
                 let format = if a.json {
@@ -765,10 +1100,7 @@ fn run() -> Result<()> {
                     a.format.into_command_format()
                 };
                 let exit = commands::candidate::run_show(&cli.repo_root, &a.id, format)?;
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
-                Ok(())
+                Ok(exit_code(exit))
             }
             CandidateSub::Review(a) => {
                 let status = if a.accept {
@@ -796,18 +1128,12 @@ fn run() -> Result<()> {
                         json: a.json,
                     },
                 )?;
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
-                Ok(())
+                Ok(exit_code(exit))
             }
         },
         Commands::Logic(args) => {
             let exit = commands::logic::run(&cli.repo_root, args.json, args.only_risks)?;
-            if exit != 0 {
-                std::process::exit(exit);
-            }
-            Ok(())
+            Ok(exit_code(exit))
         }
         Commands::Propose(args) => commands::propose::run(commands::propose::ProposeRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -816,7 +1142,8 @@ fn run() -> Result<()> {
             pretty: args.pretty,
             max_modules: args.max_modules,
             max_entry_points: args.max_entry_points,
-        }),
+        })
+        .map(|()| 0),
         Commands::BusinessDoc(args) => {
             commands::business_doc::run(commands::business_doc::BusinessDocRunArgs {
                 repo_root: cli.repo_root.clone(),
@@ -826,6 +1153,7 @@ fn run() -> Result<()> {
                 include_rejected: args.include_rejected,
                 pretty: args.pretty,
             })
+            .map(|()| 0)
         }
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -838,7 +1166,8 @@ fn run() -> Result<()> {
             max_nodes: args.max_nodes,
             pretty: args.pretty,
             include_noise: args.include_noise,
-        }),
+        })
+        .map(|()| 0),
         Commands::Search(args) => {
             // `--json` legacy flag wins when explicit; otherwise honour `--format`.
             let format = if args.json {
@@ -859,6 +1188,7 @@ fn run() -> Result<()> {
                 output: args.output,
                 include_noise: args.include_noise,
             })
+            .map(|()| 0)
         }
         Commands::DeadCode(args) => {
             commands::dead_code::run(commands::dead_code::DeadCodeRunArgs {
@@ -867,6 +1197,7 @@ fn run() -> Result<()> {
                 include_tests: args.include_tests,
                 json: args.json,
             })
+            .map(|()| 0)
         }
         Commands::Similar(args) => commands::similar::run(commands::similar::SimilarRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -878,7 +1209,8 @@ fn run() -> Result<()> {
             shingle_k: args.shingle_k,
             max_pairwise: args.max_pairwise,
             format: args.format,
-        }),
+        })
+        .map(|()| 0),
         Commands::SelectTests(args) => {
             commands::select_tests::run(commands::select_tests::SelectTestsRunArgs {
                 repo_root: cli.repo_root.clone(),
@@ -888,6 +1220,7 @@ fn run() -> Result<()> {
                 max_propagation_depth: args.max_depth,
                 format: args.format,
             })
+            .map(|()| 0)
         }
         Commands::Features(args) => commands::features::run(commands::features::FeaturesRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -895,7 +1228,8 @@ fn run() -> Result<()> {
             max_propagation_depth: args.max_depth,
             min_cluster_size: args.min_cluster_size,
             format: args.format,
-        }),
+        })
+        .map(|()| 0),
         Commands::GraphDiff(args) => {
             commands::graph_diff::run(commands::graph_diff::GraphDiffRunArgs {
                 base_db: args.base_db,
@@ -904,6 +1238,7 @@ fn run() -> Result<()> {
                 head_repo_root: args.head_repo_root,
                 format: args.format,
             })
+            .map(|()| 0)
         }
         Commands::Questions(args) => {
             commands::questions::run(commands::questions::QuestionsRunArgs {
@@ -911,6 +1246,136 @@ fn run() -> Result<()> {
                 max_per_category: args.max_per_category,
                 format: args.format,
             })
+            .map(|()| 0)
         }
+        Commands::Facts(args) => {
+            let purity = match args.purity {
+                Some(s) => Some(commands::facts::parse_purity(&s)?),
+                None => None,
+            };
+            commands::facts::run_facts(commands::facts::FactsRunArgs {
+                repo_root: cli.repo_root.clone(),
+                include_types: args.include_types,
+                purity,
+                max: args.max,
+                max_evidence: args.max_evidence,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::Purity(args) => {
+            let only = match args.only {
+                Some(s) => Some(commands::facts::parse_purity(&s)?),
+                None => None,
+            };
+            commands::facts::run_purity(commands::facts::PurityRunArgs {
+                repo_root: cli.repo_root.clone(),
+                include_types: args.include_types,
+                only,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::Constants(args) => {
+            let kind = match args.kind {
+                Some(s) => Some(commands::constants::parse_kind(&s)?),
+                None => None,
+            };
+            commands::constants::run(commands::constants::ConstantsRunArgs {
+                repo_root: cli.repo_root.clone(),
+                include_types: args.include_types,
+                include_trivial: args.include_trivial,
+                min_occurrences: args.min_occurrences,
+                kind,
+                max: args.max,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::Contract(args) => commands::contract::run(commands::contract::ContractRunArgs {
+            repo_root: cli.repo_root.clone(),
+            tables_only: args.tables_only,
+            keys_only: args.keys_only,
+            json: args.json,
+        })
+        .map(|()| 0),
+        Commands::PortCoverage(args) => {
+            commands::port_coverage::run(commands::port_coverage::PortCoverageRunArgs {
+                source_db: args.source_db,
+                target_db: args.target_db,
+                include_types: !args.callables_only,
+                include_extra: args.include_extra,
+                include_generated: args.include_generated,
+                include_tests: args.include_tests,
+                include_synthetic: args.include_synthetic,
+                normalize_names: args.normalize_names,
+                ignore_case: args.ignore_case,
+                port_map: args.port_map,
+                exclude: args.exclude,
+                max: args.max,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::GraphEquiv(args) => {
+            commands::graph_equiv::run(commands::graph_equiv::GraphEquivRunArgs {
+                source_db: args.source_db,
+                target_db: args.target_db,
+                source_scope: args.source_scope,
+                target_scope: args.target_scope,
+                callables_only: args.callables_only,
+                ignore_case: args.ignore_case,
+                normalize_names: args.normalize_names,
+                include_generated: args.include_generated,
+                include_tests: args.include_tests,
+                max: args.max,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::SchemaIndex(args) => {
+            commands::schema_index::run(commands::schema_index::SchemaIndexRunArgs {
+                repo_root: cli.repo_root.clone(),
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::SuggestTests(args) => {
+            commands::suggest_tests::run(commands::suggest_tests::SuggestTestsRunArgs {
+                repo_root: cli.repo_root.clone(),
+                include_types: args.include_types,
+                only_pure: args.only_pure,
+                min_priority: args.min_priority,
+                max: args.max,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::FeaturePack(args) => {
+            commands::feature_pack::run(commands::feature_pack::FeaturePackRunArgs {
+                repo_root: cli.repo_root.clone(),
+                path: args.path,
+                requirement: args.requirement,
+                max_evidence: args.max_evidence,
+                text: args.text,
+            })
+            .map(|()| 0)
+        }
+        Commands::Stats(args) => commands::stats::run(commands::stats::StatsRunArgs {
+            repo_root: cli.repo_root.clone(),
+            json: args.json,
+            reset: args.reset,
+        })
+        .map(|()| 0),
+        Commands::Trace(args) => commands::trace::run(commands::trace::TraceRunArgs {
+            repo_root: cli.repo_root.clone(),
+            query: args.query,
+            max_depth: args.depth,
+            max_nodes: args.max_nodes,
+            max_seeds: args.seeds,
+            include_noise: args.include_noise,
+            json: args.json,
+        })
+        .map(|()| 0),
     }
 }

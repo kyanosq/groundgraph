@@ -79,6 +79,7 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
       --risk: #d24a4a;
       --module: #6f5cff;
       --file: #2c87c7;
+      --table: #2fb6c6;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -154,6 +155,8 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
     .tree-item .count { color: var(--muted); font-size: 10px; }
     .tree-item.layer-confirmed .label { color: var(--confirmed); }
     .tree-item.layer-risk .label { color: var(--risk); }
+    .tree-item.kind-db_table .label { color: var(--table); }
+    .tree-item .badge-cols { color: var(--table); font-size: 9px; margin-left: 4px; }
     .tree-item.depth-0 { padding-left: 14px; }
     .tree-item.depth-1 { padding-left: 28px; }
     .tree-item.depth-2 { padding-left: 42px; }
@@ -176,6 +179,8 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
     svg .node-card.layer-risk rect.node-bg { stroke: var(--risk); fill: #2a1717; }
     svg .node-card.kind-module rect.node-bg { stroke: var(--module); }
     svg .node-card.kind-file rect.node-bg { stroke: var(--file); }
+    svg .node-card.kind-db_table rect.node-bg { stroke: var(--table); fill: #112730; stroke-width: 1.6; }
+    svg .node-card.kind-db_table text.node-label { fill: var(--table); }
     svg .node-card.selected rect.node-bg { stroke: var(--accent); stroke-width: 2.5; filter: drop-shadow(0 0 6px rgba(47,170,114,0.65)); }
     svg text.node-label { fill: var(--text); font-size: 12px; font-weight: 600; }
     svg text.node-sub { fill: var(--muted); font-size: 10px; }
@@ -211,6 +216,11 @@ const STATIC_TEMPLATE: &str = r#"<html lang="en">
       <option value="code">View: code</option>
       <option value="business">View: business</option>
       <option value="focus">View: focus</option>
+    </select>
+    <select id="level" title="Drill-down level (GitNexus style)">
+      <option value="1">Level: L1 架构概览</option>
+      <option value="2">Level: L2 文件/聚类</option>
+      <option value="3">Level: L3 符号 + 表</option>
     </select>
     <input type="text" id="search" placeholder="Search label / path / id">
     <input type="text" id="focus" placeholder="Focus id (REQ-…)">
@@ -366,8 +376,9 @@ const RENDERER_JS: &str = r#"(function () {
     const kids = (childrenOf.get(node.id) || []).slice();
     const labelText = node.label || node.id;
     const item = document.createElement('button');
-    item.className = 'tree-item depth-' + Math.min(depth, 4) + ' layer-' + node.layer;
+    item.className = 'tree-item depth-' + Math.min(depth, 4) + ' layer-' + node.layer + ' kind-' + node.kind;
     if (selected && selected.id === node.id) item.classList.add('selected');
+    const colsBadge = (node.badges || []).find(b => /cols$/.test(b));
     const twirl = document.createElement('span');
     twirl.className = 'twirl';
     twirl.textContent = kids.length ? (userExpanded.has(node.id) ? '▾' : '▸') : '·';
@@ -377,6 +388,7 @@ const RENDERER_JS: &str = r#"(function () {
     const count = document.createElement('span');
     count.className = 'count';
     if (kids.length) count.textContent = node.child_count + '';
+    else if (colsBadge) { count.className = 'badge-cols'; count.textContent = colsBadge; }
     item.appendChild(twirl);
     item.appendChild(label);
     item.appendChild(count);
@@ -412,6 +424,21 @@ const RENDERER_JS: &str = r#"(function () {
       userExpanded.delete(k.id);
       collapseSubtree(k);
     }
+  }
+
+  // ----- Level drill-down (GitNexus style) -----
+  // L1 架构概览: only the engine's default_visible seed (modules).
+  // L2 文件/聚类: expand every module so its files surface.
+  // L3 符号 + 表: expand modules + files so symbols and DB tables surface.
+  function applyLevel(level) {
+    userExpanded.clear();
+    userCollapsed.clear();
+    for (const n of nodes) {
+      if (level >= 2 && n.kind === 'module') userExpanded.add(n.id);
+      if (level >= 3 && (n.kind === 'module' || n.kind === 'file')) userExpanded.add(n.id);
+    }
+    resetSearchCache();
+    render();
   }
 
   // ----- Canvas rendering -----
@@ -511,13 +538,16 @@ const RENDERER_JS: &str = r#"(function () {
       const p = positions.get(n.id);
       if (!p) continue;
       const tmp = document.createElement('div');
+      const colsBadge = (n.badges || []).find(b => /cols$/.test(b));
       const subText = n.kind === 'module'
         ? (n.path || '') + ' • ' + (n.child_count || 0) + ' child' + ((n.child_count || 0) === 1 ? '' : 'ren')
-        : (n.path
-          ? (n.line_range
-            ? n.path + ':' + n.line_range[0] + '-' + n.line_range[1]
-            : n.path)
-          : n.kind);
+        : n.kind === 'db_table'
+          ? '🗄 ' + (colsBadge || 'table') + (n.path ? ' • ' + n.path : '')
+          : (n.path
+            ? (n.line_range
+              ? n.path + ':' + n.line_range[0] + '-' + n.line_range[1]
+              : n.path)
+            : n.kind);
       const classes = ['node-card', 'kind-' + n.kind, 'layer-' + n.layer];
       if (selected && selected.id === n.id) classes.push('selected');
       tmp.innerHTML = '<svg><g class="' + classes.join(' ') + '" data-id="' + escapeAttr(n.id) + '">' +
@@ -734,6 +764,13 @@ const RENDERER_JS: &str = r#"(function () {
       render();
     });
   });
+  const levelSelect = document.getElementById('level');
+  if (levelSelect) {
+    levelSelect.addEventListener('change', (ev) => {
+      const lvl = parseInt(ev.target.value, 10) || 1;
+      applyLevel(lvl);
+    });
+  }
   document.getElementById('view').value = currentView;
   // The view-select acts as informational; switching actively requires
   // regenerating the HTML (CLI flag). Hint the user.
@@ -794,6 +831,10 @@ mod tests {
         assert!(html.contains("class=\"detail\""));
         assert!(html.contains("layer-confirmed"));
         assert!(html.contains("layer-fact"));
+        // P25: GitNexus-style level drill-down control + DB-table evidence styling.
+        assert!(html.contains("id=\"level\""));
+        assert!(html.contains("applyLevel"));
+        assert!(html.contains("kind-db_table"));
         assert!(!html.contains("https://"));
         assert!(!html.contains("http://"));
     }

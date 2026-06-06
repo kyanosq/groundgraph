@@ -122,6 +122,19 @@ pub enum NodeKind {
     CppEnum,
     CppFunction,
     CppMethod,
+    // ---- P25 data layer: DB schema as a first-class graph node ------------
+    /// A database table (logical name) extracted from `CREATE TABLE` (.sql)
+    /// or an ORM annotation (MyBatis-Plus `@TableName` / JPA `@Table`).
+    /// Columns are carried in `metadata_json`. Putting tables in the graph
+    /// lets a rewrite be checked for table/column parity, not just call
+    /// parity — the persistence contract becomes evidence.
+    DbTable,
+    /// A MyBatis mapper statement (`<select|insert|update|delete id="...">`)
+    /// extracted from mapper XML. `name` is the statement id (== the Java
+    /// mapper-interface method); `metadata_json` carries the raw SQL + kind +
+    /// namespace. This makes the SQL searchable graph evidence so a Java→X port
+    /// can read the query semantics from the graph instead of grepping XML.
+    SqlMapperStmt,
 }
 
 impl NodeKind {
@@ -186,6 +199,8 @@ impl NodeKind {
         NodeKind::CppEnum,
         NodeKind::CppFunction,
         NodeKind::CppMethod,
+        NodeKind::DbTable,
+        NodeKind::SqlMapperStmt,
     ];
 
     /// Parse the stable snake_case string back into a [`NodeKind`]. Inverse
@@ -370,6 +385,8 @@ impl NodeKind {
             NodeKind::CppEnum => "cpp_enum",
             NodeKind::CppFunction => "cpp_function",
             NodeKind::CppMethod => "cpp_method",
+            NodeKind::DbTable => "db_table",
+            NodeKind::SqlMapperStmt => "sql_mapper_stmt",
         }
     }
 }

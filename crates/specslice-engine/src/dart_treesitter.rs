@@ -64,6 +64,18 @@ fn child_of_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sit
     found
 }
 
+/// The constructor *suffix* of a qualified name: `Foo.named` → `named`,
+/// `Foo` → `None` (the unnamed default). Trailing/empty parts are rejected.
+fn dart_ctor_suffix(qualified: &str) -> Option<String> {
+    let (_class, name) = qualified.split_once('.')?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// First descendant of the given kind, breadth-bounded so a pathological
 /// tree cannot loop forever.
 fn first_descendant<'a>(
@@ -158,16 +170,49 @@ fn dart_is_callable(kind: &str) -> bool {
             | "getter_signature"
             | "setter_signature"
             | "constructor_signature"
+            // `const` / `factory` / redirecting-factory constructors are
+            // distinct grammar nodes; without them a `factory Foo.fromJson`
+            // or `const Foo(...)` falls through to the default callable path
+            // and is mislabelled as a `dart_method` named after the class
+            // (dogfood #5).
+            | "constant_constructor_signature"
+            | "factory_constructor_signature"
+            | "redirecting_factory_constructor_signature"
             | "lambda_expression"
     )
 }
 
 fn dart_callable_kind(node: tree_sitter::Node<'_>, _src: &[u8], base: NodeKind) -> NodeKind {
-    if node.kind() == "constructor_signature" {
+    if is_dart_constructor_kind(node.kind()) || wraps_dart_constructor(node) {
         NodeKind::DartConstructor
     } else {
         base
     }
+}
+
+/// A `factory`/`const`/redirecting constructor *with a body* parses as a
+/// `method_signature` wrapping the constructor signature; recognise that shape
+/// so it is classified as a constructor rather than a method.
+fn wraps_dart_constructor(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "method_signature" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .any(|c| is_dart_constructor_kind(c.kind()));
+    found
+}
+
+/// Every grammar node that denotes a Dart constructor declaration.
+fn is_dart_constructor_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "constructor_signature"
+            | "constant_constructor_signature"
+            | "factory_constructor_signature"
+            | "redirecting_factory_constructor_signature"
+    )
 }
 
 /// Methods / constructors: the grammar splits the signature from the
@@ -177,20 +222,18 @@ fn dart_callable_kind(node: tree_sitter::Node<'_>, _src: &[u8], base: NodeKind) 
 /// [2..4]`). Top-level functions are a `lambda_expression` whose body is a
 /// child, so they already span correctly → `None` (use self).
 fn dart_callable_span(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    match node.kind() {
-        "method_signature" | "constructor_signature" => {
-            let mut cur = node.parent();
-            for _ in 0..4 {
-                let p = cur?;
-                if p.kind() == "class_member_definition" {
-                    return Some(p);
-                }
-                cur = p.parent();
+    if node.kind() == "method_signature" || is_dart_constructor_kind(node.kind()) {
+        let mut cur = node.parent();
+        for _ in 0..4 {
+            let p = cur?;
+            if p.kind() == "class_member_definition" {
+                return Some(p);
             }
-            None
+            cur = p.parent();
         }
-        _ => None,
+        return None;
     }
+    None
 }
 
 fn dart_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -206,12 +249,19 @@ fn dart_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
             .and_then(|n| node_text(n, src))
             .map(str::to_string)
             .filter(|s| !s.is_empty()),
-        // concrete method / getter / setter: dig into the inner signature.
+        // concrete method / getter / setter / constructor: dig into the inner
+        // signature. A `factory`/`const`/redirecting constructor with a body
+        // parses as `method_signature(<ctor>_signature)`; delegate to the
+        // constructor name extractor so it is not mislabelled as a method
+        // named after the class (dogfood #5).
         "method_signature" => {
             let mut cursor = node.walk();
             let inner = node
                 .named_children(&mut cursor)
                 .find(|c| c.kind().ends_with("_signature"))?;
+            if is_dart_constructor_kind(inner.kind()) {
+                return dart_name_of(inner, src);
+            }
             inner
                 .child_by_field_name("name")
                 .or_else(|| child_of_kind(inner, "identifier"))
@@ -234,6 +284,32 @@ fn dart_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
             let names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
             if names.len() >= 2 {
                 node_text(names[names.len() - 1], src)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some("<default>".to_string())
+            }
+        }
+        // `const Foo(...)` / `const Foo.named(...)`: the name lives in a
+        // `qualified` child (`Foo` or `Foo.named`); the constructor *suffix*
+        // is the part after the dot, else the unnamed default.
+        "constant_constructor_signature" => Some(
+            child_of_kind(node, "qualified")
+                .and_then(|q| node_text(q, src))
+                .and_then(dart_ctor_suffix)
+                .unwrap_or_else(|| "<default>".to_string()),
+        ),
+        // `factory Foo.fromJson(...)` / `factory Foo() = Bar`: the class name
+        // and (optional) constructor name are separate `identifier` children;
+        // ≥2 → the trailing one is the constructor name, else the default.
+        "factory_constructor_signature" | "redirecting_factory_constructor_signature" => {
+            let mut cursor = node.walk();
+            let idents: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|c| c.kind() == "identifier")
+                .collect();
+            if idents.len() >= 2 {
+                node_text(idents[idents.len() - 1], src)
                     .map(str::to_string)
                     .filter(|s| !s.is_empty())
             } else {
@@ -536,6 +612,36 @@ mod tests {
 
     fn ids(s: &DartFileStructure) -> Vec<String> {
         s.symbols.iter().map(|x| x.id.to_string()).collect()
+    }
+
+    #[test]
+    fn factory_constructor_is_a_ctor_not_a_class_named_method() {
+        // Dogfood #5: `factory Foo.fromJson(...)` must yield a single
+        // `dart_ctor::…#Foo.fromJson`, never a spurious
+        // `dart_method::…#Foo.Foo` (the class name leaking in as a method).
+        let src = r#"
+class Foo {
+  const Foo({this.a});
+  factory Foo.fromJson(Map<String, dynamic> json) {
+    return Foo(a: json['a'] as int? ?? 0);
+  }
+  final int a;
+}
+"#;
+        let s = dart_extract_structure("lib/foo.dart", src);
+        let got = ids(&s);
+        assert!(
+            got.contains(&"dart_ctor::lib/foo.dart#Foo.fromJson".to_string()),
+            "factory must be a named ctor: {got:?}"
+        );
+        assert!(
+            got.contains(&"dart_ctor::lib/foo.dart#Foo.<default>".to_string()),
+            "default ctor present: {got:?}"
+        );
+        assert!(
+            !got.contains(&"dart_method::lib/foo.dart#Foo.Foo".to_string()),
+            "no spurious class-named method: {got:?}"
+        );
     }
 
     #[test]

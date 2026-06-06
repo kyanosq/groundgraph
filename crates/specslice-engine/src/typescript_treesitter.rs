@@ -68,9 +68,18 @@ fn ts_import_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Vec<String> {
 fn ts_is_transparent(kind: &str) -> bool {
     // `namespace X {}` parses as `expression_statement → internal_module`,
     // so we must descend through expression statements to reach it.
+    //
+    // `object` / `pair` are descended so object-literal *shorthand methods*
+    // become symbols. This is what makes Vue 2 Options API components legible:
+    // `export default { data() {…}, methods: { foo() {…} } }` nests its
+    // business methods two object levels deep (`export_statement → object →
+    // pair(methods) → object → method_definition`). Only named `method_definition`
+    // nodes are emitted while descending; arrow/function-expression *values*
+    // (`foo: () => {}`) carry no name and stay refs-only, so the extra descent
+    // adds real methods without flooding the graph with anonymous callbacks.
     matches!(
         kind,
-        "export_statement" | "ambient_declaration" | "expression_statement"
+        "export_statement" | "ambient_declaration" | "expression_statement" | "object" | "pair"
     )
 }
 
@@ -167,10 +176,12 @@ fn ts_resolve_import(
         format!("{canonical}.jsx"),
         format!("{canonical}.mjs"),
         format!("{canonical}.cjs"),
+        format!("{canonical}.vue"),
         format!("{canonical}/index.ts"),
         format!("{canonical}/index.tsx"),
         format!("{canonical}/index.js"),
         format!("{canonical}/index.jsx"),
+        format!("{canonical}/index.vue"),
     ];
     candidates
         .into_iter()
@@ -309,7 +320,11 @@ pub(crate) static TYPESCRIPT_SPEC: LangSpec =
 /// real-world `.js` files embed JSX, so routing them here maximises coverage.
 /// Shares `language_id = "typescript"` so every pass lands in the same node /
 /// id / indexer namespace.
-pub(crate) static TSX_SPEC: LangSpec = ts_family_spec(tsx_language, &["tsx", "js", "jsx"]);
+/// `.vue` Single-File Components are routed here too: their `<script>` blocks
+/// are plain JS/JSX (Vue 2 Options API), which the JSX-superset grammar parses
+/// correctly once the surrounding `<template>`/`<style>` is stripped upstream
+/// (see `treesitter::preprocess_source`).
+pub(crate) static TSX_SPEC: LangSpec = ts_family_spec(tsx_language, &["tsx", "js", "jsx", "vue"]);
 
 #[cfg(test)]
 mod tests {

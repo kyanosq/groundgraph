@@ -70,6 +70,9 @@ pub fn run(args: SearchRunArgs) -> Result<()> {
         include_noise: args.include_noise,
     };
     let result = run_search(options).context("running search")?;
+    specslice_engine::stats::set_metric("hits", result.matches.len() as i64);
+    specslice_engine::stats::set_metric("subgraph_nodes", result.subgraph.nodes.len() as i64);
+    specslice_engine::stats::set_metric("subgraph_edges", result.subgraph.edges.len() as i64);
     match args.format {
         SearchFormat::Json => {
             println!(

@@ -34,6 +34,17 @@ pub const TYPESCRIPT_INDEXER_NAME: &str = "typescript_lsp";
 pub const TYPESCRIPT_LANGUAGE_ID: &str = "typescript";
 pub const TYPESCRIPT_LSP_COMMAND_ENV: &str = "SPECSLICE_TYPESCRIPT_LSP_BIN";
 
+/// Sentinel `lsp_command` used to keep the TypeScript adapter dependency-free.
+///
+/// TypeScript needs its dedicated adapter (not the generic single-spec driver)
+/// to cover *both* dialects — `.ts`/`.mts`/`.cts` and `.tsx`/`.js`/`.jsx`/`.vue`.
+/// When `enrichment.lsp = false` we still route through the adapter for full
+/// structural coverage, but point its optional LSP overlay at this
+/// deliberately unresolvable command so the probe fails fast and no external
+/// process is ever launched. (No real binary can match: PATH names cannot
+/// contain `/`.)
+pub const LSP_DISABLED_SENTINEL: &str = "specslice/lsp-disabled";
+
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptIndexOptions {
     pub repo_root: PathBuf,
@@ -86,7 +97,7 @@ pub fn index_typescript(
         &options.repo_root,
         &options.code_roots,
         &options.exclude_globs,
-        &["ts", "mts", "cts", "tsx", "js", "jsx", "mjs", "cjs"],
+        &["ts", "mts", "cts", "tsx", "js", "jsx", "mjs", "cjs", "vue"],
         TYPESCRIPT_SPEC.skip_dirs,
     )
     .context("discovering TypeScript files")?;
@@ -573,6 +584,85 @@ mod tests {
             crate::edge_confidence::confidence_for_edge(edge),
             EdgeConfidence::Medium,
             "heuristic tree-sitter call edges must stay at medium confidence"
+        );
+    }
+
+    /// Vue Single-File Components (`.vue`) index through the same TypeScript
+    /// driver: the `<script>` block is parsed (template/style stripped), the
+    /// file node + ESM imports are recovered (resolving `.vue` targets across
+    /// the extension boundary), and Options-API component methods nested in
+    /// `export default { methods: { … } }` are captured as symbols.
+    #[test]
+    fn vue_sfc_script_block_indexes_imports_and_options_methods() {
+        use specslice_core::EdgeKind;
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for (rel, body) in [
+            (
+                "src/api/order.js",
+                "import request from '@/utils/request'\nexport function getOrderList(params) {\n  return request({ url: '/order/list', method: 'get', params })\n}\n",
+            ),
+            (
+                "src/components/Toolbar.vue",
+                "<template>\n  <div class=\"bar\">{{ 标题 }}</div>\n</template>\n\n<script>\nexport default {\n  name: 'Toolbar',\n}\n</script>\n",
+            ),
+            (
+                "src/views/OrderList.vue",
+                "<template>\n  <div class=\"order\">\n    <Toolbar/>\n    <span>{{ title }}</span>\n  </div>\n</template>\n\n<script>\nimport Toolbar from '../components/Toolbar.vue'\nimport { getOrderList } from '../api/order'\n\nexport default {\n  name: 'OrderList',\n  components: { Toolbar },\n  data() {\n    return { title: '订单列表', list: [] }\n  },\n  methods: {\n    async fetchList() {\n      this.list = await getOrderList({})\n    },\n    handleDelete(id) {\n      this.list = this.list.filter((x) => x.id !== id)\n    },\n  },\n}\n</script>\n\n<style scoped>\n.order { color: red; }\n</style>\n",
+            ),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let (mut store, _db) = open_temp_store(root);
+        let opts = TypescriptIndexOptions {
+            repo_root: root.to_path_buf(),
+            code_roots: vec![PathBuf::from("src")],
+            exclude_globs: Vec::new(),
+            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
+        };
+        let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
+        assert!(
+            result.files >= 3,
+            "two .vue + one .js must all be indexed: {result:?}"
+        );
+
+        let nodes = store.list_all_nodes().unwrap();
+        let method_names: std::collections::BTreeSet<&str> = nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    NodeKind::TypescriptMethod | NodeKind::TypescriptFunction
+                )
+            })
+            .filter_map(|n| n.name.as_deref())
+            .collect();
+        for required in ["fetchList", "handleDelete", "getOrderList"] {
+            assert!(
+                method_names.contains(required),
+                "expected Vue/JS symbol `{required}` indexed, got {method_names:?}"
+            );
+        }
+
+        let edges = store.list_all_edges().unwrap();
+        // `.vue` → `.js` import resolves across the extension boundary.
+        let vue_to_js = edges.iter().any(|e| {
+            e.kind == EdgeKind::Imports
+                && e.from_id.as_str() == "file::src/views/OrderList.vue"
+                && e.to_id.as_str() == "file::src/api/order.js"
+        });
+        assert!(vue_to_js, "`.vue` → `.js` import should resolve: {edges:?}");
+        // `.vue` → `.vue` import resolves (explicit `.vue` specifier).
+        let vue_to_vue = edges.iter().any(|e| {
+            e.kind == EdgeKind::Imports
+                && e.from_id.as_str() == "file::src/views/OrderList.vue"
+                && e.to_id.as_str() == "file::src/components/Toolbar.vue"
+        });
+        assert!(
+            vue_to_vue,
+            "`.vue` → `.vue` import should resolve: {edges:?}"
         );
     }
 

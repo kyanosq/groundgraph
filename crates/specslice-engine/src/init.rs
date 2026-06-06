@@ -1,10 +1,11 @@
 //! `specslice init` behaviour.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME, DEFAULT_STORAGE_DIR};
+use crate::config::{EngineConfig, LanguageSelection, DEFAULT_CONFIG_FILE_NAME, DEFAULT_STORAGE_DIR};
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -78,7 +79,7 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
     let config = if config_already_existed {
         load_existing_config(&config_path)?
     } else {
-        let cfg = EngineConfig::default();
+        let cfg = default_config_for(&repo_root);
         let yaml = serde_yaml::to_string(&cfg).context("serialising default config to YAML")?;
         std::fs::write(&config_path, yaml)
             .with_context(|| format!("writing default config to {}", config_path.display()))?;
@@ -137,6 +138,190 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
     })
 }
 
+/// Build the config written on a fresh `init`.
+///
+/// Dart (or an unrecognised tree) keeps the historical default — the `code`
+/// section drives the Dart analyzer / lightweight backend. When a *non-Dart*
+/// language clearly dominates the repo we instead emit a unified
+/// `languages:` entry pointing at the detected source roots and disable LSP
+/// enrichment, so a freshly-initialised Swift / Rust / TS / … workspace gets a
+/// working graph from the always-available, dependency-free tree-sitter
+/// backend (operators flip `enrichment.lsp: true` for richer edges).
+fn default_config_for(repo_root: &Path) -> EngineConfig {
+    let selections = detect_language_selections(repo_root);
+    // Pure-Dart (or unrecognised/empty) repo: keep the historical `code`-section
+    // default so a bare Dart skeleton's `lib/`/`test/` still works and the
+    // on-disk config stays minimal. The authoritative `languages:` list is only
+    // emitted once a *second* first-party language appears — i.e. a polyglot
+    // monorepo, the case the single-language detector got wrong.
+    if selections.iter().all(|s| s.id == "dart") {
+        return EngineConfig::default();
+    }
+    let mut cfg = EngineConfig::default();
+    cfg.languages = selections;
+    // Zero external dependencies out of the box; the per-language LSP adapters
+    // can be opted back in by flipping this flag.
+    cfg.enrichment.lsp = false;
+    // `languages` is authoritative: `normalized()` repopulates the Dart `code`
+    // section from a `dart` selection when present, and clears it otherwise.
+    cfg.code.paths = Vec::new();
+    cfg
+}
+
+/// Directories that never hold first-party sources worth indexing — version
+/// control, dependency caches, and build outputs across ecosystems.
+const DETECT_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".build",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".dart_tool",
+    ".specslice",
+    "generated",
+    ".next",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    ".gradle",
+];
+
+/// Map a lower-case file extension to its canonical SpecSlice language id.
+fn ext_language(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "rs" => "rust",
+        "swift" => "swift",
+        "dart" => "dart",
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "vue" => "typescript",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        _ => return None,
+    })
+}
+
+/// Flutter / React-Native / desktop *platform-embedding* directories. They
+/// hold generated glue (`GeneratedPluginRegistrant.java`), native scaffolding
+/// (`AppDelegate.swift`, `MainActivity.kt`) and build manifests
+/// (`build.gradle`) — never first-party application logic. Skipping them
+/// *during language detection* stops a Flutter app's Android/iOS scaffolding
+/// from electing a phantom `java`/`swift` project. (They are still indexed
+/// normally once their real language is selected.)
+const DETECT_EMBED_DIRS: &[&str] = &["android", "ios", "macos", "windows", "linux"];
+
+/// Conventional build-output excludes for a detected language.
+fn language_build_excludes(lang: &str) -> Vec<String> {
+    match lang {
+        "swift" => vec!["**/.build/**".into()],
+        "rust" => vec!["**/target/**".into()],
+        "typescript" => vec!["**/node_modules/**".into(), "**/dist/**".into()],
+        "python" => vec!["**/.venv/**".into(), "**/__pycache__/**".into()],
+        "go" => vec!["**/vendor/**".into()],
+        "java" => vec!["**/target/**".into(), "**/build/**".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Detect *every* first-party language present in the repo and the top-level
+/// source roots each lives under.
+///
+/// A polyglot monorepo (Go backend + Flutter app + Swift app + TS admin web,
+/// …) must enable all of them, so this returns one [`LanguageSelection`] per
+/// language that has at least one real source file — including Dart, which the
+/// caller routes onto the legacy `code` section via `normalized()`. Returns an
+/// empty vec when nothing recognisable is found, so the caller falls back to
+/// the historical Dart default.
+///
+/// Selection is by *source-file presence only* — build manifests are
+/// deliberately not scored, because nested build files (Flutter's
+/// `android/build.gradle`, an `ios/Podfile`, …) would otherwise elect phantom
+/// languages. Platform-embedding dirs are skipped entirely. The walk is
+/// bounded (depth + file cap) and skips VCS / dependency / build directories.
+fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut topdirs: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+
+    let mut stack: Vec<(PathBuf, usize)> = vec![(repo_root.to_path_buf(), 0)];
+    let mut visited_files = 0usize;
+    'walk: while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ft.is_dir() {
+                if depth >= 12
+                    || name.starts_with('.')
+                    || DETECT_SKIP_DIRS.contains(&name.as_str())
+                    || DETECT_EMBED_DIRS.contains(&name.as_str())
+                {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if ft.is_file() {
+                visited_files += 1;
+                if visited_files > 200_000 {
+                    break 'walk;
+                }
+                let path = entry.path();
+                let Some(lang) = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .and_then(|e| ext_language(&e))
+                else {
+                    continue;
+                };
+                *counts.entry(lang).or_default() += 1;
+                if let Ok(rel) = path.strip_prefix(repo_root) {
+                    let mut comps = rel.components();
+                    let first = comps.next();
+                    let has_more = comps.next().is_some();
+                    let topdir = match (first, has_more) {
+                        (Some(c), true) => c.as_os_str().to_string_lossy().into_owned(),
+                        _ => ".".to_string(), // file directly at the repo root
+                    };
+                    topdirs.entry(lang).or_default().insert(topdir);
+                }
+            }
+        }
+    }
+
+    // One selection per language with ≥1 real source file, deterministically
+    // ordered by language id.
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c > 0)
+        .map(|(lang, _)| {
+            let mut paths: Vec<String> = topdirs
+                .get(lang)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            paths.sort();
+            LanguageSelection {
+                id: lang.to_string(),
+                paths,
+                exclude: language_build_excludes(lang),
+                lsp_command: None,
+            }
+        })
+        .collect()
+}
+
 fn load_existing_config(path: &Path) -> Result<EngineConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading existing config {}", path.display()))?;
@@ -159,5 +344,103 @@ fn resolve_links_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
         raw.to_path_buf()
     } else {
         repo_root.join(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn ids(sels: &[LanguageSelection]) -> Vec<String> {
+        let mut v: Vec<String> = sels.iter().map(|s| s.id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// A polyglot monorepo (FitHub-shaped) must enable *every* first-party
+    /// language, not just the single highest-scoring one.
+    #[test]
+    fn detects_all_first_party_languages_in_monorepo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Go modules.
+        write(root, "backend/go.mod", "module x\n");
+        write(root, "backend/internal/api/server.go", "package api\nfunc Serve(){}\n");
+        write(root, "piclient/go.mod", "module y\n");
+        write(root, "piclient/internal/m/run.go", "package m\nfunc Run(){}\n");
+        // Dart app.
+        write(root, "apps/app/pubspec.yaml", "name: app\n");
+        write(root, "apps/app/lib/main.dart", "void main() {}\n");
+        // Swift app (SwiftPM-style sources).
+        write(root, "apps/Studio/Sources/Core/model.swift", "struct M {}\n");
+        write(root, "apps/Studio/Sources/Core/view.swift", "struct V {}\n");
+        // TypeScript admin web.
+        write(root, "backend/web/package.json", "{}\n");
+        write(root, "backend/web/src/client.ts", "export const x = 1;\n");
+
+        let sels = detect_language_selections(root);
+        assert_eq!(
+            ids(&sels),
+            vec!["dart", "go", "swift", "typescript"],
+            "every first-party language must be selected"
+        );
+    }
+
+    /// Flutter / React-Native platform-embedding dirs (`android`, `ios`,
+    /// `macos`) hold generated/scaffolding sources — they must NOT elect a
+    /// phantom language (the original bug: Flutter's `android/build.gradle` +
+    /// `GeneratedPluginRegistrant.java` made `java` win and suppressed Go/Dart).
+    #[test]
+    fn ignores_flutter_platform_embed_scaffolding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "apps/app/pubspec.yaml", "name: app\n");
+        write(root, "apps/app/lib/main.dart", "void main() {}\n");
+        // Flutter Android embedding — generated Java + gradle manifests.
+        write(root, "apps/app/android/build.gradle", "// gradle\n");
+        write(
+            root,
+            "apps/app/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java",
+            "package io.flutter.plugins; class GeneratedPluginRegistrant {}\n",
+        );
+        // Flutter iOS/macOS embedding — scaffolding Swift.
+        write(root, "apps/app/ios/Runner/AppDelegate.swift", "import UIKit\n");
+        write(root, "apps/app/macos/Runner/AppDelegate.swift", "import Cocoa\n");
+
+        let sels = detect_language_selections(root);
+        assert_eq!(ids(&sels), vec!["dart"], "only the real Dart app, no phantom java/swift");
+    }
+
+    /// A pure-Dart repo still resolves to a single Dart selection scoped to its
+    /// real source dirs (so the legacy `code` section keeps working).
+    #[test]
+    fn pure_dart_repo_selects_dart_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pubspec.yaml", "name: app\n");
+        write(root, "lib/main.dart", "void main() {}\n");
+        write(root, "test/main_test.dart", "void main() {}\n");
+
+        let sels = detect_language_selections(root);
+        assert_eq!(ids(&sels), vec!["dart"]);
+        let dart = sels.iter().find(|s| s.id == "dart").unwrap();
+        let mut paths = dart.paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["lib", "test"]);
+    }
+
+    /// An empty / unrecognised tree yields no selections (caller falls back to
+    /// the legacy Dart default).
+    #[test]
+    fn empty_tree_yields_no_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "README.md", "# hi\n");
+        assert!(detect_language_selections(dir.path()).is_empty());
     }
 }

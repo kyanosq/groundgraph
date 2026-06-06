@@ -321,6 +321,63 @@ pub fn extract(spec: &LangSpec, source: &str) -> Scan {
     scan
 }
 
+/// Map a source file to the byte stream the grammar should actually parse.
+///
+/// Most languages parse their file verbatim. Container formats whose code is
+/// embedded in markup (today: Vue `.vue` SFCs) are reduced to just the
+/// embedded code, with every other byte blanked so recovered spans still
+/// index correctly into the original file. The single extension point keeps
+/// the `LangSpec`s — and the generic file loop — unaware of any one format.
+pub(crate) fn preprocess_source<'a>(rel_path: &str, source: &'a str) -> std::borrow::Cow<'a, str> {
+    if rel_path.ends_with(".vue") {
+        std::borrow::Cow::Owned(vue_script_only(source))
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    }
+}
+
+/// Blank everything outside `<script>…</script>` in a Vue SFC, preserving byte
+/// length and newline positions so tree-sitter spans map 1:1 back onto the
+/// original file. All `<script>` blocks (e.g. `<script>` + `<script setup>`)
+/// are retained verbatim; `<template>`/`<style>` and any non-ASCII markup
+/// collapse to ASCII spaces (each byte → one space) so the result stays valid
+/// UTF-8 without shifting a single offset.
+pub(crate) fn vue_script_only(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = bytes
+        .iter()
+        .map(|&b| if b == b'\n' { b'\n' } else { b' ' })
+        .collect();
+    // ASCII-lowercased copy for case-insensitive tag scanning; `to_ascii_lowercase`
+    // preserves byte length so indices stay aligned with `bytes`.
+    let lower = source.to_ascii_lowercase();
+    let lower = lower.as_bytes();
+    let find = |hay: &[u8], needle: &[u8], from: usize| -> Option<usize> {
+        if from >= hay.len() {
+            return None;
+        }
+        hay[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| from + p)
+    };
+    let mut search = 0usize;
+    while let Some(tag_start) = find(lower, b"<script", search) {
+        let Some(gt) = find(lower, b">", tag_start) else {
+            break;
+        };
+        let content_start = gt + 1;
+        let Some(close) = find(lower, b"</script", content_start) else {
+            break;
+        };
+        out[content_start..close].copy_from_slice(&bytes[content_start..close]);
+        search = close + b"</script".len();
+    }
+    // Only original bytes (at their original offsets) and ASCII blanks are
+    // present, so the buffer is guaranteed valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk(
     container: tree_sitter::Node<'_>,
@@ -445,18 +502,23 @@ fn walk(
                         }
                     }
                 }
-            }
-            // Optional: descend into the callable body so call-based tests
-            // hosted inside a function (Dart's `void main() { test(…); }`)
-            // are discovered. The body's nodes attach to *this callable's*
-            // parent (file / module), not to the callable, matching how the
-            // Dart analyzer files top-level `test(...)` nodes under the file.
-            if spec.recurse_callables {
-                if let Some(body) = (spec.body_of)(child) {
-                    walk(body, source, spec, parent_qualified, false, depth + 1, scan);
+                // Optional: descend into the callable body so call-based tests
+                // hosted inside a function (Dart's `void main() { test(…); }`)
+                // are discovered. The body's nodes attach to *this callable's*
+                // parent (file / module), not to the callable, matching how the
+                // Dart analyzer files top-level `test(...)` nodes under the file.
+                if spec.recurse_callables {
+                    if let Some(body) = (spec.body_of)(child) {
+                        walk(body, source, spec, parent_qualified, false, depth + 1, scan);
+                    }
                 }
+                continue;
             }
-            continue;
+            // A callable node the spec declined to name — e.g. a Swift *stored*
+            // property routed here so *computed* properties can be emitted (see
+            // `swift_name_of`). It is not a symbol; fall through to the general
+            // reference collector (section 6) so its type-position references
+            // stay attached to the enclosing scope instead of being dropped.
         }
 
         // 4b. Call-based tests (`describe`/`it`, Dart `test`/`group`).
@@ -988,7 +1050,11 @@ fn index_repo_with_spec_impl(
         let Ok(source) = std::fs::read_to_string(&file.absolute) else {
             continue; // non-UTF-8 / unreadable: skip, never abort.
         };
-        let scanned = extract(spec, &source);
+        // Container formats (Vue SFCs) wrap parseable code in a `<script>` block;
+        // hand the grammar only that region (offsets preserved) so the rest of
+        // the file — `<template>` HTML, `<style>` CSS — never reaches the parser.
+        let parse_source = preprocess_source(&file.relative, &source);
+        let scanned = extract(spec, &parse_source);
         result.files += 1;
 
         let file_artifact_id = file_id(&file.relative);
@@ -1500,6 +1566,38 @@ mod driver_capability_tests {
             resolve_import: cap_resolve,
             ..crate::python_treesitter::PYTHON_SPEC
         }
+    }
+
+    #[test]
+    fn vue_script_only_keeps_script_blanks_markup_and_preserves_offsets() {
+        let src = "<template>\n  <div>{{ 你好 }}</div>\n</template>\n\n<script>\nexport default { greet() { return 1 } }\n</script>\n\n<style>\n.a { color: red }\n</style>\n";
+        let out = super::vue_script_only(src);
+        // Byte length and every newline offset are preserved 1:1.
+        assert_eq!(out.len(), src.len(), "byte length must be preserved");
+        let nl = |s: &str| -> Vec<usize> {
+            s.bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(nl(&out), nl(src), "newline offsets must be preserved");
+        // Script body survives; template/style markup is gone.
+        assert!(out.contains("export default { greet() { return 1 } }"));
+        assert!(!out.contains("<div>"));
+        assert!(!out.contains("color: red"));
+        assert!(!out.contains("你好"));
+        // The retained script sits at its original byte offset.
+        let at = src.find("export default").unwrap();
+        assert_eq!(&out[at..at + "export default".len()], "export default");
+        // The blanked, valid-UTF-8 result parses as JS with the TSX grammar and
+        // the object's shorthand method is reachable via object/pair descent.
+        let scan = extract(&crate::typescript_treesitter::TSX_SPEC, &out);
+        assert!(
+            scan.symbols.iter().any(|s| s.name == "greet"),
+            "the script's object shorthand method should be reachable: {:?}",
+            scan.symbols
+        );
     }
 
     #[test]

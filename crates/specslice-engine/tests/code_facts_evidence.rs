@@ -30,6 +30,17 @@ fn workspace_with_evidence_and_noise() -> TempDir {
         repo_root: tmp.path().into(),
     })
     .unwrap();
+    // Pin the lightweight Dart body parser so this evidence-contract fixture is
+    // hermetic: P6.3 is specifically about the *heuristic* adapter's edge
+    // evidence, so it must exercise that path regardless of whether a Dart
+    // analyzer sidecar happens to be installed on the host (with the sidecar
+    // enabled the resolver would be `dart_analyzer`, not `dart_lightweight`).
+    let cfg_path = tmp.path().join(".specslice.yaml");
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg
+        .replace("analyzer: true", "analyzer: false")
+        .replace("lsp: true", "lsp: false");
+    std::fs::write(&cfg_path, cfg).unwrap();
     write(
         &tmp.path().join("lib/core/iap/iap_constants.dart"),
         "class IapProductIds {\n  static const String monthly = 'pro_monthly';\n  static const String yearly = 'pro_yearly';\n  static const List<String> all = <String>[monthly, yearly];\n}\n",

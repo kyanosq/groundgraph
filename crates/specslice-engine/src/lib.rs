@@ -12,8 +12,10 @@ pub mod checks;
 pub mod confidence_view;
 pub mod config;
 pub mod connect;
+pub mod constants;
 pub mod context_pack;
 pub mod cpp_treesitter;
+pub mod data_contract;
 pub mod dart_indexer;
 pub mod dart_sidecar;
 pub mod dart_treesitter;
@@ -23,11 +25,13 @@ pub mod edge_confidence;
 pub mod export;
 pub mod feature_cluster;
 pub mod feature_map;
+pub mod feature_pack;
 pub mod git_diff;
 pub mod go_indexer;
 pub mod go_treesitter;
 pub mod graph;
 pub mod graph_diff;
+pub mod graph_equiv;
 pub mod impact;
 pub mod index;
 pub mod init;
@@ -38,6 +42,8 @@ pub mod logic_confidence;
 pub mod lsp_client;
 pub mod lsp_indexer;
 pub mod lsp_probe;
+pub mod path_class;
+pub mod port_coverage;
 pub mod python_frameworks;
 pub mod python_indexer;
 pub mod python_treesitter;
@@ -45,12 +51,18 @@ pub mod questions;
 pub mod requirements_md_indexer;
 pub mod rust_indexer;
 pub mod rust_treesitter;
+pub mod schema_indexer;
 pub mod search;
 pub mod similarity;
+pub mod stats;
+pub mod trace;
 pub mod slice;
+pub mod source_text;
+pub mod symbol_facts;
 pub mod swift_indexer;
 pub mod swift_treesitter;
 pub mod test_selection;
+pub mod test_suggestions;
 pub mod treesitter;
 pub mod typescript_indexer;
 pub mod typescript_treesitter;
@@ -76,6 +88,10 @@ pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,
 };
 pub use config::EngineConfig;
+pub use constants::{
+    analyze_constants, analyze_constants_with_store, ConstantEntry, ConstantsOptions,
+    ConstantsReport, ConstantsStats, LiteralKind, LiteralSite, CONSTANTS_SCHEMA_VERSION,
+};
 pub use connect::{
     apply_candidates, propose_evidence, AcceptedCandidate, ApplyOptions, ApplyOutcome,
     CandidatesDocument, ClarifyingQuestion, EvidenceDocSection, EvidencePack, EvidenceRequirement,
@@ -83,6 +99,11 @@ pub use connect::{
 };
 pub use context_pack::{
     build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
+};
+pub use data_contract::{
+    analyze_data_contract, analyze_data_contract_with_store, DataContractOptions,
+    DataContractReport, DataContractStats, JsonKey, KeySite, TableColumn, TableSchema,
+    DATA_CONTRACT_SCHEMA_VERSION,
 };
 pub use dead_code::{
     analyze_dead_code, analyze_dead_code_with_store, DeadCodeCandidate, DeadCodeConfidence,
@@ -94,6 +115,10 @@ pub use export::{export, ExportFormat, ExportOptions, ExportOutcome};
 pub use feature_map::{
     analyze_feature_map, analyze_feature_map_with_store, FeatureCluster, FeatureClusterMember,
     FeatureMap, FeatureMapOptions, FeatureMapStats, FEATURE_MAP_SCHEMA_VERSION,
+};
+pub use feature_pack::{
+    build_feature_pack, build_feature_pack_with_store, FeaturePack, FeaturePackOptions,
+    FeaturePackSelector, FeaturePackStats, PackEdge, FEATURE_PACK_SCHEMA_VERSION,
 };
 pub use graph::{
     build_graph_view, GraphColumn, GraphEdge, GraphFinding, GraphLayer, GraphNode, GraphOptions,
@@ -114,6 +139,11 @@ pub use logic_confidence::{
     compute_logic_confidence, run_logic_confidence, LogicConfidenceItem, LogicConfidenceKind,
     LogicConfidenceOptions, LogicConfidenceReport, LogicConfidenceSource, LogicConfidenceSummary,
 };
+pub use port_coverage::{
+    analyze_port_coverage, analyze_port_coverage_with_stores, FileCoverage, MissingSymbol,
+    PortCoverageOptions, PortCoverageReport, PortCoverageStats, PortedSymbol,
+    PORT_COVERAGE_SCHEMA_VERSION,
+};
 pub use questions::{
     analyze_questions, analyze_questions_with_store, Question, QuestionsOptions, QuestionsReport,
     QuestionsStats, QUESTIONS_SCHEMA_VERSION,
@@ -132,9 +162,18 @@ pub use similarity::{
     DEFAULT_SHINGLE_K as SIMILARITY_DEFAULT_SHINGLE_K, SIMILARITY_SCHEMA_VERSION,
 };
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
+pub use symbol_facts::{
+    analyze_symbol_facts, analyze_symbol_facts_with_store, BehaviorCounts, FactLine, Purity,
+    SymbolFact, SymbolFactsOptions, SymbolFactsReport, SymbolFactsStats, SYMBOL_FACTS_SCHEMA_VERSION,
+};
 pub use test_selection::{
     select_tests, select_tests_with_store, SelectedTest, TestSelection, TestSelectionOptions,
     TestSelectionStats, TEST_SELECTION_SCHEMA_VERSION,
+};
+pub use test_suggestions::{
+    analyze_test_suggestions, analyze_test_suggestions_with_store, Suggestion, SuggestionKind,
+    SymbolSuggestions, TestSuggestionsOptions, TestSuggestionsReport, TestSuggestionsStats,
+    TEST_SUGGESTIONS_SCHEMA_VERSION,
 };
 
 pub use go_indexer::{
