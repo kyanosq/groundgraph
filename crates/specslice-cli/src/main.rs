@@ -229,6 +229,14 @@ struct PortCoverageArgs {
     /// 额外排除的源/目标路径 glob（可重复，如 `**/l10n/**`）。
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+    /// 仅源侧包含范围 glob（可重复）：把覆盖率分母收敛到源工程的某个切片，
+    /// 如 `**/rcmtm-cloud-craft/**` 只统计 craft 微服务的移植进度。不影响目标侧。
+    #[arg(long = "source-include", value_name = "GLOB")]
+    source_include: Vec<String>,
+    /// 仅源侧排除范围 glob（可重复），在 --source-include 之后施加；只从源侧分母
+    /// 剔除，不会隐藏目标侧的 extra 符号。
+    #[arg(long = "source-exclude", value_name = "GLOB")]
+    source_exclude: Vec<String>,
     /// 列表长度上限（0 = 不限）。
     #[arg(long, value_name = "N", default_value_t = 0)]
     max: usize,
@@ -1312,6 +1320,8 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 ignore_case: args.ignore_case,
                 port_map: args.port_map,
                 exclude: args.exclude,
+                source_include: args.source_include,
+                source_exclude: args.source_exclude,
                 max: args.max,
                 json: args.json,
             })

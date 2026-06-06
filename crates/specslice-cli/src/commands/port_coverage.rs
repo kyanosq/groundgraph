@@ -30,6 +30,8 @@ pub struct PortCoverageRunArgs {
     /// Optional YAML port-map of source→target name aliases.
     pub port_map: Option<PathBuf>,
     pub exclude: Vec<String>,
+    pub source_include: Vec<String>,
+    pub source_exclude: Vec<String>,
     pub max: usize,
     pub json: bool,
 }
@@ -53,6 +55,8 @@ pub fn run(args: PortCoverageRunArgs) -> Result<()> {
         ignore_names: port_map.ignore_names.into_iter().collect(),
         ignore_name_prefixes: port_map.ignore_name_prefixes,
         exclude: args.exclude,
+        source_include: args.source_include,
+        source_exclude: args.source_exclude,
         max_items: args.max,
     })
     .context("计算移植覆盖率")?;

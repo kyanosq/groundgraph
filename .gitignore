@@ -5,6 +5,7 @@ dist/
 # SpecSlice local runtime state.
 .specslice/graph.db
 .specslice/export/
+.specslice/stats.jsonl
 
 # Rust/editor local files.
 *.swp

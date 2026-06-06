@@ -135,6 +135,16 @@ specslice port-coverage \
   --ignore-case --port-map /path/to/go/docs/port-map.yaml --json
 ```
 
+Scope the **source denominator** to one slice when porting a microservice out of a monolith — `--source-include`/`--source-exclude` are path globs applied to the **source side only** (the target's `extra` list is untouched), so coverage % reflects just that slice's progress instead of the whole monolith:
+
+```bash
+# measure only the craft microservice's port progress
+specslice port-coverage --source-db java/.specslice/graph.db --target-db go/.specslice/graph.db \
+  --ignore-case --source-include '**/rcmtm-cloud-craft/**' --source-exclude '**/generated/**' --json
+```
+
+(`--exclude` differs: it drops paths from *both* sides. Use `--source-include`/`--source-exclude` for denominator scoping, `--exclude` for noise that exists in both trees.)
+
 `port-map.yaml` shape:
 
 ```yaml

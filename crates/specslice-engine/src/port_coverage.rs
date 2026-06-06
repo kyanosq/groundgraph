@@ -131,6 +131,17 @@ pub struct PortCoverageOptions {
     pub ignore_name_prefixes: Vec<String>,
     /// Extra user globs applied to source *and* target node paths.
     pub exclude: Vec<String>,
+    /// Source-only include scope: when non-empty, a source symbol counts toward
+    /// coverage only if its path matches one of these globs (paths with no path
+    /// are excluded). This scopes the *denominator* to one slice of the source
+    /// — e.g. `**/rcmtm-cloud-craft/**` to measure just the craft microservice's
+    /// port progress out of a big monolith. Does not affect the target side.
+    pub source_include: Vec<String>,
+    /// Source-only exclude globs, applied after `source_include`. Unlike
+    /// `exclude` (both sides), this drops paths from the source denominator only
+    /// — e.g. exclude a not-yet-in-scope sibling service without hiding any
+    /// target symbol from the `extra` list.
+    pub source_exclude: Vec<String>,
     /// Cap `missing` / `ported` / `extra` list lengths (0 = unlimited).
     pub max_items: usize,
 }
@@ -151,6 +162,8 @@ impl Default for PortCoverageOptions {
             ignore_names: BTreeSet::new(),
             ignore_name_prefixes: Vec::new(),
             exclude: Vec::new(),
+            source_include: Vec::new(),
+            source_exclude: Vec::new(),
             max_items: 0,
         }
     }
@@ -221,6 +234,10 @@ pub fn analyze_port_coverage_with_stores(
     options: &PortCoverageOptions,
 ) -> Result<PortCoverageReport> {
     let user_globs = build_globset(&options.exclude).context("compiling port-coverage exclude globs")?;
+    let source_include_globs =
+        build_globset(&options.source_include).context("compiling port-coverage --source-include globs")?;
+    let source_exclude_globs =
+        build_globset(&options.source_exclude).context("compiling port-coverage --source-exclude globs")?;
 
     let path_excluded = |path: Option<&str>| -> bool {
         let Some(p) = path else { return false };
@@ -254,10 +271,27 @@ pub fn analyze_port_coverage_with_stores(
         }
     };
 
+    // Source-only scope: shrink the coverage *denominator* to one slice without
+    // touching the target side. `source_include` (when set) is an allow-list;
+    // `source_exclude` then removes from what remains. A node with no path is
+    // kept only when no include scope is configured.
+    let has_source_include = !options.source_include.is_empty();
+    let in_source_scope = |path: Option<&str>| -> bool {
+        match path {
+            None => !has_source_include,
+            Some(p) => {
+                if has_source_include && !source_include_globs.is_match(p) {
+                    return false;
+                }
+                !source_exclude_globs.is_match(p)
+            }
+        }
+    };
+
     let source_nodes: Vec<Node> = source
         .list_all_nodes()?
         .into_iter()
-        .filter(|n| eligible(n))
+        .filter(|n| eligible(n) && in_source_scope(n.path.as_deref()))
         .collect();
     let target_nodes: Vec<Node> = target
         .list_all_nodes()?
@@ -667,6 +701,78 @@ mod tests {
         .unwrap();
         let missing: Vec<&str> = report.missing.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(missing, vec!["keep"]);
+    }
+
+    #[test]
+    fn source_include_scopes_denominator_to_one_slice() {
+        // Source (Java) spans two microservices; the target (Go) ported only the
+        // craft slice. Unscoped coverage is 2/4; scoping the SOURCE to the craft
+        // service makes the denominator 2 and coverage 100% — this is how you
+        // measure progress on a single-service slice of a big monolith port.
+        let (source, _s) = store_with(&[
+            ("selectCraftTree", NodeKind::JavaMethod, "rcmtm-cloud-craft/src/CraftController.java"),
+            ("getDictSystem", NodeKind::JavaMethod, "rcmtm-cloud-craft/src/DictController.java"),
+            ("createOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/src/OrderController.java"),
+            ("cancelOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/src/OrderController.java"),
+        ]);
+        let (target, _t) = store_with(&[
+            ("SelectCraftTree", NodeKind::GoFunction, "internal/craft/handler.go"),
+            ("GetDictSystem", NodeKind::GoFunction, "internal/craft/handler.go"),
+        ]);
+
+        // Unscoped baseline: 2 of 4 ported (ignore_case maps Java->Go casing).
+        let base = analyze_port_coverage_with_stores(
+            &source,
+            &target,
+            &PortCoverageOptions { ignore_case: true, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(base.stats.source_distinct_names, 4);
+        assert_eq!(base.stats.ported_names, 2);
+
+        // Scoped to the craft service: denominator 2, coverage 100%.
+        let scoped = analyze_port_coverage_with_stores(
+            &source,
+            &target,
+            &PortCoverageOptions {
+                ignore_case: true,
+                source_include: vec!["**/rcmtm-cloud-craft/**".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped.stats.source_distinct_names, 2);
+        assert_eq!(scoped.stats.ported_names, 2);
+        assert!((scoped.stats.coverage - 1.0).abs() < 1e-9);
+        assert!(scoped.missing.is_empty(), "scoped missing must be empty: {:?}", scoped.missing);
+    }
+
+    #[test]
+    fn source_exclude_drops_slice_from_source_only() {
+        // source_exclude removes the order slice from the SOURCE denominator
+        // without touching the target (unlike `exclude`, which applies to both).
+        let (source, _s) = store_with(&[
+            ("selectCraftTree", NodeKind::JavaMethod, "rcmtm-cloud-craft/Craft.java"),
+            ("createOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/Order.java"),
+        ]);
+        let (target, _t) = store_with(&[
+            ("selectCraftTree", NodeKind::GoFunction, "internal/craft.go"),
+        ]);
+        let report = analyze_port_coverage_with_stores(
+            &source,
+            &target,
+            &PortCoverageOptions {
+                source_exclude: vec!["**/rcmtm-cloud-order/**".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.stats.source_distinct_names, 1);
+        assert!(
+            report.missing.is_empty(),
+            "order excluded from source, craft ported -> no missing: {:?}",
+            report.missing
+        );
     }
 
     #[test]
