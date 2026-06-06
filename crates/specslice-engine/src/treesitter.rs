@@ -723,6 +723,37 @@ pub fn keep_raw_import(
     }
 }
 
+/// Expand a Java `import a.b.c.*;` wildcard to the repo files that are *direct*
+/// members of package `a.b.c` (any `…/a/b/c/<Name>.java`). Used for name
+/// resolution scope only — not for file→file import edges. Returns empty for a
+/// non-wildcard or JDK/third-party package with no indexed files.
+fn java_wildcard_package_files(raw: &str, all_files: &[String]) -> Vec<String> {
+    let dotted = raw.trim().trim_end_matches(';').trim();
+    let Some(pkg) = dotted.strip_suffix(".*") else {
+        return Vec::new();
+    };
+    let pkg = pkg.trim_end_matches('.').trim();
+    if pkg.is_empty() {
+        return Vec::new();
+    }
+    let pkgdir = pkg.replace('.', "/");
+    let mut out = Vec::new();
+    for f in all_files {
+        let Some(slash) = f.rfind('/') else {
+            continue;
+        };
+        let (parent, name) = (&f[..slash], &f[slash + 1..]);
+        // Direct member of the package dir (source-root agnostic: the package
+        // path is a suffix of the file's parent dir, or the whole parent for a
+        // root-level layout), and a Java source file.
+        if name.ends_with(".java") && (parent == pkgdir || parent.ends_with(&format!("/{pkgdir}")))
+        {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// Collapse `.`/`..` segments in a path into a clean repo-relative string
 /// using `/` separators. Leading `..` that would escape the root simply
 /// clears the accumulator (we never emit paths above the repo root).
@@ -1131,6 +1162,19 @@ fn index_repo_with_spec_impl(
                     to_path: target,
                 });
                 result.imports += 1;
+            } else if spec.language_id == "java" && !scanned.references.is_empty() {
+                // `import a.b.c.*;` — a wildcard package import resolves to no
+                // single file, but the package's symbols ARE in scope: a bare
+                // call (`baseMapper.selectX()` collects `selectX`) must reach a
+                // method defined in any `…/a/b/c/<Name>.java`. Feed those files
+                // into name resolution ONLY (no file→file ImportEdge, so the
+                // file graph and import stats stay byte-identical to before).
+                for target in java_wildcard_package_files(&imp.path, &all_files) {
+                    import_targets
+                        .entry(file.relative.clone())
+                        .or_default()
+                        .push(target);
+                }
             }
         }
 
@@ -1835,6 +1879,71 @@ describe('outer', () => {
             .find(|n| n.kind == NodeKind::PythonClass && n.name.as_deref() == Some("Service"))
             .expect("Service node present");
         assert_eq!(service.metadata_json.as_deref(), Some(r#"{"tag":"py"}"#));
+    }
+
+    // --- Java wildcard package imports (`import pkg.*;`) -------------------
+    // MyBatis / Spring code wildcard-imports whole packages and calls the
+    // imported symbols by bare name (`baseMapper.selectX()` collects `selectX`).
+    // Dropping `pkg.*` left those calls unresolved, so an endpoint→table trace
+    // dead-ended at the service impl. A wildcard now feeds every file under that
+    // package into the file's name-resolution scope (resolution only — no
+    // file→file import edge, so the file graph/import stats are unchanged).
+    #[test]
+    fn java_wildcard_package_import_resolves_called_symbol() {
+        use specslice_core::EdgeKind;
+        use specslice_store::Store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("com/x/mapper")).unwrap();
+        std::fs::create_dir_all(root.join("com/x/service")).unwrap();
+        // Mapper interface lives in com.x.mapper; only wildcard-imported below.
+        std::fs::write(
+            root.join("com/x/mapper/CraftConflictMapper.java"),
+            "package com.x.mapper;\npublic interface CraftConflictMapper {\n    int selectStyleConflicted(int id);\n}\n",
+        )
+        .unwrap();
+        // Service impl wildcard-imports the mapper package and calls the method
+        // by bare name (as `baseMapper.selectStyleConflicted(id)` would collect).
+        std::fs::write(
+            root.join("com/x/service/CraftConflictServiceImpl.java"),
+            "package com.x.service;\nimport com.x.mapper.*;\npublic class CraftConflictServiceImpl {\n    public int selectStyleConflictById(int id) {\n        return selectStyleConflicted(id);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        index_repo_with_spec(
+            &mut store,
+            &crate::java_treesitter::JAVA_SPEC,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        let nodes = store.list_all_nodes().unwrap();
+        let find = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::JavaMethod && n.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing JavaMethod {name}: {nodes:?}"))
+                .id
+                .clone()
+        };
+        let impl_m = find("selectStyleConflictById");
+        let mapper_m = find("selectStyleConflicted");
+        let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.from_id == impl_m && e.to_id == mapper_m),
+            "wildcard `import com.x.mapper.*` must let the bare call \
+             `selectStyleConflicted` resolve to the mapper method: {calls:?}"
+        );
     }
 
     // --- Module-scoped (flat-namespace) name resolution -------------------
