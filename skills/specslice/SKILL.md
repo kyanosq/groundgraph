@@ -102,7 +102,7 @@ specslice --repo-root /path/to/repo trace "selectCraftTree" --json   # for agent
 For this to reach the data layer, `schema-index` stitches four derived edge families into the graph (counts printed by `index`/`schema-index`):
 - `mapper-interface method --references--> SqlMapperStmt` (MyBatis statement),
 - `SqlMapperStmt --persists_to--> DbTable` (table names parsed from the SQL),
-- `interface method --declares_implementation--> impl method` (Spring `I<Name>` ↔ `<Name>Impl`), so traversal descends through interface dispatch instead of dead-ending at the declaration.
+- `interface method --declares_implementation--> impl method` — both Java/Spring conventions: the dominant `<Name>Service` ↔ `<Name>ServiceImpl` **and** the legacy `I<Name>` ↔ `<Name>Impl`. So traversal descends through interface dispatch instead of dead-ending at the declaration (a real Spring repo links thousands of these, not just the rare `I`-prefixed ones).
 - `callable --persists_to--> DbTable` for **inline SQL** — any non-Java method/function (Go/Dart/TS/Python/Rust/…) whose body embeds SQL string literals referencing a known table. This is what lets `trace` reach tables in repos that keep SQL in code instead of MyBatis XML (e.g. a Go `repo.go` with `` `SELECT … FROM craft` ``). A table edge is only emitted when the parsed name matches an existing `DbTable`, so it cannot invent tables.
 
 ## Port / Rewrite Workflow (P24–P26)

@@ -257,28 +257,54 @@ fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
 
     let mut edges: Vec<EdgeAssertion> = Vec::new();
 
-    // interface → impl: `I<Core>.method` ⇒ `<Core>Impl.method` (the dominant
-    // Spring convention). The existence check on the impl key makes the
-    // `I`-prefix heuristic safe (a class like `Image` yields `mageImpl`, which
-    // won't exist, so no bogus edge is emitted).
-    for (suffix, iface_id) in &java_methods {
+    // interface → impl edges, two Java/Spring conventions (both require the
+    // paired method to actually exist, so no bogus edge is emitted; a dedup set
+    // prevents double-counting when the two conventions ever overlap):
+    //   A) C#/legacy `I<Core>` interface ⇒ `<Core>Impl`   (ICraftService→CraftServiceImpl)
+    //   B) dominant Spring `<Name>` interface ⇒ `<Name>Impl` (DictSystemService→DictSystemServiceImpl)
+    // Convention B is what real Spring services overwhelmingly use; only relying
+    // on A made polyglot/Spring repos report near-zero interface→impl coverage.
+    let mut iface_impl_seen: std::collections::HashSet<(ArtifactId, ArtifactId)> =
+        std::collections::HashSet::new();
+    for (suffix, node_id) in &java_methods {
         let Some((class, method)) = suffix.rsplit_once('.') else {
             continue;
         };
-        if !is_interface_class_name(class) {
-            continue;
+        // A: this node is the `I<Core>` interface; pair with `<Core>Impl`.
+        if is_interface_class_name(class) {
+            let impl_key = format!("{}Impl.{method}", &class[1..]).to_ascii_lowercase();
+            if let Some(impl_ids) = method_by_suffix.get(&impl_key) {
+                for impl_id in impl_ids {
+                    if node_id != impl_id
+                        && iface_impl_seen.insert((node_id.clone(), impl_id.clone()))
+                    {
+                        edges.push(EdgeAssertion::fact(
+                            node_id.clone(),
+                            impl_id.clone(),
+                            EdgeKind::DeclaresImplementation,
+                            EdgeSource::LanguageAdapter,
+                        ));
+                        stats.iface_impl_edges += 1;
+                    }
+                }
+            }
         }
-        let impl_key = format!("{}Impl.{method}", &class[1..]).to_ascii_lowercase();
-        if let Some(impl_ids) = method_by_suffix.get(&impl_key) {
-            for impl_id in impl_ids {
-                if impl_id != iface_id {
-                    edges.push(EdgeAssertion::fact(
-                        iface_id.clone(),
-                        impl_id.clone(),
-                        EdgeKind::DeclaresImplementation,
-                        EdgeSource::LanguageAdapter,
-                    ));
-                    stats.iface_impl_edges += 1;
+        // B: this node is the `<Name>Impl` impl; pair with interface `<Name>`.
+        if let Some(core) = class.strip_suffix("Impl").filter(|c| !c.is_empty()) {
+            let iface_key = format!("{core}.{method}").to_ascii_lowercase();
+            if let Some(iface_ids) = method_by_suffix.get(&iface_key) {
+                for iface_id in iface_ids {
+                    if iface_id != node_id
+                        && iface_impl_seen.insert((iface_id.clone(), node_id.clone()))
+                    {
+                        edges.push(EdgeAssertion::fact(
+                            iface_id.clone(),
+                            node_id.clone(),
+                            EdgeKind::DeclaresImplementation,
+                            EdgeSource::LanguageAdapter,
+                        ));
+                        stats.iface_impl_edges += 1;
+                    }
                 }
             }
         }
@@ -1142,6 +1168,67 @@ public class CraftConflict implements Serializable {
                     && e.to_id.as_str().ends_with("::craft_conflict")),
             "expected stmt->table PersistsTo edge, got {from_stmt:?}"
         );
+    }
+
+    #[test]
+    fn links_spring_service_impl_without_i_prefix() {
+        // Dominant Spring convention: `FooService` (interface) ⇒ `FooServiceImpl`
+        // (impl), with NO `I` prefix. The linker must pair them so traversal
+        // descends through interface dispatch instead of dead-ending at the
+        // declaration. Reproduces the vub/yolan miss (DictSystemService).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("schema.sql"), "CREATE TABLE dict_system (id BIGINT);").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let iface = ArtifactId::new(
+            "java::src/com/vhub/yolan/service/DictSystemService.java::DictSystemService.getDictSystem",
+        );
+        let impl_id = ArtifactId::new(
+            "java::src/com/vhub/yolan/service/impl/DictSystemServiceImpl.java::DictSystemServiceImpl.getDictSystem",
+        );
+        store.upsert_node(&Node::new(iface.clone(), NodeKind::JavaMethod)).unwrap();
+        store.upsert_node(&Node::new(impl_id.clone(), NodeKind::JavaMethod)).unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert!(
+            stats.iface_impl_edges >= 1,
+            "expected >=1 interface->impl edge (Spring <Name>Service convention), got {}",
+            stats.iface_impl_edges
+        );
+        let from_iface = store.list_edges_from(&iface).unwrap();
+        assert!(
+            from_iface
+                .iter()
+                .any(|e| e.kind == EdgeKind::DeclaresImplementation && e.to_id == impl_id),
+            "expected DictSystemService->DictSystemServiceImpl DeclaresImplementation edge, got {from_iface:?}"
+        );
+    }
+
+    #[test]
+    fn iface_impl_no_edge_without_matching_impl() {
+        // A plain class ending in `Impl` with no same-named interface, and an
+        // interface with no `Impl`, must NOT fabricate an edge.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("schema.sql"), "CREATE TABLE t (id BIGINT);").unwrap();
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_node(&Node::new(
+                ArtifactId::new("java::a/LonelyServiceImpl.java::LonelyServiceImpl.run"),
+                NodeKind::JavaMethod,
+            ))
+            .unwrap();
+        store
+            .upsert_node(&Node::new(
+                ArtifactId::new("java::a/OtherService.java::OtherService.ping"),
+                NodeKind::JavaMethod,
+            ))
+            .unwrap();
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.iface_impl_edges, 0, "no matching pair -> no edge");
     }
 
     #[test]
