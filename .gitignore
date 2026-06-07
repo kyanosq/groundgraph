@@ -6,6 +6,8 @@ dist/
 .specslice/graph.db
 .specslice/export/
 .specslice/stats.jsonl
+# Auto-generated SCIP indexes (rebuilt by `specslice index`; can be large).
+.specslice/scip/
 
 # Rust/editor local files.
 *.swp

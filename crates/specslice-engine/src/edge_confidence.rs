@@ -17,8 +17,9 @@
 //!     bottlenecked by dynamic call sites).
 //!   - `Calls` / `References` / `ReadsProvider` / `NavigatesTo` /
 //!     `PersistsTo` / `SubscribesStream` produced by an LSP server
-//!     (`*_lsp` indexer name) or the Dart analyzer sidecar
-//!     (`dart_analyzer`), since those resolve symbol bindings
+//!     (`*_lsp` indexer name), the Dart analyzer sidecar
+//!     (`dart_analyzer`), or offline SCIP ingestion (`scip` /
+//!     `scip:<lang>`), since those resolve symbol bindings
 //!     using compiler-grade type information.
 //!   - Markdown `Documents`, `DeclaresImplementation` /
 //!     `DeclaresVerification` from explicit manifests — user
@@ -171,6 +172,11 @@ pub fn derive_confidence(
         return match indexer {
             Some(i) if i.ends_with("_lsp") => EdgeConfidence::High,
             Some("dart_analyzer") => EdgeConfidence::High,
+            // SCIP ingestion (`scip`, `scip:rust`, …): the edge was resolved
+            // offline by a language's real compiler frontend (rust-analyzer /
+            // scip-go / scip-typescript / scip-java / scip-python), so it is
+            // compiler-grade — at least as trustworthy as a live LSP.
+            Some(i) if i == "scip" || i.starts_with("scip:") => EdgeConfidence::High,
             Some(i) if i.ends_with("_ast") => EdgeConfidence::Medium,
             _ => EdgeConfidence::Medium,
         };
@@ -219,6 +225,30 @@ mod tests {
                 EdgeSource::LanguageAdapter,
                 Some("dart_analyzer")
             ),
+            EdgeConfidence::High
+        );
+    }
+
+    #[test]
+    fn scip_resolved_calls_are_high_confidence() {
+        // SCIP indexers run a language's real compiler frontend offline, so a
+        // `Calls`/`References` edge they produce is as trustworthy as an LSP's
+        // — strictly stronger than the in-process heuristic resolver.
+        assert_eq!(
+            derive(EdgeKind::Calls, EdgeSource::LanguageAdapter, Some("scip")),
+            EdgeConfidence::High
+        );
+        assert_eq!(
+            derive(
+                EdgeKind::References,
+                EdgeSource::LanguageAdapter,
+                Some("scip")
+            ),
+            EdgeConfidence::High
+        );
+        // Per-language SCIP tags (`scip:rust`, `scip:go`, …) are also high.
+        assert_eq!(
+            derive(EdgeKind::Calls, EdgeSource::LanguageAdapter, Some("scip:rust")),
             EdgeConfidence::High
         );
     }

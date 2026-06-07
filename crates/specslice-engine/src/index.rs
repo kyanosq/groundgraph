@@ -92,6 +92,16 @@ pub struct IndexResult {
     /// language that produced output (in `treesitter.languages` order).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub treesitter: Vec<TreeSitterLangResult>,
+    /// ADR-0001 R1 — offline SCIP overlay (`.specslice/scip/*.scip`). `None`
+    /// when code indexing is skipped or `enrichment.scip = false`; present with
+    /// zero counts when enabled but no `.scip` file is on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scip: Option<crate::scip_overlay::ScipOverlayResult>,
+    /// ADR-0001 R2 — per-language SCIP indexer auto-invocation outcomes
+    /// (`Generated` / `Skipped` / `Unsupported` / `Failed`). Empty when code
+    /// indexing is skipped or `enrichment.scip = false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scip_runs: Vec<crate::scip_runner::ScipRunOutcome>,
 }
 
 /// Per-language outcome of the unified tree-sitter pass.
@@ -331,6 +341,22 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
                 });
             }
         }
+
+        // ADR-0001 R1/R2 — SCIP is the single precision layer. First
+        // auto-invoke each indexed language's installed SCIP indexer
+        // (`rust-analyzer scip`, `scip-go`, …) to regenerate
+        // `.specslice/scip/<lang>.scip` — a one-shot batch, silently skipped
+        // when the binary is absent — then overlay every `.scip` as
+        // high-confidence `Calls`/`References` edges. Runs *last*, after every
+        // structural pass, so the precise edges bind to symbols that already
+        // exist. A no-op when no indexer is installed and no `.scip` is present.
+        if config.enrichment.scip {
+            let languages = indexed_languages(&config);
+            result.scip_runs = crate::scip_runner::run_indexers(&options.repo_root, &languages);
+            let scip = crate::scip_overlay::ingest_scip_overlay(&mut store, &options.repo_root)
+                .context("ingesting SCIP overlay")?;
+            result.scip = Some(scip);
+        }
     }
 
     if options.include_links {
@@ -392,4 +418,39 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
     } else {
         repo_root.join(raw)
     }
+}
+
+/// Canonical ids of every language this run indexed (post-`normalized`), used
+/// to decide which SCIP indexers to auto-invoke. Mirrors the enable-gates of
+/// the structural passes above; `run_indexers` dedupes and skips ids without
+/// an auto-invoke spec (e.g. `swift`, `java`, `c`, `cpp`).
+fn indexed_languages(config: &EngineConfig) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::new();
+    if !config.code.paths.is_empty() {
+        langs.push("dart".to_string());
+    }
+    if config.swift.enabled {
+        langs.push("swift".to_string());
+    }
+    if config.go.enabled {
+        langs.push("go".to_string());
+    }
+    if config.python.enabled {
+        langs.push("python".to_string());
+    }
+    if config.typescript.enabled {
+        langs.push("typescript".to_string());
+    }
+    if config.java.enabled {
+        langs.push("java".to_string());
+    }
+    if config.rust.enabled {
+        langs.push("rust".to_string());
+    }
+    for lang in &config.treesitter.languages {
+        if let Some(canon) = crate::config::canonical_language_id(lang) {
+            langs.push(canon.to_string());
+        }
+    }
+    langs
 }

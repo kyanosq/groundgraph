@@ -630,6 +630,7 @@ fn p23_enrichment_lsp_false_routes_lsp_languages_to_structure_only() {
         enrichment: EnrichmentConfig {
             lsp: false,
             analyzer: true,
+            scip: true,
         },
         languages: vec![
             LanguageSelection {

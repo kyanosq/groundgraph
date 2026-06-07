@@ -52,6 +52,8 @@ pub mod requirements_md_indexer;
 pub mod rust_indexer;
 pub mod rust_treesitter;
 pub mod schema_indexer;
+pub mod scip_overlay;
+pub mod scip_runner;
 pub mod search;
 pub mod similarity;
 pub mod stats;

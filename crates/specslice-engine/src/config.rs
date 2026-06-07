@@ -124,6 +124,13 @@ pub struct EnrichmentConfig {
     pub lsp: bool,
     #[serde(default = "default_true")]
     pub analyzer: bool,
+    /// Ingest offline SCIP indexes (`.specslice/scip/*.scip`) as a
+    /// high-confidence `Calls`/`References` overlay (ADR-0001 R1). A no-op
+    /// when no `.scip` is present, so it is safe to leave on; the file is
+    /// produced out-of-band by a language's SCIP indexer (`rust-analyzer
+    /// scip`, `scip-go`, `scip-typescript`, …).
+    #[serde(default = "default_true")]
+    pub scip: bool,
 }
 
 impl Default for EnrichmentConfig {
@@ -131,6 +138,7 @@ impl Default for EnrichmentConfig {
         Self {
             lsp: true,
             analyzer: true,
+            scip: true,
         }
     }
 }

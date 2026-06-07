@@ -246,6 +246,44 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             .ok();
         }
     }
+    {
+        use specslice_engine::scip_runner::ScipRunStatus;
+        // Auto-invocation outcomes. `Unsupported` (no indexer spec) is not
+        // actionable, so the section only appears when at least one language
+        // generated / was skipped (binary absent) / failed.
+        let actionable: Vec<_> = result
+            .scip_runs
+            .iter()
+            .filter(|r| !matches!(r.status, ScipRunStatus::Unsupported))
+            .collect();
+        if !actionable.is_empty() {
+            writeln!(out, "SCIP indexers:").ok();
+            for run in actionable {
+                match &run.status {
+                    ScipRunStatus::Generated => {
+                        writeln!(out, "  {}: generated", run.language).ok();
+                    }
+                    ScipRunStatus::Skipped(reason) => {
+                        writeln!(out, "  {}: skipped ({reason})", run.language).ok();
+                    }
+                    ScipRunStatus::Failed(reason) => {
+                        writeln!(out, "  {}: failed ({reason})", run.language).ok();
+                    }
+                    ScipRunStatus::Unsupported => {}
+                }
+            }
+        }
+    }
+    if let Some(scip) = &result.scip {
+        // Only surfaced when a `.scip` file was actually ingested; an enabled
+        // overlay that found nothing on disk reports zero and stays silent.
+        if scip.scip_files > 0 {
+            writeln!(out, "SCIP overlay:").ok();
+            writeln!(out, "  Files: {}", scip.scip_files).ok();
+            writeln!(out, "  Documents: {}", scip.documents).ok();
+            writeln!(out, "  Edges: {}", scip.edges).ok();
+        }
+    }
     if let Some(links) = &result.links {
         writeln!(out, "Links index:").ok();
         writeln!(out, "  Requirements: {}", links.requirements).ok();
@@ -619,6 +657,91 @@ mod tests {
         );
         assert!(out.contains("Symbols: 140"));
         assert!(out.contains("Imports: 60"));
+    }
+
+    #[test]
+    fn render_includes_scip_indexers_section_for_generated_and_skipped() {
+        use specslice_engine::scip_runner::{ScipRunOutcome, ScipRunStatus};
+        let result = IndexResult {
+            scip_runs: vec![
+                ScipRunOutcome {
+                    language: "rust".into(),
+                    status: ScipRunStatus::Generated,
+                    output: Some(std::path::PathBuf::from(".specslice/scip/rust.scip")),
+                },
+                ScipRunOutcome {
+                    language: "go".into(),
+                    status: ScipRunStatus::Skipped("未在 PATH 找到 `scip-go`".into()),
+                    output: None,
+                },
+            ],
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            out.contains("SCIP indexers"),
+            "missing SCIP indexers section: {out}"
+        );
+        assert!(out.contains("rust"), "missing generated lang: {out}");
+        assert!(out.contains("scip-go"), "missing skip reason: {out}");
+    }
+
+    #[test]
+    fn render_omits_unsupported_only_scip_indexers_section() {
+        use specslice_engine::scip_runner::{ScipRunOutcome, ScipRunStatus};
+        // Languages with no auto-invoke spec (java/swift/c/cpp) report
+        // Unsupported; that is not actionable, so the section stays hidden.
+        let result = IndexResult {
+            scip_runs: vec![ScipRunOutcome {
+                language: "java".into(),
+                status: ScipRunStatus::Unsupported,
+                output: None,
+            }],
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            !out.contains("SCIP indexers"),
+            "section should hide when only Unsupported entries: {out}"
+        );
+    }
+
+    #[test]
+    fn render_includes_scip_section_when_overlay_ingested_files() {
+        let result = IndexResult {
+            scip: Some(specslice_engine::scip_overlay::ScipOverlayResult {
+                scip_files: 2,
+                documents: 318,
+                edges: 9681,
+            }),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(out.contains("SCIP overlay"), "missing SCIP section: {out}");
+        assert!(out.contains("Files: 2"), "missing SCIP file count: {out}");
+        assert!(
+            out.contains("Documents: 318"),
+            "missing SCIP document count: {out}"
+        );
+        assert!(
+            out.contains("Edges: 9681"),
+            "missing SCIP edge count: {out}"
+        );
+    }
+
+    #[test]
+    fn render_omits_scip_section_when_no_scip_file_on_disk() {
+        // Enrichment ran (`Some`) but found no `.scip` file → zero counts.
+        // A noisy "SCIP overlay: 0 files" line would only confuse, so suppress.
+        let result = IndexResult {
+            scip: Some(specslice_engine::scip_overlay::ScipOverlayResult::default()),
+            ..IndexResult::default()
+        };
+        let out = format_result(&result);
+        assert!(
+            !out.contains("SCIP overlay"),
+            "SCIP section should be hidden when no .scip ingested: {out}"
+        );
     }
 
     #[test]
