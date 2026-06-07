@@ -247,9 +247,16 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         // the handler method, even when the path segment != the Java method
         // name. Done before the table early-continue below because controllers
         // usually declare no `@TableName`, so they would otherwise be skipped.
-        if ext == "java" {
+        if ext == "java" || ext == "go" {
             if let Ok(text) = std::fs::read_to_string(path) {
-                let routes = parse_http_routes(&text);
+                // Spring MVC annotations (Java) and net/http ServeMux registrations
+                // (Go) both land as HttpRoute nodes so the *URL path* tailorx calls
+                // resolves to its handler regardless of backend language.
+                let routes = if ext == "java" {
+                    parse_http_routes(&text)
+                } else {
+                    parse_go_routes(&text)
+                };
                 if !routes.is_empty() {
                     let rel = path
                         .strip_prefix(root)
@@ -575,12 +582,16 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         return Ok(());
     }
     let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
-    for m in store.list_nodes_by_kind(NodeKind::JavaMethod)? {
-        if let Some(suffix) = m.id.as_str().rsplit("::").next() {
-            method_by_suffix
-                .entry(suffix.to_ascii_lowercase())
-                .or_default()
-                .push(m.id.clone());
+    // Both Java (`JavaMethod`) and Go (`GoMethod`) handler nodes share the same
+    // id suffix shape `Type.method`, so one map serves Spring and net/http alike.
+    for kind in [NodeKind::JavaMethod, NodeKind::GoMethod] {
+        for m in store.list_nodes_by_kind(kind)? {
+            if let Some(suffix) = m.id.as_str().rsplit("::").next() {
+                method_by_suffix
+                    .entry(suffix.to_ascii_lowercase())
+                    .or_default()
+                    .push(m.id.clone());
+            }
         }
     }
 
@@ -1403,6 +1414,194 @@ pub fn parse_http_routes(text: &str) -> Vec<ParsedRoute> {
     routes
 }
 
+/// Recover HTTP routes registered on a Go `net/http` `ServeMux` (Go 1.22+
+/// method-aware patterns) — the Go analogue of [`parse_http_routes`] for Spring.
+/// Handles `mux.HandleFunc("VERB /path", recv.Method)` / `mux.Handle(...)`,
+/// including a pattern split across string concatenation with a gateway-prefix
+/// variable (`"GET "+prefix+"/p"` → path `/p`). The handler's declaring type is
+/// taken from the enclosing method receiver (`func (recv *Type) Register(...)`),
+/// so the route links to the `Type.Method` suffix of the indexed `GoMethod` node.
+pub fn parse_go_routes(text: &str) -> Vec<ParsedRoute> {
+    if !text.contains("HandleFunc") && !text.contains(".Handle(") {
+        return Vec::new();
+    }
+    let b = text.as_bytes();
+    let receivers = collect_go_receivers(b);
+    let mut routes = Vec::new();
+    // Call sites: byte index of the `(` opening each `.HandleFunc(`/`.Handle(`.
+    let mut calls: Vec<usize> = Vec::new();
+    for (idx, _) in text.match_indices(".HandleFunc(") {
+        calls.push(idx + ".HandleFunc".len());
+    }
+    for (idx, _) in text.match_indices(".Handle(") {
+        calls.push(idx + ".Handle".len());
+    }
+    calls.sort_unstable();
+    for open in calls {
+        let Some((body, _end)) = balanced_parens(b, open) else {
+            continue;
+        };
+        let args = split_top_level_commas(body);
+        if args.len() < 2 {
+            continue;
+        }
+        let Some((verb, path)) = parse_go_route_pattern(&args[0]) else {
+            continue;
+        };
+        let Some((handler_recv, handler_method)) = parse_go_handler(&args[args.len() - 1]) else {
+            continue;
+        };
+        let class = resolve_go_receiver_type(&receivers, open, &handler_recv);
+        if class.is_empty() || handler_method.is_empty() {
+            continue;
+        }
+        routes.push(ParsedRoute {
+            verb,
+            path: normalize_route("", &path),
+            class,
+            method: handler_method,
+            line: line_of(text, open),
+        });
+    }
+    routes
+}
+
+/// All method receivers in source order: `(byte offset of `func`, recv var,
+/// recv type)`. Plain functions (no `(recv ...)` clause) are skipped.
+fn collect_go_receivers(b: &[u8]) -> Vec<(usize, String, String)> {
+    let text = std::str::from_utf8(b).unwrap_or("");
+    let mut out = Vec::new();
+    for (idx, _) in text.match_indices("func") {
+        let before_ok = idx == 0 || !is_ident_byte(b[idx - 1]);
+        let after = idx + 4;
+        if !before_ok || after >= b.len() || !b[after].is_ascii_whitespace() {
+            continue;
+        }
+        let j = skip_ws(b, after);
+        if j >= b.len() || b[j] != b'(' {
+            continue; // a plain function, not a method
+        }
+        let mut k = skip_ws(b, j + 1);
+        let (recv_var, k2) = read_ident(b, k);
+        k = skip_ws(b, k2);
+        if k < b.len() && b[k] == b'*' {
+            k = skip_ws(b, k + 1);
+        }
+        let (recv_type, _k3) = read_ident(b, k);
+        if !recv_var.is_empty() && !recv_type.is_empty() {
+            out.push((idx, recv_var, recv_type));
+        }
+    }
+    out
+}
+
+/// The receiver type whose method body encloses the call at `call_offset`, but
+/// only when its receiver variable matches the handler selector's receiver
+/// (`h.Method` → `h`). Empty when the handler isn't a method on that receiver.
+fn resolve_go_receiver_type(
+    receivers: &[(usize, String, String)],
+    call_offset: usize,
+    handler_recv: &str,
+) -> String {
+    let mut best: Option<&(usize, String, String)> = None;
+    for r in receivers {
+        if r.0 < call_offset {
+            best = Some(r);
+        } else {
+            break;
+        }
+    }
+    match best {
+        Some((_, var, ty)) if var == handler_recv => ty.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Parse a Go ServeMux pattern argument into `(verb, path)`. Joins every string
+/// literal in the (possibly concatenated) expression, then splits an optional
+/// leading HTTP-method token. Returns `None` when the result isn't a `/`-path.
+fn parse_go_route_pattern(arg: &str) -> Option<(String, String)> {
+    let lit = concat_string_literals(arg);
+    let lit = lit.trim();
+    if lit.is_empty() {
+        return None;
+    }
+    let (head, rest) = match lit.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim_start()),
+        None => ("", lit),
+    };
+    const VERBS: &[&str] = &[
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE",
+    ];
+    let upper = head.to_ascii_uppercase();
+    let (verb, path) = if VERBS.contains(&upper.as_str()) && !rest.is_empty() {
+        (upper, rest.to_string())
+    } else {
+        ("ANY".to_string(), lit.to_string())
+    };
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((verb, path))
+}
+
+/// Concatenate the contents of every double-quoted or backtick-raw string
+/// literal in an expression, ignoring `+` operators and variable identifiers.
+fn concat_string_literals(expr: &str) -> String {
+    let b = expr.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' && j + 1 < b.len() {
+                        out.push(b[j + 1] as char);
+                        j += 2;
+                        continue;
+                    }
+                    out.push(b[j] as char);
+                    j += 1;
+                }
+                i = j + 1;
+            }
+            b'`' => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'`' {
+                    out.push(b[j] as char);
+                    j += 1;
+                }
+                i = j + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Parse a handler argument expression into `(receiver var, method)`. Recognizes
+/// a method value `recv.Method` (returns the trailing receiver segment + method)
+/// and a bare function `Fn` (returns an empty receiver).
+fn parse_go_handler(arg: &str) -> Option<(String, String)> {
+    let s = arg.trim_matches(|c: char| c == '(' || c == ')' || c == '&' || c.is_whitespace());
+    if let Some(dot) = s.rfind('.') {
+        let recv_last = s[..dot].rsplit('.').next().unwrap_or("");
+        let method = &s[dot + 1..];
+        if is_ident(method) && is_ident(recv_last) {
+            return Some((recv_last.to_string(), method.to_string()));
+        }
+        if is_ident(method) {
+            return Some((String::new(), method.to_string()));
+        }
+        return None;
+    }
+    if is_ident(s) {
+        return Some((String::new(), s.to_string()));
+    }
+    None
+}
+
 /// `(simple class name, byte index of the `class` keyword)` for the controller —
 /// the first `class <Ident>` after the `@RestController`/`@Controller`
 /// stereotype, so a comment mentioning "class" before the annotations can't
@@ -1868,6 +2067,116 @@ public class StyleInfoController {
                 .iter()
                 .any(|e| e.kind == EdgeKind::References && e.to_id == method_id),
             "expected route->method References edge, got {from_route:?}"
+        );
+    }
+
+    #[test]
+    fn parse_go_routes_direct_and_concat_pattern() {
+        // Go 1.22 `net/http` ServeMux: a method-aware pattern string, where the
+        // handler is a method value on the enclosing receiver. The pattern may be
+        // split across string concatenation with a gateway-prefix variable.
+        let go = r#"
+package handler
+
+import "net/http"
+
+type CustomerSizeHandler struct{ Svc any }
+
+func (h *CustomerSizeHandler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /customer/customer/size/getCustomerPosition", h.GetCustomerPosition)
+}
+
+type DesignHandler struct{ Svc any }
+
+func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
+	mux.HandleFunc("GET "+gatewayPrefix+"/app/craft/getDesignInfo", h.GetDesignInfo)
+}
+"#;
+        let routes = parse_go_routes(go);
+        assert_eq!(routes.len(), 2, "two routes parsed, got {routes:?}");
+
+        let pos = routes
+            .iter()
+            .find(|r| r.method == "GetCustomerPosition")
+            .expect("getCustomerPosition route");
+        assert_eq!(pos.verb, "POST");
+        assert_eq!(pos.path, "/customer/customer/size/getCustomerPosition");
+        assert_eq!(pos.class, "CustomerSizeHandler");
+
+        let design = routes
+            .iter()
+            .find(|r| r.method == "GetDesignInfo")
+            .expect("getDesignInfo route");
+        assert_eq!(design.verb, "GET");
+        // The gateway-prefix variable is opaque at index time; the stable static
+        // path segments are still recovered from the literal concatenation parts.
+        assert_eq!(design.path, "/app/craft/getDesignInfo");
+        assert_eq!(design.class, "DesignHandler");
+    }
+
+    #[test]
+    fn parse_go_routes_ignores_non_routing_go() {
+        let go = r#"
+package service
+
+type DesignService struct{}
+
+func (s *DesignService) GetDesignInfo(id int) (any, error) {
+	return s.repo.GetDesignInfo(id)
+}
+"#;
+        assert!(parse_go_routes(go).is_empty());
+    }
+
+    #[test]
+    fn links_go_http_route_to_handler_method() {
+        // A Go handler file registering a route + a pre-seeded handler GoMethod
+        // node must yield an HttpRoute node and a route--references-->method edge,
+        // matched by the `Type.Method` suffix shared with `JavaMethod`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("internal/craft/handler")).unwrap();
+        std::fs::write(
+            root.join("internal/craft/handler/design_handler.go"),
+            r#"
+package handler
+
+import "net/http"
+
+type DesignHandler struct{ Svc any }
+
+func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
+	mux.HandleFunc("GET "+gatewayPrefix+"/app/craft/getDesignInfo", h.GetDesignInfo)
+}
+"#,
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        // Pre-seed the handler method node (normally from the Go code indexer).
+        let method_id = ArtifactId::new(
+            "go::internal/craft/handler/design_handler.go::DesignHandler.GetDesignInfo",
+        );
+        store
+            .upsert_node(&Node::new(method_id.clone(), NodeKind::GoMethod))
+            .unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.http_routes, 1, "one Go HTTP route indexed");
+        assert_eq!(stats.route_method_edges, 1, "route->method edge linked");
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name.as_deref(), Some("getDesignInfo"));
+        assert_eq!(routes[0].path.as_deref(), Some("/app/craft/getDesignInfo"));
+
+        let from_route = store.list_edges_from(&routes[0].id).unwrap();
+        assert!(
+            from_route
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.to_id == method_id),
+            "expected Go route->method References edge, got {from_route:?}"
         );
     }
 
