@@ -62,7 +62,7 @@ const SPECS: &[IndexerSpec] = &[
     IndexerSpec {
         language: "python",
         binary: "scip-python",
-        args: &["index", ".", "--output", "{out}"],
+        args: &["index", "--cwd", "{root}", "--output", "{out}"],
         writes_cwd_index: false,
     },
     IndexerSpec {
