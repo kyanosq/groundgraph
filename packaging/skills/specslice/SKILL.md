@@ -215,6 +215,12 @@ Swift 缺乏成熟 SCIP indexer，是**唯一**保留实时 LSP 的语言。
 LSP 缺失时静默跳过并把原因写入 `result.sidecar_skip_reason`。
 CLI 这一段仍显示 `References (LSP)` / `LSP skipped`（仅 Swift）。
 
+Swift 是 LSP 退役后**唯一**仍受 `enrichment.lsp` 影响的语言：开关与
+`sourcekit-lsp` 路径都配在根 `.specslice.yaml`（`enrichment.lsp: true` +
+可选 `swift.lsp_command` / `SPECSLICE_SWIFT_LSP_COMMAND`）。Go 等其余语言
+的精度则统一交给根 `.specslice.yaml` 里对应 `*.enabled` 的 SCIP overlay，
+不再有任何 LSP 开关。
+
 ## Go via tree-sitter + 启发式（精度交给 SCIP）
 
 Go 的 **LSP（gopls）已退役**（ADR-0001 §8.8）。`go.enabled: true` 时
