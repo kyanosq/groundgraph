@@ -754,6 +754,36 @@ fn java_wildcard_package_files(raw: &str, all_files: &[String]) -> Vec<String> {
     out
 }
 
+/// Expand a resolved Go import (a single *representative* package file, e.g.
+/// `internal/repo/admin.go`) to every `.go` file that is a direct member of
+/// that package directory. A Go package's symbols are spread across all its
+/// files, but [`go_resolve_import`](crate::go_treesitter) collapses the package
+/// to one representative; a bare cross-package call (`s.repo.GetX()` collects
+/// `GetX`) may target a method defined in any sibling file. Used for the name-
+/// resolution scope only — the file→file `ImportEdge` keeps the single
+/// representative, so the file graph and import stats are unchanged. Returns the
+/// package's files (including the representative); empty when the target has no
+/// parent dir.
+fn go_package_sibling_files(target: &str, all_files: &[String]) -> Vec<String> {
+    let Some(slash) = target.rfind('/') else {
+        // Root-level package: members are the root-level `.go` files.
+        return all_files
+            .iter()
+            .filter(|f| !f.contains('/') && f.ends_with(".go"))
+            .cloned()
+            .collect();
+    };
+    let pkgdir = &target[..slash];
+    all_files
+        .iter()
+        .filter(|f| {
+            f.ends_with(".go")
+                && matches!(f.rsplit_once('/'), Some((parent, _)) if parent == pkgdir)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Collapse `.`/`..` segments in a path into a clean repo-relative string
 /// using `/` separators. Leading `..` that would escape the root simply
 /// clears the accumulator (we never emit paths above the repo root).
@@ -1152,10 +1182,18 @@ fn index_repo_with_spec_impl(
                 (spec.resolve_import)(&imp.path, &file.relative, &all_files, &src_roots)
             {
                 if !scanned.references.is_empty() {
-                    import_targets
-                        .entry(file.relative.clone())
-                        .or_default()
-                        .push(target.clone());
+                    let entry = import_targets.entry(file.relative.clone()).or_default();
+                    if spec.language_id == "go" {
+                        // A Go import names a *package* (directory); the resolved
+                        // representative is one of its files. Feed every sibling
+                        // file of that package into the resolution scope so a
+                        // bare cross-package call reaches a method defined in any
+                        // of them (resolution only — the ImportEdge below keeps
+                        // the single representative, so import stats are unchanged).
+                        entry.extend(go_package_sibling_files(&target, &all_files));
+                    } else {
+                        entry.push(target.clone());
+                    }
                 }
                 batch.imports.push(ImportEdge {
                     from_file: file_artifact_id.clone(),
@@ -1355,6 +1393,16 @@ pub(crate) fn resolve_heuristic_refs(
             let name = r.to_name.as_str();
             if let Some(q) = by_file.get(file.as_str()).and_then(|m| m.get(name)) {
                 for qn in q {
+                    // Skip a self-match (`*qn == from_qualified`): a bare call
+                    // whose name equals the caller's own qualified name is either
+                    // self-recursion (whose self edge is dropped at emit anyway)
+                    // or a `recv.Name()` delegation where the receiver field
+                    // shares the method's name. Pushing the self target here would
+                    // wrongly suppress the import-target fallback below and lose
+                    // the real cross-package edge.
+                    if *qn == r.from_qualified.as_str() {
+                        continue;
+                    }
                     targets.push((file.as_str(), (*qn).to_string(), r.kind.edge_kind()));
                 }
             }
@@ -1943,6 +1991,145 @@ describe('outer', () => {
                 .any(|e| e.from_id == impl_m && e.to_id == mapper_m),
             "wildcard `import com.x.mapper.*` must let the bare call \
              `selectStyleConflicted` resolve to the mapper method: {calls:?}"
+        );
+    }
+
+    // --- Go cross-package calls into non-representative package files -----
+    // A Go `import "mod/pkg"` resolves to a single *representative* file of
+    // the package directory, but the package's symbols are spread across all
+    // its files. A bare cross-package call (`s.repo.GetOrCreateCode()` collects
+    // `GetOrCreateCode`) must reach a method defined in ANY file of that
+    // package — not only the representative. The whole package dir is fed into
+    // the file's name-resolution scope (resolution only — the single
+    // representative ImportEdge is unchanged, so file graph/import stats stay
+    // byte-identical). Reproduces the Shift Go backend miss where every
+    // handler→service→repo call dead-ended at the package boundary.
+    #[test]
+    fn go_cross_package_call_resolves_into_non_representative_file() {
+        use specslice_core::EdgeKind;
+        use specslice_store::Store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        std::fs::create_dir_all(root.join("service")).unwrap();
+        // `repo/aaa.go` sorts first, so it is the package representative; the
+        // called method lives in `repo/referral.go`, which is NOT the rep.
+        std::fs::write(
+            root.join("repo/aaa.go"),
+            "package repo\ntype Other struct{}\nfunc (o *Other) Misc() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("repo/referral.go"),
+            "package repo\ntype ReferralRepo struct{}\nfunc (r *ReferralRepo) GetOrCreateCode() string { return \"\" }\n",
+        )
+        .unwrap();
+        // Service imports the repo package and calls the method through a field
+        // selector, exactly as the Shift backend does.
+        std::fs::write(
+            root.join("service/service.go"),
+            "package service\nimport \"mymod/repo\"\ntype Service struct{ repo *repo.ReferralRepo }\nfunc (s *Service) Overview() string {\n\treturn s.repo.GetOrCreateCode()\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        index_repo_with_spec(
+            &mut store,
+            &crate::go_treesitter::GO_SPEC,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        let nodes = store.list_all_nodes().unwrap();
+        let find = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::GoMethod && n.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing GoMethod {name}: {nodes:?}"))
+                .id
+                .clone()
+        };
+        let caller = find("Overview");
+        let callee = find("GetOrCreateCode");
+        let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.from_id == caller && e.to_id == callee),
+            "cross-package call `s.repo.GetOrCreateCode()` must resolve to the \
+             method defined in the non-representative package file: {calls:?}"
+        );
+    }
+
+    // --- Delegation across packages when names collide --------------------
+    // A handler that delegates to a same-named service method
+    // (`func (h *Handler) Handle() { return h.svc.Handle() }`) collects the bare
+    // call `Handle`, which also matches the caller's OWN simple name. Same-file
+    // resolution must not let that self-match shadow the imported cross-package
+    // target: the self edge is dropped anyway, so the import-target fallback has
+    // to still run. Reproduces the platform-go port miss where every
+    // handler→service delegation (deliberately mirroring the Java method names)
+    // produced no call edge.
+    #[test]
+    fn go_self_named_call_resolves_to_imported_method_not_dropped() {
+        use specslice_core::EdgeKind;
+        use specslice_store::Store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        std::fs::create_dir_all(root.join("handler")).unwrap();
+        std::fs::write(
+            root.join("svc/svc.go"),
+            "package svc\ntype Selector struct{}\nfunc (s *Selector) Handle() string { return \"\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("handler/handler.go"),
+            "package handler\nimport \"mymod/svc\"\ntype Handler struct{ sel *svc.Selector }\nfunc (h *Handler) Handle() string {\n\treturn h.sel.Handle()\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        index_repo_with_spec(
+            &mut store,
+            &crate::go_treesitter::GO_SPEC,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        let nodes = store.list_all_nodes().unwrap();
+        let by_id = |sub: &str| {
+            nodes
+                .iter()
+                .find(|n| n.id.as_str().ends_with(sub))
+                .unwrap_or_else(|| panic!("missing {sub}: {nodes:?}"))
+                .id
+                .clone()
+        };
+        let caller = by_id("handler/handler.go::Handler.Handle");
+        let callee = by_id("svc/svc.go::Selector.Handle");
+        let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.from_id == caller && e.to_id == callee),
+            "delegation `h.sel.Handle()` must resolve to the imported service \
+             method even though the call name collides with the caller's own \
+             name: {calls:?}"
         );
     }
 

@@ -48,7 +48,47 @@ fn ts_is_callable(kind: &str) -> bool {
             | "method_definition"
             | "method_signature"
             | "abstract_method_signature"
+            // `const NAME = (…) => {…}` / `const NAME = function(){}` — the
+            // dominant React/JS pattern. The declarator is only treated as a
+            // function symbol when its value is a function expression (gated in
+            // `ts_name_of`); other declarators decline a name and fall through
+            // to the reference collector.
+            | "variable_declarator"
     )
+}
+
+/// Names a `variable_declarator` only when it binds a function expression to a
+/// plain identifier (`const Foo = () => {}` / `const f = function(){}`), so
+/// literal / call / destructuring consts never masquerade as functions. Every
+/// other callable kind keeps the standard `name` field.
+fn ts_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    if node.kind() == "variable_declarator" {
+        let value = node.child_by_field_name("value")?;
+        if !matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "function"
+        ) {
+            return None;
+        }
+        let name = node.child_by_field_name("name")?;
+        if name.kind() != "identifier" {
+            return None; // object/array destructuring pattern — not a symbol.
+        }
+        return node_text(name, src).map(str::to_string);
+    }
+    name_from_field(node, src)
+}
+
+/// Body of a callable. For a function-valued `variable_declarator` the body
+/// lives one level down in the arrow / function expression, so call extraction
+/// and the line span reach into the actual function body.
+fn ts_body_of(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.kind() == "variable_declarator" {
+        return node
+            .child_by_field_name("value")
+            .and_then(|v| v.child_by_field_name("body"));
+    }
+    body_from_field(node)
 }
 
 fn ts_import_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Vec<String> {
@@ -79,7 +119,15 @@ fn ts_is_transparent(kind: &str) -> bool {
     // adds real methods without flooding the graph with anonymous callbacks.
     matches!(
         kind,
-        "export_statement" | "ambient_declaration" | "expression_statement" | "object" | "pair"
+        "export_statement"
+            | "ambient_declaration"
+            | "expression_statement"
+            | "object"
+            | "pair"
+            // Descend `const`/`let`/`var` declarations so a function-valued
+            // `variable_declarator` inside is reached and emitted as a symbol.
+            | "lexical_declaration"
+            | "variable_declaration"
     )
 }
 
@@ -297,8 +345,8 @@ const fn ts_family_spec(
         impl_type_of: no_text,
         receiver_type_of: no_text,
         import_of: ts_import_of,
-        name_of: name_from_field,
-        body_of: body_from_field,
+        name_of: ts_name_of,
+        body_of: ts_body_of,
         is_transparent_kind: ts_is_transparent,
         metadata_of: no_text,
         test_of: no_test_of,
@@ -374,6 +422,71 @@ namespace Geo {
             "namespaced function should qualify"
         );
         assert!(s.imports.iter().any(|i| i.path == "./foo"));
+    }
+
+    #[test]
+    fn arrow_and_function_expression_consts_are_captured_as_functions() {
+        // The dominant modern TS/JS pattern: components, hooks and utilities are
+        // `const NAME = (…) => {…}` / `const NAME = function(){}`, not
+        // `function NAME(){}`. Missing these made a 79-file React frontend report
+        // only 64 symbols (zero components). The arrow body's calls must also be
+        // attributed to the const so the call graph reaches into it.
+        use crate::treesitter::RefKind;
+        let src = r#"
+import React from "react";
+export const EditUser: React.FC<Props> = ({ user }) => {
+  save(user);
+  return null;
+};
+const helper = async () => { return 1; };
+const legacy = function () { return 2; };
+const NUM = 5;
+const { a, b } = obj;
+const memo = useMemo(() => 1, []);
+function save(u: any) {}
+"#;
+        let s = extract(&TSX_SPEC, src);
+        let fns = qnames(&s, NodeKind::TypescriptFunction);
+        assert!(
+            fns.contains(&"EditUser".to_string()),
+            "arrow const component: {fns:?}"
+        );
+        assert!(
+            fns.contains(&"helper".to_string()),
+            "async arrow const: {fns:?}"
+        );
+        assert!(
+            fns.contains(&"legacy".to_string()),
+            "function-expression const: {fns:?}"
+        );
+        assert!(
+            fns.contains(&"save".to_string()),
+            "plain function still works: {fns:?}"
+        );
+        // Non-function consts must NOT be mistaken for functions.
+        assert!(
+            !fns.contains(&"NUM".to_string()),
+            "literal const is not a function: {fns:?}"
+        );
+        assert!(
+            !fns.contains(&"memo".to_string()),
+            "call-valued const is not a function: {fns:?}"
+        );
+        assert!(
+            !fns.iter().any(|n| n == "a" || n == "b"),
+            "destructuring binding is not a function: {fns:?}"
+        );
+        // The arrow body's call is attributed to the const.
+        let from_edit: Vec<&str> = s
+            .references
+            .iter()
+            .filter(|r| r.from_qualified == "EditUser" && r.kind == RefKind::Call)
+            .map(|r| r.to_name.as_str())
+            .collect();
+        assert!(
+            from_edit.contains(&"save"),
+            "arrow body call save(user) should be attributed to EditUser, got {from_edit:?}"
+        );
     }
 
     #[test]

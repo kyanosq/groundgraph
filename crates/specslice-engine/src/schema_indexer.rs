@@ -199,6 +199,13 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         let tables = match ext.as_str() {
             "sql" => read_and(path, parse_sql_tables),
             "java" => read_and(path, parse_java_entity_tables),
+            // Backends that keep their schema as an embedded string literal
+            // (Go `migrations.go`, Rust/Python/TS migration modules, …) define
+            // `CREATE TABLE` inside source code, never a `.sql` file. The same
+            // tolerant DDL scanner finds it there too, so the inline-SQL linker
+            // below can reach those tables. Java is excluded — it uses ORM
+            // annotations (handled above) and the MyBatis XML path.
+            _ if is_embedded_sql_source_ext(&ext) => read_and(path, parse_sql_tables),
             _ => continue,
         };
         let Some(tables) = tables else { continue };
@@ -487,7 +494,12 @@ pub fn parse_mapper_stmts(text: &str) -> Vec<ParsedMapperStmt> {
     if !lower.contains("<mapper") {
         return Vec::new();
     }
-    let namespace = extract_attr(text, &lower, lower.find("<mapper").unwrap_or(0), "namespace");
+    let namespace = extract_attr(
+        text,
+        &lower,
+        lower.find("<mapper").unwrap_or(0),
+        "namespace",
+    );
     let mut out = Vec::new();
     for tag in ["select", "insert", "update", "delete"] {
         let open = format!("<{tag}");
@@ -498,8 +510,10 @@ pub fn parse_mapper_stmts(text: &str) -> Vec<ParsedMapperStmt> {
             // Ensure it's a tag boundary (next char is space, newline, or '>').
             let after = start + open.len();
             let boundary = lower.as_bytes().get(after).copied();
-            if !matches!(boundary, Some(b' ') | Some(b'\n') | Some(b'\r') | Some(b'\t') | Some(b'>'))
-            {
+            if !matches!(
+                boundary,
+                Some(b' ') | Some(b'\n') | Some(b'\r') | Some(b'\t') | Some(b'>')
+            ) {
                 from = after;
                 continue;
             }
@@ -618,6 +632,33 @@ fn is_skipped_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
 }
 
+/// Source-code extensions whose files may embed `CREATE TABLE` DDL as a string
+/// literal (Go migrations, Rust/Python/TS migration modules, …). Java is
+/// deliberately omitted: its tables come from `@TableName`/`@Table` ORM
+/// annotations (parsed via [`parse_java_entity_tables`]) and MyBatis XML, and
+/// re-scanning every `.java` body for DDL would invite false positives.
+fn is_embedded_sql_source_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "go" | "rs"
+            | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "dart"
+            | "kt"
+            | "kts"
+            | "rb"
+            | "php"
+            | "cs"
+            | "scala"
+            | "swift"
+    )
+}
+
 fn read_and(path: &Path, f: fn(&str) -> Vec<ParsedTable>) -> Option<Vec<ParsedTable>> {
     let text = std::fs::read_to_string(path).ok()?;
     let tables = f(&text);
@@ -717,14 +758,7 @@ fn parse_sql_columns(body: &str) -> Vec<ParsedColumn> {
 fn is_sql_constraint_kw(token: &str) -> bool {
     matches!(
         token.to_ascii_uppercase().as_str(),
-        "PRIMARY"
-            | "FOREIGN"
-            | "UNIQUE"
-            | "KEY"
-            | "CONSTRAINT"
-            | "INDEX"
-            | "CHECK"
-            | "EXCLUDE"
+        "PRIMARY" | "FOREIGN" | "UNIQUE" | "KEY" | "CONSTRAINT" | "INDEX" | "CHECK" | "EXCLUDE"
     )
 }
 
@@ -753,7 +787,8 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
 
         if depth == 0 {
             // Class-level annotations: @TableName("x") / @Table(name="x").
-            if (line.starts_with("@TableName") || line.starts_with("@Table(")) && table_name.is_none()
+            if (line.starts_with("@TableName") || line.starts_with("@Table("))
+                && table_name.is_none()
             {
                 if let Some(v) = first_quoted(line) {
                     table_name = Some(v);
@@ -948,13 +983,16 @@ fn first_quoted(s: &str) -> Option<String> {
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !s.chars().next().unwrap().is_ascii_digit()
 }
 
 fn line_of(text: &str, byte_idx: usize) -> u32 {
-    text[..byte_idx.min(text.len())].bytes().filter(|b| *b == b'\n').count() as u32 + 1
+    text[..byte_idx.min(text.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count() as u32
+        + 1
 }
 
 fn to_snake_case(s: &str) -> String {
@@ -1060,7 +1098,10 @@ public class CraftConflict implements Serializable {
 
     #[test]
     fn normalize_column_aligns_dialects() {
-        assert_eq!(normalize_column("categoryId"), normalize_column("category_id"));
+        assert_eq!(
+            normalize_column("categoryId"),
+            normalize_column("category_id")
+        );
         assert_eq!(normalize_column("conflictPid"), "conflictpid");
     }
 
@@ -1088,10 +1129,25 @@ public class CraftConflict implements Serializable {
         let s0 = &stmts[0];
         assert_eq!(s0.id, "selectConflictListTreeByCloth");
         assert_eq!(s0.stmt_kind, "select");
-        assert_eq!(s0.namespace.as_deref(), Some("com.kutesmart.cloud.craft.mapper.CraftConflictMapper"));
-        assert!(s0.sql.contains("from craft_conflict cc"), "sql body kept: {}", s0.sql);
-        assert!(s0.sql.contains("category_id in"), "sql body kept: {}", s0.sql);
-        assert!(s0.line >= 4 && s0.line <= 5, "line points at the <select>: {}", s0.line);
+        assert_eq!(
+            s0.namespace.as_deref(),
+            Some("com.kutesmart.cloud.craft.mapper.CraftConflictMapper")
+        );
+        assert!(
+            s0.sql.contains("from craft_conflict cc"),
+            "sql body kept: {}",
+            s0.sql
+        );
+        assert!(
+            s0.sql.contains("category_id in"),
+            "sql body kept: {}",
+            s0.sql
+        );
+        assert!(
+            s0.line >= 4 && s0.line <= 5,
+            "line points at the <select>: {}",
+            s0.line
+        );
         let s1 = &stmts[1];
         assert_eq!(s1.id, "batchInsertConflicts");
         assert_eq!(s1.stmt_kind, "insert");
@@ -1150,7 +1206,8 @@ public class CraftConflict implements Serializable {
         assert_eq!(stats.stmt_method_edges, 1, "method->stmt edge linked");
         assert_eq!(stats.stmt_table_edges, 1, "stmt->table edge linked");
 
-        let stmt_id = ArtifactId::new("sql_mapper::CraftConflictMapper.xml::selectConflictListTreeByCloth");
+        let stmt_id =
+            ArtifactId::new("sql_mapper::CraftConflictMapper.xml::selectConflictListTreeByCloth");
         // method --references--> stmt
         let from_method = store.list_edges_from(&method_id).unwrap();
         assert!(
@@ -1162,10 +1219,8 @@ public class CraftConflict implements Serializable {
         // stmt --persists_to--> craft_conflict table
         let from_stmt = store.list_edges_from(&stmt_id).unwrap();
         assert!(
-            from_stmt
-                .iter()
-                .any(|e| e.kind == EdgeKind::PersistsTo
-                    && e.to_id.as_str().ends_with("::craft_conflict")),
+            from_stmt.iter().any(|e| e.kind == EdgeKind::PersistsTo
+                && e.to_id.as_str().ends_with("::craft_conflict")),
             "expected stmt->table PersistsTo edge, got {from_stmt:?}"
         );
     }
@@ -1178,7 +1233,11 @@ public class CraftConflict implements Serializable {
         // declaration. Reproduces the vub/yolan miss (DictSystemService).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("schema.sql"), "CREATE TABLE dict_system (id BIGINT);").unwrap();
+        std::fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE dict_system (id BIGINT);",
+        )
+        .unwrap();
 
         let mut store = Store::open(root.join("graph.db")).unwrap();
         store.migrate().unwrap();
@@ -1188,8 +1247,12 @@ public class CraftConflict implements Serializable {
         let impl_id = ArtifactId::new(
             "java::src/com/vhub/yolan/service/impl/DictSystemServiceImpl.java::DictSystemServiceImpl.getDictSystem",
         );
-        store.upsert_node(&Node::new(iface.clone(), NodeKind::JavaMethod)).unwrap();
-        store.upsert_node(&Node::new(impl_id.clone(), NodeKind::JavaMethod)).unwrap();
+        store
+            .upsert_node(&Node::new(iface.clone(), NodeKind::JavaMethod))
+            .unwrap();
+        store
+            .upsert_node(&Node::new(impl_id.clone(), NodeKind::JavaMethod))
+            .unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
         assert!(
@@ -1232,6 +1295,60 @@ public class CraftConflict implements Serializable {
     }
 
     #[test]
+    fn discovers_create_table_embedded_in_go_migrations_and_links_repo_method() {
+        // Real Go pattern (Shift backend): the schema is defined as a Go raw
+        // string literal in `migrations.go` (no `.sql` file at all), and repo
+        // methods embed SQL string literals. The schema indexer must (1) parse
+        // the embedded `CREATE TABLE` into a DbTable node, and (2) link the repo
+        // method body's inline `... FROM referrals ...` to it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("migrations.go"),
+            "package storage\nvar migrations = []migration{{\n  version: 1,\n  sql: `\nCREATE TABLE referrals (\n    id          TEXT PRIMARY KEY,  -- internal uuid (v7)\n    referrer_id TEXT NOT NULL,\n    referee_id  TEXT NOT NULL\n);\nCREATE INDEX idx_ref ON referrals(referrer_id);\n`,\n}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("referral.go"),
+            "package repo\nfunc (r *ReferralRepo) CountByReferrer() {\n\t_ = `SELECT COUNT(*) FROM referrals WHERE referrer_id = ?`\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let method_id = ArtifactId::new("go::referral.go::ReferralRepo.CountByReferrer");
+        let mut m = Node::new(method_id.clone(), NodeKind::GoMethod);
+        m.path = Some("referral.go".to_string());
+        m.start_line = Some(2);
+        m.end_line = Some(4);
+        store.upsert_node(&m).unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(
+            stats.sql_tables, 1,
+            "embedded CREATE TABLE in a .go file must be discovered: {stats:?}"
+        );
+        let tables = store.list_nodes_by_kind(NodeKind::DbTable).unwrap();
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.name.as_deref() == Some("referrals")),
+            "expected a `referrals` DbTable node, got {tables:?}"
+        );
+        assert!(
+            stats.inline_sql_table_edges >= 1,
+            "repo method inline SQL must link to the embedded table: {stats:?}"
+        );
+        let from_method = store.list_edges_from(&method_id).unwrap();
+        assert!(
+            from_method.iter().any(
+                |e| e.kind == EdgeKind::PersistsTo && e.to_id.as_str().ends_with("::referrals")
+            ),
+            "expected repo-method->table PersistsTo edge, got {from_method:?}"
+        );
+    }
+
+    #[test]
     fn links_go_method_inline_sql_to_table() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1271,8 +1388,7 @@ public class CraftConflict implements Serializable {
         assert!(
             from_method
                 .iter()
-                .any(|e| e.kind == EdgeKind::PersistsTo
-                    && e.to_id.as_str().ends_with("::craft")),
+                .any(|e| e.kind == EdgeKind::PersistsTo && e.to_id.as_str().ends_with("::craft")),
             "expected go-method->table PersistsTo edge, got {from_method:?}"
         );
     }
@@ -1303,8 +1419,12 @@ public class CraftConflict implements Serializable {
         let imp = ArtifactId::new(
             "java::a/service/impl/CraftConflictServiceImpl.java::CraftConflictServiceImpl.selectStyleConflictById",
         );
-        store.upsert_node(&Node::new(iface.clone(), NodeKind::JavaMethod)).unwrap();
-        store.upsert_node(&Node::new(imp.clone(), NodeKind::JavaMethod)).unwrap();
+        store
+            .upsert_node(&Node::new(iface.clone(), NodeKind::JavaMethod))
+            .unwrap();
+        store
+            .upsert_node(&Node::new(imp.clone(), NodeKind::JavaMethod))
+            .unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
         assert_eq!(stats.iface_impl_edges, 1, "one interface->impl edge");
@@ -1320,10 +1440,22 @@ public class CraftConflict implements Serializable {
 
     #[test]
     fn extracts_table_refs_for_write_stmts_and_skips_subquery() {
-        assert_eq!(extract_sql_table_refs("update craft_default set sort=1 where id=#{id}"), vec!["craft_default"]);
-        assert_eq!(extract_sql_table_refs("insert into craft_recommend(id) values(#{id})"), vec!["craft_recommend"]);
+        assert_eq!(
+            extract_sql_table_refs("update craft_default set sort=1 where id=#{id}"),
+            vec!["craft_default"]
+        );
+        assert_eq!(
+            extract_sql_table_refs("insert into craft_recommend(id) values(#{id})"),
+            vec!["craft_recommend"]
+        );
         // a subquery after FROM (next token is '(') must not yield a bogus table.
-        assert!(extract_sql_table_refs("select * from (select id from craft) t").contains(&"craft".to_string()));
-        assert!(!extract_sql_table_refs("select * from (select id from craft) t").contains(&"(select".to_string()));
+        assert!(
+            extract_sql_table_refs("select * from (select id from craft) t")
+                .contains(&"craft".to_string())
+        );
+        assert!(
+            !extract_sql_table_refs("select * from (select id from craft) t")
+                .contains(&"(select".to_string())
+        );
     }
 }
