@@ -67,6 +67,11 @@ pub struct DbColumnMeta {
 pub struct DbTableMeta {
     pub columns: Vec<DbColumnMeta>,
     pub source: String,
+    /// True when the table has no entity/DDL in the indexed sources and was
+    /// synthesized purely from a SQL reference (junction/sequence/other-service
+    /// table). Its schema is unknown; it exists so traces stay complete.
+    #[serde(default)]
+    pub external: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +79,10 @@ pub struct SchemaIndexStats {
     pub files_scanned: usize,
     pub sql_tables: usize,
     pub orm_tables: usize,
+    /// Subset of `orm_tables` whose name was *inferred* from the entity class
+    /// name because no explicit `@TableName` was present (MyBatis-Plus
+    /// convention). Surfaced separately so the recovered-table count is visible.
+    pub implicit_orm_tables: usize,
     pub columns: usize,
     /// MyBatis mapper `<select|insert|update|delete>` statements indexed.
     pub mapper_stmts: usize,
@@ -90,6 +99,17 @@ pub struct SchemaIndexStats {
     /// This is what lets `trace` reach tables for repos that embed SQL directly
     /// instead of using MyBatis XML mappers.
     pub inline_sql_table_edges: usize,
+    /// `HttpRoute` nodes indexed from Spring MVC controller mapping annotations
+    /// (`@GetMapping`/`@PostMapping`/…/`@RequestMapping`). Lets a query for the
+    /// *URL path* tailorx calls resolve to its handler method.
+    pub http_routes: usize,
+    /// `HttpRoute --references--> handler method` edges linked by matching the
+    /// controller `Class.method` against Java method node id suffixes.
+    pub route_method_edges: usize,
+    /// Synthetic `DbTable` nodes for tables referenced by SQL but having no
+    /// entity/DDL in the indexed sources (marked `external`, schema unknown).
+    /// Keeps `trace` complete for junction/sequence/cross-service tables.
+    pub external_tables: usize,
 }
 
 /// One MyBatis mapper statement (`<select|insert|update|delete id="...">`).
@@ -116,6 +136,32 @@ pub struct MapperStmtMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub sql: String,
+}
+
+/// One HTTP endpoint route recovered from a Spring MVC controller annotation.
+/// The handler `class`/`method` are kept so the route can be linked to its
+/// already-indexed `JavaMethod` node; the full `path` is the URL tailorx calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedRoute {
+    /// HTTP verb: `GET`/`POST`/`PUT`/`DELETE`/`PATCH`, or `ANY` for a
+    /// `@RequestMapping` without an explicit `method=`.
+    pub verb: String,
+    /// Full normalized route: class-level `@RequestMapping` prefix + method path.
+    pub path: String,
+    /// Declaring controller simple class name.
+    pub class: String,
+    /// Handler method name (often != the URL path segment).
+    pub method: String,
+    /// 1-based line of the mapping annotation.
+    pub line: u32,
+}
+
+/// Serialized into [`Node::metadata_json`] for an `HttpRoute` node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRouteMeta {
+    pub verb: String,
+    pub handler_class: String,
+    pub handler_method: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +242,29 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
             }
             continue;
         }
+        // Spring MVC controllers: index each @GetMapping/@PostMapping/… as an
+        // HttpRoute node so a query for the *URL path* tailorx calls resolves to
+        // the handler method, even when the path segment != the Java method
+        // name. Done before the table early-continue below because controllers
+        // usually declare no `@TableName`, so they would otherwise be skipped.
+        if ext == "java" {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let routes = parse_http_routes(&text);
+                if !routes.is_empty() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    for r in &routes {
+                        stats.http_routes += 1;
+                        store.upsert_node(&http_route_node(&rel, r)).with_context(|| {
+                            format!("upserting http route {} {} from {rel}", r.verb, r.path)
+                        })?;
+                    }
+                }
+            }
+        }
         let tables = match ext.as_str() {
             "sql" => read_and(path, parse_sql_tables),
             "java" => read_and(path, parse_java_entity_tables),
@@ -218,6 +287,10 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         for t in tables {
             match t.source {
                 "sql" => stats.sql_tables += 1,
+                "orm-implicit" => {
+                    stats.orm_tables += 1;
+                    stats.implicit_orm_tables += 1;
+                }
                 _ => stats.orm_tables += 1,
             }
             stats.columns += t.columns.len();
@@ -228,6 +301,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     }
     link_data_layer_edges(store, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
+    link_http_route_edges(store, &mut stats)?;
     Ok(stats)
 }
 
@@ -316,16 +390,20 @@ fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
             }
         }
     }
-    // table name (lower-cased) -> table node ids.
+    // table name (lower-cased) -> table node ids, plus a registry of existing
+    // synthetic "external" tables (so re-index reuses them instead of dupes).
     let mut table_by_name: HashMap<String, Vec<ArtifactId>> = HashMap::new();
+    let mut external_registry: HashMap<String, ArtifactId> = HashMap::new();
     for t in store.list_nodes_by_kind(NodeKind::DbTable)? {
         if let Some(name) = &t.name {
-            table_by_name
-                .entry(name.to_ascii_lowercase())
-                .or_default()
-                .push(t.id.clone());
+            let key = name.to_ascii_lowercase();
+            if t.id.as_str().starts_with("db_table::<external>::") {
+                external_registry.insert(key.clone(), t.id.clone());
+            }
+            table_by_name.entry(key).or_default().push(t.id.clone());
         }
     }
+    let mut new_external_nodes: Vec<Node> = Vec::new();
 
     for stmt in store.list_nodes_by_kind(NodeKind::SqlMapperStmt)? {
         let Some(meta_json) = &stmt.metadata_json else {
@@ -362,8 +440,38 @@ fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
                     ));
                     stats.stmt_table_edges += 1;
                 }
+            } else if is_plausible_table_name(&table) {
+                // No entity/DDL for this table — synthesize a single external
+                // node (schema unknown) so the trace still reaches it.
+                let tid = external_registry
+                    .entry(table.clone())
+                    .or_insert_with(|| {
+                        let node = external_db_table_node(&table);
+                        let id = node.id.clone();
+                        new_external_nodes.push(node);
+                        id
+                    })
+                    .clone();
+                table_by_name
+                    .entry(table.clone())
+                    .or_default()
+                    .push(tid.clone());
+                edges.push(EdgeAssertion::fact(
+                    stmt.id.clone(),
+                    tid,
+                    EdgeKind::PersistsTo,
+                    EdgeSource::LanguageAdapter,
+                ));
+                stats.stmt_table_edges += 1;
             }
         }
+    }
+    stats.external_tables = external_registry.len();
+    // Persist synthetic nodes before their edges (nodes-before-edges invariant).
+    for node in &new_external_nodes {
+        store
+            .upsert_node(node)
+            .with_context(|| format!("upserting external table {}", node.id.as_str()))?;
     }
     for edge in &edges {
         store.upsert_edge(edge).with_context(|| {
@@ -453,6 +561,62 @@ fn link_inline_sql_edges(
     Ok(())
 }
 
+/// Stitch each `HttpRoute` into the call graph with a `route --references-->
+/// handler method` edge, matched by the route's `handler_class.handler_method`
+/// against Java method node id suffixes (`...::StyleInfoController.measuresInfo`).
+/// `References` is in [`crate::search::EXPANSION_EDGE_KINDS`], so `trace` started
+/// from the URL path descends straight into the handler and its downstream
+/// service → mapper → SQL → tables. Idempotent (upsert).
+fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
+    use std::collections::HashMap;
+
+    let routes = store.list_nodes_by_kind(NodeKind::HttpRoute)?;
+    if routes.is_empty() {
+        return Ok(());
+    }
+    let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
+    for m in store.list_nodes_by_kind(NodeKind::JavaMethod)? {
+        if let Some(suffix) = m.id.as_str().rsplit("::").next() {
+            method_by_suffix
+                .entry(suffix.to_ascii_lowercase())
+                .or_default()
+                .push(m.id.clone());
+        }
+    }
+
+    let mut edges: Vec<EdgeAssertion> = Vec::new();
+    for route in routes {
+        let Some(meta_json) = &route.metadata_json else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<HttpRouteMeta>(meta_json) else {
+            continue;
+        };
+        let key = format!("{}.{}", meta.handler_class, meta.handler_method).to_ascii_lowercase();
+        if let Some(method_ids) = method_by_suffix.get(&key) {
+            for mid in method_ids {
+                edges.push(EdgeAssertion::fact(
+                    route.id.clone(),
+                    mid.clone(),
+                    EdgeKind::References,
+                    EdgeSource::LanguageAdapter,
+                ));
+                stats.route_method_edges += 1;
+            }
+        }
+    }
+    for edge in &edges {
+        store.upsert_edge(edge).with_context(|| {
+            format!(
+                "linking http-route edge {} -> {}",
+                edge.from_id.as_str(),
+                edge.to_id.as_str()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn read_and_xml(path: &Path) -> Option<Vec<ParsedMapperStmt>> {
     let text = std::fs::read_to_string(path).ok()?;
     let stmts = parse_mapper_stmts(&text);
@@ -484,6 +648,27 @@ pub fn mapper_stmt_node(rel_path: &str, stmt: &ParsedMapperStmt) -> Node {
     node
 }
 
+/// Build an `HttpRoute` node for one Spring MVC route. The id is namespaced by
+/// file + verb + full path so distinct endpoints stay separate; `name` is the
+/// method-level URL segment so `search <segment>` matches it like a symbol, and
+/// `path` carries the full route so a query for any segment can substring-hit.
+pub fn http_route_node(rel_path: &str, r: &ParsedRoute) -> Node {
+    let id = ArtifactId::new(format!("http_route::{rel_path}::{} {}", r.verb, r.path));
+    let mut node = Node::new(id, NodeKind::HttpRoute);
+    node.name = Some(route_search_name(&r.path));
+    node.path = Some(r.path.clone());
+    node.source_file = Some(rel_path.to_string());
+    node.start_line = Some(r.line);
+    node.indexer = Some("schema".to_string());
+    let meta = HttpRouteMeta {
+        verb: r.verb.clone(),
+        handler_class: r.class.clone(),
+        handler_method: r.method.clone(),
+    };
+    node.metadata_json = serde_json::to_string(&meta).ok();
+    node
+}
+
 /// Parse MyBatis mapper XML into its CRUD statements. Deliberately tolerant
 /// (no full XML parser): finds `<mapper namespace="...">` then each
 /// `<select|insert|update|delete ... id="x" ...> BODY </tag>`. Non-mapper XML
@@ -500,6 +685,9 @@ pub fn parse_mapper_stmts(text: &str) -> Vec<ParsedMapperStmt> {
         lower.find("<mapper").unwrap_or(0),
         "namespace",
     );
+    // Reusable `<sql id="x">…</sql>` fragments, so `<include refid="x"/>` inside
+    // a statement can be inlined and its FROM/JOIN tables recovered.
+    let fragments = collect_sql_fragments(text, &lower);
     let mut out = Vec::new();
     for tag in ["select", "insert", "update", "delete"] {
         let open = format!("<{tag}");
@@ -529,16 +717,100 @@ pub fn parse_mapper_stmts(text: &str) -> Vec<ParsedMapperStmt> {
             let body_end = open_end + close_rel;
             from = body_end + close.len();
             let Some(id) = id else { continue };
+            let body = text[open_end..body_end].trim();
             out.push(ParsedMapperStmt {
                 id,
                 stmt_kind: tag.to_string(),
                 namespace: namespace.clone(),
-                sql: text[open_end..body_end].trim().to_string(),
+                sql: expand_includes(body, &fragments, 0),
                 line: line_of(text, start),
             });
         }
     }
     out.sort_by_key(|s| s.line);
+    out
+}
+
+/// Collect MyBatis `<sql id="x">BODY</sql>` reusable fragments, keyed by the
+/// lower-cased `id`. Tolerant scan mirroring [`parse_mapper_stmts`].
+fn collect_sql_fragments(text: &str, lower: &str) -> std::collections::HashMap<String, String> {
+    let mut frags = std::collections::HashMap::new();
+    let open = "<sql";
+    let close = "</sql>";
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(open) {
+        let start = from + rel;
+        let after = start + open.len();
+        // Tag boundary so `<sqlMap>`/`<sqlSession…>` don't match.
+        let boundary = lower.as_bytes().get(after).copied();
+        if !matches!(
+            boundary,
+            Some(b' ') | Some(b'\n') | Some(b'\r') | Some(b'\t') | Some(b'>')
+        ) {
+            from = after;
+            continue;
+        }
+        let Some(gt_rel) = lower[start..].find('>') else {
+            break;
+        };
+        let open_end = start + gt_rel + 1;
+        let id = extract_attr(text, lower, start, "id");
+        let Some(c_rel) = lower[open_end..].find(close) else {
+            from = open_end;
+            continue;
+        };
+        let body_end = open_end + c_rel;
+        from = body_end + close.len();
+        if let Some(id) = id {
+            frags.insert(id.to_ascii_lowercase(), text[open_end..body_end].trim().to_string());
+        }
+    }
+    frags
+}
+
+/// Inline `<include refid="x"/>` (and `<include refid="x">…</include>`) with the
+/// body of fragment `x`, recursively (bounded). Unknown refids are dropped.
+fn expand_includes(
+    body: &str,
+    fragments: &std::collections::HashMap<String, String>,
+    depth: u8,
+) -> String {
+    if depth >= 8 || !body.contains("<include") {
+        return body.to_string();
+    }
+    let lower = body.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("<include") {
+        let start = i + rel;
+        out.push_str(&body[i..start]);
+        let Some(gt_rel) = lower[start..].find('>') else {
+            // Malformed tag: keep the rest verbatim.
+            out.push_str(&body[start..]);
+            return out;
+        };
+        let open_end = start + gt_rel + 1;
+        let self_closing = gt_rel > 0 && bytes[start + gt_rel - 1] == b'/';
+        let refid = extract_attr(body, &lower, start, "refid");
+        // Span of the whole <include> element to drop.
+        let drop_end = if self_closing {
+            open_end
+        } else if let Some(c_rel) = lower[open_end..].find("</include>") {
+            open_end + c_rel + "</include>".len()
+        } else {
+            open_end
+        };
+        if let Some(rid) = refid {
+            if let Some(frag) = fragments.get(&rid.to_ascii_lowercase()) {
+                out.push(' ');
+                out.push_str(&expand_includes(frag, fragments, depth + 1));
+                out.push(' ');
+            }
+        }
+        i = drop_end;
+    }
+    out.push_str(&body[i..]);
     out
 }
 
@@ -560,47 +832,129 @@ fn is_interface_class_name(class: &str) -> bool {
 /// Lower-cased for matching `DbTable` node names. Deliberately tolerant — this
 /// is evidence linking, not a SQL parser.
 pub fn extract_sql_table_refs(sql: &str) -> Vec<String> {
-    // Pad with a leading space so a statement-initial keyword (`update x`,
-    // `insert into x`) still matches the ` <kw> ` patterns.
-    let lower = format!(" {}", sql.to_ascii_lowercase());
+    let lower = sql.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut out: Vec<String> = Vec::new();
-    for kw in [" from ", " join ", " update ", " into "] {
-        let mut from = 0usize;
-        while let Some(rel) = lower[from..].find(kw) {
-            let mut i = from + rel + kw.len();
-            from = i;
-            // Skip whitespace.
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // Read a (possibly backtick / schema-qualified) table identifier starting at
+    // `i` (after skipping any whitespace). Returns the bare table name, or
+    // `None` for a subquery/expression `(...)`.
+    let read_table = |mut i: usize| -> Option<String> {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'(' {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'`' {
                 i += 1;
+            } else {
+                break;
             }
-            // Subquery / expression — not a table name.
-            if i >= bytes.len() || bytes[i] == b'(' {
+        }
+        if i == start {
+            return None;
+        }
+        let raw = &lower[start..i];
+        // Keep only the table part of `schema.table`, drop backticks.
+        let name = raw
+            .rsplit('.')
+            .next()
+            .unwrap_or(raw)
+            .trim_matches('`')
+            .to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    };
+    // Collect CTE / derived-table names defined as `<name> AS ( … )` so a later
+    // `FROM <name>` is not mistaken for (or synthesized as) a base table.
+    let mut cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut s = 0usize;
+        while let Some(rel) = lower[s..].find("as") {
+            let at = s + rel;
+            s = at + 2;
+            let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+            let after_idx = at + 2;
+            let after_ok = after_idx >= bytes.len() || !is_ident(bytes[after_idx]);
+            if !before_ok || !after_ok {
                 continue;
             }
-            // Read a (possibly backtick / schema-qualified) identifier.
-            let start = i;
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'`' {
-                    i += 1;
-                } else {
-                    break;
+            // The CTE body opens with `(` right after `as`.
+            let mut j = after_idx;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                continue;
+            }
+            // The identifier immediately before `as` is the CTE name.
+            let mut k = at;
+            while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+                k -= 1;
+            }
+            let end = k;
+            while k > 0 && is_ident(bytes[k - 1]) {
+                k -= 1;
+            }
+            if k < end {
+                cte_names.insert(lower[k..end].to_string());
+            }
+        }
+    }
+    // Match each keyword as a *whole word* — boundaries are any non-identifier
+    // byte — so `FROM\n`, `JOIN\t`, `(select … from x)` and a leading `update x`
+    // all resolve, while `date_from` / `transform` / `into_x` do not.
+    for kw in ["from", "join", "update", "into", "insert"] {
+        let mut search = 0usize;
+        while let Some(rel) = lower[search..].find(kw) {
+            let at = search + rel;
+            search = at + kw.len();
+            let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+            let after_idx = at + kw.len();
+            let after_ok = after_idx >= bytes.len() || !is_ident(bytes[after_idx]);
+            if !before_ok || !after_ok {
+                continue;
+            }
+            // `ON DUPLICATE KEY UPDATE col=…`: the token after UPDATE is a SET
+            // column, not a table. Skip when the preceding word is `key`.
+            if kw == "update" {
+                let mut k = at;
+                while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                let word_end = k;
+                while k > 0 && is_ident(bytes[k - 1]) {
+                    k -= 1;
+                }
+                if &lower[k..word_end] == "key" {
+                    continue;
                 }
             }
-            if i == start {
-                continue;
+            let mut i = after_idx;
+            // `INSERT [INTO] table`: MySQL allows omitting INTO. Skip an optional
+            // `into` so both `insert into x` and `insert x` reach the table.
+            if kw == "insert" {
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if lower[j..].starts_with("into")
+                    && bytes.get(j + 4).map_or(true, |c| !is_ident(*c))
+                {
+                    i = j + 4;
+                }
             }
-            let raw = &lower[start..i];
-            // Keep only the table part of `schema.table`, drop backticks.
-            let name = raw
-                .rsplit('.')
-                .next()
-                .unwrap_or(raw)
-                .trim_matches('`')
-                .to_string();
-            if !name.is_empty() && !out.contains(&name) {
-                out.push(name);
+            if let Some(name) = read_table(i) {
+                if !cte_names.contains(&name) && !out.contains(&name) {
+                    out.push(name);
+                }
             }
         }
     }
@@ -687,9 +1041,55 @@ pub fn db_table_node(rel_path: &str, table: &ParsedTable) -> Node {
             })
             .collect(),
         source: table.source.to_string(),
+        external: false,
     };
     node.metadata_json = serde_json::to_string(&meta).ok();
     node
+}
+
+/// Build a synthetic `DbTable` node for a table that is referenced by SQL but
+/// has no entity/DDL in the indexed sources. Keyed globally by name (no source
+/// file), so every reference to the same table shares one node, and marked
+/// `external` so consumers can show it as "schema unknown".
+pub fn external_db_table_node(name: &str) -> Node {
+    let id = ArtifactId::new(format!("db_table::<external>::{name}"));
+    let mut node = Node::new(id, NodeKind::DbTable);
+    node.name = Some(name.to_string());
+    node.indexer = Some("schema".to_string());
+    let meta = DbTableMeta {
+        columns: Vec::new(),
+        source: "external".to_string(),
+        external: true,
+    };
+    node.metadata_json = serde_json::to_string(&meta).ok();
+    node
+}
+
+/// Whether a SQL-parsed identifier is plausibly a real table name worth
+/// synthesizing an external node for. Rejects SQL keywords that a tolerant
+/// scanner might mis-read as a table, blank/numeric tokens, and 1-char names.
+pub fn is_plausible_table_name(name: &str) -> bool {
+    const NON_TABLES: &[&str] = &[
+        "select", "from", "where", "join", "on", "as", "set", "values", "value",
+        "into", "insert", "update", "delete", "dual", "and", "or", "by", "group",
+        "order", "limit", "having", "union", "case", "when", "then", "else", "end",
+    ];
+    if name.len() < 2 {
+        return false;
+    }
+    // A trailing `_` is the residue of a truncated dynamic name (`x_${var}`).
+    if name.ends_with('_') {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    !NON_TABLES.contains(&name)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +1172,14 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
     let mut columns: Vec<ParsedColumn> = Vec::new();
     let mut explicit: Option<String> = None;
     let mut skip_field = false;
+    // First top-level `class` name + line, used to infer the table name when no
+    // explicit @TableName is present (MyBatis-Plus class-name convention).
+    let mut class_name: Option<String> = None;
+    let mut class_line = 1u32;
+    // Whether the class declares a @TableId/@TableField field — the tell that it
+    // is a persisted MyBatis-Plus entity (vs. a VO/DTO/ServiceImpl that merely
+    // imports the library). Gates the class-name inference to avoid false tables.
+    let mut saw_mp_field_anno = false;
     // Brace depth: 0 = file/class-annotation level, 1 = class body (fields),
     // ≥2 = method bodies (ignored, so `return null;` is never a "field").
     let mut depth: i32 = 0;
@@ -794,12 +1202,19 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
                     table_name = Some(v);
                     table_line = (idx + 1) as u32;
                 }
+            } else if class_name.is_none() {
+                if let Some(name) = class_name_from_decl(line) {
+                    class_name = Some(name);
+                    class_line = (idx + 1) as u32;
+                }
             }
         } else if depth == 1 {
             // Class body: field annotations + field declarations.
             if line.starts_with("@TableId") {
+                saw_mp_field_anno = true;
                 explicit = first_quoted(line);
             } else if line.starts_with("@TableField") {
+                saw_mp_field_anno = true;
                 if line.contains("exist") && line.contains("false") {
                     skip_field = true;
                 } else if let Some(v) = first_quoted(line) {
@@ -831,15 +1246,73 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
         depth += opens - closes;
     }
 
-    match table_name {
-        Some(name) => vec![ParsedTable {
+    if let Some(name) = table_name {
+        return vec![ParsedTable {
             name,
             columns,
             source: "orm",
             line: table_line,
-        }],
-        None => Vec::new(),
+        }];
     }
+    // No explicit @TableName: fall back to the MyBatis-Plus default, where the
+    // table is the snake_case of the entity class name (`SizeSys` -> `size_sys`).
+    // Gated on a @TableId/@TableField annotation so only real persisted entities
+    // qualify — a ServiceImpl/Controller/VO that imports the library does not.
+    if saw_mp_field_anno {
+        if let Some(cls) = class_name {
+            if !is_non_entity_class_name(&cls) {
+                return vec![ParsedTable {
+                    name: to_snake_case(&cls),
+                    columns,
+                    source: "orm-implicit",
+                    line: class_line,
+                }];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Extract the declared class name from a class-declaration line, e.g.
+/// `public class SizeSys implements Serializable {` → `SizeSys`. Returns
+/// `None` for `interface`/`enum`/`record` declarations (no `class` keyword) or
+/// any line without a `class Name` token pair.
+fn class_name_from_decl(line: &str) -> Option<String> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let pos = tokens.iter().position(|t| *t == "class")?;
+    let raw = tokens.get(pos + 1)?;
+    // Strip generic params / attached brace: `Foo<T>{` → `Foo`.
+    let name: String = raw
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let first = name.chars().next()?;
+    if first.is_ascii_uppercase() {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Reject class names that obviously are not persisted entities even if they
+/// carry MyBatis-Plus annotations for some other reason. Belt-and-suspenders on
+/// top of the @TableId/@TableField gate.
+fn is_non_entity_class_name(name: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "Controller",
+        "ServiceImpl",
+        "Service",
+        "Mapper",
+        "Application",
+        "Config",
+        "Configuration",
+        "Handler",
+        "Interceptor",
+        "Aspect",
+        "Exception",
+        "Test",
+    ];
+    SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// Extract a persisted field's name, or `None` if the line is not a simple
@@ -862,6 +1335,260 @@ fn parse_java_field(line: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Spring MVC HTTP route parsing
+// ---------------------------------------------------------------------------
+
+/// Parse Spring MVC controller mapping annotations into [`ParsedRoute`]s.
+///
+/// Deliberately tolerant (no Java parser): gated on the class-level stereotype
+/// (`@RestController`/`@Controller`) so Feign *clients* and other
+/// `@RequestMapping` users are excluded. For each method-level
+/// `@GetMapping`/`@PostMapping`/`@PutMapping`/`@DeleteMapping`/`@PatchMapping`
+/// (and method-level `@RequestMapping`), it joins the class-level prefix with
+/// the annotation's path, reads the HTTP verb, and recovers the handler method
+/// name by skipping any intervening annotations/comments to the signature.
+pub fn parse_http_routes(text: &str) -> Vec<ParsedRoute> {
+    if !(text.contains("@RestController") || text.contains("@Controller")) {
+        return Vec::new();
+    }
+    let Some((class_name, class_decl_at)) = find_controller_class(text) else {
+        return Vec::new();
+    };
+    let base = class_level_base_path(text, class_decl_at);
+    let b = text.as_bytes();
+    let mut routes = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        let (annot, after_name) = read_ident(b, i + 1);
+        let (verb, is_mapping) = mapping_kind(&annot);
+        if !is_mapping {
+            i = after_name;
+            continue;
+        }
+        // The class-level @RequestMapping is the prefix, not a route itself.
+        if annot == "RequestMapping" && i < class_decl_at {
+            i = after_name;
+            continue;
+        }
+        let j = skip_ws(b, after_name);
+        let (method_path, verb_final, args_end) = if j < b.len() && b[j] == b'(' {
+            let (body, end) = balanced_parens(b, j).unwrap_or(("", j + 1));
+            let v = if annot == "RequestMapping" {
+                request_method_verb(body).unwrap_or_else(|| "ANY".to_string())
+            } else {
+                verb.to_string()
+            };
+            (annotation_path(body), v, end)
+        } else {
+            (String::new(), verb.to_string(), j)
+        };
+        if let Some(method) = find_handler_method(b, args_end) {
+            routes.push(ParsedRoute {
+                verb: verb_final,
+                path: normalize_route(&base, &method_path),
+                class: class_name.clone(),
+                method,
+                line: line_of(text, i),
+            });
+        }
+        i = args_end;
+    }
+    routes
+}
+
+/// `(simple class name, byte index of the `class` keyword)` for the controller —
+/// the first `class <Ident>` after the `@RestController`/`@Controller`
+/// stereotype, so a comment mentioning "class" before the annotations can't
+/// derail detection.
+fn find_controller_class(text: &str) -> Option<(String, usize)> {
+    let stereotype = text
+        .find("@RestController")
+        .or_else(|| text.find("@Controller"))?;
+    let b = text.as_bytes();
+    let mut i = stereotype;
+    while let Some(rel) = text[i..].find("class") {
+        let at = i + rel;
+        let before_ok = at == 0 || !is_ident_byte(b[at - 1]);
+        let after = at + 5;
+        let after_ok = after < b.len() && b[after].is_ascii_whitespace();
+        if before_ok && after_ok {
+            let ns = skip_ws(b, after);
+            let (name, _) = read_ident(b, ns);
+            if !name.is_empty() {
+                return Some((name, at));
+            }
+        }
+        i = at + 5;
+    }
+    None
+}
+
+/// The class-level `@RequestMapping` path (the route prefix), or empty.
+fn class_level_base_path(text: &str, class_decl_at: usize) -> String {
+    let region = &text[..class_decl_at];
+    let Some(at) = region.rfind("@RequestMapping") else {
+        return String::new();
+    };
+    let b = text.as_bytes();
+    let after = at + "@RequestMapping".len();
+    let j = skip_ws(b, after);
+    if j < b.len() && b[j] == b'(' {
+        if let Some((body, _)) = balanced_parens(b, j) {
+            return annotation_path(body);
+        }
+    }
+    String::new()
+}
+
+/// `(verb, is_mapping_annotation)` for a Spring mapping annotation simple name.
+fn mapping_kind(annot: &str) -> (&'static str, bool) {
+    match annot {
+        "GetMapping" => ("GET", true),
+        "PostMapping" => ("POST", true),
+        "PutMapping" => ("PUT", true),
+        "DeleteMapping" => ("DELETE", true),
+        "PatchMapping" => ("PATCH", true),
+        "RequestMapping" => ("ANY", true),
+        _ => ("", false),
+    }
+}
+
+/// The mapping path inside an annotation's `(...)` body. Prefers an explicit
+/// `value=`/`path=` attribute, else the first string literal; arrays like
+/// `{"/a","/b"}` take the first entry.
+fn annotation_path(body: &str) -> String {
+    for key in ["value", "path"] {
+        if let Some(p) = body.find(key) {
+            let rest = body[p + key.len()..].trim_start();
+            if let Some(stripped) = rest.strip_prefix('=') {
+                if let Some(q) = first_quoted(stripped) {
+                    return q;
+                }
+            }
+        }
+    }
+    first_quoted(body).unwrap_or_default()
+}
+
+/// The verb of a method-level `@RequestMapping`, read from
+/// `method = RequestMethod.<VERB>`.
+fn request_method_verb(body: &str) -> Option<String> {
+    let p = body.find("RequestMethod.")?;
+    let (v, _) = read_ident(body.as_bytes(), p + "RequestMethod.".len());
+    (!v.is_empty()).then(|| v.to_ascii_uppercase())
+}
+
+/// From just past a mapping annotation, skip any further annotations + comments,
+/// then return the handler method name (the identifier right before the first
+/// `(` of the signature). Tolerates Swagger annotations, `@Override`/
+/// `@ResponseBody`, Javadoc, and generic return types containing `<...>`.
+fn find_handler_method(b: &[u8], start: usize) -> Option<String> {
+    let mut i = start;
+    loop {
+        i = skip_ws_and_comments(b, i);
+        if i < b.len() && b[i] == b'@' {
+            let (_annot, after) = read_ident(b, i + 1);
+            let mut k = skip_ws(b, after);
+            if k < b.len() && b[k] == b'(' {
+                if let Some((_body, end)) = balanced_parens(b, k) {
+                    k = end;
+                }
+            }
+            i = k;
+            continue;
+        }
+        break;
+    }
+    // At the signature: find the first '(' (the param list). The method name is
+    // the identifier immediately before it (generics carry no '(').
+    let mut j = i;
+    while j < b.len() && b[j] != b'(' {
+        // Hitting a class/block boundary first means this wasn't a method.
+        if matches!(b[j], b'{' | b'}' | b';' | b'=') {
+            return None;
+        }
+        j += 1;
+    }
+    if j >= b.len() {
+        return None;
+    }
+    let mut end = j;
+    while end > i && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut s = end;
+    while s > i && is_ident_byte(b[s - 1]) {
+        s -= 1;
+    }
+    if s == end {
+        return None;
+    }
+    let name = std::str::from_utf8(&b[s..end]).ok()?;
+    if name.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Join a class-level prefix and a method path into one normalized route:
+/// single leading slash, no empty/duplicate segments, no trailing slash.
+fn normalize_route(base: &str, method: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for part in [base, method] {
+        for seg in part.split('/') {
+            let s = seg.trim();
+            if !s.is_empty() {
+                segs.push(s);
+            }
+        }
+    }
+    if segs.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segs.join("/"))
+    }
+}
+
+/// The searchable `name` for a route node: the last static (non-`{var}`) path
+/// segment, so `search getMeasuresInfo` resolves `/style-info/getMeasuresInfo`.
+fn route_search_name(path: &str) -> String {
+    path.split('/')
+        .filter(|s| !s.is_empty() && !s.starts_with('{'))
+        .next_back()
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Skip whitespace and `//` / `/* */` comments.
+fn skip_ws_and_comments(b: &[u8], mut i: usize) -> usize {
+    loop {
+        i = skip_ws(b, i);
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else {
+            break;
+        }
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1755,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_spring_controller_routes_with_class_prefix_and_verbs() {
+        // The crux: the URL path segment (`getMeasuresInfo`) is NOT the Java
+        // method name (`measuresInfo`). The parser must recover both, joined to
+        // the class-level `@RequestMapping` prefix, with the right HTTP verb,
+        // even with Swagger/`@ApiOperation` + Javadoc noise between annotation
+        // and signature, and a generic return type containing `<...>`.
+        let java = r#"
+@RestController
+@RequestMapping("/style-info")
+public class StyleInfoController {
+
+    @ApiOperation("标准号尺码")
+    /** javadoc noise */
+    @GetMapping("/getMeasuresInfo")
+    @ResponseBody
+    public RS<List<SizeVO>> measuresInfo(@RequestParam Integer id) { return null; }
+
+    @PostMapping(value = "/save", produces = "application/json")
+    public RS<Void> doSave(@RequestBody Foo f) { return null; }
+
+    @RequestMapping(value = "/legacy", method = RequestMethod.PUT)
+    public RS<Void> legacyUpdate() { return null; }
+
+    @GetMapping
+    public RS<String> root() { return null; }
+}
+"#;
+        let routes = parse_http_routes(java);
+        let find = |m: &str| routes.iter().find(|r| r.method == m).cloned();
+
+        let measures = find("measuresInfo").expect("measuresInfo route");
+        assert_eq!(measures.path, "/style-info/getMeasuresInfo");
+        assert_eq!(measures.verb, "GET");
+        assert_eq!(measures.class, "StyleInfoController");
+
+        let save = find("doSave").expect("doSave route");
+        assert_eq!(save.path, "/style-info/save");
+        assert_eq!(save.verb, "POST");
+
+        let legacy = find("legacyUpdate").expect("legacyUpdate route");
+        assert_eq!(legacy.path, "/style-info/legacy");
+        assert_eq!(legacy.verb, "PUT");
+
+        // A bare @GetMapping with no path falls back to the class prefix.
+        let root = find("root").expect("root route");
+        assert_eq!(root.path, "/style-info");
+        assert_eq!(root.verb, "GET");
+    }
+
+    #[test]
+    fn ignores_feign_clients_and_non_controllers() {
+        // Feign *clients* use @GetMapping on interface methods but are NOT HTTP
+        // servers — indexing them as routes would be wrong. The class-level
+        // stereotype gate (@RestController/@Controller) must exclude them.
+        let feign = r#"
+@FeignClient(name = "craft", path = "/craft")
+public interface CraftFeign {
+    @GetMapping("/getById")
+    RS<CraftVO> getCraftById(@RequestParam Integer id);
+}
+"#;
+        assert!(parse_http_routes(feign).is_empty());
+    }
+
+    #[test]
+    fn links_http_route_to_handler_method_by_class_and_method() {
+        // End-to-end: a controller file + a pre-seeded handler JavaMethod node
+        // must yield an HttpRoute node whose `name` is the URL segment and a
+        // `route --references--> method` edge so `trace <url-path>` descends
+        // into the handler even though path segment != method name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("StyleInfoController.java"),
+            r#"
+package com.kutesmart.cloud.style.controller;
+@RestController
+@RequestMapping("/style-info")
+public class StyleInfoController {
+    @GetMapping("/getMeasuresInfo")
+    public RS<List<SizeVO>> measuresInfo(@RequestParam Integer id) { return null; }
+}
+"#,
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        // Pre-seed the handler method node (normally from the Java code indexer).
+        let method_id = ArtifactId::new(
+            "java::src/main/java/com/kutesmart/cloud/style/controller/StyleInfoController.java::StyleInfoController.measuresInfo",
+        );
+        store
+            .upsert_node(&Node::new(method_id.clone(), NodeKind::JavaMethod))
+            .unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.http_routes, 1, "one HTTP route indexed");
+        assert_eq!(stats.route_method_edges, 1, "route->method edge linked");
+
+        // The route node is searchable by the URL segment.
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name.as_deref(), Some("getMeasuresInfo"));
+        assert_eq!(routes[0].path.as_deref(), Some("/style-info/getMeasuresInfo"));
+
+        // route --references--> handler method.
+        let from_route = store.list_edges_from(&routes[0].id).unwrap();
+        assert!(
+            from_route
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.to_id == method_id),
+            "expected route->method References edge, got {from_route:?}"
+        );
+    }
+
+    #[test]
     fn parses_create_table_skipping_constraints() {
         let sql = r#"
         CREATE TABLE IF NOT EXISTS craft_conflict (
@@ -1097,6 +1941,73 @@ public class CraftConflict implements Serializable {
     }
 
     #[test]
+    fn infers_table_name_from_class_when_tablename_absent() {
+        // MyBatis-Plus convention: an entity without an explicit @TableName maps
+        // to the snake_case of its class name (`SizeSys` -> `size_sys`). Such
+        // entities were previously dropped, so mapper SQL like
+        // `from size_sys ss` had no DbTable node to persist_to and the table
+        // silently vanished from traces. The @TableId / @TableField field
+        // annotations are the tell that this class IS a persisted entity.
+        let java = r#"
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
+import com.baomidou.mybatisplus.annotation.TableId;
+
+@Data
+@ApiModel(value="SizeSys对象", description="尺寸主表")
+public class SizeSys implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    @TableId(value = "id", type = IdType.AUTO)
+    private Integer id;
+
+    @ApiModelProperty(value = "尺码名称")
+    private String name;
+
+    private Integer isDefault;
+
+    @TableField(exist = false)
+    private String extra;
+}
+"#;
+        let tables = parse_java_entity_tables(java);
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.name, "size_sys");
+        assert_eq!(t.source, "orm-implicit");
+        let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "is_default"]);
+        assert!(!names.contains(&"extra")); // @TableField(exist=false) skipped
+    }
+
+    #[test]
+    fn does_not_infer_table_for_non_entity_classes() {
+        // A service impl imports MyBatis-Plus (ServiceImpl/BaseMapper) yet has no
+        // @TableId/@TableField fields — it must NOT be mistaken for a table
+        // named `size_sys_service_impl`.
+        let svc = r#"
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+public class SizeSysServiceImpl extends ServiceImpl<SizeSysMapper, SizeSys>
+        implements ISizeSysService {
+    private Integer cacheSize;
+    public java.util.List<SizeSys> all() { return null; }
+}
+"#;
+        assert!(parse_java_entity_tables(svc).is_empty());
+
+        // A plain VO/DTO with no MyBatis-Plus field annotations is not a table.
+        let vo = r#"
+@Data
+public class SizeSysVO implements Serializable {
+    private Integer id;
+    private String name;
+}
+"#;
+        assert!(parse_java_entity_tables(vo).is_empty());
+    }
+
+    #[test]
     fn normalize_column_aligns_dialects() {
         assert_eq!(
             normalize_column("categoryId"),
@@ -1160,6 +2071,39 @@ public class CraftConflict implements Serializable {
     }
 
     #[test]
+    fn mapper_include_refid_inlines_sql_fragment() {
+        // The FROM clause lives in a reusable `<sql>` fragment pulled in via
+        // `<include refid>`; the statement body alone has no table. The parser
+        // must inline the fragment so the SQL — and its table refs — are whole.
+        let xml = r#"<?xml version="1.0"?>
+<mapper namespace="com.x.OrdenCraftMapper">
+  <sql id="selectOrdenCraftVO">
+      select oc.id, oc.orden_detail_id from orden_craft oc
+  </sql>
+  <select id="selectOrdenCraftByDetailId" resultType="x">
+      <include refid="selectOrdenCraftVO" />
+      where oc.orden_detail_id = #{detailId}
+      order by oc.id
+  </select>
+</mapper>"#;
+        let stmts = parse_mapper_stmts(xml);
+        // The <sql> fragment is not itself a CRUD statement.
+        assert_eq!(stmts.len(), 1, "only the <select> is a statement: {stmts:?}");
+        let s = &stmts[0];
+        assert_eq!(s.id, "selectOrdenCraftByDetailId");
+        assert!(
+            s.sql.to_ascii_lowercase().contains("from orden_craft"),
+            "include not inlined: {}",
+            s.sql
+        );
+        assert!(
+            extract_sql_table_refs(&s.sql).contains(&"orden_craft".to_string()),
+            "table not recovered after inlining: {}",
+            s.sql
+        );
+    }
+
+    #[test]
     fn extracts_table_refs_from_sql() {
         let sql = "select cc.craft_id, a.img_path from craft_conflict cc \
                    left join attachment a on a.id = cc.image_id \
@@ -1168,6 +2112,80 @@ public class CraftConflict implements Serializable {
         let mut t = extract_sql_table_refs(sql);
         t.sort();
         assert_eq!(t, vec!["attachment", "craft", "craft_conflict"]);
+    }
+
+    #[test]
+    fn extract_table_refs_handles_newline_and_tab_delimited_keywords() {
+        // Real mappers put `FROM` at end-of-line with the table on the next:
+        // keyword matching must treat any whitespace (newline/tab), not only a
+        // literal space, as the delimiter.
+        let sql = "SELECT GROUP_CONCAT(DISTINCT img_id)\n        FROM\n        style_finish_stock\n        WHERE x = 1";
+        assert_eq!(extract_sql_table_refs(sql), vec!["style_finish_stock"]);
+
+        // Newline before JOIN, tab after it.
+        let j = "select * from a\nleft join\tb on a.id = b.id";
+        let mut t = extract_sql_table_refs(j);
+        t.sort();
+        assert_eq!(t, vec!["a", "b"]);
+
+        // A `from`/`join` embedded in an identifier or column name is not a hit.
+        assert!(extract_sql_table_refs("select date_from, transform_id from t").contains(&"t".to_string()));
+        assert_eq!(extract_sql_table_refs("select date_from, transform_id from t").len(), 1);
+    }
+
+    #[test]
+    fn extract_table_refs_handles_insert_without_into() {
+        // MySQL allows `INSERT <table>` (no INTO); MyBatis batch inserts use it.
+        let t1 = extract_sql_table_refs("insert style_package_info ( category, style_code ) values");
+        assert!(
+            t1.contains(&"style_package_info".to_string()),
+            "insert-without-into missed the table: {t1:?}"
+        );
+        // Classic `insert into x` still resolves to x (and never to `into`).
+        let t2 = extract_sql_table_refs("insert into v_image_post(string, time) value(#{s}, now())");
+        assert_eq!(t2, vec!["v_image_post"]);
+    }
+
+    #[test]
+    fn extract_table_refs_excludes_cte_names() {
+        // `WITH RECURSIVE cte AS (…) … FROM cte`: `cte` is a CTE alias, not a
+        // base table. The real table (`craft`) is kept; the CTE name is dropped
+        // so it isn't mistaken for (or synthesized as) a table.
+        let sql = "WITH RECURSIVE cte AS ( SELECT id, pid FROM craft WHERE id = 1 ) SELECT * FROM cte";
+        let t = extract_sql_table_refs(sql);
+        assert!(t.contains(&"craft".to_string()), "real base table kept: {t:?}");
+        assert!(!t.contains(&"cte".to_string()), "CTE alias excluded: {t:?}");
+
+        // Multiple CTEs in one WITH.
+        let multi = "with a as (select 1 from t1), b as (select 2 from t2) select * from a join b";
+        let mut m = extract_sql_table_refs(multi);
+        m.sort();
+        assert_eq!(m, vec!["t1", "t2"], "only base tables, no CTE aliases: {m:?}");
+    }
+
+    #[test]
+    fn extract_table_refs_skips_on_duplicate_key_update_columns() {
+        // `ON DUPLICATE KEY UPDATE col=…` — the token after UPDATE is a column,
+        // not a table, so it must not be mistaken for one (would otherwise
+        // synthesize a bogus external table named after the column).
+        let sql = "insert into t (a, b) values (1, 2) on duplicate key update a = values(a)";
+        let t = extract_sql_table_refs(sql);
+        assert!(t.contains(&"t".to_string()), "{t:?}");
+        assert!(!t.contains(&"a".to_string()), "SET column must not be a table: {t:?}");
+    }
+
+    #[test]
+    fn external_table_name_plausibility() {
+        assert!(is_plausible_table_name("member_role"));
+        assert!(is_plausible_table_name("sys_user_role"));
+        // SQL keywords / junk are rejected.
+        assert!(!is_plausible_table_name("select"));
+        assert!(!is_plausible_table_name("dual"));
+        assert!(!is_plausible_table_name("1table"));
+        assert!(!is_plausible_table_name("x"));
+        assert!(!is_plausible_table_name(""));
+        // Trailing `_` is the residue of a dynamic name `express_dict_${x}`.
+        assert!(!is_plausible_table_name("express_dict_"));
     }
 
     #[test]
@@ -1223,6 +2241,60 @@ public class CraftConflict implements Serializable {
                 && e.to_id.as_str().ends_with("::craft_conflict")),
             "expected stmt->table PersistsTo edge, got {from_stmt:?}"
         );
+    }
+
+    #[test]
+    fn synthesizes_external_table_node_for_entityless_sql_ref() {
+        // A junction table touched only via raw mapper SQL — no entity, no DDL.
+        // specslice must synthesize an `external` DbTable node so the trace from
+        // the mapper still reaches a table instead of dead-ending.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("MemberRoleMapper.xml"),
+            r#"<?xml version="1.0"?>
+<mapper namespace="com.x.MemberRoleMapper">
+  <delete id="deleteMemberRole">delete from member_role where user_id = #{userId}</delete>
+</mapper>"#,
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.external_tables, 1, "one external table synthesized");
+
+        let tables = store.list_nodes_by_kind(NodeKind::DbTable).unwrap();
+        let ext = tables
+            .iter()
+            .find(|n| n.id.as_str() == "db_table::<external>::member_role")
+            .expect("external table node present");
+        assert_eq!(ext.name.as_deref(), Some("member_role"));
+        let meta: DbTableMeta = serde_json::from_str(ext.metadata_json.as_ref().unwrap()).unwrap();
+        assert!(meta.external, "node marked external");
+        assert_eq!(meta.source, "external");
+        assert!(meta.columns.is_empty(), "schema unknown -> no columns");
+
+        // stmt --persists_to--> external table.
+        let stmt_id = ArtifactId::new("sql_mapper::MemberRoleMapper.xml::deleteMemberRole");
+        let from_stmt = store.list_edges_from(&stmt_id).unwrap();
+        assert!(
+            from_stmt
+                .iter()
+                .any(|e| e.kind == EdgeKind::PersistsTo && e.to_id == ext.id),
+            "expected stmt->external table PersistsTo edge, got {from_stmt:?}"
+        );
+
+        // Idempotent: a second pass synthesizes nothing new (node reused).
+        let stats2 = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats2.external_tables, 1, "external count stable on re-index");
+        let after: Vec<_> = store
+            .list_nodes_by_kind(NodeKind::DbTable)
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.id.as_str() == "db_table::<external>::member_role")
+            .collect();
+        assert_eq!(after.len(), 1, "no duplicate external node on re-index");
     }
 
     #[test]

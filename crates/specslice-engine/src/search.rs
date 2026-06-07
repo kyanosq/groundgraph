@@ -398,6 +398,9 @@ pub fn default_search_kinds() -> Vec<NodeKind> {
         // MyBatis mapper SQL is searchable evidence too: a query for a mapper
         // method name returns the actual `<select>` body.
         NodeKind::SqlMapperStmt,
+        // HTTP routes are the entry-point contract: a query for the URL path a
+        // client calls resolves to the handler even when path != method name.
+        NodeKind::HttpRoute,
     ]
 }
 

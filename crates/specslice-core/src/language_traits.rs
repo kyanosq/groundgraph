@@ -126,7 +126,7 @@ pub fn language_of(kind: NodeKind) -> Language {
         | NodeKind::AcceptanceCriterion
         | NodeKind::Adr
         | NodeKind::DocSection => Language::Doc,
-        NodeKind::Route | NodeKind::Storage => Language::Synthetic,
+        NodeKind::Route | NodeKind::Storage | NodeKind::HttpRoute => Language::Synthetic,
         // Tests are produced by language-specific parsers but their kind
         // is shared (`TestCase` / `TestGroup`). Callers that need the
         // actual host language must look at the file path; here we mark
@@ -200,7 +200,9 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::Adr
         | NodeKind::DocSection => SymbolFamily::Doc,
         // Framework-anchored.
-        NodeKind::DartProvider | NodeKind::Route | NodeKind::Storage => SymbolFamily::Framework,
+        NodeKind::DartProvider | NodeKind::Route | NodeKind::Storage | NodeKind::HttpRoute => {
+            SymbolFamily::Framework
+        }
         // Candidates.
         NodeKind::BusinessCandidate => SymbolFamily::Candidate,
         // Schema (persistence layer): tables + mapper SQL statements.

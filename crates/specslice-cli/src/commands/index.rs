@@ -19,7 +19,10 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
         match specslice_engine::schema_indexer::index_schema(repo_root) {
             Ok(s) => {
                 println!("Schema index:");
-                println!("  Tables (SQL {} + ORM {})", s.sql_tables, s.orm_tables);
+                println!(
+                    "  Tables (SQL {} + ORM {}, of which {} inferred from class name; + {} external schema-unknown)",
+                    s.sql_tables, s.orm_tables, s.implicit_orm_tables, s.external_tables
+                );
                 println!("  Columns: {}", s.columns);
                 println!("  Mapper statements: {}", s.mapper_stmts);
                 println!(
@@ -29,7 +32,21 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
                     s.iface_impl_edges,
                     s.inline_sql_table_edges
                 );
+                println!(
+                    "  HTTP routes: {} (route→method edges {})",
+                    s.http_routes, s.route_method_edges
+                );
+                specslice_engine::stats::set_metric("http_routes", s.http_routes as i64);
+                specslice_engine::stats::set_metric(
+                    "route_method_edges",
+                    s.route_method_edges as i64,
+                );
                 specslice_engine::stats::set_metric("tables", (s.sql_tables + s.orm_tables) as i64);
+                specslice_engine::stats::set_metric(
+                    "implicit_orm_tables",
+                    s.implicit_orm_tables as i64,
+                );
+                specslice_engine::stats::set_metric("external_tables", s.external_tables as i64);
                 specslice_engine::stats::set_metric("columns", s.columns as i64);
                 specslice_engine::stats::set_metric("mapper_stmts", s.mapper_stmts as i64);
                 specslice_engine::stats::set_metric(

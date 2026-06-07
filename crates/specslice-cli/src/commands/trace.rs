@@ -23,6 +23,7 @@ pub struct TraceRunArgs {
 
 /// Layer print order — data flows top to bottom.
 const LAYER_ORDER: &[&str] = &[
+    "route",
     "controller",
     "service",
     "service_impl",

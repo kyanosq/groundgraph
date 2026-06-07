@@ -22,6 +22,11 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
     let stats: SchemaIndexStats =
         index_schema(&args.repo_root).context("索引数据库表结构 (schema-index)")?;
     specslice_engine::stats::set_metric("tables", (stats.sql_tables + stats.orm_tables) as i64);
+    specslice_engine::stats::set_metric(
+        "implicit_orm_tables",
+        stats.implicit_orm_tables as i64,
+    );
+    specslice_engine::stats::set_metric("external_tables", stats.external_tables as i64);
     specslice_engine::stats::set_metric("columns", stats.columns as i64);
     specslice_engine::stats::set_metric("mapper_stmts", stats.mapper_stmts as i64);
     specslice_engine::stats::set_metric(
@@ -33,15 +38,19 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
         "inline_sql_table_edges",
         stats.inline_sql_table_edges as i64,
     );
+    specslice_engine::stats::set_metric("http_routes", stats.http_routes as i64);
+    specslice_engine::stats::set_metric("route_method_edges", stats.route_method_edges as i64);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
         println!("SpecSlice 表结构索引完成 (DbTable / SqlMapperStmt 节点)");
         println!(
-            "扫描文件 {} · SQL 表 {} · ORM 表 {} · 列合计 {} · Mapper 语句 {}",
+            "扫描文件 {} · SQL 表 {} · ORM 表 {} (含类名约定推断 {}) · 外部表(无 schema) {} · 列合计 {} · Mapper 语句 {}",
             stats.files_scanned,
             stats.sql_tables,
             stats.orm_tables,
+            stats.implicit_orm_tables,
+            stats.external_tables,
             stats.columns,
             stats.mapper_stmts,
         );
@@ -51,6 +60,10 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
             stats.stmt_table_edges,
             stats.iface_impl_edges,
             stats.inline_sql_table_edges,
+        );
+        println!(
+            "HTTP 路由: {} 个 · 路由→方法 {} 条 (按 URL 路径反查 Spring 处理方法)",
+            stats.http_routes, stats.route_method_edges,
         );
     }
     Ok(())

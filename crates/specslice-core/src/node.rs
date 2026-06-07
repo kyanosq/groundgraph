@@ -135,6 +135,17 @@ pub enum NodeKind {
     /// namespace. This makes the SQL searchable graph evidence so a Java→X port
     /// can read the query semantics from the graph instead of grepping XML.
     SqlMapperStmt,
+    /// An HTTP endpoint route extracted from a web framework annotation
+    /// (Spring MVC `@GetMapping`/`@PostMapping`/…/`@RequestMapping`). `name` is
+    /// the method-level path segment so a query for the URL segment resolves it;
+    /// `path` carries the full route (class prefix + method path) and
+    /// `metadata_json` the HTTP verb + handler. A `route --references--> handler
+    /// method` edge links it into the call graph, so `search`/`trace` can start
+    /// from the *URL tailorx calls* even when the route path ≠ the Java method
+    /// name (e.g. `@GetMapping("/getMeasuresInfo")` on a method named
+    /// `measuresInfo`). This makes the HTTP contract first-class graph evidence,
+    /// the entry-point analogue of `DbTable`/`SqlMapperStmt`.
+    HttpRoute,
 }
 
 impl NodeKind {
@@ -201,6 +212,7 @@ impl NodeKind {
         NodeKind::CppMethod,
         NodeKind::DbTable,
         NodeKind::SqlMapperStmt,
+        NodeKind::HttpRoute,
     ];
 
     /// Parse the stable snake_case string back into a [`NodeKind`]. Inverse
@@ -387,6 +399,7 @@ impl NodeKind {
             NodeKind::CppMethod => "cpp_method",
             NodeKind::DbTable => "db_table",
             NodeKind::SqlMapperStmt => "sql_mapper_stmt",
+            NodeKind::HttpRoute => "http_route",
         }
     }
 }

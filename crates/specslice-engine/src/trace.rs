@@ -215,10 +215,7 @@ fn trace_forward(
         let (kind, label, path) = match store.find_node(&aid)? {
             Some(n) => {
                 let kind = n.kind.as_str().to_string();
-                let label = n
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| display_label(id));
+                let label = n.name.clone().unwrap_or_else(|| display_label(id));
                 if n.kind == NodeKind::DbTable {
                     tables.insert(label.clone());
                 }
@@ -276,6 +273,9 @@ fn classify_layer(kind: &str, path: Option<&str>, _label: &str) -> String {
     match kind {
         "db_table" => return "table".to_string(),
         "sql_mapper_stmt" => return "sql".to_string(),
+        // The HTTP route is the entry point — the URL a client calls, sitting
+        // just above its controller handler in the data-flow order.
+        "http_route" => return "route".to_string(),
         _ => {}
     }
     let p = path.unwrap_or("");
@@ -310,20 +310,38 @@ mod tests {
         store.migrate().unwrap();
 
         // controller -> service -> impl -> mapper(method) -> sql -> table
-        let ctrl = method("java::a/CraftController.java::CraftController.selectCraftTree", "a/controller/CraftController.java");
-        let svc = method("java::a/ICraftService.java::ICraftService.selectCraftTree", "a/service/ICraftService.java");
-        let imp = method("java::a/CraftServiceImpl.java::CraftServiceImpl.selectCraftTree", "a/service/impl/CraftServiceImpl.java");
-        let mapper = method("java::a/CraftMapper.java::CraftMapper.selectTree", "a/mapper/CraftMapper.java");
+        let ctrl = method(
+            "java::a/CraftController.java::CraftController.selectCraftTree",
+            "a/controller/CraftController.java",
+        );
+        let svc = method(
+            "java::a/ICraftService.java::ICraftService.selectCraftTree",
+            "a/service/ICraftService.java",
+        );
+        let imp = method(
+            "java::a/CraftServiceImpl.java::CraftServiceImpl.selectCraftTree",
+            "a/service/impl/CraftServiceImpl.java",
+        );
+        let mapper = method(
+            "java::a/CraftMapper.java::CraftMapper.selectTree",
+            "a/mapper/CraftMapper.java",
+        );
         for n in [&ctrl, &svc, &imp, &mapper] {
             store.upsert_node(n).unwrap();
         }
         let stmt = {
-            let mut n = Node::new(ArtifactId::new("sql_mapper::CraftMapper.xml::selectTree"), NodeKind::SqlMapperStmt);
+            let mut n = Node::new(
+                ArtifactId::new("sql_mapper::CraftMapper.xml::selectTree"),
+                NodeKind::SqlMapperStmt,
+            );
             n.name = Some("selectTree".to_string());
             n
         };
         let table = {
-            let mut n = Node::new(ArtifactId::new("db_table::schema.sql::craft"), NodeKind::DbTable);
+            let mut n = Node::new(
+                ArtifactId::new("db_table::schema.sql::craft"),
+                NodeKind::DbTable,
+            );
             n.name = Some("craft".to_string());
             n
         };
@@ -331,24 +349,59 @@ mod tests {
         store.upsert_node(&table).unwrap();
 
         let mk = |from: &str, to: &str, kind: EdgeKind| {
-            EdgeAssertion::fact(ArtifactId::new(from), ArtifactId::new(to), kind, EdgeSource::LanguageAdapter)
+            EdgeAssertion::fact(
+                ArtifactId::new(from),
+                ArtifactId::new(to),
+                kind,
+                EdgeSource::LanguageAdapter,
+            )
         };
-        store.upsert_edge(&mk(ctrl.id.as_str(), svc.id.as_str(), EdgeKind::Calls)).unwrap();
-        store.upsert_edge(&mk(svc.id.as_str(), imp.id.as_str(), EdgeKind::Calls)).unwrap();
-        store.upsert_edge(&mk(imp.id.as_str(), mapper.id.as_str(), EdgeKind::Calls)).unwrap();
-        store.upsert_edge(&mk(mapper.id.as_str(), stmt.id.as_str(), EdgeKind::References)).unwrap();
-        store.upsert_edge(&mk(stmt.id.as_str(), table.id.as_str(), EdgeKind::PersistsTo)).unwrap();
+        store
+            .upsert_edge(&mk(ctrl.id.as_str(), svc.id.as_str(), EdgeKind::Calls))
+            .unwrap();
+        store
+            .upsert_edge(&mk(svc.id.as_str(), imp.id.as_str(), EdgeKind::Calls))
+            .unwrap();
+        store
+            .upsert_edge(&mk(imp.id.as_str(), mapper.id.as_str(), EdgeKind::Calls))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                mapper.id.as_str(),
+                stmt.id.as_str(),
+                EdgeKind::References,
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                stmt.id.as_str(),
+                table.id.as_str(),
+                EdgeKind::PersistsTo,
+            ))
+            .unwrap();
         // a framework-noise call that must be filtered out by default.
         let noise = method("java::a/X.java::Object.toString", "a/X.java");
         store.upsert_node(&noise).unwrap();
-        store.upsert_edge(&mk(imp.id.as_str(), noise.id.as_str(), EdgeKind::Calls)).unwrap();
+        store
+            .upsert_edge(&mk(imp.id.as_str(), noise.id.as_str(), EdgeKind::Calls))
+            .unwrap();
 
         let opts = TraceOptions::new(dir.path(), "selectCraftTree");
         let res = trace_forward(&store, &opts, vec![ctrl.id.clone()]).unwrap();
 
-        assert_eq!(res.tables, vec!["craft".to_string()], "endpoint must reach the table");
-        assert!(res.nodes.iter().any(|n| n.layer == "sql"), "SQL layer present");
-        assert!(res.nodes.iter().any(|n| n.layer == "mapper"), "mapper layer present");
+        assert_eq!(
+            res.tables,
+            vec!["craft".to_string()],
+            "endpoint must reach the table"
+        );
+        assert!(
+            res.nodes.iter().any(|n| n.layer == "sql"),
+            "SQL layer present"
+        );
+        assert!(
+            res.nodes.iter().any(|n| n.layer == "mapper"),
+            "mapper layer present"
+        );
         assert!(
             !res.nodes.iter().any(|n| n.label == "toString"),
             "framework-noise call must be filtered: {:?}",
@@ -357,6 +410,86 @@ mod tests {
         // depth: ctrl=0, svc=1, impl=2, mapper=3, sql=4, table=5
         let table_node = res.nodes.iter().find(|n| n.layer == "table").unwrap();
         assert_eq!(table_node.depth, 5);
+    }
+
+    #[test]
+    fn forward_closure_starts_from_http_route_when_path_differs_from_method() {
+        // The motivating case: tailorx calls `/style-info/getMeasuresInfo`, but
+        // the Java handler is named `measuresInfo`. Starting the trace from the
+        // HttpRoute (resolved by the URL segment) must descend route -> handler
+        // -> ... -> table, with the route grouped in the top `route` layer.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+
+        let route = {
+            let mut n = Node::new(
+                ArtifactId::new("http_route::a/StyleInfoController.java::GET /style-info/getMeasuresInfo"),
+                NodeKind::HttpRoute,
+            );
+            n.name = Some("getMeasuresInfo".to_string());
+            n.path = Some("/style-info/getMeasuresInfo".to_string());
+            n
+        };
+        let handler = method(
+            "java::a/StyleInfoController.java::StyleInfoController.measuresInfo",
+            "a/controller/StyleInfoController.java",
+        );
+        let table = {
+            let mut n = Node::new(
+                ArtifactId::new("db_table::schema.sql::size_value"),
+                NodeKind::DbTable,
+            );
+            n.name = Some("size_value".to_string());
+            n
+        };
+        for n in [&route, &handler, &table] {
+            store.upsert_node(n).unwrap();
+        }
+        let mk = |from: &str, to: &str, kind: EdgeKind| {
+            EdgeAssertion::fact(
+                ArtifactId::new(from),
+                ArtifactId::new(to),
+                kind,
+                EdgeSource::LanguageAdapter,
+            )
+        };
+        // route --references--> handler (schema indexer), handler --persists_to--> table.
+        store
+            .upsert_edge(&mk(
+                route.id.as_str(),
+                handler.id.as_str(),
+                EdgeKind::References,
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                handler.id.as_str(),
+                table.id.as_str(),
+                EdgeKind::PersistsTo,
+            ))
+            .unwrap();
+
+        let opts = TraceOptions::new(dir.path(), "getMeasuresInfo");
+        let res = trace_forward(&store, &opts, vec![route.id.clone()]).unwrap();
+
+        assert_eq!(
+            res.tables,
+            vec!["size_value".to_string()],
+            "route trace must reach the table the handler persists to"
+        );
+        assert!(
+            res.nodes.iter().any(|n| n.layer == "route" && n.depth == 0),
+            "the HTTP route is the seed and belongs to the `route` layer: {:?}",
+            res.nodes
+        );
+        assert!(
+            res.nodes
+                .iter()
+                .any(|n| n.label.ends_with("measuresInfo") && n.depth == 1),
+            "handler reached at depth 1 even though path segment != method name: {:?}",
+            res.nodes
+        );
     }
 
     #[test]
