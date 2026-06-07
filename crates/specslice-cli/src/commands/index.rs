@@ -144,20 +144,15 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
         writeln!(out, "  TestCases: {}", go.tests).ok();
         writeln!(out, "  Imports: {}", go.imports).ok();
         if go.references > 0 {
-            writeln!(out, "  References (LSP): {}", go.references).ok();
+            writeln!(out, "  References (heuristic): {}", go.references).ok();
         }
         if !go.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", go.resolver_used).ok();
         }
-        if !go.sidecar_skip_reason.is_empty() {
-            writeln!(out, "  LSP skipped: {}", go.sidecar_skip_reason).ok();
-        }
     }
-    // P16 — Python adapter status. The resolver field disambiguates
-    // between `python_lsp` (pyright/basedpyright/pylsp ran) and
-    // `python_ast` (AST-only fallback). The `LSP skipped` line surfaces
-    // exactly *why* the LSP layer was bypassed so operators see whether
-    // their venv was discovered or not.
+    // P16 — Python adapter status. Structure + heuristic edges come from the
+    // tree-sitter driver (`Resolver: python_treesitter`); precision comes from
+    // a SCIP overlay when present.
     if let Some(python) = &result.python {
         writeln!(out, "Python index:").ok();
         writeln!(out, "  Python files: {}", python.files).ok();
@@ -173,24 +168,16 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             python.framework_entrypoints
         )
         .ok();
-        // P23.1: structure always comes from tree-sitter; the LSP server
-        // (when present) only contributes Calls/References edges. Surface
-        // that overlay count so operators can tell enrichment ran.
         if python.references > 0 {
-            writeln!(out, "  References (LSP): {}", python.references).ok();
+            writeln!(out, "  References (heuristic): {}", python.references).ok();
         }
         if !python.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", python.resolver_used).ok();
         }
-        if !python.sidecar_skip_reason.is_empty() {
-            writeln!(out, "  LSP skipped: {}", python.sidecar_skip_reason).ok();
-        }
     }
-    // P20/P23 — TypeScript / Java adapter status. Structure comes from the
-    // tree-sitter driver (`Resolver: typescript_treesitter`); an optional LSP
-    // only overlays `Calls`/`References`. `References (LSP)` surfaces that
-    // overlay count, and `LSP skipped` surfaces why the LSP pass was bypassed
-    // (binary missing, broken shebang, etc).
+    // P20/P23 — TypeScript / Java adapter status. Structure + heuristic edges
+    // come from the tree-sitter driver (`Resolver: typescript_treesitter`);
+    // precision comes from the SCIP overlay (`scip-typescript` / `scip-java`).
     if let Some(ts) = &result.typescript {
         writeln!(out, "TypeScript index:").ok();
         writeln!(out, "  TypeScript files: {}", ts.files).ok();
@@ -200,14 +187,8 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
         if ts.heuristic_references > 0 {
             writeln!(out, "  References (heuristic): {}", ts.heuristic_references).ok();
         }
-        if ts.references > 0 {
-            writeln!(out, "  References (LSP): {}", ts.references).ok();
-        }
         if !ts.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", ts.resolver_used).ok();
-        }
-        if !ts.sidecar_skip_reason.is_empty() {
-            writeln!(out, "  LSP skipped: {}", ts.sidecar_skip_reason).ok();
         }
     }
     if let Some(java) = &result.java {
@@ -217,13 +198,10 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
         writeln!(out, "  TestCases: {}", java.tests).ok();
         writeln!(out, "  Imports: {}", java.imports).ok();
         if java.references > 0 {
-            writeln!(out, "  References (LSP): {}", java.references).ok();
+            writeln!(out, "  References (heuristic): {}", java.references).ok();
         }
         if !java.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", java.resolver_used).ok();
-        }
-        if !java.sidecar_skip_reason.is_empty() {
-            writeln!(out, "  LSP skipped: {}", java.sidecar_skip_reason).ok();
         }
     }
     if let Some(rust) = &result.rust {
@@ -404,7 +382,6 @@ mod tests {
                 imports: 6,
                 references: 5,
                 resolver_used: "go_treesitter".into(),
-                sidecar_skip_reason: String::new(),
             }),
             ..IndexResult::default()
         };
@@ -414,13 +391,13 @@ mod tests {
         assert!(out.contains("18"), "missing Go symbol count: {out}");
         assert!(out.contains("go_treesitter"), "missing Go resolver: {out}");
         assert!(
-            out.contains("References (LSP): 5"),
-            "missing LSP reference overlay count: {out}"
+            out.contains("References (heuristic): 5"),
+            "missing heuristic reference count: {out}"
         );
     }
 
     #[test]
-    fn render_includes_python_section_with_treesitter_resolver_and_lsp_references() {
+    fn render_includes_python_section_with_treesitter_resolver_and_heuristic_references() {
         let result = IndexResult {
             python: Some(PythonIndexResult {
                 files: 5,
@@ -430,7 +407,6 @@ mod tests {
                 framework_entrypoints: 4,
                 references: 12,
                 resolver_used: "python_treesitter".into(),
-                sidecar_skip_reason: String::new(),
             }),
             ..IndexResult::default()
         };
@@ -450,48 +426,13 @@ mod tests {
             "missing framework entrypoint count: {out}"
         );
         assert!(
-            out.contains("References (LSP): 12"),
-            "missing LSP reference overlay count: {out}"
+            out.contains("References (heuristic): 12"),
+            "missing heuristic reference count: {out}"
         );
     }
 
     #[test]
-    fn render_includes_python_section_with_skip_reason_when_lsp_enrichment_missing() {
-        let result = IndexResult {
-            python: Some(PythonIndexResult {
-                files: 2,
-                symbols: 4,
-                tests: 0,
-                imports: 1,
-                framework_entrypoints: 0,
-                references: 0,
-                resolver_used: "python_treesitter".into(),
-                sidecar_skip_reason: "未在 PATH / .venv 中找到 pyright/basedpyright/pylsp".into(),
-            }),
-            ..IndexResult::default()
-        };
-        let out = format_result(&result);
-        assert!(
-            out.contains("Python index"),
-            "missing Python section: {out}"
-        );
-        assert!(
-            out.contains("python_treesitter"),
-            "structure resolver should be tree-sitter: {out}"
-        );
-        // No LSP server → no reference overlay line at all.
-        assert!(
-            !out.contains("References (LSP):"),
-            "should not show reference line when enrichment skipped: {out}"
-        );
-        assert!(
-            out.contains("LSP skipped"),
-            "missing skip reason in Python section: {out}"
-        );
-    }
-
-    #[test]
-    fn render_includes_go_section_with_skip_reason_when_skipped() {
+    fn render_omits_go_reference_line_when_zero_and_keeps_no_lsp_label() {
         let result = IndexResult {
             go: Some(GoIndexResult {
                 files: 0,
@@ -499,65 +440,33 @@ mod tests {
                 tests: 0,
                 imports: 0,
                 references: 0,
-                resolver_used: String::new(),
-                sidecar_skip_reason: "未在 PATH 中找到 `gopls`".into(),
+                resolver_used: "go_treesitter".into(),
             }),
             ..IndexResult::default()
         };
         let out = format_result(&result);
         assert!(out.contains("Go index"), "missing Go section: {out}");
+        // LSP overlay was retired for Go: no LSP labels should ever appear.
         assert!(
-            out.contains("PATH"),
-            "missing skip reason in Go section: {out}"
+            !out.contains("References (LSP)") && !out.contains("LSP skipped"),
+            "Go must not surface any LSP labels: {out}"
+        );
+        assert!(
+            !out.contains("References (heuristic)"),
+            "zero references → no reference line: {out}"
         );
     }
 
     #[test]
-    fn render_includes_typescript_section_with_lsp_references_when_enriched() {
-        let result = IndexResult {
-            typescript: Some(TypescriptIndexResult {
-                files: 6,
-                symbols: 19,
-                tests: 4,
-                imports: 11,
-                references: 7,
-                heuristic_references: 0,
-                resolver_used: "typescript_treesitter".into(),
-                sidecar_skip_reason: String::new(),
-            }),
-            ..IndexResult::default()
-        };
-        let out = format_result(&result);
-        assert!(
-            out.contains("TypeScript index"),
-            "missing TypeScript section: {out}"
-        );
-        assert!(
-            out.contains("typescript_treesitter"),
-            "missing TypeScript resolver label: {out}"
-        );
-        assert!(
-            out.contains("References (LSP): 7"),
-            "missing LSP reference overlay count: {out}"
-        );
-        assert!(out.contains("TestCases: 4"));
-        assert!(out.contains("Imports: 11"));
-    }
-
-    #[test]
-    fn render_includes_typescript_section_with_treesitter_resolver_when_lsp_missing() {
+    fn render_includes_typescript_section_with_heuristic_references() {
         let result = IndexResult {
             typescript: Some(TypescriptIndexResult {
                 files: 3,
                 symbols: 8,
                 tests: 2,
                 imports: 5,
-                references: 0,
                 heuristic_references: 6,
                 resolver_used: "typescript_treesitter".into(),
-                sidecar_skip_reason:
-                    "未在 PATH / node_modules/.bin 找到 typescript-language-server，跳过 Calls/References 富化"
-                        .into(),
             }),
             ..IndexResult::default()
         };
@@ -570,22 +479,21 @@ mod tests {
             out.contains("typescript_treesitter"),
             "structure should always come from the tree-sitter driver: {out}"
         );
+        // LSP overlay was retired for TypeScript: no LSP labels should appear.
         assert!(
-            !out.contains("References (LSP)"),
-            "no LSP overlay → no reference line: {out}"
+            !out.contains("References (LSP)") && !out.contains("LSP skipped"),
+            "TypeScript must not surface any LSP labels: {out}"
         );
         assert!(
             out.contains("References (heuristic): 6"),
-            "heuristic resolver count should surface even without LSP: {out}"
+            "heuristic resolver count should surface: {out}"
         );
-        assert!(
-            out.contains("LSP skipped"),
-            "missing skip reason in TypeScript section: {out}"
-        );
+        assert!(out.contains("TestCases: 2"));
+        assert!(out.contains("Imports: 5"));
     }
 
     #[test]
-    fn render_includes_java_section_with_lsp_references_when_enriched() {
+    fn render_includes_java_section_with_treesitter_resolver_and_heuristic_references() {
         let result = IndexResult {
             java: Some(JavaIndexResult {
                 files: 7,
@@ -594,7 +502,6 @@ mod tests {
                 imports: 9,
                 references: 4,
                 resolver_used: "java_treesitter".into(),
-                sidecar_skip_reason: String::new(),
             }),
             ..IndexResult::default()
         };
@@ -604,42 +511,17 @@ mod tests {
             out.contains("java_treesitter"),
             "missing Java resolver label: {out}"
         );
+        // LSP overlay was retired for Java: no LSP labels should appear.
         assert!(
-            out.contains("References (LSP): 4"),
-            "missing LSP reference overlay count: {out}"
+            !out.contains("References (LSP)") && !out.contains("LSP skipped"),
+            "Java must not surface any LSP labels: {out}"
+        );
+        assert!(
+            out.contains("References (heuristic): 4"),
+            "missing heuristic reference count: {out}"
         );
         assert!(out.contains("TestCases: 5"));
         assert!(out.contains("Imports: 9"));
-    }
-
-    #[test]
-    fn render_includes_java_section_with_treesitter_resolver_when_lsp_missing() {
-        let result = IndexResult {
-            java: Some(JavaIndexResult {
-                files: 2,
-                symbols: 4,
-                tests: 1,
-                imports: 3,
-                references: 0,
-                resolver_used: "java_treesitter".into(),
-                sidecar_skip_reason: "未在 PATH 找到 jdtls，跳过 Calls/References 富化".into(),
-            }),
-            ..IndexResult::default()
-        };
-        let out = format_result(&result);
-        assert!(out.contains("Java index"), "missing Java section: {out}");
-        assert!(
-            out.contains("java_treesitter"),
-            "structure should always come from the tree-sitter driver: {out}"
-        );
-        assert!(
-            !out.contains("References (LSP)"),
-            "no LSP overlay → no reference line: {out}"
-        );
-        assert!(
-            out.contains("LSP skipped"),
-            "missing skip reason in Java section: {out}"
-        );
     }
 
     #[test]

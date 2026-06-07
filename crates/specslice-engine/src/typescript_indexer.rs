@@ -1,56 +1,45 @@
-//! P20/P23.2 — TypeScript language adapter.
+//! P20/P23.2 — TypeScript language adapter (structure + heuristic).
 //!
-//! Since the P23 收敛, the in-process tree-sitter driver
-//! ([`crate::typescript_treesitter`]) is the **sole structural source of
-//! truth** for `.ts` / `.mts` / `.cts` ([`TYPESCRIPT_SPEC`]) and `.tsx`
-//! ([`TSX_SPEC`]). It owns classes / functions / methods, jest / vitest
-//! tests, and ESM imports resolved to repo-relative file ids (including
-//! cross-extension `.ts` ↔ `.tsx`). Output is tagged
-//! `indexer = typescript_treesitter`.
+//! The in-process tree-sitter driver ([`crate::typescript_treesitter`]) is the
+//! **sole source of truth** for `.ts` / `.mts` / `.cts` ([`TYPESCRIPT_SPEC`])
+//! and `.tsx` / `.js` / `.jsx` / `.vue` ([`TSX_SPEC`]). It owns classes /
+//! functions / methods, jest / vitest tests, ESM imports resolved to
+//! repo-relative file ids (including cross-extension `.ts` ↔ `.tsx`), and the
+//! medium-confidence heuristic `Calls` / `References` edges resolved across the
+//! merged dialect symbol set. Output is tagged `indexer = typescript_treesitter`.
 //!
-//! `typescript-language-server` is an **optional Tier-3 enrichment**: when
-//! discovered it contributes only the semantic `Calls` / `References`
-//! edges, overlaid onto the existing tree-sitter symbol ids (the two id
-//! schemes are identical by construction). LSP edges are tagged
-//! `indexer = typescript_lsp`. When no LSP is present the structural graph
-//! is already complete; there is no longer any second structural pass.
+//! Precise cross-symbol resolution is supplied out-of-band by the SCIP overlay
+//! (`scip-typescript`; ADR-0001 R1/R2), which the engine ingests after this
+//! pass and which authoritatively supersedes the heuristic edges on the files
+//! it covers. The former in-process `typescript-language-server` Tier-3 sidecar
+//! was retired in favour of SCIP — only Swift keeps an LSP.
+//!
+//! TypeScript keeps a *dedicated* adapter (not the generic single-spec driver)
+//! because it must cover **both** dialects in one pass: the generic driver runs
+//! a single grammar and would silently miss the entire JSX/JS/Vue dialect.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use specslice_core::language_batch::LanguageIndexBatch;
-use specslice_core::NodeKind;
 use specslice_store::Store;
 
 use crate::dart_indexer::ingest_language_batch_minimal;
-use crate::lsp_client::LspSymbolKind;
-use crate::lsp_indexer::{
-    binary_on_path, run_profile, LspIndexOptions, LspIndexOutcome, LspProfile,
-};
 use crate::treesitter::{self, TsIndexOptions};
 use crate::typescript_treesitter::{TSX_SPEC, TYPESCRIPT_SPEC};
 
-pub const TYPESCRIPT_INDEXER_NAME: &str = "typescript_lsp";
 pub const TYPESCRIPT_LANGUAGE_ID: &str = "typescript";
-pub const TYPESCRIPT_LSP_COMMAND_ENV: &str = "SPECSLICE_TYPESCRIPT_LSP_BIN";
 
-/// Sentinel `lsp_command` used to keep the TypeScript adapter dependency-free.
-///
-/// TypeScript needs its dedicated adapter (not the generic single-spec driver)
-/// to cover *both* dialects — `.ts`/`.mts`/`.cts` and `.tsx`/`.js`/`.jsx`/`.vue`.
-/// When `enrichment.lsp = false` we still route through the adapter for full
-/// structural coverage, but point its optional LSP overlay at this
-/// deliberately unresolvable command so the probe fails fast and no external
-/// process is ever launched. (No real binary can match: PATH names cannot
-/// contain `/`.)
-pub const LSP_DISABLED_SENTINEL: &str = "specslice/lsp-disabled";
+/// Legacy `indexer` tag for the retired TypeScript LSP overlay. Cleared on
+/// every run so upgrading an existing store drops any stale `typescript_lsp`
+/// rows it still holds.
+const LEGACY_TYPESCRIPT_LSP_INDEXER: &str = "typescript_lsp";
 
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptIndexOptions {
     pub repo_root: PathBuf,
     pub code_roots: Vec<PathBuf>,
     pub exclude_globs: Vec<String>,
-    pub lsp_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -59,25 +48,20 @@ pub struct TypescriptIndexResult {
     pub symbols: usize,
     pub tests: usize,
     pub imports: usize,
-    /// Number of `Calls` / `References` edges contributed by the optional
-    /// Tier-3 LSP enrichment pass (0 when no LSP was available).
-    #[serde(default)]
-    pub references: usize,
     /// Number of medium-confidence `Calls` / `References` edges produced by the
-    /// in-process tree-sitter heuristic resolver (P23 R1/R2), resolved across
-    /// the merged `.ts` + `.tsx` symbol set. Independent of the LSP overlay.
+    /// in-process tree-sitter heuristic resolver, resolved across the merged
+    /// `.ts` + `.tsx` symbol set. SCIP supersedes these on the files it covers.
     #[serde(default)]
     pub heuristic_references: usize,
     /// `typescript_treesitter` when the structural pass produced anything,
     /// empty when no TypeScript files were found.
     pub resolver_used: String,
-    pub sidecar_skip_reason: String,
 }
 
 /// Top-level entrypoint. The tree-sitter driver runs once per dialect
 /// (`.ts/.mts/.cts` then `.tsx`) to produce the entire structural graph
-/// (symbols + tests + resolved imports); an optional LSP pass then overlays
-/// `Calls` / `References`.
+/// (symbols + tests + resolved imports) and the heuristic Calls/References
+/// across the merged symbol set.
 pub fn index_typescript(
     store: &mut Store,
     options: &TypescriptIndexOptions,
@@ -87,8 +71,8 @@ pub fn index_typescript(
         .clear_indexer_outputs(&ts_name)
         .context("clearing previous TypeScript tree-sitter outputs")?;
     store
-        .clear_indexer_outputs(TYPESCRIPT_INDEXER_NAME)
-        .context("clearing previous TypeScript LSP outputs")?;
+        .clear_indexer_outputs(LEGACY_TYPESCRIPT_LSP_INDEXER)
+        .context("clearing retired TypeScript LSP outputs")?;
 
     // Resolution universe spans every dialect (TS + JS) so a `.ts` importing a
     // `.tsx` component, or a `.js` importing a `.ts` module (and vice-versa),
@@ -170,200 +154,20 @@ pub fn index_typescript(
         }
     }
 
-    // Id set of structural nodes so the optional LSP pass attaches edges
-    // without dangling targets.
-    let mut known_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for node in store.list_all_nodes().context("listing nodes")? {
-        if node.indexer.as_deref() == Some(ts_name.as_str()) {
-            known_ids.insert(node.id.to_string());
-        }
-    }
-
-    // Tier 3 (optional): LSP `Calls` / `References` enrichment overlaid onto
-    // the tree-sitter symbol ids (identical id scheme).
-    let probe = ProbeOutcome::from_options(options);
-    let mut references = 0usize;
-    let skip_reason = match probe.command.clone() {
-        Some(cmd) => {
-            let profile = typescript_profile();
-            let lsp_options = LspIndexOptions {
-                repo_root: options.repo_root.clone(),
-                code_roots: options.code_roots.clone(),
-                exclude_globs: options.exclude_globs.clone(),
-                lsp_command: Some(cmd),
-            };
-            match run_profile(&profile, &lsp_options)? {
-                LspIndexOutcome::Indexed(boxed) => {
-                    let crate::lsp_indexer::LspIndexedBatch { batch, stats } = *boxed;
-                    let refs: Vec<_> = batch
-                        .references
-                        .into_iter()
-                        .filter(|r| {
-                            known_ids.contains(r.from_symbol_id.as_str())
-                                && known_ids.contains(r.to_symbol_id.as_str())
-                        })
-                        .collect();
-                    references = refs.len();
-                    if !refs.is_empty() {
-                        let refs_batch = LanguageIndexBatch {
-                            language: TYPESCRIPT_LANGUAGE_ID.into(),
-                            references: refs,
-                            ..Default::default()
-                        };
-                        ingest_language_batch_minimal(store, &refs_batch, TYPESCRIPT_INDEXER_NAME)
-                            .context("ingesting TypeScript LSP reference edges")?;
-                    }
-                    stats.skip_reason
-                }
-                LspIndexOutcome::Skipped { reason, .. } => reason,
-            }
-        }
-        None => probe.skip_reason,
-    };
-
     Ok(TypescriptIndexResult {
         files,
         symbols,
         tests,
         imports,
-        references,
         heuristic_references,
         resolver_used,
-        sidecar_skip_reason: skip_reason,
     })
-}
-
-/// True when an optional TypeScript LSP enrichment server is discoverable.
-/// Structural indexing no longer depends on it — this only gates the Tier-3
-/// `Calls` / `References` overlay.
-pub fn typescript_lsp_available(options: &TypescriptIndexOptions) -> bool {
-    ProbeOutcome::from_options(options).command.is_some()
-}
-
-/// Helper for the TypeScript probe: a binary is "available" only when
-/// it both resolves on PATH (or as an absolute path) AND survives the
-/// shared `lsp_probe` smoke launch. This catches `tsserver` wrappers
-/// whose `node` shebang points at a deleted nvm install.
-fn typescript_binary_runnable(cmd: &str) -> bool {
-    if !binary_on_path(cmd) {
-        return false;
-    }
-    crate::lsp_probe::probe_lsp_command(
-        cmd,
-        crate::lsp_probe::DEFAULT_SMOKE_ARGS,
-        crate::lsp_probe::DEFAULT_TIMEOUT,
-    )
-    .is_runnable()
-}
-
-fn typescript_profile() -> LspProfile {
-    LspProfile {
-        language: TYPESCRIPT_LANGUAGE_ID,
-        language_id: TYPESCRIPT_LANGUAGE_ID,
-        file_extensions: &["ts", "tsx", "mts", "cts"],
-        skip_dirs: &[
-            "node_modules",
-            ".next",
-            ".nuxt",
-            "dist",
-            "build",
-            ".turbo",
-            ".cache",
-            "coverage",
-            ".git",
-        ],
-        skip_suffixes: &[".d.ts"],
-        default_command: "typescript-language-server",
-        default_args: &["--stdio"],
-        command_env_var: TYPESCRIPT_LSP_COMMAND_ENV,
-        map_kind: typescript_map_kind,
-        qualify: typescript_qualify,
-    }
-}
-
-fn typescript_map_kind(kind: LspSymbolKind, _parent: Option<NodeKind>) -> Option<NodeKind> {
-    match kind {
-        LspSymbolKind::Module | LspSymbolKind::Namespace => Some(NodeKind::TypescriptModule),
-        LspSymbolKind::Class => Some(NodeKind::TypescriptClass),
-        LspSymbolKind::Interface => Some(NodeKind::TypescriptInterface),
-        LspSymbolKind::Enum => Some(NodeKind::TypescriptEnum),
-        LspSymbolKind::Method | LspSymbolKind::Constructor => Some(NodeKind::TypescriptMethod),
-        LspSymbolKind::Function => Some(NodeKind::TypescriptFunction),
-        _ => None,
-    }
-}
-
-fn typescript_qualify(file_rel: &str, parent: Option<&str>, name: &str) -> String {
-    match parent {
-        Some(p) => format!("{p}.{name}"),
-        None => format!("{file_rel}::{name}"),
-    }
-}
-
-#[derive(Debug, Default)]
-struct ProbeOutcome {
-    command: Option<String>,
-    skip_reason: String,
-}
-
-impl ProbeOutcome {
-    fn from_options(options: &TypescriptIndexOptions) -> Self {
-        if let Ok(env_cmd) = std::env::var(TYPESCRIPT_LSP_COMMAND_ENV) {
-            if typescript_binary_runnable(&env_cmd) {
-                return Self {
-                    command: Some(env_cmd),
-                    skip_reason: String::new(),
-                };
-            }
-            return Self {
-                command: None,
-                skip_reason: format!(
-                    "{TYPESCRIPT_LSP_COMMAND_ENV}=`{env_cmd}` smoke launch 未通过，已退化为 AST fallback"
-                ),
-            };
-        }
-        if let Some(cmd) = options.lsp_command.as_deref() {
-            if typescript_binary_runnable(cmd) {
-                return Self {
-                    command: Some(cmd.to_string()),
-                    skip_reason: String::new(),
-                };
-            }
-            return Self {
-                command: None,
-                skip_reason: format!(
-                    "`typescript.lsp_command = {cmd}` smoke launch 未通过，已退化为 AST fallback"
-                ),
-            };
-        }
-        // Project-local: `node_modules/.bin/typescript-language-server`.
-        let local = options
-            .repo_root
-            .join("node_modules/.bin/typescript-language-server");
-        if local.is_file() && typescript_binary_runnable(&local.to_string_lossy()) {
-            return Self {
-                command: Some(local.to_string_lossy().into_owned()),
-                skip_reason: String::new(),
-            };
-        }
-        if typescript_binary_runnable("typescript-language-server") {
-            return Self {
-                command: Some("typescript-language-server".into()),
-                skip_reason: String::new(),
-            };
-        }
-        Self {
-            command: None,
-            skip_reason:
-                "未在 PATH / node_modules/.bin 找到 typescript-language-server，已退化为 AST fallback"
-                    .into(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use specslice_core::NodeKind;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -405,14 +209,13 @@ mod tests {
             repo_root: tmp.path().to_path_buf(),
             code_roots: vec![PathBuf::from("src"), PathBuf::from("tests")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
 
         let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
         assert_eq!(
             result.resolver_used,
             treesitter::indexer_name(&TYPESCRIPT_SPEC),
-            "structure now comes from the tree-sitter driver: {result:?}"
+            "structure comes from the tree-sitter driver: {result:?}"
         );
         assert!(result.files >= 3, "{result:?}");
         assert!(result.tests >= 1, "{result:?}");
@@ -461,7 +264,6 @@ mod tests {
             repo_root: root.to_path_buf(),
             code_roots: vec![PathBuf::from("src")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
         let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
         assert!(result.files >= 2, "tsx + ts counted: {result:?}");
@@ -509,7 +311,6 @@ mod tests {
             repo_root: root.to_path_buf(),
             code_roots: vec![PathBuf::from("src")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
         let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
         assert!(
@@ -568,9 +369,12 @@ mod tests {
             repo_root: root.to_path_buf(),
             code_roots: vec![PathBuf::from("src")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
-        index_typescript(&mut store, &opts).expect("typescript indexer ran");
+        let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
+        assert!(
+            result.heuristic_references >= 1,
+            "heuristic resolver should link run() -> helper(): {result:?}"
+        );
 
         let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
         let run_to_helper = calls.iter().find(|e| {
@@ -620,7 +424,6 @@ mod tests {
             repo_root: root.to_path_buf(),
             code_roots: vec![PathBuf::from("src")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
         let result = index_typescript(&mut store, &opts).expect("typescript indexer ran");
         assert!(
@@ -677,7 +480,6 @@ mod tests {
             repo_root: tmp.path().to_path_buf(),
             code_roots: vec![PathBuf::from("src"), PathBuf::from("tests")],
             exclude_globs: Vec::new(),
-            lsp_command: Some("specslice_nonexistent_ts_lsp_999".into()),
         };
         let first = index_typescript(&mut store, &opts).expect("first index ok");
         let nodes_1 = store.list_all_nodes().unwrap().len();

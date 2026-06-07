@@ -15,10 +15,10 @@ pub mod connect;
 pub mod constants;
 pub mod context_pack;
 pub mod cpp_treesitter;
-pub mod data_contract;
 pub mod dart_indexer;
 pub mod dart_sidecar;
 pub mod dart_treesitter;
+pub mod data_contract;
 pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
@@ -56,15 +56,15 @@ pub mod scip_overlay;
 pub mod scip_runner;
 pub mod search;
 pub mod similarity;
-pub mod stats;
-pub mod trace;
 pub mod slice;
 pub mod source_text;
-pub mod symbol_facts;
+pub mod stats;
 pub mod swift_indexer;
 pub mod swift_treesitter;
+pub mod symbol_facts;
 pub mod test_selection;
 pub mod test_suggestions;
+pub mod trace;
 pub mod treesitter;
 pub mod typescript_indexer;
 pub mod typescript_treesitter;
@@ -90,14 +90,14 @@ pub use checks::{
     compute_checks, run_checks, CheckFinding, CheckOptions, CheckReport, CheckSeverity,
 };
 pub use config::EngineConfig;
-pub use constants::{
-    analyze_constants, analyze_constants_with_store, ConstantEntry, ConstantsOptions,
-    ConstantsReport, ConstantsStats, LiteralKind, LiteralSite, CONSTANTS_SCHEMA_VERSION,
-};
 pub use connect::{
     apply_candidates, propose_evidence, AcceptedCandidate, ApplyOptions, ApplyOutcome,
     CandidatesDocument, ClarifyingQuestion, EvidenceDocSection, EvidencePack, EvidenceRequirement,
     EvidenceSymbol, EvidenceTest, LinkCandidate, RejectedCandidate,
+};
+pub use constants::{
+    analyze_constants, analyze_constants_with_store, ConstantEntry, ConstantsOptions,
+    ConstantsReport, ConstantsStats, LiteralKind, LiteralSite, CONSTANTS_SCHEMA_VERSION,
 };
 pub use context_pack::{
     build_context, CodeSnippet, ContextOptions, ContextPack, DocSnippet, EdgeSummary,
@@ -166,7 +166,8 @@ pub use similarity::{
 pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
 pub use symbol_facts::{
     analyze_symbol_facts, analyze_symbol_facts_with_store, BehaviorCounts, FactLine, Purity,
-    SymbolFact, SymbolFactsOptions, SymbolFactsReport, SymbolFactsStats, SYMBOL_FACTS_SCHEMA_VERSION,
+    SymbolFact, SymbolFactsOptions, SymbolFactsReport, SymbolFactsStats,
+    SYMBOL_FACTS_SCHEMA_VERSION,
 };
 pub use test_selection::{
     select_tests, select_tests_with_store, SelectedTest, TestSelection, TestSelectionOptions,
@@ -178,17 +179,9 @@ pub use test_suggestions::{
     TEST_SUGGESTIONS_SCHEMA_VERSION,
 };
 
-pub use go_indexer::{
-    go_lsp_available, index_go, GoIndexOptions, GoIndexResult, GO_INDEXER_NAME, GO_LSP_COMMAND_ENV,
-};
-pub use java_indexer::{
-    index_java, java_lsp_available, JavaIndexOptions, JavaIndexResult, JAVA_INDEXER_NAME,
-    JAVA_LSP_COMMAND_ENV,
-};
-pub use python_indexer::{
-    index_python, python_lsp_available, PythonIndexOptions, PythonIndexResult, PYTHON_INDEXER_NAME,
-    PYTHON_LSP_COMMAND_ENV,
-};
+pub use go_indexer::{index_go, GoIndexOptions, GoIndexResult, GO_LANGUAGE_ID};
+pub use java_indexer::{index_java, JavaIndexOptions, JavaIndexResult, JAVA_LANGUAGE_ID};
+pub use python_indexer::{index_python, PythonIndexOptions, PythonIndexResult, PYTHON_LANGUAGE_ID};
 pub use rust_indexer::{
     index_rust, RustIndexOptions, RustIndexResult, RUST_INDEXER_NAME, RUST_LANGUAGE_ID,
 };
@@ -197,6 +190,5 @@ pub use swift_indexer::{
     SWIFT_LSP_COMMAND_ENV,
 };
 pub use typescript_indexer::{
-    index_typescript, typescript_lsp_available, TypescriptIndexOptions, TypescriptIndexResult,
-    TYPESCRIPT_INDEXER_NAME, TYPESCRIPT_LSP_COMMAND_ENV,
+    index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_LANGUAGE_ID,
 };

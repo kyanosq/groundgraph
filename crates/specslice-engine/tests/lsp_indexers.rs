@@ -1,41 +1,42 @@
-//! P11 / P13 / P15 acceptance — drive the Swift and Go LSP-backed
-//! indexers against their minimal fixtures.
+//! P11 / P13 / P15 / P20 acceptance — drive the language adapters against
+//! their minimal fixtures.
 //!
-//! The "skips when unavailable" tests are always run; they exercise
-//! our graceful-degradation contract without spawning any real LSP.
+//! Swift is the **only** language that still carries an LSP sidecar
+//! (`sourcekit-lsp`); every other language (Go / Python / TypeScript / Java)
+//! retired its LSP overlay in favour of SCIP-authoritative precision with a
+//! tree-sitter structure + heuristic `Calls`/`References` base. The tests
+//! below therefore split into two groups:
 //!
-//! The "emits ... when lsp present" tests spawn `sourcekit-lsp` /
-//! `gopls` and rely on resolved SwiftPM / Go module state. These are
-//! marked `#[ignore]` so a sandboxed `cargo test --workspace` stays
-//! green — sandboxes routinely block sourcekit's `IndexStoreDB` cache
-//! writes and gopls's module-proxy fetches. Run them explicitly with:
+//!   * Swift LSP contract — a "skips when unavailable" test (always run) plus
+//!     an `#[ignore]` "emits when present" test that spawns the real
+//!     `sourcekit-lsp` (run with `--include-ignored`).
+//!   * Structure+heuristic contract — Go / Python / TypeScript / Java each run
+//!     their tree-sitter driver against a fixture with no toolchain installed
+//!     and must produce the full structural graph deterministically.
+//!
+//! Run the opt-in Swift LSP test explicitly with:
 //!
 //! ```
 //! cargo test -p specslice-engine --test lsp_indexers -- \
 //!   --include-ignored --nocapture
 //! ```
 //!
-//! Override the binaries on a hermetic CI machine with:
+//! Override the Swift binary on a hermetic CI machine with:
 //!
 //! ```
 //! SPECSLICE_SWIFT_LSP_BIN=/path/to/sourcekit-lsp \
-//! SPECSLICE_GO_LSP_BIN=/path/to/gopls \
-//!   cargo test -p specslice-engine --test lsp_indexers -- \
-//!     --include-ignored
+//!   cargo test -p specslice-engine --test lsp_indexers -- --include-ignored
 //! ```
 
 use std::path::{Path, PathBuf};
 
 use specslice_core::edge::EdgeKind;
 use specslice_engine::{
-    go_indexer::{go_lsp_available, index_go, GoIndexOptions, GO_LSP_COMMAND_ENV},
-    java_indexer::{index_java, java_lsp_available, JavaIndexOptions, JAVA_LSP_COMMAND_ENV},
-    python_indexer::{index_python, PythonIndexOptions, PYTHON_LSP_COMMAND_ENV},
+    go_indexer::{index_go, GoIndexOptions},
+    java_indexer::{index_java, JavaIndexOptions},
+    python_indexer::{index_python, PythonIndexOptions},
     swift_indexer::{index_swift, swift_lsp_available, SwiftIndexOptions, SWIFT_LSP_COMMAND_ENV},
-    typescript_indexer::{
-        index_typescript, typescript_lsp_available, TypescriptIndexOptions,
-        TYPESCRIPT_LSP_COMMAND_ENV,
-    },
+    typescript_indexer::{index_typescript, TypescriptIndexOptions},
 };
 use specslice_store::Store;
 
@@ -69,6 +70,22 @@ fn open_temp_store(repo: &Path) -> (Store, PathBuf) {
     (store, db)
 }
 
+fn debug_kinds(nodes: &[specslice_core::Node]) -> Vec<(String, String)> {
+    nodes
+        .iter()
+        .map(|n| {
+            (
+                n.kind.as_str().to_string(),
+                n.name.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Swift — the sole remaining LSP-backed adapter.
+// ---------------------------------------------------------------------------
+
 #[test]
 fn swift_indexer_skips_when_sourcekit_lsp_unavailable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -86,27 +103,6 @@ fn swift_indexer_skips_when_sourcekit_lsp_unavailable() {
     assert!(
         result.sidecar_skip_reason.contains("PATH"),
         "expected PATH hint in skip reason, got `{}`",
-        result.sidecar_skip_reason
-    );
-}
-
-#[test]
-fn go_indexer_skips_when_gopls_unavailable() {
-    let tmp = tempfile::tempdir().unwrap();
-    let opts = GoIndexOptions {
-        repo_root: tmp.path().to_path_buf(),
-        code_roots: vec![PathBuf::from(".")],
-        exclude_globs: Vec::new(),
-        lsp_command: Some("specslice_nonexistent_gopls_xyz".into()),
-    };
-    let (mut store, _db) = open_temp_store(tmp.path());
-    let result = index_go(&mut store, &opts).expect("index_go Ok");
-    assert_eq!(result.files, 0);
-    assert_eq!(result.symbols, 0);
-    assert!(result.resolver_used.is_empty());
-    assert!(
-        result.sidecar_skip_reason.contains("PATH"),
-        "expected PATH hint, got `{}`",
         result.sidecar_skip_reason
     );
 }
@@ -305,196 +301,12 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
     }
 }
 
-#[test]
-fn python_indexer_treesitter_pass_runs_against_python_hello_fixture_without_lsp() {
-    // The in-process tree-sitter driver must produce the full structural
-    // graph without any toolchain installed. We point `lsp_command` at a
-    // bogus binary and disable venv discovery so the optional LSP overlay
-    // is skipped and the test is fully deterministic in sandboxed CI.
-    let tmp = tempfile::tempdir().unwrap();
-    let fixture = workspace_root().join("tests/fixtures/python_hello");
-    copy_dir(&fixture, tmp.path());
-    let (mut store, _db) = open_temp_store(tmp.path());
-    let opts = PythonIndexOptions {
-        repo_root: tmp.path().to_path_buf(),
-        code_roots: vec![PathBuf::from("app"), PathBuf::from("tests")],
-        exclude_globs: Vec::new(),
-        lsp_command: Some("specslice_nonexistent_python_lsp_xyz".into()),
-        disable_venv_discovery: true,
-    };
-    let result = index_python(&mut store, &opts).expect("python indexer ran");
-    assert_eq!(result.resolver_used, "python_treesitter");
-    assert!(
-        result.files >= 4,
-        "expected >=4 python files in fixture, got {}",
-        result.files
-    );
-    assert!(
-        result.symbols >= 4,
-        "expected >=4 structural symbols, got {}",
-        result.symbols
-    );
-    assert!(
-        result.tests >= 3,
-        "expected >=3 pytest tests/groups, got {}",
-        result.tests
-    );
-    assert!(
-        result.imports >= 2,
-        "expected >=2 resolvable imports, got {}",
-        result.imports
-    );
-    assert!(
-        result.sidecar_skip_reason.contains("AST fallback")
-            || result.sidecar_skip_reason.contains("未找到"),
-        "expected AST fallback reason, got `{}`",
-        result.sidecar_skip_reason
-    );
-
-    let nodes = store.list_all_nodes().unwrap();
-    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in [
-        "python_class",
-        "python_method",
-        "python_function",
-        "test_case",
-        "test_group",
-        "file",
-    ] {
-        assert!(
-            kinds.contains(required),
-            "expected `{required}` in {:?}",
-            kinds
-        );
-    }
-}
+// ---------------------------------------------------------------------------
+// Go — structure + heuristic (LSP retired; precision via `scip-go`).
+// ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires pyright/basedpyright/pylsp installed in a venv; run with --include-ignored"]
-fn python_indexer_emits_class_function_method_nodes_when_lsp_present() {
-    let lsp_override = std::env::var(PYTHON_LSP_COMMAND_ENV).ok();
-    let probe = PythonIndexOptions {
-        repo_root: workspace_root(),
-        code_roots: Vec::new(),
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override.clone(),
-        disable_venv_discovery: false,
-    };
-    if !specslice_engine::python_indexer::python_lsp_available(&probe) {
-        eprintln!(
-            "skipping {} — no Python LSP passed the shared `lsp_probe` smoke launch (PATH / .venv empty, or all candidates returned broken-stub stderr); {PYTHON_LSP_COMMAND_ENV} unset",
-            module_path!()
-        );
-        return;
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let fixture = workspace_root().join("tests/fixtures/python_hello");
-    copy_dir(&fixture, tmp.path());
-    let (mut store, _db) = open_temp_store(tmp.path());
-
-    let opts = PythonIndexOptions {
-        repo_root: tmp.path().to_path_buf(),
-        code_roots: vec![PathBuf::from("app"), PathBuf::from("tests")],
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override,
-        disable_venv_discovery: false,
-    };
-    let result = match index_python(&mut store, &opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "soft-skip {}: `index_python` returned Err ({e}); LSP probe passed but session failed",
-                module_path!()
-            );
-            return;
-        }
-    };
-    if result.resolver_used != "python_lsp" {
-        // Soft skip — `python_lsp_available` claimed a binary, the
-        // launcher decided otherwise (typical cause: the binary's
-        // shebang resolves at probe time but the long-running stdio
-        // session fails). We log the actual fallback reason so
-        // operators can diagnose without staring at a green
-        // "passed" with no signal.
-        eprintln!(
-            "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
-            module_path!(),
-            result.resolver_used,
-            result.sidecar_skip_reason
-        );
-        return;
-    }
-    assert!(result.files >= 4);
-    assert!(result.symbols >= 4);
-
-    let nodes = store.list_all_nodes().unwrap();
-    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in ["python_class", "python_method", "python_function"] {
-        assert!(
-            kinds.contains(required),
-            "expected `{required}` in {:?}",
-            kinds
-        );
-    }
-    let _greeter = nodes
-        .iter()
-        .find(|n| n.kind.as_str() == "python_class" && n.name.as_deref() == Some("Greeter"))
-        .unwrap_or_else(|| panic!("Greeter class missing; saw {:?}", debug_kinds(&nodes)));
-
-    // Pyright / basedpyright / pylsp all support callHierarchy, but
-    // warmup time varies wildly. Treat empty calls as a soft warning
-    // like the Swift / Go opt-in tests.
-    let calls = store
-        .list_edges_by_kind(EdgeKind::Calls)
-        .expect("calls edges queryable");
-    if calls.is_empty() {
-        eprintln!(
-            "python_indexer_emits_*: LSP returned no Calls — likely cross-file resolve \
-             pending or stdlib not surveyed in budget"
-        );
-    } else {
-        for edge in &calls {
-            let to_node = nodes.iter().find(|n| n.id.as_str() == edge.to_id.as_str());
-            assert!(
-                to_node.is_some(),
-                "Calls edge target `{}` not present in indexed graph",
-                edge.to_id.as_str()
-            );
-        }
-    }
-}
-
-fn debug_kinds(nodes: &[specslice_core::Node]) -> Vec<(String, String)> {
-    nodes
-        .iter()
-        .map(|n| {
-            (
-                n.kind.as_str().to_string(),
-                n.name.clone().unwrap_or_default(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-#[ignore = "requires gopls + module proxy access; run with --include-ignored"]
-fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
-    let lsp_override = std::env::var(GO_LSP_COMMAND_ENV).ok();
-    let probe = GoIndexOptions {
-        repo_root: workspace_root(),
-        code_roots: Vec::new(),
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override.clone(),
-    };
-    if !go_lsp_available(&probe) {
-        eprintln!(
-            "skipping {} — `gopls` did not pass the shared `lsp_probe` smoke launch (binary missing on PATH, {GO_LSP_COMMAND_ENV} unset, or non-zero exit / broken-stub stderr)",
-            module_path!()
-        );
-        return;
-    }
-
+fn go_indexer_emits_struct_interface_method_function_nodes_via_treesitter() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/go_hello");
     copy_dir(&fixture, tmp.path());
@@ -504,20 +316,8 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
         repo_root: tmp.path().to_path_buf(),
         code_roots: vec![PathBuf::from(".")],
         exclude_globs: Vec::new(),
-        lsp_command: lsp_override,
     };
-    let result = match index_go(&mut store, &opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "soft-skip {}: `index_go` returned Err ({e}); LSP probe passed but session failed",
-                module_path!()
-            );
-            return;
-        }
-    };
-    // Structure always comes from the tree-sitter driver now; gopls only
-    // overlays Calls/References on top of those same ids.
+    let result = index_go(&mut store, &opts).expect("index_go Ok");
     assert_eq!(
         result.resolver_used, "go_treesitter",
         "structure is owned by the tree-sitter driver: {result:?}"
@@ -547,9 +347,6 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
         .iter()
         .find(|n| n.kind.as_str() == "go_struct" && n.name.as_deref() == Some("Server"))
         .unwrap_or_else(|| panic!("Server struct missing; saw {:?}", debug_kinds(&nodes)));
-    // `gopls` reports method symbols in two flavours depending on the
-    // version: a flat `Server.Greet` (kind=Method) and a nested `Greet`
-    // under `Server`. Either is acceptable for the structural pass.
     let _greet_callable = nodes
         .iter()
         .find(|n| {
@@ -557,39 +354,71 @@ fn go_indexer_emits_struct_interface_method_function_nodes_when_lsp_present() {
                 && (n.name.as_deref() == Some("Greet") || n.name.as_deref() == Some("Server.Greet"))
         })
         .unwrap_or_else(|| panic!("Greet callable missing; saw {:?}", debug_kinds(&nodes)));
+}
 
-    // P13 / P15 — gopls should surface at least one `Calls` edge for
-    // the fixture (`main` → `api.NewServer`, `Server.Greet`). When
-    // gopls cannot reach the module proxy or hasn't finished its
-    // workspace warmup, the probe returns empty — surface that as a
-    // log rather than fail the opt-in test. Still hard-assert that
-    // every emitted edge resolves to an indexed node.
-    let calls = store
-        .list_edges_by_kind(EdgeKind::Calls)
-        .expect("calls edges queryable");
-    if calls.is_empty() {
-        eprintln!(
-            "go_indexer_emits_*: gopls returned no Calls — likely workspace warmup \
-             didn't complete or module proxy unreachable"
+// ---------------------------------------------------------------------------
+// Python — structure + heuristic (LSP retired; precision via `scip-python`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn python_indexer_treesitter_pass_runs_against_python_hello_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = workspace_root().join("tests/fixtures/python_hello");
+    copy_dir(&fixture, tmp.path());
+    let (mut store, _db) = open_temp_store(tmp.path());
+    let opts = PythonIndexOptions {
+        repo_root: tmp.path().to_path_buf(),
+        code_roots: vec![PathBuf::from("app"), PathBuf::from("tests")],
+        exclude_globs: Vec::new(),
+    };
+    let result = index_python(&mut store, &opts).expect("python indexer ran");
+    assert_eq!(result.resolver_used, "python_treesitter");
+    assert!(
+        result.files >= 4,
+        "expected >=4 python files in fixture, got {}",
+        result.files
+    );
+    assert!(
+        result.symbols >= 4,
+        "expected >=4 structural symbols, got {}",
+        result.symbols
+    );
+    assert!(
+        result.tests >= 3,
+        "expected >=3 pytest tests/groups, got {}",
+        result.tests
+    );
+    assert!(
+        result.imports >= 2,
+        "expected >=2 resolvable imports, got {}",
+        result.imports
+    );
+
+    let nodes = store.list_all_nodes().unwrap();
+    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+    for required in [
+        "python_class",
+        "python_method",
+        "python_function",
+        "test_case",
+        "test_group",
+        "file",
+    ] {
+        assert!(
+            kinds.contains(required),
+            "expected `{required}` in {:?}",
+            kinds
         );
-    } else {
-        for edge in &calls {
-            let to_node = nodes.iter().find(|n| n.id.as_str() == edge.to_id.as_str());
-            assert!(
-                to_node.is_some(),
-                "Calls edge target `{}` not present in the indexed graph",
-                edge.to_id.as_str()
-            );
-        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// P20 — TypeScript adapter.
+// TypeScript — structure + heuristic (LSP retired; precision via
+// `scip-typescript`).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn typescript_indexer_uses_treesitter_structure_when_tsserver_unavailable() {
+fn typescript_indexer_uses_treesitter_structure() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/typescript_hello");
     copy_dir(&fixture, tmp.path());
@@ -599,7 +428,6 @@ fn typescript_indexer_uses_treesitter_structure_when_tsserver_unavailable() {
         repo_root: tmp.path().to_path_buf(),
         code_roots: vec![PathBuf::from("src"), PathBuf::from("tests")],
         exclude_globs: Vec::new(),
-        lsp_command: Some("specslice_nonexistent_tsserver_xyz".into()),
     };
     let result = index_typescript(&mut store, &opts).expect("ts indexer ran");
     // The tree-sitter driver is the sole structural backend now; it must
@@ -624,10 +452,6 @@ fn typescript_indexer_uses_treesitter_structure_when_tsserver_unavailable() {
         "structure now comes from the tree-sitter driver, got `{}`",
         result.resolver_used
     );
-    assert!(
-        !result.sidecar_skip_reason.is_empty(),
-        "skip reason should explain why LSP was bypassed"
-    );
 
     let nodes = store.list_all_nodes().unwrap();
     let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
@@ -647,100 +471,12 @@ fn typescript_indexer_uses_treesitter_structure_when_tsserver_unavailable() {
     );
 }
 
-#[test]
-#[ignore = "requires typescript-language-server installed; run with --include-ignored"]
-fn typescript_indexer_emits_class_function_method_nodes_when_lsp_present() {
-    let lsp_override = std::env::var(TYPESCRIPT_LSP_COMMAND_ENV).ok();
-    let probe = TypescriptIndexOptions {
-        repo_root: workspace_root(),
-        code_roots: Vec::new(),
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override.clone(),
-    };
-    if !typescript_lsp_available(&probe) {
-        eprintln!(
-            "skipping {} — `typescript-language-server` did not pass the shared `lsp_probe` smoke launch (PATH / node_modules/.bin empty, {TYPESCRIPT_LSP_COMMAND_ENV} unset, or non-zero exit / broken-node-shebang)",
-            module_path!()
-        );
-        return;
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let fixture = workspace_root().join("tests/fixtures/typescript_hello");
-    copy_dir(&fixture, tmp.path());
-    let (mut store, _db) = open_temp_store(tmp.path());
-
-    let opts = TypescriptIndexOptions {
-        repo_root: tmp.path().to_path_buf(),
-        code_roots: vec![PathBuf::from("src"), PathBuf::from("tests")],
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override,
-    };
-    let result = match index_typescript(&mut store, &opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "soft-skip {}: `index_typescript` returned Err ({e}); LSP probe passed but session failed",
-                module_path!()
-            );
-            return;
-        }
-    };
-    if result.resolver_used != "typescript_lsp" {
-        eprintln!(
-            "soft-skip {}: probe ok but adapter fell back to `{}` (reason: {})",
-            module_path!(),
-            result.resolver_used,
-            result.sidecar_skip_reason
-        );
-        return;
-    }
-    assert!(result.files >= 3, "got {}", result.files);
-    assert!(result.symbols >= 3, "got {}", result.symbols);
-
-    let nodes = store.list_all_nodes().unwrap();
-    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in [
-        "typescript_class",
-        "typescript_method",
-        "typescript_function",
-    ] {
-        assert!(
-            kinds.contains(required),
-            "expected `{required}` in {:?}",
-            kinds
-        );
-    }
-    let _greeter = nodes
-        .iter()
-        .find(|n| n.kind.as_str() == "typescript_class" && n.name.as_deref() == Some("Greeter"))
-        .unwrap_or_else(|| panic!("Greeter class missing; saw {:?}", debug_kinds(&nodes)));
-
-    let calls = store
-        .list_edges_by_kind(EdgeKind::Calls)
-        .expect("calls edges queryable");
-    if calls.is_empty() {
-        eprintln!(
-            "typescript_indexer_emits_*: tsserver returned no Calls — likely workspace \
-             warmup didn't complete"
-        );
-    } else {
-        for edge in &calls {
-            assert!(
-                nodes.iter().any(|n| n.id.as_str() == edge.to_id.as_str()),
-                "Calls edge target `{}` not present in the indexed graph",
-                edge.to_id.as_str()
-            );
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// P20 — Java adapter.
+// Java — structure + heuristic (LSP retired; precision via `scip-java`).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn java_indexer_uses_treesitter_structure_when_jdtls_unavailable() {
+fn java_indexer_uses_treesitter_structure() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = workspace_root().join("tests/fixtures/java_hello");
     copy_dir(&fixture, tmp.path());
@@ -750,7 +486,6 @@ fn java_indexer_uses_treesitter_structure_when_jdtls_unavailable() {
         repo_root: tmp.path().to_path_buf(),
         code_roots: vec![PathBuf::from("src")],
         exclude_globs: Vec::new(),
-        lsp_command: Some("specslice_nonexistent_jdtls_xyz".into()),
     };
     let result = index_java(&mut store, &opts).expect("java indexer ran");
     assert!(
@@ -790,62 +525,4 @@ fn java_indexer_uses_treesitter_structure_when_jdtls_unavailable() {
         "Greeter class missing; saw {:?}",
         debug_kinds(&nodes)
     );
-}
-
-#[test]
-#[ignore = "requires jdtls installed; run with --include-ignored"]
-fn java_indexer_overlays_lsp_references_when_jdtls_present() {
-    let lsp_override = std::env::var(JAVA_LSP_COMMAND_ENV).ok();
-    let probe = JavaIndexOptions {
-        repo_root: workspace_root(),
-        code_roots: Vec::new(),
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override.clone(),
-    };
-    if !java_lsp_available(&probe) {
-        eprintln!(
-            "skipping {} — `jdtls` did not pass the shared `lsp_probe` smoke launch (binary missing on PATH, {JAVA_LSP_COMMAND_ENV} unset, or missing JRE / non-zero exit)",
-            module_path!()
-        );
-        return;
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let fixture = workspace_root().join("tests/fixtures/java_hello");
-    copy_dir(&fixture, tmp.path());
-    let (mut store, _db) = open_temp_store(tmp.path());
-
-    let opts = JavaIndexOptions {
-        repo_root: tmp.path().to_path_buf(),
-        code_roots: vec![PathBuf::from("src")],
-        exclude_globs: Vec::new(),
-        lsp_command: lsp_override,
-    };
-    let result = match index_java(&mut store, &opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "soft-skip {}: `index_java` returned Err ({e}); LSP probe passed but session failed",
-                module_path!()
-            );
-            return;
-        }
-    };
-    // Structure always comes from the tree-sitter driver now; the LSP only
-    // overlays Calls/References on top of those same ids.
-    assert_eq!(
-        result.resolver_used, "java_treesitter",
-        "structure is owned by the tree-sitter driver: {result:?}"
-    );
-    assert!(result.symbols >= 3, "got {}", result.symbols);
-
-    let nodes = store.list_all_nodes().unwrap();
-    let kinds: std::collections::BTreeSet<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
-    for required in ["java_class", "java_method"] {
-        assert!(
-            kinds.contains(required),
-            "expected `{required}` in {:?}",
-            kinds
-        );
-    }
 }

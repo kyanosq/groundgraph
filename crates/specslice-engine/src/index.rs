@@ -8,12 +8,10 @@ use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
-use crate::go_indexer::{index_go, GoIndexOptions, GoIndexResult, GO_LSP_COMMAND_ENV};
-use crate::java_indexer::{index_java, JavaIndexOptions, JavaIndexResult, JAVA_LSP_COMMAND_ENV};
+use crate::go_indexer::{index_go, GoIndexOptions, GoIndexResult};
+use crate::java_indexer::{index_java, JavaIndexOptions, JavaIndexResult};
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
-use crate::python_indexer::{
-    index_python, PythonIndexOptions, PythonIndexResult, PYTHON_LSP_COMMAND_ENV,
-};
+use crate::python_indexer::{index_python, PythonIndexOptions, PythonIndexResult};
 use crate::requirements_md_indexer::{
     index_requirements_md, RequirementsMdIndexOptions, RequirementsMdIndexResult,
     DEFAULT_REQUIREMENTS_DIR, REQUIREMENTS_MD_INDEXER_NAME,
@@ -23,9 +21,7 @@ use crate::swift_indexer::{
     index_swift, SwiftIndexOptions, SwiftIndexResult, SWIFT_LSP_COMMAND_ENV,
 };
 use crate::treesitter::{self, TsIndexOptions};
-use crate::typescript_indexer::{
-    index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_LSP_COMMAND_ENV,
-};
+use crate::typescript_indexer::{index_typescript, TypescriptIndexOptions, TypescriptIndexResult};
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -188,37 +184,32 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             result.swift = Some(swift);
         }
 
-        // P11/P23.4 — Go adapter. The tree-sitter driver owns structure; an
-        // optional `gopls` server overlays only `Calls` / `References`.
-        // `index_go` clears its own prior `go_treesitter` + `go_lsp` rows.
+        // P11/P23.4 — Go adapter. The tree-sitter driver owns structure +
+        // heuristic `Calls`/`References`; precise edges come from the SCIP
+        // overlay (`scip-go`). `index_go` clears its own prior `go_treesitter`
+        // rows (and any retired `go_lsp` rows).
         if config.go.enabled {
             let go_paths = config.go.paths_or(&["."]);
             let go_options = GoIndexOptions {
                 repo_root: options.repo_root.clone(),
                 code_roots: go_paths.iter().map(PathBuf::from).collect(),
                 exclude_globs: config.go.exclude.clone(),
-                lsp_command: std::env::var(GO_LSP_COMMAND_ENV)
-                    .ok()
-                    .or_else(|| config.go.lsp_command.clone()),
             };
             let go = index_go(&mut store, &go_options).context("indexing Go sources")?;
             result.go = Some(go);
         }
 
-        // P16/P23.1 — Python adapter. The in-process tree-sitter driver
-        // owns the structural graph; an optional LSP server overlays only
-        // `Calls` / `References`. `index_python` clears its own prior
-        // `python_treesitter` + `python_lsp` rows, so no pre-clear here.
+        // P16/P23.1 — Python adapter. The in-process tree-sitter driver owns
+        // the structural graph + heuristic `Calls`/`References`; precise edges
+        // come from a SCIP overlay (`scip-python`) when present. `index_python`
+        // clears its own prior `python_treesitter` rows (and retired
+        // `python_lsp` rows), so no pre-clear here.
         if config.python.enabled {
             let python_paths = config.python.paths_or(&["."]);
             let python_options = PythonIndexOptions {
                 repo_root: options.repo_root.clone(),
                 code_roots: python_paths.iter().map(PathBuf::from).collect(),
                 exclude_globs: config.python.exclude.clone(),
-                lsp_command: std::env::var(PYTHON_LSP_COMMAND_ENV)
-                    .ok()
-                    .or_else(|| config.python.lsp_command.clone()),
-                disable_venv_discovery: false,
             };
             let python =
                 index_python(&mut store, &python_options).context("indexing Python sources")?;
@@ -226,37 +217,32 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         }
 
         // P20/P23.2 — TypeScript adapter. The tree-sitter driver (`.ts` +
-        // `.tsx`) owns structure; an optional LSP server overlays only
-        // `Calls` / `References`. `index_typescript` clears its own prior
-        // `typescript_treesitter` + `typescript_lsp` rows.
+        // `.tsx`/`.js`/`.vue`) owns structure + heuristic `Calls`/`References`;
+        // precise edges come from the SCIP overlay (`scip-typescript`).
+        // `index_typescript` clears its own prior `typescript_treesitter` rows
+        // (and any retired `typescript_lsp` rows).
         if config.typescript.enabled {
             let ts_paths = config.typescript.paths_or(&["src", "tests", "test"]);
             let ts_options = TypescriptIndexOptions {
                 repo_root: options.repo_root.clone(),
                 code_roots: ts_paths.iter().map(PathBuf::from).collect(),
                 exclude_globs: config.typescript.exclude.clone(),
-                lsp_command: std::env::var(TYPESCRIPT_LSP_COMMAND_ENV)
-                    .ok()
-                    .or_else(|| config.typescript.lsp_command.clone()),
             };
             let ts =
                 index_typescript(&mut store, &ts_options).context("indexing TypeScript sources")?;
             result.typescript = Some(ts);
         }
 
-        // P20/P23.3 — Java adapter. The tree-sitter driver owns structure;
-        // an optional `jdtls` server overlays only `Calls` / `References`.
-        // `index_java` clears its own prior `java_treesitter` + `java_lsp`
-        // rows.
+        // P20/P23.3 — Java adapter. The tree-sitter driver owns structure +
+        // heuristic `Calls`/`References`; precise edges come from a SCIP
+        // overlay (`scip-java`) when present. `index_java` clears its own prior
+        // `java_treesitter` rows (and any retired `java_lsp` rows).
         if config.java.enabled {
             let java_paths = config.java.paths_or(&["src"]);
             let java_options = JavaIndexOptions {
                 repo_root: options.repo_root.clone(),
                 code_roots: java_paths.iter().map(PathBuf::from).collect(),
                 exclude_globs: config.java.exclude.clone(),
-                lsp_command: std::env::var(JAVA_LSP_COMMAND_ENV)
-                    .ok()
-                    .or_else(|| config.java.lsp_command.clone()),
             };
             let java = index_java(&mut store, &java_options).context("indexing Java sources")?;
             result.java = Some(java);

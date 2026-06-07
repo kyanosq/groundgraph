@@ -227,15 +227,9 @@ impl EngineConfig {
                 // (`.ts`/`.mts`/`.cts` + `.tsx`/`.js`/`.jsx`/`.vue`). The generic
                 // single-spec driver would silently miss the entire JSX/JS/Vue
                 // dialect (a JS/Vue repo would index zero files), so route through
-                // the adapter regardless of `lsp`, disabling only the optional
-                // LSP overlay when enrichment is off.
-                "typescript" => {
-                    self.typescript = adapter_from(sel);
-                    if !lsp && self.typescript.lsp_command.is_none() {
-                        self.typescript.lsp_command =
-                            Some(crate::typescript_indexer::LSP_DISABLED_SENTINEL.to_string());
-                    }
-                }
+                // the adapter regardless of `lsp`. The adapter is structure +
+                // heuristic only (precision comes from the SCIP overlay).
+                "typescript" => self.typescript = adapter_from(sel),
                 "java" if lsp => self.java = adapter_from(sel),
                 // c / cpp always, and any lsp-capable language when
                 // `enrichment.lsp == false`: structure-only generic driver.

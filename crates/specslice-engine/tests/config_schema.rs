@@ -438,7 +438,11 @@ fn init_autodetects_swift_repo_and_writes_treesitter_config() {
     std::fs::create_dir_all(root.join("App/Views")).unwrap();
     std::fs::create_dir_all(root.join("Sources/Core")).unwrap();
     std::fs::write(root.join("Package.swift"), "// swift-tools-version:5.9\n").unwrap();
-    std::fs::write(root.join("App/Views/HomeView.swift"), "struct HomeView {}\n").unwrap();
+    std::fs::write(
+        root.join("App/Views/HomeView.swift"),
+        "struct HomeView {}\n",
+    )
+    .unwrap();
     std::fs::write(root.join("Sources/Core/Engine.swift"), "struct Engine {}\n").unwrap();
 
     init_repository(InitOptions {
@@ -531,16 +535,18 @@ fn index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing()
             "docs:\n  paths: []\n",
             "code:\n  paths: []\n",
             "swift:\n  enabled: true\n  paths: [Sources]\n  lsp_command: specslice_missing_sourcekit_lsp\n",
-            "go:\n  enabled: true\n  paths: ['.']\n  lsp_command: specslice_missing_gopls\n",
+            "go:\n  enabled: true\n  paths: ['.']\n",
         ),
     );
     let result = index_repository(IndexOptions::all(root.to_path_buf())).unwrap();
+    // Swift keeps the LSP sidecar: a missing binary surfaces a skip reason.
     let swift = result.swift.expect("swift section present when enabled");
     assert_eq!(swift.files, 0);
     assert!(swift.sidecar_skip_reason.contains("PATH"));
+    // Go retired its LSP sidecar: the structure+heuristic adapter just runs and
+    // finds zero Go files in the empty temp repo (no skip-reason concept).
     let go = result.go.expect("go section present when enabled");
     assert_eq!(go.files, 0);
-    assert!(go.sidecar_skip_reason.contains("PATH"));
 }
 
 #[test]
