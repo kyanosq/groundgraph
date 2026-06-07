@@ -36,10 +36,19 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
                     "  HTTP routes: {} (route→method edges {})",
                     s.http_routes, s.route_method_edges
                 );
+                println!(
+                    "  Consumed routes: {} (consumer→route edges {})",
+                    s.consumed_routes, s.route_consumer_edges
+                );
                 specslice_engine::stats::set_metric("http_routes", s.http_routes as i64);
                 specslice_engine::stats::set_metric(
                     "route_method_edges",
                     s.route_method_edges as i64,
+                );
+                specslice_engine::stats::set_metric("consumed_routes", s.consumed_routes as i64);
+                specslice_engine::stats::set_metric(
+                    "route_consumer_edges",
+                    s.route_consumer_edges as i64,
                 );
                 specslice_engine::stats::set_metric("tables", (s.sql_tables + s.orm_tables) as i64);
                 specslice_engine::stats::set_metric(

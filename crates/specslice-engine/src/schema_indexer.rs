@@ -110,6 +110,17 @@ pub struct SchemaIndexStats {
     /// entity/DDL in the indexed sources (marked `external`, schema unknown).
     /// Keeps `trace` complete for junction/sequence/cross-service tables.
     pub external_tables: usize,
+    /// Client-consumed `HttpRoute` nodes recovered from a Dart endpoint-table
+    /// class (`class ApiEndpoints { static const String x = '/path'; }`). These
+    /// are the backend routes the client *calls* (verb `CONSUMED`), the mirror
+    /// image of the server-side served routes — so a client repo's API surface
+    /// becomes queryable by URL path and comparable to the server it ports.
+    #[serde(default)]
+    pub consumed_routes: usize,
+    /// `caller method --references--> consumed HttpRoute` edges linked by finding
+    /// `<EndpointsClass>.<NAME>` references in a callable's body.
+    #[serde(default)]
+    pub route_consumer_edges: usize,
 }
 
 /// One MyBatis mapper statement (`<select|insert|update|delete id="...">`).
@@ -217,6 +228,10 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     store
         .clear_indexer_outputs(SCHEMA_INDEXER_NAME)
         .context("clearing prior schema-indexer outputs")?;
+    // Client-consumed backend routes recovered from Dart endpoint-table classes,
+    // accumulated across the walk and turned into nodes/edges after it (needs the
+    // language indexers' callable nodes to already exist in the store).
+    let mut dart_route_consts: Vec<DartRouteConst> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !is_skipped_dir(e.file_name().to_str().unwrap_or("")))
@@ -284,6 +299,15 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
                 }
             }
         }
+        // Dart clients keep the backend routes they call in a constant table
+        // (`class ApiEndpoints { static const String x = '/path'; }`). Collect
+        // them now; nodes/edges are emitted after the walk so the consuming
+        // callable nodes already exist.
+        if ext == "dart" {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                dart_route_consts.extend(parse_dart_route_constants(&text));
+            }
+        }
         let tables = match ext.as_str() {
             "sql" => read_and(path, parse_sql_tables),
             "java" => read_and(path, parse_java_entity_tables),
@@ -321,6 +345,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     link_data_layer_edges(store, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
+    link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
     Ok(stats)
 }
 
@@ -617,6 +642,11 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         let Ok(meta) = serde_json::from_str::<HttpRouteMeta>(meta_json) else {
             continue;
         };
+        // Client-consumed routes carry no server handler; they are linked from
+        // the calling Dart method by `link_dart_consumed_routes`, not here.
+        if meta.handler_class.is_empty() && meta.handler_method.is_empty() {
+            continue;
+        }
         let key = format!("{}.{}", meta.handler_class, meta.handler_method).to_ascii_lowercase();
         if let Some(method_ids) = method_by_suffix.get(&key) {
             for mid in method_ids {
@@ -641,6 +671,111 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         })?;
     }
     Ok(())
+}
+
+/// Mirror image of [`link_http_route_edges`] for *client* repos: turn the routes
+/// a Dart client consumes (recovered from its `ApiEndpoints`-style constant
+/// table) into `HttpRoute` nodes (verb `CONSUMED`) and link each calling method
+/// with a `method --references--> route` edge. The handler match is by source:
+/// a callable references a route when its body mentions `<Class>.<const>`.
+///
+/// This makes a client's backend API surface queryable by URL path and directly
+/// comparable to the server it ports — the same path string resolves on both
+/// sides, so a `trace` of the served route and a `search` of the consumed route
+/// line up. Idempotent (upsert); each `(callable, path)` pair links at most once.
+fn link_dart_consumed_routes(
+    store: &mut Store,
+    root: &Path,
+    consts: &[DartRouteConst],
+    stats: &mut SchemaIndexStats,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+    if consts.is_empty() {
+        return Ok(());
+    }
+    // Unique path -> consumed route node id (nodes created up front so the
+    // edges below satisfy the nodes-before-edges invariant); `Class.const`
+    // reference token -> path so a body mention resolves to the route.
+    let mut path_to_id: HashMap<String, ArtifactId> = HashMap::new();
+    let mut ref_to_path: HashMap<String, String> = HashMap::new();
+    for c in consts {
+        ref_to_path.insert(format!("{}.{}", c.class_name, c.name), c.path.clone());
+        if !path_to_id.contains_key(&c.path) {
+            let node = consumed_route_node(&c.path);
+            let id = node.id.clone();
+            store
+                .upsert_node(&node)
+                .with_context(|| format!("upserting consumed route {}", c.path))?;
+            stats.consumed_routes += 1;
+            path_to_id.insert(c.path.clone(), id);
+        }
+    }
+
+    let mut edges: Vec<EdgeAssertion> = Vec::new();
+    for &kind in NodeKind::ALL {
+        if !kind.is_callable() || kind.language() != Some("dart") {
+            continue;
+        }
+        for node in store.list_nodes_by_kind(kind)? {
+            let Some(src) = read_node_source(root, &node) else {
+                continue;
+            };
+            let mut linked: HashSet<String> = HashSet::new();
+            for (token, path) in &ref_to_path {
+                if !body_references_token(&src.raw, token) {
+                    continue;
+                }
+                if !linked.insert(path.clone()) {
+                    continue; // already linked this route for this callable
+                }
+                if let Some(route_id) = path_to_id.get(path) {
+                    edges.push(EdgeAssertion::fact(
+                        node.id.clone(),
+                        route_id.clone(),
+                        EdgeKind::References,
+                        EdgeSource::LanguageAdapter,
+                    ));
+                    stats.route_consumer_edges += 1;
+                }
+            }
+        }
+    }
+    for edge in &mut edges {
+        edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+        store.upsert_edge(edge).with_context(|| {
+            format!(
+                "linking dart route-consumer edge {} -> {}",
+                edge.from_id.as_str(),
+                edge.to_id.as_str()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// True when `body` mentions `token` (e.g. `ApiEndpoints.styleDetail`) as a
+/// whole reference — the char before must not extend the leading identifier
+/// (nor be a `.`, which would make it a nested member access) and the char
+/// after must not extend the trailing identifier. Prevents a constant name
+/// from matching inside a longer identifier.
+fn body_references_token(body: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let b = body.as_bytes();
+    let t = token.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = body[i..].find(token) {
+        let start = i + rel;
+        let end = start + t.len();
+        let before_ok = start == 0 || (!is_ident_byte(b[start - 1]) && b[start - 1] != b'.');
+        let after_ok = end >= b.len() || !is_ident_byte(b[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = start + 1;
+    }
+    false
 }
 
 fn read_and_xml(path: &Path) -> Option<Vec<ParsedMapperStmt>> {
@@ -690,6 +825,25 @@ pub fn http_route_node(rel_path: &str, r: &ParsedRoute) -> Node {
         verb: r.verb.clone(),
         handler_class: r.class.clone(),
         handler_method: r.method.clone(),
+    };
+    node.metadata_json = serde_json::to_string(&meta).ok();
+    node
+}
+
+/// Build an `HttpRoute` node for a backend path a client *consumes* (verb
+/// `CONSUMED`, no server handler). Id is keyed by path alone so the same path
+/// referenced from several endpoint classes collapses to one node; `name` is
+/// the last path segment so `search <segment>` matches it like the served side.
+pub fn consumed_route_node(path: &str) -> Node {
+    let id = ArtifactId::new(format!("http_route::consumed::{path}"));
+    let mut node = Node::new(id, NodeKind::HttpRoute);
+    node.name = Some(route_search_name(path));
+    node.path = Some(path.to_string());
+    node.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+    let meta = HttpRouteMeta {
+        verb: "CONSUMED".to_string(),
+        handler_class: String::new(),
+        handler_method: String::new(),
     };
     node.metadata_json = serde_json::to_string(&meta).ok();
     node
@@ -1617,6 +1771,132 @@ fn parse_go_handler(arg: &str) -> Option<(String, String)> {
     None
 }
 
+/// One backend route a (Dart) client *consumes*, recovered from a route-table
+/// constant such as `class ApiEndpoints { static const String x = '/path'; }`.
+/// `class_name`/`name` are kept so a caller body referencing `ApiEndpoints.x`
+/// can be linked to the route node for `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DartRouteConst {
+    pub class_name: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// Recover client-consumed backend routes from Dart endpoint-table classes.
+/// A constant counts only when (a) its enclosing class looks like a route table
+/// (name contains `api`/`endpoint`/`route`/`uri`) and (b) its string value is an
+/// absolute URL path (`/…`). This excludes base URLs (`https://…`), storage keys
+/// and styling constants, which share the `static const` shape.
+pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
+    if !text.contains("static const") {
+        return Vec::new();
+    }
+    let classes = collect_dart_classes(text);
+    let mut out = Vec::new();
+    for (idx, _) in text.match_indices("static const") {
+        let k = idx + "static const".len();
+        // The declaration runs to the first `=`; bail if a statement boundary
+        // intervenes (defensive — class-field consts never contain one here).
+        let Some(eq_rel) = text[k..].find('=') else {
+            continue;
+        };
+        let eq = k + eq_rel;
+        if text[k..eq].contains([';', '{', '}']) {
+            continue;
+        }
+        // The identifier just before `=` is the constant name; any preceding
+        // tokens are its (optional) type.
+        let name = text[k..eq].split_whitespace().last().unwrap_or("").to_string();
+        if !is_ident(&name) {
+            continue;
+        }
+        let Some(path) = first_dart_string_literal(&text[eq + 1..]) else {
+            continue;
+        };
+        if !path.starts_with('/') || path.len() < 2 {
+            continue;
+        }
+        let class_name = enclosing_dart_class(&classes, idx);
+        if !is_route_table_class(&class_name) {
+            continue;
+        }
+        out.push(DartRouteConst {
+            class_name,
+            name,
+            path,
+        });
+    }
+    out
+}
+
+/// `(byte offset, class name)` for every `class <Name>` declaration, in source
+/// order — used to attribute a `static const` to its enclosing class.
+fn collect_dart_classes(text: &str) -> Vec<(usize, String)> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    for (idx, _) in text.match_indices("class") {
+        let before_ok = idx == 0 || !is_ident_byte(b[idx - 1]);
+        let after = idx + 5;
+        if !before_ok || after >= b.len() || !b[after].is_ascii_whitespace() {
+            continue;
+        }
+        let ns = skip_ws(b, after);
+        let (name, _) = read_ident(b, ns);
+        if !name.is_empty() {
+            out.push((idx, name));
+        }
+    }
+    out
+}
+
+/// Name of the class whose declaration most closely precedes `offset`.
+fn enclosing_dart_class(classes: &[(usize, String)], offset: usize) -> String {
+    let mut best = "";
+    for (at, name) in classes {
+        if *at < offset {
+            best = name;
+        } else {
+            break;
+        }
+    }
+    best.to_string()
+}
+
+/// True when a class name looks like a table of API routes.
+fn is_route_table_class(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["endpoint", "api", "route", "uri"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
+/// Content of the first single- or double-quoted string literal in `s` (Dart
+/// path constants use either). Stops at the matching quote; no escape handling
+/// is needed for URL paths.
+fn first_dart_string_literal(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'"' || b[i] == b'\'' {
+            let quote = b[i];
+            let from = i + 1;
+            let mut j = from;
+            while j < b.len() && b[j] != quote {
+                j += 1;
+            }
+            if j <= b.len() {
+                return Some(String::from_utf8_lossy(&b[from..j.min(b.len())]).to_string());
+            }
+        }
+        // Stop scanning at a statement end so we never wander into the next decl.
+        if b[i] == b';' {
+            break;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// `(simple class name, byte index of the `class` keyword)` for the controller —
 /// the first `class <Ident>` after the `@RestController`/`@Controller`
 /// stereotype, so a comment mentioning "class" before the annotations can't
@@ -2270,6 +2550,112 @@ func (h *DesignHandler) Register(mux *http.ServeMux) {
             })
             .sum();
         assert_eq!(all_route_edges, 1, "exactly one live route->method edge");
+    }
+
+    #[test]
+    fn parse_dart_route_constants_extracts_api_paths() {
+        // A route-table class (`ApiEndpoints`) exposes the backend paths the
+        // client consumes; sibling non-route constants must be ignored.
+        let dart = r#"
+class AppConstants {
+  static const String baseUrl = 'https://platform.kutetailor.com/api';
+  static const String accessToken = 'access_token';
+  static const int pageSize = 20;
+}
+
+class ApiEndpoints {
+  ApiEndpoints._();
+  static const String login = '/token/oauth/token';
+  static const String styleDetail =
+      '/style/app/style-info/getDesignDetail';
+  static const String markRead = '/member/member/markRead';
+}
+"#;
+        let routes = parse_dart_route_constants(dart);
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"/token/oauth/token"), "login path, got {paths:?}");
+        assert!(paths.contains(&"/style/app/style-info/getDesignDetail"));
+        assert!(paths.contains(&"/member/member/markRead"));
+        // base URL (https), storage key (no slash), numeric, and the whole
+        // non-route AppConstants class are excluded.
+        assert!(!paths.iter().any(|p| p.starts_with("https")));
+        assert!(!paths.contains(&"access_token"));
+        assert_eq!(routes.len(), 3, "only the 3 ApiEndpoints paths, got {routes:?}");
+
+        let sd = routes
+            .iter()
+            .find(|r| r.path == "/style/app/style-info/getDesignDetail")
+            .unwrap();
+        assert_eq!(sd.class_name, "ApiEndpoints");
+        assert_eq!(sd.name, "styleDetail");
+    }
+
+    #[test]
+    fn parse_dart_route_constants_ignores_non_route_class() {
+        // Same `static const String = '/...'` shape, but the class name does not
+        // look like a route table → not treated as consumed routes.
+        let dart = r#"
+class AssetPaths {
+  static const String logo = '/assets/logo.png';
+}
+"#;
+        assert!(parse_dart_route_constants(dart).is_empty());
+    }
+
+    #[test]
+    fn links_dart_consumer_to_consumed_route() {
+        // An api-client method whose body references `ApiEndpoints.styleDetail`
+        // must yield a consumed HttpRoute node for that path and a
+        // method--references-->route edge, so the client's backend API surface
+        // is queryable by URL path (symmetric with server-side HttpRoute).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("lib/core")).unwrap();
+        std::fs::write(
+            root.join("lib/core/endpoints.dart"),
+            r#"
+class ApiEndpoints {
+  static const String styleDetail = '/style/app/style-info/getDesignDetail';
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib/core/client.dart"),
+            "class StyleApiClient {\n  Future<dynamic> getDetail() {\n    return _http.get(ApiEndpoints.styleDetail);\n  }\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        // Pre-seed the consumer method node (normally from the Dart indexer).
+        let method_id =
+            ArtifactId::new("dart_method::lib/core/client.dart#StyleApiClient.getDetail");
+        let mut mnode = Node::new(method_id.clone(), NodeKind::DartMethod);
+        mnode.path = Some("lib/core/client.dart".to_string());
+        mnode.source_file = Some("lib/core/client.dart".to_string());
+        mnode.start_line = Some(2);
+        mnode.end_line = Some(4);
+        store.upsert_node(&mnode).unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.consumed_routes, 1, "one consumed route indexed");
+        assert_eq!(stats.route_consumer_edges, 1, "one consumer->route edge");
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        let route = routes
+            .iter()
+            .find(|r| r.path.as_deref() == Some("/style/app/style-info/getDesignDetail"))
+            .expect("consumed route node");
+        assert_eq!(route.name.as_deref(), Some("getDesignDetail"));
+
+        let edges = store.list_edges_from(&method_id).unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.to_id == route.id),
+            "expected consumer->route References edge, got {edges:?}"
+        );
     }
 
     #[test]

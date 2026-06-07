@@ -40,6 +40,11 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
     );
     specslice_engine::stats::set_metric("http_routes", stats.http_routes as i64);
     specslice_engine::stats::set_metric("route_method_edges", stats.route_method_edges as i64);
+    specslice_engine::stats::set_metric("consumed_routes", stats.consumed_routes as i64);
+    specslice_engine::stats::set_metric(
+        "route_consumer_edges",
+        stats.route_consumer_edges as i64,
+    );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -64,6 +69,10 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
         println!(
             "HTTP 路由: {} 个 · 路由→方法 {} 条 (按 URL 路径反查 Spring 处理方法)",
             stats.http_routes, stats.route_method_edges,
+        );
+        println!(
+            "客户端消费路由: {} 个 · 调用方→路由 {} 条 (按 URL 路径反查 Dart 调用方,与服务端对齐)",
+            stats.consumed_routes, stats.route_consumer_edges,
         );
     }
     Ok(())
