@@ -168,6 +168,11 @@ pub struct HttpRouteMeta {
 // Walker
 // ---------------------------------------------------------------------------
 
+/// Indexer name stamped on every node and edge the schema pass produces, so a
+/// re-index can wholesale-clear its prior outputs (like the language indexers)
+/// instead of leaving stale routes/tables/edges behind.
+pub const SCHEMA_INDEXER_NAME: &str = "schema";
+
 /// Open the repo's configured graph.db and add/refresh its `DbTable` nodes by
 /// scanning `.sql` + entity `.java` files. Idempotent (upsert).
 pub fn index_schema(repo_root: &Path) -> Result<SchemaIndexStats> {
@@ -205,6 +210,13 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 
 pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexStats> {
     let mut stats = SchemaIndexStats::default();
+    // Re-index = clean slate for this pass. Without this, upsert-only writes leave
+    // orphaned nodes/edges when a route/table/mapper statement is deleted or
+    // renamed in source (forcing a full graph rebuild). Mirrors how the language
+    // indexers clear their own prior generation before re-emitting.
+    store
+        .clear_indexer_outputs(SCHEMA_INDEXER_NAME)
+        .context("clearing prior schema-indexer outputs")?;
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !is_skipped_dir(e.file_name().to_str().unwrap_or("")))
@@ -480,7 +492,8 @@ fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
             .upsert_node(node)
             .with_context(|| format!("upserting external table {}", node.id.as_str()))?;
     }
-    for edge in &edges {
+    for edge in &mut edges {
+        edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
         store.upsert_edge(edge).with_context(|| {
             format!(
                 "linking data-layer edge {} -> {}",
@@ -556,7 +569,8 @@ fn link_inline_sql_edges(
             }
         }
     }
-    for edge in &edges {
+    for edge in &mut edges {
+        edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
         store.upsert_edge(edge).with_context(|| {
             format!(
                 "linking inline-sql edge {} -> {}",
@@ -616,7 +630,8 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
             }
         }
     }
-    for edge in &edges {
+    for edge in &mut edges {
+        edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
         store.upsert_edge(edge).with_context(|| {
             format!(
                 "linking http-route edge {} -> {}",
@@ -649,7 +664,7 @@ pub fn mapper_stmt_node(rel_path: &str, stmt: &ParsedMapperStmt) -> Node {
     node.path = Some(rel_path.to_string());
     node.source_file = Some(rel_path.to_string());
     node.start_line = Some(stmt.line);
-    node.indexer = Some("schema".to_string());
+    node.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
     let meta = MapperStmtMeta {
         stmt_kind: stmt.stmt_kind.clone(),
         namespace: stmt.namespace.clone(),
@@ -670,7 +685,7 @@ pub fn http_route_node(rel_path: &str, r: &ParsedRoute) -> Node {
     node.path = Some(r.path.clone());
     node.source_file = Some(rel_path.to_string());
     node.start_line = Some(r.line);
-    node.indexer = Some("schema".to_string());
+    node.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
     let meta = HttpRouteMeta {
         verb: r.verb.clone(),
         handler_class: r.class.clone(),
@@ -1041,7 +1056,7 @@ pub fn db_table_node(rel_path: &str, table: &ParsedTable) -> Node {
     node.path = Some(rel_path.to_string());
     node.source_file = Some(rel_path.to_string());
     node.start_line = Some(table.line);
-    node.indexer = Some("schema".to_string());
+    node.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
     let meta = DbTableMeta {
         columns: table
             .columns
@@ -1066,7 +1081,7 @@ pub fn external_db_table_node(name: &str) -> Node {
     let id = ArtifactId::new(format!("db_table::<external>::{name}"));
     let mut node = Node::new(id, NodeKind::DbTable);
     node.name = Some(name.to_string());
-    node.indexer = Some("schema".to_string());
+    node.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
     let meta = DbTableMeta {
         columns: Vec::new(),
         source: "external".to_string(),
@@ -2178,6 +2193,83 @@ func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
                 .any(|e| e.kind == EdgeKind::References && e.to_id == method_id),
             "expected Go route->method References edge, got {from_route:?}"
         );
+    }
+
+    #[test]
+    fn reindex_prunes_stale_schema_nodes_and_edges() {
+        // Re-indexing must not leave behind nodes/edges for source that no longer
+        // exists. Like the language indexers, the schema pass must clear its own
+        // prior outputs first, so a deleted route/table disappears without a full
+        // rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("internal/craft/handler")).unwrap();
+        let p = root.join("internal/craft/handler/h.go");
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        for m in ["DesignHandler.GetDesignInfo", "DesignHandler.SelectCraftTree"] {
+            let id = ArtifactId::new(format!("go::internal/craft/handler/h.go::{m}"));
+            store
+                .upsert_node(&Node::new(id, NodeKind::GoMethod))
+                .unwrap();
+        }
+
+        std::fs::write(
+            &p,
+            r#"
+package handler
+import "net/http"
+type DesignHandler struct{}
+func (h *DesignHandler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /app/craft/getDesignInfo", h.GetDesignInfo)
+	mux.HandleFunc("GET /app/craft/selectCraftTree", h.SelectCraftTree)
+}
+"#,
+        )
+        .unwrap();
+        let s1 = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(s1.http_routes, 2, "first pass indexes both routes");
+        assert_eq!(store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap().len(), 2);
+
+        // Drop the second route, then re-index the same store.
+        std::fs::write(
+            &p,
+            r#"
+package handler
+import "net/http"
+type DesignHandler struct{}
+func (h *DesignHandler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /app/craft/getDesignInfo", h.GetDesignInfo)
+}
+"#,
+        )
+        .unwrap();
+        let _s2 = index_schema_into(&mut store, root).unwrap();
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert_eq!(
+            routes.len(),
+            1,
+            "stale route node must be pruned on re-index, got {routes:?}"
+        );
+        assert_eq!(routes[0].name.as_deref(), Some("getDesignInfo"));
+        // The surviving route keeps exactly one handler edge; no dangling edge
+        // for the removed route remains.
+        let all_route_edges: usize = store
+            .list_nodes_by_kind(NodeKind::HttpRoute)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                store
+                    .list_edges_from(&r.id)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == EdgeKind::References)
+                    .count()
+            })
+            .sum();
+        assert_eq!(all_route_edges, 1, "exactly one live route->method edge");
     }
 
     #[test]
