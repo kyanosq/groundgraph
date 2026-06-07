@@ -281,6 +281,44 @@ impl Store {
         tx.commit().map_err(StoreError::sqlite)?;
         Ok(())
     }
+
+    /// SCIP-authoritative suppression. For each `source_file` SCIP covered,
+    /// delete its `Calls`/`References` edges whose `indexer` differs from
+    /// `keep_indexer` (i.e. the heuristic/LSP precision edges), so a covered
+    /// file carries exactly one precision source — its SCIP edges. Files SCIP
+    /// did not cover are left untouched and keep their heuristic gap-fill.
+    /// Structural edges (`Contains`/`Imports`/…) are never removed. Returns the
+    /// number of edges deleted.
+    pub fn delete_precision_edges_for_files_except(
+        &mut self,
+        source_files: &[String],
+        keep_indexer: &str,
+    ) -> StoreResult<usize> {
+        if source_files.is_empty() {
+            return Ok(0);
+        }
+        let calls = EdgeKind::Calls.as_str();
+        let references = EdgeKind::References.as_str();
+        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
+        let mut removed = 0usize;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "DELETE FROM edge_assertions \
+                     WHERE source_file = ?1 \
+                       AND kind IN (?2, ?3) \
+                       AND (indexer IS NULL OR indexer != ?4)",
+                )
+                .map_err(StoreError::sqlite)?;
+            for file in source_files {
+                removed += stmt
+                    .execute(params![file, calls, references, keep_indexer])
+                    .map_err(StoreError::sqlite)?;
+            }
+        }
+        tx.commit().map_err(StoreError::sqlite)?;
+        Ok(removed)
+    }
 }
 
 fn opt_u32(row: &Row<'_>, idx: usize) -> Result<Option<u32>, rusqlite::Error> {
@@ -787,6 +825,91 @@ mod decode_tests {
             .list_all_nodes()
             .expect_err("negative node start_line must error");
         assert!(format!("{err}").contains("does not fit in u32"), "{err}");
+    }
+
+    #[test]
+    fn scip_suppression_clears_only_nonscip_precision_on_covered_files() {
+        let mut store = fresh_store();
+        let mk = |from: &str, kind: EdgeKind, indexer: &str, file: &str| {
+            let mut e = EdgeAssertion::fact(
+                ArtifactId::new(from),
+                ArtifactId::new("t"),
+                kind,
+                EdgeSource::LanguageAdapter,
+            );
+            e.indexer = Some(indexer.to_string());
+            e.source_file = Some(file.to_string());
+            e
+        };
+        // covered.go: a SCIP call + a heuristic call (dup) + a heuristic CONTAINS (structural).
+        store
+            .upsert_edge(&mk("scip_call", EdgeKind::Calls, "scip", "covered.go"))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                "heur_call",
+                EdgeKind::Calls,
+                "go_treesitter",
+                "covered.go",
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                "heur_ref",
+                EdgeKind::References,
+                "go_treesitter",
+                "covered.go",
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&mk(
+                "heur_contains",
+                EdgeKind::Contains,
+                "go_treesitter",
+                "covered.go",
+            ))
+            .unwrap();
+        // uncovered.go: heuristic-only gap-fill that must survive.
+        store
+            .upsert_edge(&mk(
+                "gap_call",
+                EdgeKind::Calls,
+                "go_treesitter",
+                "uncovered.go",
+            ))
+            .unwrap();
+
+        let removed = store
+            .delete_precision_edges_for_files_except(&["covered.go".to_string()], "scip")
+            .unwrap();
+        assert_eq!(removed, 2, "the heuristic Calls + References on covered.go");
+
+        let froms: std::collections::BTreeSet<String> = store
+            .list_all_edges()
+            .unwrap()
+            .iter()
+            .map(|e| e.from_id.as_str().to_string())
+            .collect();
+        assert!(
+            froms.contains("scip_call"),
+            "SCIP edge on covered file kept"
+        );
+        assert!(
+            froms.contains("heur_contains"),
+            "structural CONTAINS never suppressed"
+        );
+        assert!(
+            froms.contains("gap_call"),
+            "heuristic gap-fill on uncovered file kept"
+        );
+        assert!(
+            !froms.contains("heur_call"),
+            "heuristic Calls dup on covered file removed"
+        );
+        assert!(
+            !froms.contains("heur_ref"),
+            "heuristic References on covered file removed"
+        );
     }
 
     #[test]

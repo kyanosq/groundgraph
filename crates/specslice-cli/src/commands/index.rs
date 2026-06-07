@@ -282,6 +282,11 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             writeln!(out, "  Files: {}", scip.scip_files).ok();
             writeln!(out, "  Documents: {}", scip.documents).ok();
             writeln!(out, "  Edges: {}", scip.edges).ok();
+            // Heuristic precision SCIP displaced on its covered files (dedup →
+            // single source of truth). Silent when nothing was suppressed.
+            if scip.suppressed > 0 {
+                writeln!(out, "  Suppressed (heuristic): {}", scip.suppressed).ok();
+            }
         }
     }
     if let Some(links) = &result.links {
@@ -713,6 +718,7 @@ mod tests {
                 scip_files: 2,
                 documents: 318,
                 edges: 9681,
+                suppressed: 142,
             }),
             ..IndexResult::default()
         };
@@ -726,6 +732,10 @@ mod tests {
         assert!(
             out.contains("Edges: 9681"),
             "missing SCIP edge count: {out}"
+        );
+        assert!(
+            out.contains("Suppressed (heuristic): 142"),
+            "missing SCIP suppression count: {out}"
         );
     }
 

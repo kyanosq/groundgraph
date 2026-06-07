@@ -172,6 +172,9 @@ pub struct ScipOverlayResult {
     pub documents: usize,
     /// `Calls` / `References` edges overlaid (post-dedup).
     pub edges: usize,
+    /// Heuristic/LSP `Calls`/`References` edges suppressed because SCIP now
+    /// authoritatively covers their source file (ADR-0001 §3.2, D2).
+    pub suppressed: usize,
 }
 
 /// Ingest every `.specslice/scip/*.scip` under `repo_root` as a high-confidence
@@ -192,6 +195,11 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
     store
         .clear_indexer_outputs(RESOLVER_SCIP)
         .context("clearing previous SCIP overlay edges")?;
+    // Files SCIP authoritatively analysed (≥1 occurrence). Heuristic/LSP
+    // precision on these is suppressed after ingest so a covered file carries a
+    // single precision source — SCIP. A broken indexer that writes a 0-document
+    // index therefore suppresses nothing and the heuristic gap-fill stands.
+    let mut covered_files: BTreeSet<String> = BTreeSet::new();
     for path in scip_files {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("reading SCIP index {}", path.display()))?;
@@ -203,6 +211,9 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
         let mut seen_files = BTreeSet::new();
         let mut ranges = Vec::new();
         for doc in &index.documents {
+            if !doc.occurrences.is_empty() {
+                covered_files.insert(doc.relative_path.clone());
+            }
             if seen_files.insert(doc.relative_path.clone()) {
                 ranges.extend(
                     store
@@ -234,6 +245,15 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
         result.scip_files += 1;
         result.documents += index.documents.len();
     }
+
+    // SCIP-authoritative gap-fill: drop heuristic/LSP `Calls`/`References` on
+    // every file SCIP covered, leaving SCIP's own edges as the lone precision
+    // source there. Files SCIP never analysed keep their heuristic edges.
+    let covered: Vec<String> = covered_files.into_iter().collect();
+    result.suppressed = store
+        .delete_precision_edges_for_files_except(&covered, RESOLVER_SCIP)
+        .context("suppressing heuristic precision on SCIP-covered files")?;
+
     Ok(result)
 }
 
@@ -366,7 +386,7 @@ mod tests {
             documents: vec![Document {
                 relative_path: "src/g.rs".into(),
                 occurrences: vec![
-                    occ(2, POINT, true),  // struct Point defined at line 3
+                    occ(2, POINT, true),   // struct Point defined at line 3
                     occ(20, POINT, false), // used inside `make` at line 21
                 ],
                 ..Default::default()
@@ -381,7 +401,11 @@ mod tests {
         ];
         let edges = overlay_edges(&index, &ranges);
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].from_symbol_id.as_str(), "S:make", "innermost caller");
+        assert_eq!(
+            edges[0].from_symbol_id.as_str(),
+            "S:make",
+            "innermost caller"
+        );
         assert_eq!(edges[0].to_symbol_id.as_str(), "S:Point");
         assert_eq!(edges[0].kind, EdgeKind::References, "type ref, not a call");
     }
@@ -419,7 +443,10 @@ mod tests {
         assert_eq!(none, ScipOverlayResult::default());
 
         // Seed the structural facts the tree-sitter pass would have produced.
-        for (id, kind) in [("S:caller", NodeKind::RustFunction), ("S:run", NodeKind::RustMethod)] {
+        for (id, kind) in [
+            ("S:caller", NodeKind::RustFunction),
+            ("S:run", NodeKind::RustMethod),
+        ] {
             store
                 .upsert_node(&Node::new(ArtifactId::new(id), kind))
                 .expect("node");
@@ -454,7 +481,15 @@ mod tests {
             .expect("write scip");
 
         let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
-        assert_eq!(res, ScipOverlayResult { scip_files: 1, documents: 2, edges: 1 });
+        assert_eq!(
+            res,
+            ScipOverlayResult {
+                scip_files: 1,
+                documents: 2,
+                edges: 1,
+                suppressed: 0
+            }
+        );
 
         let edges = store
             .list_edges_from(&ArtifactId::new("S:caller"))
@@ -470,8 +505,121 @@ mod tests {
         let again = ingest_scip_overlay(&mut store, repo).expect("re-ingest");
         assert_eq!(again.edges, 1);
         assert_eq!(
-            store.list_edges_from(&ArtifactId::new("S:caller")).unwrap().len(),
+            store
+                .list_edges_from(&ArtifactId::new("S:caller"))
+                .unwrap()
+                .len(),
             1
         );
+    }
+
+    /// SCIP-authoritative gap-fill (ADR-0001 §3.2, D2). On a file SCIP covered,
+    /// a *heuristic-only* edge SCIP did not reproduce (a wrong-overload / false
+    /// positive) is suppressed — SCIP is the single precision source there. On
+    /// a file SCIP never analysed, the heuristic edge survives as gap-fill.
+    #[test]
+    fn ingest_suppresses_heuristic_edges_only_on_scip_covered_files() {
+        use specslice_core::Node;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let mut store = Store::open(repo.join("graph.db")).expect("open store");
+        store.migrate().expect("migrate");
+
+        for (id, kind) in [
+            ("S:caller", NodeKind::RustFunction),
+            ("S:run", NodeKind::RustMethod),
+            ("S:bogus", NodeKind::RustMethod),
+            ("S:g1", NodeKind::RustFunction),
+            ("S:gtarget", NodeKind::RustMethod),
+        ] {
+            store
+                .upsert_node(&Node::new(ArtifactId::new(id), kind))
+                .expect("node");
+        }
+        store
+            .upsert_symbol_range(&range(
+                "covered.rs",
+                "S:caller",
+                8,
+                15,
+                NodeKind::RustFunction,
+            ))
+            .expect("range caller");
+        store
+            .upsert_symbol_range(&range("def.rs", "S:run", 5, 9, NodeKind::RustMethod))
+            .expect("range run");
+
+        // Heuristic precision the in-process resolver produced. On covered.rs it
+        // guessed the WRONG target (S:bogus, not S:run). On gap.rs — a file no
+        // SCIP index covers — it is the only precision we have.
+        let heuristic = |from: &str, to: &str, file: &str| {
+            let mut e = EdgeAssertion::fact(
+                ArtifactId::new(from),
+                ArtifactId::new(to),
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            );
+            e.indexer = Some("rust_treesitter".to_string());
+            e.source_file = Some(file.to_string());
+            e
+        };
+        store
+            .upsert_edge(&heuristic("S:caller", "S:bogus", "covered.rs"))
+            .expect("heur covered");
+        store
+            .upsert_edge(&heuristic("S:g1", "S:gtarget", "gap.rs"))
+            .expect("heur gap");
+
+        // SCIP: Svc#run defined in def.rs, correctly called from covered.rs.
+        const RUN: &str = "rust-analyzer cargo demo 0.1.0 demo/Svc#run().";
+        let index = Index {
+            documents: vec![
+                Document {
+                    relative_path: "def.rs".into(),
+                    occurrences: vec![occ(4, RUN, true)],
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "covered.rs".into(),
+                    occurrences: vec![occ(9, RUN, false)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let scip_dir = repo.join(".specslice").join("scip");
+        std::fs::create_dir_all(&scip_dir).expect("mkdir scip");
+        std::fs::write(scip_dir.join("index.scip"), index.write_to_bytes().unwrap())
+            .expect("write scip");
+
+        let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
+        assert_eq!(res.edges, 1, "one SCIP Calls edge overlaid");
+        assert_eq!(
+            res.suppressed, 1,
+            "the one wrong heuristic edge on covered.rs"
+        );
+
+        let covered = store
+            .list_edges_from(&ArtifactId::new("S:caller"))
+            .expect("covered edges");
+        assert_eq!(
+            covered.len(),
+            1,
+            "wrong heuristic edge gone, only SCIP remains"
+        );
+        assert_eq!(covered[0].to_id.as_str(), "S:run");
+        assert_eq!(covered[0].indexer.as_deref(), Some(RESOLVER_SCIP));
+
+        let gap = store
+            .list_edges_from(&ArtifactId::new("S:g1"))
+            .expect("gap edges");
+        assert_eq!(
+            gap.len(),
+            1,
+            "heuristic gap-fill on the uncovered file survives"
+        );
+        assert_eq!(gap[0].to_id.as_str(), "S:gtarget");
+        assert_eq!(gap[0].indexer.as_deref(), Some("rust_treesitter"));
     }
 }
