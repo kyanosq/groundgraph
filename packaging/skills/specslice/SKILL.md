@@ -105,35 +105,30 @@ specslice-mcp --repo-root /path/to/repo
 ```
 
 `get_subgraph` accepts a `resolvers: [...]` filter
-(`"swift_lsp"`, `"go_lsp"`, `"dart_analyzer"`, …) so an agent can
-restrict expansion to a single language adapter when needed.
+(`"scip"`, `"go_treesitter"`, `"swift_treesitter"`, `"dart_analyzer"`,
+…) so an agent can restrict expansion to a single provenance / adapter
+when needed.
 
-## Python via LSP + AST 补强 (P16)
+## Python via tree-sitter + 启发式（精度交给 SCIP）(P16)
 
-`python.enabled: true` activates the Python adapter. It runs in two
-overlapping passes:
+`python.enabled: true` activates the Python adapter. **LSP 已退役**
+（见 ADR-0001 §8.8）。结构与基线精度都来自进程内 tree-sitter 驱动：
 
-1. **LSP pass (preferred).** Discovery order:
-   `SPECSLICE_PYTHON_LSP_BIN` → `python.lsp_command` →
-   `<repo>/.venv/bin/basedpyright-langserver` →
-   `<repo>/.venv/bin/pyright-langserver` →
-   `<repo>/.venv/bin/pylsp` → same three binaries on PATH. The chosen
-   server gets `--stdio` automatically. Surfaced node kinds:
-   `python_module`, `python_class`, `python_method`, `python_function`.
-   `Calls` / `References` come from `callHierarchy/outgoingCalls` and
-   `textDocument/references`. Edges are tagged
-   `indexer = python_lsp` so callers know the provenance.
-2. **AST pass (always).** A tiny indentation-driven scanner adds the
-   facts no LSP exposes directly:
-   - `Imports` edges (resolved across repo files; unresolvable
-     stdlib / third-party imports drop silently);
-   - pytest `TestCase` / `TestGroup` nodes via `def test_*` and
-     `class Test*`;
-   - structural class / function / method symbols when the LSP pass
-     skipped (no toolchain installed).
-   AST-produced rows carry `indexer = python_ast`.
+1. **结构 + 启发式（始终运行）.** tree-sitter 驱动产出节点
+   （`python_module` / `python_class` / `python_method` /
+   `python_function`）、`Imports`（跨 repo 文件解析；无法解析的
+   stdlib / 第三方导入静默丢弃）、pytest `TestCase` / `TestGroup`
+   （`def test_*` 与 `class Test*`），以及**启发式 `Calls` /
+   `References`**（按调用标识符就近匹配）。所有行标
+   `indexer = python_treesitter`，resolver 即 `python_treesitter`。
+2. **SCIP 精度叠加（有 indexer 时）.** 若 `scip-python` 在 PATH，
+   `specslice index` 会自动调用它产出 `.specslice/scip/python.scip`，
+   overlay 在覆盖文件上用高可信 SCIP 边**取代**同名启发式边
+   （§8.8「权威 + 补空」）。**上游限制**：实测 `scip-python`（0.6.6）
+   对样例仓库产出空索引（0 documents），因此 Python 目前**多由启发式
+   独撑**；待上游修复后自动恢复 SCIP 权威，无需改配置。
 
-`specslice index` reports both Python files, pytest tests, and the
+`specslice index` reports Python files, pytest tests, and the
 P17 framework entrypoint count:
 
 ```
@@ -143,29 +138,22 @@ Python index:
   TestCases: 272
   Imports: 662
   Framework entrypoints: 45
-  Resolver: python_ast
-  LSP skipped: 无法启动 python LSP `pylsp`：spawning LSP server `pylsp`
+  References (heuristic): 540
+  Resolver: python_treesitter
 ```
 
-When `Resolver: python_ast` appears the LSP server was unavailable —
-read the `LSP skipped` line for the exact reason
-(missing binary, venv override mismatched, broken shebang interpreter,
-etc.). The validated atagent FastAPI backend hit exactly this branch
-because its `pylsp` script pointed at a deleted Anaconda interpreter;
-the AST pass still produced a usable graph including all 45 framework
-entrypoints.
-
-Python `Calls` should be treated as a *line, not a fact*. The agent
-should cross-check with the surrounding AST scanner output and the
-P17 framework facts before claiming a function is unused or
-unreachable.
+Python 启发式 `Calls` should be treated as a *line, not a fact* —
+unless that file is covered by a SCIP overlay (then it is authoritative,
+tagged `indexer = scip`). The agent should cross-check with the
+surrounding structural output and the P17 framework facts before
+claiming a function is unused or unreachable.
 
 ## Framework facts (P17)
 
-Decorator-based entry points are detected during the AST pass and
-recorded as `metadata_json` on the wrapped symbol. The detection is
-purely structural (no LSP required) and covers the most common
-Python application frameworks:
+Decorator-based entry points are detected during the tree-sitter
+structural pass and recorded as `metadata_json` on the wrapped symbol.
+The detection is purely structural (no LSP required) and covers the
+most common Python application frameworks:
 
 - **FastAPI / Starlette / APIRouter** routes — `@router.get(...)`,
   `@app.post(...)`, `@app.websocket(...)`, `@app.api_route(...)`,
@@ -205,40 +193,46 @@ For every framework-decorated symbol, two surfaces light up:
    Agents and humans can spot framework entry points at a glance
    without re-parsing the underlying `metadata_json`.
 
-## Swift / Go via LSP (P11–P15)
+## Swift via LSP (P11–P15) — 唯一保留 LSP 的语言
 
-When `swift.enabled: true` (or `go.enabled: true`) is set in
-the root `.specslice.yaml`, the indexer drives `sourcekit-lsp` /
-`gopls` over LSP and surfaces:
+Swift 缺乏成熟 SCIP indexer，是**唯一**保留实时 LSP 的语言。
+当 `swift.enabled: true` 时，indexer 用 tree-sitter 产出结构
+（`swift_class`、`swift_struct`、`swift_protocol`、`swift_method`、
+`swift_function`、`swift_initializer`、`swift_enum`），再用
+`sourcekit-lsp` overlay 叠加：
 
-- file + symbol nodes (`swift_class`, `swift_struct`,
-  `swift_protocol`, `swift_method`, `swift_function`,
-  `swift_initializer`, `swift_enum`; `go_struct`, `go_interface`,
-  `go_method`, `go_function`);
-- `EdgeKind::Calls` from `callHierarchy/outgoingCalls`. Edge
-  evidence (`source_file` / call line) points at the caller-side
-  `fromRanges`, i.e. the actual call site, not the callee
-  declaration;
-- `EdgeKind::References` from `textDocument/references`.
+- `EdgeKind::Calls`（`callHierarchy/outgoingCalls`）。边证据
+  （`source_file` / 调用行）指向调用方的 `fromRanges`（真实调用点，
+  而非被调用者声明处）；
+- `EdgeKind::References`（`textDocument/references`）。
 
-If the server is missing, the indexer skips silently and
-reports the reason via `result.sidecar_skip_reason`. Always check
-that field before claiming Swift / Go data is present.
+LSP 缺失时静默跳过并把原因写入 `result.sidecar_skip_reason`。
+CLI 这一段仍显示 `References (LSP)` / `LSP skipped`（仅 Swift）。
 
-## TypeScript / Java via LSP + AST 补强 (P20)
+## Go via tree-sitter + 启发式（精度交给 SCIP）
+
+Go 的 **LSP（gopls）已退役**（ADR-0001 §8.8）。`go.enabled: true` 时
+indexer 用 tree-sitter 产出结构（`go_struct`、`go_interface`、
+`go_method`、`go_function`）+ `Imports` + 启发式 `Calls` /
+`References`（`indexer = go_treesitter`）。若 `scip-go` 在 PATH，
+`specslice index` 自动调用产出 `.specslice/scip/go.scip`，overlay 在覆盖
+文件上以高可信 SCIP 边取代启发式边（已实测 Go✓）。CLI 显示
+`References (heuristic)`，无 `References (LSP)` / `LSP skipped`。
+
+## TypeScript / Java via tree-sitter + 启发式（精度交给 SCIP）(P20)
 
 `typescript.enabled: true` and `java.enabled: true` activate the
-TypeScript and Java adapters. Both follow the same shape as Python:
+TypeScript and Java adapters. **两者的 LSP（typescript-language-server /
+jdtls）均已退役**（ADR-0001 §8.8）。结构与基线精度都来自 tree-sitter：
 
-- **LSP-first**: TypeScript drives `typescript-language-server --stdio`
-  (auto-detected at `node_modules/.bin/typescript-language-server`,
-  PATH, or `SPECSLICE_TYPESCRIPT_LSP_BIN`); Java drives `jdtls`
-  (PATH or `SPECSLICE_JAVA_LSP_BIN`). The LSP pass contributes
-  structural nodes + `Calls` / `References`.
-- **AST always**: a tolerant in-house scanner runs alongside, contributing
-  `Imports` and test cases unconditionally, plus structural symbols when
-  the LSP is unavailable. AST rows are tagged `indexer = typescript_ast`
-  / `indexer = java_ast`; LSP rows are `typescript_lsp` / `java_lsp`.
+- **结构 + 启发式（始终运行）**：tree-sitter 驱动产出结构节点 +
+  `Imports` + 测试用例 + 启发式 `Calls` / `References`。TypeScript
+  同时覆盖 `.ts`/`.tsx`/`.js`/`.jsx`/`.vue` 双方言；行标
+  `indexer = typescript_treesitter` / `java_treesitter`。
+- **SCIP 精度叠加（有 indexer 时）**：`scip-typescript`（已实测 TS✓）/
+  `scip-java` 在 PATH 时由 `specslice index` 自动调用，overlay 在覆盖
+  文件上以高可信 SCIP 边取代启发式边。CLI 显示 `References (heuristic)`，
+  无 `References (LSP)` / `LSP skipped`。
 
 Node kinds:
 
@@ -260,36 +254,30 @@ Test recovery:
   `@RepeatedTest`, `@TestFactory`, `@TestTemplate`, or `@Theory`
   become `TestCase`.
 
-TypeScript / Java `Calls` should be treated the same way as Python
-`Calls`: a *line, not a fact*. The AST pass never synthesizes
-`Calls` edges. Always check `result.resolver_used` and
-`result.sidecar_skip_reason` before claiming LSP-quality data is
-present.
+TypeScript / Java 启发式 `Calls` should be treated the same way as
+Python: a *line, not a fact* — unless the file is covered by a SCIP
+overlay (then authoritative, `indexer = scip`). Always check
+`result.resolver_used` (`*_treesitter`) and whether the `SCIP overlay`
+section appeared in `specslice index` output before claiming
+SCIP-quality precision is present.
 
-## Unified LSP probe (P20 close-out, batch 2)
+## Unified LSP probe（仅 Swift）
 
-Every language adapter answers "is this LSP binary actually runnable
-on this host?" through the same gate: `specslice_engine::lsp_probe::
-probe_lsp_command(command, args, timeout)`. The probe spawns the
-binary, gives it `DEFAULT_TIMEOUT` (1500ms) to exit 0 from
-`--help`, drains stderr (4 KiB cap), and rejects the binary if any
-broken-stub marker appears: `bad interpreter`, `no such file or
-directory`, `no module named`, `cannot execute`, `command not
-found`, `SOURCEKITD FATAL ERROR`, `could not load`, `no java
-runtime`, `JAVA_HOME is not set`, or `node: command not found`.
-This catches the real-world failure modes operators hit during
-v0.2.0 close-out — a `pylsp` whose shebang resolves to a deleted
-Anaconda, a `sourcekit-lsp` that crashes IndexStoreDB on init, a
-`jdtls` with no JRE on PATH — *before* the indexer starts a stdio
-session that never finishes initialise.
+LSP 退役后，唯一仍走 LSP 的 Swift 仍通过统一探针确认
+「这个 LSP 二进制在本机真的能跑吗？」：`specslice_engine::lsp_probe::
+probe_lsp_command(command, args, timeout)`。探针启动二进制、给
+`DEFAULT_TIMEOUT`（1500ms）让其从 `--help` 退出 0、抽取 stderr
+（4 KiB 上限），出现 broken-stub 标记即拒绝：`bad interpreter`、
+`no such file or directory`、`cannot execute`、`command not found`、
+`SOURCEKITD FATAL ERROR`、`could not load` 等。这能在 indexer 真正开 stdio
+会话前拦截「`sourcekit-lsp` 初始化即崩 IndexStoreDB」之类故障。
 
-`swift_lsp_available`, `go_lsp_available`, `typescript_lsp_available`,
-`java_lsp_available`, and `python_lsp_available` all chain
-`binary_on_path` → `probe_lsp_command(…).is_runnable()`. The
-opt-in LSP smoke tests further convert `index_<lang>(…) → Err` into
-a soft-skip with an `eprintln!` diagnostic, so `cargo test
---include-ignored` is green regardless of whether the operator's
-local LSP is healthy.
+`swift_lsp_available` 链 `binary_on_path` →
+`probe_lsp_command(…).is_runnable()`；opt-in 的 Swift LSP smoke 测试
+（`tests/lsp_indexers.rs`，`#[ignore]`）把 `index_swift(…) → Err` 转为
+带 `eprintln!` 的 soft-skip，使 `cargo test --include-ignored` 不因本机
+LSP 状态变红。go/python/ts/java 的 `*_lsp_available` / `*_LSP_COMMAND_ENV`
+已随 LSP 退役删除。
 
 ## Cross-language consistency (P20)
 
@@ -495,10 +483,12 @@ Every edge in `specslice graph --format json` now carries an
 - **high** — `Contains`, `Imports`, `Documents` (Markdown),
   `DeclaresImplementation` / `DeclaresVerification`, and any
   `Calls` / `References` / `ReadsProvider` / `NavigatesTo` /
-  `PersistsTo` / `SubscribesStream` resolved by an LSP (`*_lsp`
-  indexer) or Dart analyzer.
-- **medium** — AST-only `Calls` / `References` (`*_ast` indexer);
-  unknown combinations.
+  `PersistsTo` / `SubscribesStream` resolved by **offline SCIP**
+  (`scip` / `scip:<lang>` indexer — the primary precision source),
+  the Swift LSP (`*_lsp`), or the Dart analyzer (`dart_analyzer`).
+- **medium** — heuristic `Calls` / `References` from the tree-sitter
+  driver (`*_treesitter` indexer; near-match by call identifier) or
+  legacy `*_ast` rows; unknown combinations.
 - **low** — AI-derived `DerivesFrom`, GitDiff edges, anything
   with `EdgeStatus::Deprecated`.
 
@@ -571,7 +561,9 @@ Rules:
 `specslice features` clusters File / Module / Class nodes into
 "functional areas" by walking Contains / Imports / Calls /
 References edges from framework-anchored seeds. Output is a
-heuristic — improve it by indexing with LSP enabled.
+heuristic — improve it by installing the language's SCIP indexer
+(`scip-go` / `scip-typescript` / `rust-analyzer` / …) so the
+`Calls` / `References` edges become SCIP-authoritative.
 
 ```bash
 specslice features

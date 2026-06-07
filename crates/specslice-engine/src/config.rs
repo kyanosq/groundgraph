@@ -41,25 +41,35 @@ pub struct EngineConfig {
     /// `lsp_command` at a specific binary.
     #[serde(default)]
     pub swift: LanguageAdapterConfig,
-    /// P11 — opt-in Go language adapter driven by `gopls`. Same
-    /// semantics as `swift`.
+    /// P11 — opt-in Go language adapter. The LSP tier (`gopls`) was
+    /// **retired** (ADR-0001 §8.8): structure + heuristic Calls/References
+    /// come from the in-process tree-sitter driver, and precision comes
+    /// from the offline SCIP overlay (`scip-go`, auto-invoked by `index`).
+    /// The shared `lsp_command` field is ignored.
     #[serde(default)]
     pub go: LanguageAdapterConfig,
-    /// P16 — opt-in Python language adapter. Drives `pyright-langserver`
-    /// / `basedpyright-langserver` / `pylsp` (with venv auto-discovery)
-    /// for structural symbols + Calls/References, and unconditionally
-    /// runs the AST scanner for imports + pytest cases. When LSP is
-    /// unavailable the AST scanner takes over the structural pass.
+    /// P16 — opt-in Python language adapter. The LSP tier (pyright /
+    /// pylsp) was **retired** (ADR-0001 §8.8): the tree-sitter driver owns
+    /// structure + imports + pytest cases + heuristic Calls/References;
+    /// precision comes from the SCIP overlay (`scip-python`, auto-invoked).
+    /// The shared `lsp_command` field is ignored. NOTE: `scip-python` is
+    /// currently broken upstream (empty index), so Python relies on the
+    /// heuristic baseline until that is fixed.
     #[serde(default)]
     pub python: LanguageAdapterConfig,
-    /// P20 — opt-in TypeScript adapter driven by
-    /// `typescript-language-server --stdio`. AST 补强 always runs for
-    /// import edges + jest/vitest test cases regardless of LSP state.
+    /// P20 — opt-in TypeScript adapter. The LSP tier
+    /// (`typescript-language-server`) was **retired** (ADR-0001 §8.8): the
+    /// tree-sitter driver owns structure + imports + jest/vitest cases +
+    /// heuristic Calls/References across `.ts`/`.tsx`/`.js`/`.vue`;
+    /// precision comes from the SCIP overlay (`scip-typescript`,
+    /// auto-invoked). The shared `lsp_command` field is ignored.
     #[serde(default)]
     pub typescript: LanguageAdapterConfig,
-    /// P20 — opt-in Java adapter driven by `jdtls`. AST 补强 always
-    /// runs for package declarations + JUnit test methods regardless
-    /// of LSP state.
+    /// P20 — opt-in Java adapter. The LSP tier (`jdtls`) was **retired**
+    /// (ADR-0001 §8.8): the tree-sitter driver owns structure + package
+    /// declarations + JUnit cases + heuristic Calls/References; precision
+    /// comes from the SCIP overlay (`scip-java`). The shared `lsp_command`
+    /// field is ignored.
     #[serde(default)]
     pub java: LanguageAdapterConfig,
     /// P21 — Rust adapter, the first **tree-sitter breadth backend**.
@@ -89,11 +99,15 @@ pub struct EngineConfig {
     #[serde(default)]
     pub languages: Vec<LanguageSelection>,
     /// P23.7 — how the structural graph is *enriched*. Applies only when
-    /// `languages` is set. `lsp` (default `true`) routes LSP-capable
-    /// languages through their Tier-3 adapter (tree-sitter structure +
-    /// optional `Calls`/`References` overlay); when `false` they index via
-    /// the structure-only generic driver. `analyzer` (default `true`)
-    /// controls the Dart analyzer overlay.
+    /// `languages` is set. `lsp` (default `true`) now affects **Swift
+    /// only** — the sole language retaining an LSP overlay (sourcekit-lsp);
+    /// go/python/ts/java retired their LSP (ADR-0001 §8.8) and take
+    /// precision from the SCIP overlay instead, so for them `lsp` toggles
+    /// nothing beyond routing through the (structure-identical) dedicated
+    /// adapter vs the generic driver. `scip` (default `true`) controls the
+    /// offline SCIP overlay (the primary precision source for all
+    /// non-Swift languages). `analyzer` (default `true`) controls the Dart
+    /// analyzer overlay.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
 }
