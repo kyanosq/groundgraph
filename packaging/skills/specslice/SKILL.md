@@ -52,7 +52,13 @@ specslice --repo-root /path/to/repo init
 specslice --repo-root /path/to/repo index
 ```
 
-If Dart analyzer sidecar is available, confirm whether output says `resolver=dart_analyzer`; otherwise report the fallback reason.
+If Dart analyzer sidecar is available, confirm whether output says `resolver=dart_analyzer`; otherwise report the fallback reason. The
+analyzer sidecar is Dart's **authoritative** precision source — it emits
+Dart-domain semantic edges (Riverpod / Hive / navigation / IAP) that
+generic SCIP cannot. `scip_dart` is verified working and auto-invoked
+**only when the sidecar is disabled** (`enrichment.analyzer=false`),
+where it upgrades the `dart_lightweight` heuristic `Calls`/`References`
+to SCIP precision (ADR-0001 §8.8 (f)).
 
 3. Check graph consistency:
 

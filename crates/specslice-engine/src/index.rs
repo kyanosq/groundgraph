@@ -412,7 +412,15 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 /// an auto-invoke spec (e.g. `swift`, `java`, `c`, `cpp`).
 fn indexed_languages(config: &EngineConfig) -> Vec<String> {
     let mut langs: Vec<String> = Vec::new();
-    if !config.code.paths.is_empty() {
+    // Dart is special: its bespoke analyzer sidecar (`dart_analyzer`) is the
+    // authoritative precision source — it emits Dart-domain semantic edges
+    // (Riverpod / Hive / navigation / IAP) that generic SCIP cannot, *and*
+    // supplies high-confidence Calls/References. Auto-invoking `scip_dart`
+    // alongside it would make the overlay suppress the sidecar's
+    // Calls/References in favour of scip's generic ones. So `scip_dart` only
+    // fills the gap when the sidecar is disabled (`enrichment.analyzer=false`),
+    // upgrading the `dart_lightweight` heuristic to SCIP precision.
+    if !config.code.paths.is_empty() && !config.enrichment.analyzer {
         langs.push("dart".to_string());
     }
     if config.swift.enabled {
@@ -439,4 +447,46 @@ fn indexed_languages(config: &EngineConfig) -> Vec<String> {
         }
     }
     langs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+
+    fn dart_config(analyzer: bool) -> EngineConfig {
+        let mut cfg = EngineConfig::default();
+        cfg.code.paths = vec!["lib".to_string()];
+        cfg.enrichment.analyzer = analyzer;
+        cfg
+    }
+
+    #[test]
+    fn dart_scip_autoinvoke_skipped_when_analyzer_sidecar_active() {
+        // The Dart analyzer sidecar is richer than generic SCIP (it emits
+        // Riverpod / Hive / navigation / IAP domain edges SCIP has no concept
+        // of) AND already supplies high-confidence Calls/References. Letting
+        // `scip_dart` also run would make the overlay suppress the sidecar's
+        // Calls/References in favour of scip's generic ones — a regression of
+        // Dart's authoritative source. So when the sidecar is active we must
+        // NOT auto-invoke `scip_dart`.
+        let langs = indexed_languages(&dart_config(true));
+        assert!(
+            !langs.contains(&"dart".to_string()),
+            "scip_dart must not auto-invoke while the analyzer sidecar is authoritative: {langs:?}"
+        );
+    }
+
+    #[test]
+    fn dart_scip_autoinvoke_enabled_when_analyzer_sidecar_disabled() {
+        // With the sidecar off, Dart falls back to the `dart_lightweight`
+        // heuristic; `scip_dart` then fills the precision gap (verified: it
+        // upgrades the heuristic Calls/References to SCIP). So it SHOULD be
+        // auto-invoked.
+        let langs = indexed_languages(&dart_config(false));
+        assert!(
+            langs.contains(&"dart".to_string()),
+            "scip_dart should fill the precision gap when the sidecar is disabled: {langs:?}"
+        );
+    }
 }

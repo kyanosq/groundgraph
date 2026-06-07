@@ -222,6 +222,23 @@ SCIP overlay:
 
 **(e) 回归。** LSP 退役后全量测试绿：`specslice-engine` lib 511、`specslice-cli` bins 45、集成测试（`lsp_indexers.rs` 重写为「Swift LSP 契约 + go/py/ts/java 结构契约」）全部通过；`index` / overlay 重跑计数稳定（幂等）。
 
+**(f) Dart：scip-dart 验证可用，但 analyzer sidecar 仍为权威（第二个例外）。** `scip_dart`（pub 全局包 1.6.2）实测可在已 `pub get` 的 Dart 项目上一次性产出有效 `index.scip`。本仓 `tool/specslice_dart_analyzer` 验证（`enrichment.analyzer=false`，真实输出）：
+
+```
+Code index:
+  Resolver: dart_lightweight
+  Sidecar skipped: dart analyzer disabled by config (enrichment.analyzer=false)
+SCIP indexers:
+  dart: generated
+SCIP overlay:
+  Edges: 65
+  Suppressed (heuristic): 63
+```
+
+即 scip_dart 能把 `dart_lightweight` 启发式精度升级为 SCIP（63 条启发式被压制、65 条 SCIP 取代）。**但它不能替换 `dart_analyzer` sidecar**：sidecar（`tool/specslice_dart_analyzer` 的 `walker.dart`）基于 `package:analyzer` 产出 Dart 领域语义边（Riverpod `ReadsProvider`、Hive `PersistsTo`、导航 `NavigatesTo`、流 `SubscribesStream`、IAP / 框架入口），这些是通用 SCIP **没有概念**的；且 sidecar 已用同一 analyzer 引擎给出高可信 `Calls`/`References`。**决策（Dart 第二例外，类比但强于 Swift）**：Dart 精度以 analyzer sidecar 为权威；`scip_dart` 自动调用被**门控**为「仅当 `enrichment.analyzer=false`（sidecar 关闭）时运行」——否则 overlay 的压制会把 sidecar 的 `Calls`/`References` 换成 scip 的通用版本，属退化。门控落点 `index.rs::indexed_languages`，TDD：`dart_scip_autoinvoke_skipped_when_analyzer_sidecar_active` / `dart_scip_autoinvoke_enabled_when_analyzer_sidecar_disabled`。
+
+至此 R2 各语言落点收敛为：**Rust / Go / TS = SCIP 权威 + 启发式补空；Java = 待 `scip-java`（暂启发式）；Python = `scip-python` 上游损坏（暂启发式）；Swift = sourcekit-lsp 例外；Dart = analyzer sidecar 例外（scip_dart 仅在 sidecar 关时补空）。**
+
 ## 9. 参考
 
 - SCIP 协议与 `scip` Rust crate（Sourcegraph）。

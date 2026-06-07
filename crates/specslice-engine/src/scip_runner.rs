@@ -65,6 +65,12 @@ const SPECS: &[IndexerSpec] = &[
         args: &["index", "--cwd", "{root}", "--output", "{out}"],
         writes_cwd_index: false,
     },
+    // Dart's `scip_dart` ignores `--output` and writes `index.scip` into the
+    // cwd, so `writes_cwd_index` moves it to the destination. NOTE: the caller
+    // (`index.rs::indexed_languages`) only asks for "dart" when the analyzer
+    // sidecar is disabled — the sidecar is Dart's authoritative precision
+    // source (richer than generic SCIP), so scip_dart only fills the gap when
+    // it is off (ADR-0001 §8.8 (f)).
     IndexerSpec {
         language: "dart",
         binary: "scip_dart",
