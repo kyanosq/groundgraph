@@ -49,6 +49,7 @@ pub mod python_indexer;
 pub mod python_treesitter;
 pub mod questions;
 pub mod requirements_md_indexer;
+pub mod route_coverage;
 pub mod rust_indexer;
 pub mod rust_treesitter;
 pub mod schema_indexer;

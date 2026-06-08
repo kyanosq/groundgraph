@@ -96,6 +96,12 @@ enum Commands {
     /// 跟踪「还差哪些没移植」。
     #[command(name = "port-coverage")]
     PortCoverage(PortCoverageArgs),
+    /// 路由移植覆盖率 (P26) — 按规范化路由路径对比「消费方」(客户端 graph.db)
+    /// 与「服务端」(重写方 graph.db) 的 http_route，报告已服务 / 缺失 / 服务端
+    /// 独有，并按服务(路径首段)给出覆盖率。回答「客户端要的接口，重写后端还差
+    /// 哪些没实现」。匹配键默认取末 2 段(controller/action)以容忍网关前缀差异。
+    #[command(name = "route-coverage")]
+    RouteCoverage(RouteCoverageArgs),
     /// 业务图等价 (P24+) — 把「同一业务切片」在源/目标两份 graph.db 中按
     /// 路径 glob 圈定，量化对比节点数(按种类/家族)、内部边数、名称覆盖率。
     /// JSON 输出可喂给 AI 逐子图遍历、逐项审查差异，用数字证明「Go 等价替代
@@ -238,6 +244,32 @@ struct PortCoverageArgs {
     #[arg(long = "source-exclude", value_name = "GLOB")]
     source_exclude: Vec<String>,
     /// 列表长度上限（0 = 不限）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max: usize,
+    /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct RouteCoverageArgs {
+    /// 消费方(客户端)的 graph.db 路径——这些路由「必须」被服务端实现。
+    #[arg(long, value_name = "PATH")]
+    source_db: PathBuf,
+    /// 服务端(重写方)的 graph.db 路径——实际提供的路由。
+    #[arg(long, value_name = "PATH")]
+    target_db: PathBuf,
+    /// 匹配键取路由末 N 段(0 = 整条路径)。默认 2 = controller/action，
+    /// 容忍网关前缀差异，又不至于退化成易碰撞的纯动作名。
+    #[arg(long, value_name = "N", default_value_t = specslice_engine::route_coverage::DEFAULT_SUFFIX_SEGMENTS)]
+    suffix_segments: usize,
+    /// 额外列出服务端独有(无消费方)的路由。
+    #[arg(long)]
+    include_extra: bool,
+    /// 两侧都排除的路由路径 glob(可重复，如 `/token/**`)。
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+    /// 列表长度上限(0 = 不限)。
     #[arg(long, value_name = "N", default_value_t = 0)]
     max: usize,
     /// 输出 JSON。
@@ -1029,6 +1061,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Constants(_) => "constants",
         Commands::Contract(_) => "contract",
         Commands::PortCoverage(_) => "port-coverage",
+        Commands::RouteCoverage(_) => "route-coverage",
         Commands::GraphEquiv(_) => "graph-equiv",
         Commands::SchemaIndex(_) => "schema-index",
         Commands::SuggestTests(_) => "suggest-tests",
@@ -1322,6 +1355,18 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 exclude: args.exclude,
                 source_include: args.source_include,
                 source_exclude: args.source_exclude,
+                max: args.max,
+                json: args.json,
+            })
+            .map(|()| 0)
+        }
+        Commands::RouteCoverage(args) => {
+            commands::route_coverage::run(commands::route_coverage::RouteCoverageRunArgs {
+                source_db: args.source_db,
+                target_db: args.target_db,
+                suffix_segments: args.suffix_segments,
+                include_extra: args.include_extra,
+                exclude: args.exclude,
                 max: args.max,
                 json: args.json,
             })
