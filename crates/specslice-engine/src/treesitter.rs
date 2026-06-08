@@ -202,6 +202,29 @@ type ResolveImportFn = fn(&str, &str, &[String], &[String]) -> Option<String>;
 /// path (Rust `Type::assoc`). Returns empty for languages that have not
 /// opted into the heuristic call resolver. Default [`no_call_idents`].
 type CallIdentsFn = for<'a, 'b> fn(tree_sitter::Node<'a>, &'b [u8]) -> Vec<(String, RefKind)>;
+/// Decide whether a spec owns a discovered file by *content*, used only to
+/// split an extension shared between dialects (`.h` is claimed by both C and
+/// C++). Receives `(relative_path, head_of_file)` and returns whether THIS
+/// spec should parse it. `None` on [`LangSpec::claims_path`] = own every file
+/// whose extension matches (the default for every single-dialect language).
+type PathClaimFn = fn(&str, &str) -> bool;
+
+/// Heuristic: does this header text carry C++-only constructs? Used to route a
+/// `.h` file (claimed by both C and C++) to the right grammar. Keyed on signals
+/// the C grammar can never produce — scope resolution `::`, `namespace`,
+/// `template<…>`, access-specifier labels, and `class …` declarations — so a
+/// plain C header (structs / typedefs / functions only) reads as C while a
+/// header-only C++ library reads as C++.
+pub(crate) fn looks_like_cpp(head: &str) -> bool {
+    head.contains("::")
+        || head.contains("namespace ")
+        || head.contains("template<")
+        || head.contains("template <")
+        || head.contains("public:")
+        || head.contains("private:")
+        || head.contains("protected:")
+        || head.contains("class ")
+}
 
 /// Everything the generic driver needs to index one language.
 pub struct LangSpec {
@@ -308,6 +331,12 @@ pub struct LangSpec {
     /// value is an object literal, which would otherwise strand the methods two
     /// levels down (`variable_declarator → object → method_definition`).
     pub recurse_declined_callables: bool,
+    /// Content gate for an extension shared between dialects. `None` (the
+    /// default) means "own every file whose extension matches". C and C++ set
+    /// this to split the shared `.h`: C claims a header only when it does *not*
+    /// look like C++, C++ claims it only when it does — so exactly one parser
+    /// owns each header and nothing is double-indexed.
+    pub claims_path: Option<PathClaimFn>,
 }
 
 /// Default [`LangSpec::call_idents_of`]: capture nothing. Languages that
@@ -1137,6 +1166,7 @@ fn index_repo_with_spec_impl(
         &options.exclude_globs,
         spec.extensions,
         spec.skip_dirs,
+        spec.claims_path,
     )?;
     if files.is_empty() {
         return Ok((TsIndexResult::default(), RefResolutionInputs::default()));
@@ -1564,11 +1594,38 @@ pub fn discover_relative_paths(
     skip_dirs: &[&str],
 ) -> Result<Vec<String>> {
     Ok(
-        discover_files(repo_root, code_roots, exclude_globs, extensions, skip_dirs)?
-            .into_iter()
-            .map(|f| f.relative)
-            .collect(),
+        discover_files(
+            repo_root,
+            code_roots,
+            exclude_globs,
+            extensions,
+            skip_dirs,
+            None,
+        )?
+        .into_iter()
+        .map(|f| f.relative)
+        .collect(),
     )
+}
+
+/// How many leading bytes of a file a [`PathClaimFn`] sniffs. Generous enough
+/// to clear license headers / includes and reach the first declaration, small
+/// enough to stay cheap.
+const CLAIM_SNIFF_BYTES: usize = 8192;
+
+/// Read up to `max` bytes from a file as lossy UTF-8. Returns an empty string
+/// on any I/O error — a file we cannot read claims nothing, which keeps
+/// discovery total and panic-free.
+fn read_head(path: &Path, max: usize) -> String {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = vec![0u8; max];
+    match f.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 fn discover_files(
@@ -1577,6 +1634,7 @@ fn discover_files(
     exclude_globs: &[String],
     extensions: &[&str],
     skip_dirs: &[&str],
+    claims_path: Option<PathClaimFn>,
 ) -> Result<Vec<DiscoveredFile>> {
     let mut out: Vec<DiscoveredFile> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -1615,6 +1673,16 @@ fn discover_files(
                 .any(|g| crate::lsp_indexer::simple_glob_match(g, &rel))
             {
                 continue;
+            }
+            // Content gate for dialects that share an extension (C/C++ `.h`):
+            // sniff the file head and let the spec disown a file it shouldn't
+            // parse. Only invoked when a spec opts in, so single-dialect
+            // languages pay no extra I/O.
+            if let Some(claims) = claims_path {
+                let head = read_head(path, CLAIM_SNIFF_BYTES);
+                if !claims(&rel, &head) {
+                    continue;
+                }
             }
             if !seen.insert(rel.clone()) {
                 continue;

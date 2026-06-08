@@ -172,6 +172,58 @@ fn unified_languages_typescript_indexes_js_and_vue_without_lsp() {
     );
 }
 
+/// Regression: `.h` is shared between C and C++. A header carrying C++
+/// constructs (`namespace` / `class` / `::`) must be parsed by the C++ grammar,
+/// not silently handed to the C parser (which drops every C++ declaration).
+/// A plain C header (no C++ signals) must still route to C. Before the fix,
+/// `.h` was owned exclusively by `C_SPEC`, so header-only C++ libraries indexed
+/// zero classes/methods.
+#[test]
+fn cpp_header_h_is_routed_to_cpp_not_c() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // A C++ header (very common to use `.h`, not `.hpp`).
+    write(
+        root,
+        "src/widget.h",
+        "namespace ui {\n  class Widget {\n  public:\n    int area() const { return 0; }\n  };\n}\n",
+    );
+    // A genuine C header must stay with the C parser.
+    write(root, "src/legacy.h", "struct CBuf { int len; };\n");
+
+    enable_treesitter(root, "c, cpp");
+    let _ = index(root);
+
+    let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    store.migrate().unwrap();
+    let nodes = store.list_all_nodes().unwrap();
+    let has = |kind: NodeKind, name: &str| {
+        nodes
+            .iter()
+            .any(|n| n.kind == kind && n.name.as_deref() == Some(name))
+    };
+
+    // C++ header → C++ symbols recovered.
+    assert!(
+        has(NodeKind::CppNamespace, "ui"),
+        "C++ namespace in .h must be indexed by the C++ parser"
+    );
+    assert!(
+        has(NodeKind::CppClass, "Widget"),
+        "C++ class in .h must be indexed by the C++ parser"
+    );
+    assert!(
+        has(NodeKind::CppMethod, "area"),
+        "C++ method in .h must be indexed by the C++ parser"
+    );
+    // Plain C header → still owned by C.
+    assert!(
+        has(NodeKind::CStruct, "CBuf"),
+        "a plain C .h header must still route to the C parser"
+    );
+}
+
 #[test]
 fn unknown_languages_are_skipped_not_fatal() {
     let tmp = tempfile::tempdir().unwrap();

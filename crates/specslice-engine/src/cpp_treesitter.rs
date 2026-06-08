@@ -161,7 +161,7 @@ fn cpp_callee_name(func: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
 pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     language_id: "cpp",
     grammar: cpp_language,
-    extensions: &["cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp"],
+    extensions: &["cpp", "cc", "cxx", "hpp", "hh", "hxx", "ipp", "h"],
     skip_dirs: &[".git", "build", "cmake-build-debug", "node_modules"],
     separator: "::",
     func_kind: NodeKind::CppFunction,
@@ -186,7 +186,20 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     call_idents_of: cpp_call_idents,
     module_scoped_resolution: false,
     recurse_declined_callables: false,
+    // `.h` is shared with C: claim a header only when it carries C++ constructs
+    // (`namespace` / `class` / `::` / templates / access specifiers). The
+    // C++-only extensions (`.hpp`, `.cpp`, …) always read true.
+    claims_path: Some(cpp_claims_path),
 };
+
+/// [`LangSpec::claims_path`] for C++: own every C++-extension file, and own a
+/// `.h` only when its head looks like C++ (otherwise it is a plain C header).
+fn cpp_claims_path(rel: &str, head: &str) -> bool {
+    if rel.ends_with(".h") {
+        return crate::treesitter::looks_like_cpp(head);
+    }
+    true
+}
 
 #[cfg(test)]
 mod tests {

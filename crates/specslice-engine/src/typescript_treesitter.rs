@@ -358,6 +358,7 @@ const fn ts_family_spec(
         call_idents_of: ts_call_idents,
         module_scoped_resolution: false,
         recurse_declined_callables: true,
+        claims_path: None,
     }
 }
 

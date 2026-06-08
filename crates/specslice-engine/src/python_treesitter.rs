@@ -368,6 +368,7 @@ pub(crate) static PYTHON_SPEC: LangSpec = LangSpec {
     call_idents_of: py_call_idents,
     module_scoped_resolution: false,
     recurse_declined_callables: false,
+    claims_path: None,
 };
 
 #[cfg(test)]

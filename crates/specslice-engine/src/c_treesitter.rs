@@ -146,7 +146,19 @@ pub(crate) static C_SPEC: LangSpec = LangSpec {
     call_idents_of: c_call_idents,
     module_scoped_resolution: false,
     recurse_declined_callables: false,
+    // `.h` is shared with C++: claim a header only when it does NOT look like
+    // C++ (no `namespace` / `class` / `::`). A `.c` file always reads true.
+    claims_path: Some(c_claims_path),
 };
+
+/// [`LangSpec::claims_path`] for C: own every `.c`, and own a `.h` only when it
+/// carries no C++ constructs (those headers belong to the C++ parser).
+fn c_claims_path(rel: &str, head: &str) -> bool {
+    if rel.ends_with(".h") {
+        return !crate::treesitter::looks_like_cpp(head);
+    }
+    true
+}
 
 #[cfg(test)]
 mod tests {

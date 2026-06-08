@@ -476,6 +476,7 @@ pub(crate) static SWIFT_SPEC: LangSpec = LangSpec {
     // bare type/constructor name resolves module-wide (unique-file only).
     module_scoped_resolution: true,
     recurse_declined_callables: false,
+    claims_path: None,
 };
 
 #[cfg(test)]
