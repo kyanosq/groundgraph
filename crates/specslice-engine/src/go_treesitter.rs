@@ -36,7 +36,27 @@ fn go_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind> 
 }
 
 fn go_is_callable(kind: &str) -> bool {
-    matches!(kind, "function_declaration" | "method_declaration")
+    // `method_elem` is an interface method spec (`Area() float64`). It carries
+    // no receiver, so the driver nests it under the enclosing interface — the
+    // Go analogue of a Java interface method.
+    matches!(
+        kind,
+        "function_declaration" | "method_declaration" | "method_elem"
+    )
+}
+
+/// Body to recurse into. A type is a `type_spec` whose value sits under the
+/// `type` field, not a `body` field, so [`body_from_field`] would never descend
+/// into it. Surface an **interface's** method set by returning its
+/// `interface_type` value; leave struct bodies closed (their fields are not
+/// symbols, and descending would only add reference noise). Everything else
+/// (functions, methods) uses the node's own `body` field.
+fn go_body_of(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.kind() == "type_spec" {
+        let ty = node.child_by_field_name("type")?;
+        return (ty.kind() == "interface_type").then_some(ty);
+    }
+    body_from_field(node)
 }
 
 fn go_receiver_type(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -258,7 +278,7 @@ pub(crate) static GO_SPEC: LangSpec = LangSpec {
     receiver_type_of: go_receiver_type,
     import_of: go_import_of,
     name_of: name_from_field,
-    body_of: body_from_field,
+    body_of: go_body_of,
     is_transparent_kind: go_is_transparent,
     metadata_of: no_text,
     test_of: go_test_of,
@@ -374,6 +394,47 @@ func New() *Repo {
             imports.contains(&"fmt") && imports.contains(&"strings"),
             "{imports:?}"
         );
+    }
+
+    #[test]
+    fn interface_method_specs_nest_under_the_interface() {
+        // An interface's method set is its contract — the analogue of Java's
+        // interface methods, which *are* captured. tree-sitter parses each as a
+        // `method_elem` inside `interface_type`; the driver must descend into the
+        // interface body and surface them as methods nested under the interface.
+        let src = "package p\n\
+                   type Shape interface {\n\
+                   \tArea() float64\n\
+                   \tPerimeter() float64\n\
+                   \tio.Reader\n\
+                   }\n";
+        let s = scan(src);
+        let methods = qnames(&s, NodeKind::GoMethod);
+        assert!(
+            methods.contains(&"Shape.Area".to_string()),
+            "interface method should nest under the interface: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"Shape.Perimeter".to_string()),
+            "interface method should nest under the interface: {methods:?}"
+        );
+        // The embedded interface (`io.Reader`) is a `type_elem`, not a method —
+        // it must not masquerade as one.
+        assert!(
+            !methods.iter().any(|m| m.contains("Reader")),
+            "embedded interface is not a method: {methods:?}"
+        );
+    }
+
+    #[test]
+    fn struct_fields_do_not_become_methods_or_functions() {
+        // Descending into interface bodies must not also start emitting struct
+        // fields as callables (fields are `field_declaration`, not callables).
+        let src = "package p\ntype T struct {\n\tName string\n\tFn func() int\n}\n";
+        let s = scan(src);
+        assert!(qnames(&s, NodeKind::GoMethod).is_empty(), "no methods from a struct");
+        assert!(qnames(&s, NodeKind::GoFunction).is_empty(), "no functions from struct fields");
+        assert!(qnames(&s, NodeKind::GoStruct).contains(&"T".to_string()));
     }
 
     #[test]
