@@ -227,9 +227,12 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     // accumulated across the walk and turned into nodes/edges after it (needs the
     // language indexers' callable nodes to already exist in the store).
     let mut dart_route_consts: Vec<DartRouteConst> = Vec::new();
-    // Inline HTTP-client calls (`_dio.get('/v1/me')`) the Dart client makes, with
-    // their file so the consumed route links to the enclosing callable by line.
-    let mut dart_consumed_calls: Vec<(String, DartConsumedCall)> = Vec::new();
+    // Inline HTTP-client calls (Dart `_dio.get('/v1/me')`, TS `http.post('/x')`)
+    // the client makes, with their file so the consumed route links to the
+    // enclosing callable by line. Kept per-language so each links to its own
+    // callable kinds.
+    let mut dart_consumed_calls: Vec<(String, InlineConsumedCall)> = Vec::new();
+    let mut ts_consumed_calls: Vec<(String, InlineConsumedCall)> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !is_skipped_walk_entry(e))
@@ -326,6 +329,23 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
                 }
             }
         }
+        // TS/JS clients (axios/fetch) consume backend routes the same inline way;
+        // `.tsx` is included since hooks/components call the API directly too.
+        if matches!(ext.as_str(), "ts" | "tsx" | "js" | "jsx" | "mjs") {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let calls = parse_ts_consumed_calls(&text);
+                if !calls.is_empty() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    for c in calls {
+                        ts_consumed_calls.push((rel.clone(), c));
+                    }
+                }
+            }
+        }
         let tables = match ext.as_str() {
             "sql" => read_and(path, parse_sql_tables),
             "java" => read_and(path, parse_java_entity_tables),
@@ -364,7 +384,8 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     link_inline_sql_edges(store, root, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
-    link_dart_inline_consumed_routes(store, &dart_consumed_calls, &mut stats)?;
+    link_inline_consumed_routes(store, &dart_consumed_calls, "dart", &mut stats)?;
+    link_inline_consumed_routes(store, &ts_consumed_calls, "typescript", &mut stats)?;
     Ok(stats)
 }
 
@@ -786,14 +807,16 @@ fn link_dart_consumed_routes(
 }
 
 /// Sibling of [`link_dart_consumed_routes`] for the inline-call shape recovered
-/// by [`parse_dart_consumed_calls`]: turn each `_dio.get('/v1/me')` into a
-/// consumed `HttpRoute` node and link the *enclosing* Dart callable to it with a
-/// `method --references--> route` edge. The consumer is the innermost callable
-/// whose line range contains the call, so the edge lands on the real API method
-/// rather than the file. Idempotent; each `(callable, route)` links at most once.
-fn link_dart_inline_consumed_routes(
+/// by [`parse_dart_consumed_calls`] / [`parse_ts_consumed_calls`]: turn each
+/// `_dio.get('/v1/me')` into a consumed `HttpRoute` node and link the *enclosing*
+/// `lang` callable to it with a `method --references--> route` edge. The consumer
+/// is the innermost callable whose line range contains the call, so the edge
+/// lands on the real API method rather than the file. Idempotent; each
+/// `(callable, route)` links at most once.
+fn link_inline_consumed_routes(
     store: &mut Store,
-    calls: &[(String, DartConsumedCall)],
+    calls: &[(String, InlineConsumedCall)],
+    lang: &str,
     stats: &mut SchemaIndexStats,
 ) -> Result<()> {
     use std::collections::{HashMap, HashSet};
@@ -817,7 +840,7 @@ fn link_dart_inline_consumed_routes(
     // file -> [(callable id, start, end)] for innermost-enclosing attribution.
     let mut by_file: HashMap<String, Vec<(ArtifactId, u32, u32)>> = HashMap::new();
     for &kind in NodeKind::ALL {
-        if !kind.is_callable() || kind.language() != Some("dart") {
+        if !kind.is_callable() || kind.language() != Some(lang) {
             continue;
         }
         for node in store.list_nodes_by_kind(kind)? {
@@ -861,7 +884,7 @@ fn link_dart_inline_consumed_routes(
         edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
         store.upsert_edge(edge).with_context(|| {
             format!(
-                "linking dart inline route-consumer edge {} -> {}",
+                "linking inline route-consumer edge {} -> {}",
                 edge.from_id.as_str(),
                 edge.to_id.as_str()
             )
@@ -2517,33 +2540,47 @@ pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
     out
 }
 
-/// One inline HTTP call a Dart client makes — `verb` (upper-cased method name),
-/// the normalized route `path`, and the source `line` (1-based) used to attribute
-/// the call to its enclosing callable.
+/// One inline HTTP call a client makes — `verb` (upper-cased method name), the
+/// normalized route `path`, and the source `line` (1-based) used to attribute the
+/// call to its enclosing callable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DartConsumedCall {
+pub struct InlineConsumedCall {
     pub verb: String,
     pub path: String,
     pub line: u32,
 }
 
-/// HTTP verbs Dart clients call as methods (Dio: `dio.get(path)`; `http`
-/// package: `client.post(Uri.parse(path))`).
-const DART_HTTP_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head"];
+/// HTTP verbs called as a method (Dio `dio.get(path)`, axios `http.post(path)`,
+/// the `http` package `client.post(Uri.parse(path))`).
+const INLINE_HTTP_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head"];
 
 /// Recover the backend routes a Dart client consumes by calling an HTTP client
 /// *inline* — `_dio.get<T>('/v1/me')`, `_dio.post('/v1/teams/$id/sync', …)` —
 /// the dominant real-world shape, which carries no `ApiEndpoints` constant table
-/// for [`parse_dart_route_constants`] to mine. A call qualifies only when the
-/// method is an HTTP verb and its first argument yields a string literal that is
-/// an absolute path (`/…`), which rejects collection/cache `.get('key')` calls.
-/// Path interpolation (`$id`, `${x}`) normalizes to a `:param` placeholder so the
-/// consumed path matches the server's `:id` under [`route_coverage::route_key`].
-pub fn parse_dart_consumed_calls(text: &str) -> Vec<DartConsumedCall> {
+/// for [`parse_dart_route_constants`] to mine.
+pub fn parse_dart_consumed_calls(text: &str) -> Vec<InlineConsumedCall> {
+    scan_inline_consumed_calls(text, false)
+}
+
+/// TypeScript/JS sibling of [`parse_dart_consumed_calls`] for axios/fetch-style
+/// clients (`http.post<T>('/admin/login', …)`, `` http.get(`/admin/users/${id}`) ``).
+/// Same shape, plus backtick template-literal paths with `${…}` interpolation.
+pub fn parse_ts_consumed_calls(text: &str) -> Vec<InlineConsumedCall> {
+    scan_inline_consumed_calls(text, true)
+}
+
+/// Scan `<recv>.<verb>(<path-literal>, …)` HTTP calls. A call qualifies only when
+/// the method is an HTTP verb and its first argument yields a string literal that
+/// is an absolute path (`/…`), which rejects collection/cache `.get('key')`
+/// calls. Path interpolation (`$id`, `${x}`) normalizes to a `:param` placeholder
+/// so the consumed path matches the server's `:id` under
+/// [`crate::route_coverage::route_key`]. `allow_backtick` admits TS/JS template
+/// literals; Dart has none so it is disabled there.
+fn scan_inline_consumed_calls(text: &str, allow_backtick: bool) -> Vec<InlineConsumedCall> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for verb in DART_HTTP_VERBS {
+    for verb in INLINE_HTTP_VERBS {
         let needle = format!(".{verb}");
         for (pos, _) in text.match_indices(needle.as_str()) {
             // A receiver must precede the dot (`recv.get`), and the verb must be
@@ -2577,16 +2614,16 @@ pub fn parse_dart_consumed_calls(text: &str) -> Vec<DartConsumedCall> {
             let Some(first) = args.first() else {
                 continue;
             };
-            let Some(raw) = first_dart_string_literal(first) else {
+            let Some(raw) = first_inline_path_literal(first, allow_backtick) else {
                 continue;
             };
             if !raw.starts_with('/') || raw.len() < 2 {
                 continue;
             }
-            let path = normalize_dart_route_path(&raw);
+            let path = normalize_consumed_route_path(&raw);
             let line = line_of(text, pos);
             if seen.insert((verb.to_string(), path.clone(), line)) {
-                out.push(DartConsumedCall {
+                out.push(InlineConsumedCall {
                     verb: verb.to_ascii_uppercase(),
                     path,
                     line,
@@ -2595,6 +2632,22 @@ pub fn parse_dart_consumed_calls(text: &str) -> Vec<DartConsumedCall> {
         }
     }
     out
+}
+
+/// The leading string-literal content of an argument: a `'…'` / `"…"` quote and,
+/// when `allow_backtick`, a `` `…` `` template literal (TS/JS). Interpolation is
+/// kept verbatim for [`normalize_consumed_route_path`] to placeholder.
+fn first_inline_path_literal(arg: &str, allow_backtick: bool) -> Option<String> {
+    let s = arg.trim();
+    let bytes = s.as_bytes();
+    let q = *bytes.first()?;
+    let is_quote = q == b'\'' || q == b'"' || (allow_backtick && q == b'`');
+    if !is_quote {
+        return None;
+    }
+    let rest = &s[1..];
+    let close = rest.find(q as char)?;
+    Some(rest[..close].to_string())
 }
 
 /// Index just past the `>` matching the `<` at `open`, tracking nesting
@@ -2621,18 +2674,13 @@ fn skip_angle_generics(b: &[u8], open: usize) -> Option<usize> {
 }
 
 /// Normalize a consumed route path: drop any query/fragment and map each
-/// interpolated segment (`$id`, `${x}`) to a `:param` placeholder so the path
-/// param drops out of the cross-graph match key the same way a server `:id` does.
-fn normalize_dart_route_path(raw: &str) -> String {
+/// interpolated segment (Dart `$id`/`${x}`, TS `${x}`) to a `:param` placeholder
+/// so the path param drops out of the cross-graph match key the same way a server
+/// `:id` does.
+fn normalize_consumed_route_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or(raw);
     path.split('/')
-        .map(|seg| {
-            if seg.contains('$') {
-                ":param"
-            } else {
-                seg
-            }
-        })
+        .map(|seg| if seg.contains('$') { ":param" } else { seg })
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -3816,6 +3864,43 @@ class BackendClient {
     }
 
     #[test]
+    fn parse_ts_consumed_calls_handles_axios_template_literals() {
+        // Shift admin `src/api.ts`: axios with `<T>` generics and a backtick
+        // template-literal path carrying `${...}` interpolation, which must
+        // normalize to `:param` so it matches the server's `:id`. The same
+        // inline shape Dart uses, but TS adds backtick strings.
+        let ts = r#"
+const http = axios.create({ baseURL });
+export async function login(username: string) {
+  const { data } = await http.post<LoginResponse>('/admin/login', { username });
+}
+export async function getUser(id: string) {
+  const { data } = await http.get<AdminUserDetail>(`/admin/users/${encodeURIComponent(id)}`);
+}
+export async function grant(id: string, body: GrantBody) {
+  const { data } = await http.post<UserDTO>(`/admin/users/${encodeURIComponent(id)}/grant`, body);
+}
+"#;
+        let calls = parse_ts_consumed_calls(ts);
+        let got: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.verb.as_str(), c.path.as_str()))
+            .collect();
+        assert!(
+            got.contains(&("POST", "/admin/login")),
+            "POST /admin/login, got {got:?}"
+        );
+        assert!(
+            got.contains(&("GET", "/admin/users/:param")),
+            "template `${{…}}` → :param, got {got:?}"
+        );
+        assert!(
+            got.contains(&("POST", "/admin/users/:param/grant")),
+            "POST grant, got {got:?}"
+        );
+    }
+
+    #[test]
     fn links_dart_inline_dio_consumer_to_consumed_route() {
         // End-to-end of the inline-call path (the Shift-app shape): a Dart method
         // calls `_dio.get('/v1/me')` directly — no constant table — and the full
@@ -3854,6 +3939,40 @@ class BackendClient {
         assert!(
             edges.iter().any(|e| e.kind == EdgeKind::References),
             "me() references the consumed route"
+        );
+    }
+
+    #[test]
+    fn links_ts_inline_axios_consumer_to_consumed_route() {
+        // The TS/JS arm of the inline-call path: an axios call with `<T>`
+        // generics inside a typescript_function must yield a consumed route node
+        // and a function--references-->route edge (lang filter = "typescript").
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/api.ts"),
+            "export async function login() {\n  const { data } = await http.post<R>('/admin/login', body);\n  return data;\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let fn_id = ArtifactId::new("typescript_function::src/api.ts#login");
+        let mut fnode = Node::new(fn_id.clone(), NodeKind::TypescriptFunction);
+        fnode.path = Some("src/api.ts".to_string());
+        fnode.source_file = Some("src/api.ts".to_string());
+        fnode.start_line = Some(1);
+        fnode.end_line = Some(4);
+        store.upsert_node(&fnode).unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.consumed_routes, 1, "inline axios route indexed");
+        assert_eq!(stats.route_consumer_edges, 1, "one consumer->route edge");
+        let edges = store.list_edges_from(&fn_id).unwrap();
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::References),
+            "login() references the consumed route"
         );
     }
 
