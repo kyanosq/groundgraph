@@ -2011,6 +2011,7 @@ pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
         return Vec::new();
     }
     let var_types = collect_go_var_types(text);
+    let struct_fields = collect_go_struct_field_types(text);
     let b = text.as_bytes();
     const VERBS: &[(&str, &str)] = &[
         ("GET", "GET"),
@@ -2047,15 +2048,17 @@ pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
             if !path_lit.is_empty() && !path_lit.starts_with('/') {
                 continue;
             }
-            let Some((recv_var, method)) = parse_go_handler(&args[args.len() - 1]) else {
+            // Resolve the handler's declaring type through the receiver chain
+            // (`d.Auth.Me`: var `d`→`Deps`, field `Deps.Auth`→`AuthHandler`); an
+            // unresolved receiver leaves the class empty (route still indexed).
+            let Some((class, method)) =
+                resolve_go_handler(&args[args.len() - 1], &var_types, &struct_fields)
+            else {
                 continue;
             };
             if method.is_empty() {
                 continue;
             }
-            // Resolve the handler's declaring type from the var→type map; an
-            // unresolved receiver leaves the class empty (route still indexed).
-            let class = var_types.get(&recv_var).cloned().unwrap_or_default();
             let path = normalize_route(base, &path_lit);
             if seen.insert((verb.to_string(), path.clone(), class.clone(), method.clone())) {
                 routes.push(ParsedRoute {
@@ -2214,6 +2217,111 @@ fn go_constructor_type(rhs: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Map `"StructName.FieldName" → simple field type` for every named struct in a
+/// Go file. Powers dependency-injection handler resolution: routers idiomatically
+/// take a `Deps`/`Handlers` struct and register handlers via a field selector
+/// (`d.Auth.Me`), so linking the route needs the field's declaring type
+/// (`Deps.Auth *AuthHandler` → `AuthHandler`). Single-file scope — covers the
+/// common case where the dependency struct sits beside its router. Handles the
+/// `A, B Type` group form and strips struct tags / pointers / package prefixes.
+fn collect_go_struct_field_types(text: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        // `type <Name> struct {` opening the block on one line.
+        let Some(rest) = t.strip_prefix("type ") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(name) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if !is_ident(name) {
+            continue;
+        }
+        let after_name = rest[name.len()..].trim_start();
+        if !after_name.starts_with("struct") || !t.ends_with('{') {
+            continue;
+        }
+        // Consume field lines until the matching close brace. Embedded
+        // anonymous structs bump depth so their inner fields don't leak into
+        // the outer type (they carry no usable named selector anyway).
+        let mut depth = 1usize;
+        for fl in lines.by_ref() {
+            let ft = fl.trim();
+            if ft.starts_with('}') {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                continue;
+            }
+            if ft.is_empty() || ft.starts_with("//") {
+                continue;
+            }
+            // Drop a trailing struct tag (`Name Type \`json:"x"\``).
+            let decl = ft.split('`').next().unwrap_or(ft).trim();
+            if decl.ends_with('{') {
+                depth += 1;
+                continue;
+            }
+            let Some((names, ty)) = decl.rsplit_once(char::is_whitespace) else {
+                continue; // embedded field (`io.Reader`) — no name to key on
+            };
+            let simple = go_simple_type(ty);
+            if simple.is_empty() {
+                continue;
+            }
+            for fname in names.split(',') {
+                let fname = fname.trim();
+                if is_ident(fname) {
+                    map.insert(format!("{name}.{fname}"), simple.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a Gin / `net/http` handler argument to `(declaring_type, method)`.
+/// Walks the receiver selector chain so both the plain receiver
+/// (`h.Get` with `h *Handler`) and the injected dependency-struct field
+/// (`d.Auth.Me` with `d Deps` and `Deps.Auth *AuthHandler`) resolve. A bare
+/// identifier is a free function (classless). An unresolved receiver yields an
+/// empty class — the route is still indexed, just left unlinked.
+fn resolve_go_handler(
+    arg: &str,
+    var_types: &std::collections::HashMap<String, String>,
+    struct_fields: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let s = arg.trim_matches(|c: char| c == '(' || c == ')' || c == '&' || c.is_whitespace());
+    let segs: Vec<&str> = s.split('.').map(str::trim).collect();
+    if segs.iter().any(|seg| !is_ident(seg)) {
+        return None;
+    }
+    match segs.as_slice() {
+        [] => None,
+        // Free function: `Handler` → classless, matched by bare method name.
+        [method] => Some((String::new(), method.to_string())),
+        [base, rest @ .., method] => {
+            // Seed the type from the base variable, then walk each field hop.
+            let mut ty = var_types.get(*base).cloned().unwrap_or_default();
+            for field in rest {
+                if ty.is_empty() {
+                    break;
+                }
+                ty = struct_fields
+                    .get(&format!("{ty}.{field}"))
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            Some((ty, method.to_string()))
+        }
+    }
 }
 
 /// Read the identifier ending just before byte `end` (e.g. the receiver before
@@ -2970,6 +3078,56 @@ type S struct{}
 func (s *S) GET(id int) any { return s.repo.GET(id) }
 "#;
         assert!(parse_gin_routes(go).is_empty());
+    }
+
+    #[test]
+    fn parse_gin_routes_resolves_handler_via_dependency_struct_field() {
+        // Idiomatic Go DI: a `Deps` struct is injected into the router
+        // constructor and every handler is reached through a field selector
+        // (`d.Auth.Me`). Recovering the declaring type needs BOTH the param
+        // type (`d Deps`) and the struct's field types (`Deps.Auth
+        // *AuthHandler`); a 2-hop walk the old `recv_last` lookup missed,
+        // leaving `class` empty so all routes failed to link. Real repo: Shift
+        // backend `internal/api/router.go` (25 routes, every one via `d.X.M`,
+        // 0 linked). Also exercises the empty-prefix group `v1.Group("")`
+        // inheriting `/v1`.
+        let go = r#"
+package api
+
+import "github.com/gin-gonic/gin"
+
+type Deps struct {
+	Cfg  *config.Config
+	Auth *AuthHandler
+	Team *TeamHandler
+}
+
+func NewRouter(d Deps) *gin.Engine {
+	r := gin.New()
+	v1 := r.Group("/v1")
+	v1.POST("/auth/apple", d.Auth.SignInWithApple)
+	authed := v1.Group("")
+	authed.GET("/me", d.Auth.Me)
+	authed.GET("/teams/:id", d.Team.Get)
+	return r
+}
+"#;
+        let routes = parse_gin_routes(go);
+
+        let apple = routes
+            .iter()
+            .find(|r| r.method == "SignInWithApple")
+            .expect("apple route");
+        assert_eq!(apple.path, "/v1/auth/apple");
+        assert_eq!(apple.class, "AuthHandler", "d.Auth → Deps.Auth field type");
+
+        let me = routes.iter().find(|r| r.method == "Me").expect("me route");
+        assert_eq!(me.path, "/v1/me", "empty-prefix group inherits /v1");
+        assert_eq!(me.class, "AuthHandler");
+
+        let get = routes.iter().find(|r| r.method == "Get").expect("get route");
+        assert_eq!(get.path, "/v1/teams/:id");
+        assert_eq!(get.class, "TeamHandler", "d.Team → Deps.Team field type");
     }
 
     #[test]
