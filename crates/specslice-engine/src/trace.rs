@@ -424,7 +424,9 @@ mod tests {
 
         let route = {
             let mut n = Node::new(
-                ArtifactId::new("http_route::a/StyleInfoController.java::GET /style-info/getMeasuresInfo"),
+                ArtifactId::new(
+                    "http_route::a/StyleInfoController.java::GET /style-info/getMeasuresInfo",
+                ),
                 NodeKind::HttpRoute,
             );
             n.name = Some("getMeasuresInfo".to_string());

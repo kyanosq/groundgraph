@@ -162,7 +162,10 @@ fn unified_languages_typescript_indexes_js_and_vue_without_lsp() {
     store.migrate().unwrap();
     let nodes = store.list_all_nodes().unwrap();
     let names: BTreeSet<&str> = nodes.iter().filter_map(|n| n.name.as_deref()).collect();
-    assert!(names.contains("getOrders"), "JS api function missing: {names:?}");
+    assert!(
+        names.contains("getOrders"),
+        "JS api function missing: {names:?}"
+    );
     assert!(
         names.contains("load"),
         "Vue Options-API method missing: {names:?}"

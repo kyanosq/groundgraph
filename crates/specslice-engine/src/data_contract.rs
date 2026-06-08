@@ -126,7 +126,9 @@ pub fn analyze_data_contract_with_store(
             continue;
         }
         if let Some(path) = &node.path {
-            files.entry(path.clone()).or_insert_with(|| language_of(node.kind));
+            files
+                .entry(path.clone())
+                .or_insert_with(|| language_of(node.kind));
         }
     }
 
@@ -235,7 +237,13 @@ struct RawTable {
 }
 
 const SQL_CONSTRAINT_LEADERS: &[&str] = &[
-    "primary", "foreign", "unique", "check", "constraint", "key", "index",
+    "primary",
+    "foreign",
+    "unique",
+    "check",
+    "constraint",
+    "key",
+    "index",
 ];
 
 fn scan_tables(raw: &[char], line_index: &[u32]) -> Vec<RawTable> {
@@ -481,7 +489,8 @@ fn scan_json_keys(raw: &[char], masked: &[char], line_index: &[u32]) -> Vec<RawJ
         // Must be a subscript: previous non-space *code* char is an
         // identifier / `)` / `]` (not `=`, `(`, `,`, `:` => array literal).
         let prev = prev_non_space(masked, i);
-        let is_subscript = matches!(prev, Some(p) if p.is_alphanumeric() || p == '_' || p == ')' || p == ']');
+        let is_subscript =
+            matches!(prev, Some(p) if p.is_alphanumeric() || p == '_' || p == ')' || p == ']');
         if !is_subscript {
             i += 1;
             continue;
@@ -656,10 +665,8 @@ mod tests {
     fn scans_json_keys_with_defaults() {
         let src = "factory Shift.fromJson(Map j) => Shift(\n  count: j['count'] ?? 0,\n  name: j[\"name\"],\n  flag: j['is_pro'] ?? false,\n);";
         let got = keys(src, Language::Dart);
-        let map: std::collections::HashMap<String, Option<String>> = got
-            .into_iter()
-            .map(|k| (k.key, k.default))
-            .collect();
+        let map: std::collections::HashMap<String, Option<String>> =
+            got.into_iter().map(|k| (k.key, k.default)).collect();
         assert_eq!(map.get("count"), Some(&Some("0".to_string())));
         assert_eq!(map.get("name"), Some(&None));
         assert_eq!(map.get("is_pro"), Some(&Some("false".to_string())));
@@ -715,7 +722,7 @@ mod tests {
         let k = &report.json_keys[0];
         assert_eq!(k.key, "count");
         assert_eq!(k.occurrences, 2); // the two `j['count']` reads
-        // two different defaults observed: 0 and 1
+                                      // two different defaults observed: 0 and 1
         assert_eq!(k.defaults, vec!["0".to_string(), "1".to_string()]);
     }
 }

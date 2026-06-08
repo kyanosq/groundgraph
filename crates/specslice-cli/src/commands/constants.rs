@@ -59,7 +59,10 @@ pub fn run(args: ConstantsRunArgs) -> Result<()> {
 }
 
 fn print_human(report: &ConstantsReport) {
-    println!("SpecSlice 常量 / 字面量目录 (schema v{})", report.schema_version);
+    println!(
+        "SpecSlice 常量 / 字面量目录 (schema v{})",
+        report.schema_version
+    );
     println!(
         "分析 {} · 有源码 {} · 字面量 {} · 去重值 {} · 输出 {}{}",
         report.stats.analyzed,

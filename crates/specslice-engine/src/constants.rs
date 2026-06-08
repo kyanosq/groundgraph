@@ -228,7 +228,10 @@ const MAX_STR_LEN: usize = 120;
 /// dependency-free.
 pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
     let hash = matches!(lang, Language::Python);
-    let single_is_string = matches!(lang, Language::Dart | Language::Python | Language::Typescript);
+    let single_is_string = matches!(
+        lang,
+        Language::Dart | Language::Python | Language::Typescript
+    );
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
@@ -293,7 +296,10 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
             out.push(RawLiteral {
                 line_offset: start_line,
                 kind: LiteralKind::Str,
-                value: format!("{delim}{delim}{delim}{}{delim}{delim}{delim}", truncate(&buf)),
+                value: format!(
+                    "{delim}{delim}{delim}{}{delim}{delim}{delim}",
+                    truncate(&buf)
+                ),
             });
             prev_word = false;
             continue;
@@ -376,11 +382,16 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
                         seen_exp = true;
                     }
                     i += 1;
-                } else if d == '.' && !seen_dot && chars.get(i + 1).map_or(false, |x| x.is_ascii_digit())
+                } else if d == '.'
+                    && !seen_dot
+                    && chars.get(i + 1).map_or(false, |x| x.is_ascii_digit())
                 {
                     seen_dot = true;
                     i += 1;
-                } else if (d == '+' || d == '-') && seen_exp && matches!(chars.get(i - 1), Some('e') | Some('E')) {
+                } else if (d == '+' || d == '-')
+                    && seen_exp
+                    && matches!(chars.get(i - 1), Some('e') | Some('E'))
+                {
                     i += 1;
                 } else {
                     break;
@@ -443,7 +454,10 @@ fn classify_number(value: &str, seen_dot: bool) -> LiteralKind {
         return LiteralKind::Float;
     }
     // exponent without dot (1e9) is still a float
-    if lower.contains('e') && lower.trim_start_matches(|c: char| c.is_ascii_digit()).starts_with('e')
+    if lower.contains('e')
+        && lower
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with('e')
     {
         return LiteralKind::Float;
     }
@@ -598,12 +612,14 @@ mod tests {
         n.end_line = Some(6);
         store.upsert_node(&n).unwrap();
 
-        let report =
-            analyze_constants_with_store(&store, &ConstantsOptions {
+        let report = analyze_constants_with_store(
+            &store,
+            &ConstantsOptions {
                 repo_root: tmp.path().to_path_buf(),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         // `1` is trivial and filtered; `3` survives with 2 occurrences.
         assert_eq!(report.entries.len(), 1);
         let e = &report.entries[0];

@@ -1470,7 +1470,10 @@ mod tests {
     #[test]
     fn map_node_adds_column_count_badge_for_db_table() {
         use specslice_core::ArtifactId;
-        let mut node = Node::new(ArtifactId::new("db_table::craft_conflict"), NodeKind::DbTable);
+        let mut node = Node::new(
+            ArtifactId::new("db_table::craft_conflict"),
+            NodeKind::DbTable,
+        );
         node.name = Some("craft_conflict".into());
         node.path = Some("internal/db/schema.sql".into());
         node.metadata_json = Some(

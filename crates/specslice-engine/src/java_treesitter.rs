@@ -263,6 +263,7 @@ pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     src_roots_of: no_src_roots,
     resolve_import: java_resolve_import,
     recurse_callables: false,
+    emit_nested_callables_with_metadata_only: false,
     call_idents_of: java_call_idents,
     module_scoped_resolution: false,
 };

@@ -271,6 +271,15 @@ pub struct LangSpec {
     /// this on so call-based tests (`test`/`group`) written inside the
     /// conventional `void main() { … }` harness are discovered.
     pub recurse_callables: bool,
+    /// Pair with `recurse_callables`: when descending into a callable body,
+    /// only emit a *nested* callable that carries framework metadata
+    /// ([`metadata_of`] returns `Some`). Off by default, so Dart keeps
+    /// emitting every nested declaration. Python turns this on so a FastAPI
+    /// handler defined inside an app factory (`def create_app(): @app.get(…)
+    /// def handler(): …`) becomes a real symbol while plain local closures
+    /// stay invisible — the decorator is what makes the inner `def` an
+    /// addressable entry point worth a node.
+    pub emit_nested_callables_with_metadata_only: bool,
     /// Capture body-level call / reference identifiers for the heuristic
     /// call resolver. Default [`no_call_idents`] (a no-op: no references,
     /// no behaviour change). Languages that opt in (Rust) emit
@@ -314,6 +323,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Scan {
         source.as_bytes(),
         spec,
         None,
+        false,
         false,
         0,
         &mut scan,
@@ -385,6 +395,7 @@ fn walk(
     spec: &LangSpec,
     parent_qualified: Option<&str>,
     parent_is_type: bool,
+    in_callable_body: bool,
     depth: usize,
     scan: &mut Scan,
 ) {
@@ -410,13 +421,20 @@ fn walk(
         if let Some(type_name) = (spec.impl_type_of)(child, source) {
             let nested = combine(parent_qualified, &type_name, spec.separator);
             if let Some(body) = (spec.body_of)(child) {
-                walk(body, source, spec, Some(&nested), true, depth + 1, scan);
+                walk(body, source, spec, Some(&nested), true, false, depth + 1, scan);
             }
             continue;
         }
 
         // 3. Type / module containers.
         if let Some(sym) = (spec.container_of)(child, source) {
+            // Inside a callable body, a language may suppress nested
+            // declarations that are not framework entry points (e.g. a Python
+            // local class defined in a function). Those were never reachable
+            // before `recurse_callables`, so skipping keeps prior behaviour.
+            if in_callable_body && spec.emit_nested_callables_with_metadata_only {
+                continue;
+            }
             if let Some(name) = (spec.name_of)(child, source) {
                 let qualified = combine(parent_qualified, &name, spec.separator);
                 match (spec.test_of)(child, source, sym.node_kind(), &name, parent_qualified) {
@@ -443,6 +461,7 @@ fn walk(
                         spec,
                         Some(&qualified),
                         sym.is_type(),
+                        false,
                         depth + 1,
                         scan,
                     );
@@ -469,47 +488,57 @@ fn walk(
                 // range is taken from the (possibly wider) span node so a
                 // method whose body is a grammar sibling still covers it.
                 let span = (spec.callable_span_of)(child).unwrap_or(child);
-                match (spec.test_of)(child, source, kind, &name, eff_parent.as_deref()) {
-                    Some(role) => {
-                        push_test(scan, role, &name, &qualified, eff_parent.as_deref(), span);
+                let metadata = (spec.metadata_of)(child, source);
+                // A nested callable is only a real symbol when the language
+                // descends into bodies *and* either accepts every nested
+                // declaration (Dart) or this one carries framework metadata
+                // (Python: a decorated FastAPI handler vs. a plain closure).
+                let emit = !in_callable_body
+                    || !spec.emit_nested_callables_with_metadata_only
+                    || metadata.is_some();
+                if emit {
+                    match (spec.test_of)(child, source, kind, &name, eff_parent.as_deref()) {
+                        Some(role) => {
+                            push_test(scan, role, &name, &qualified, eff_parent.as_deref(), span);
+                        }
+                        None => {
+                            push_symbol(
+                                scan,
+                                kind,
+                                &name,
+                                &qualified,
+                                eff_parent.as_deref(),
+                                span,
+                                metadata,
+                            );
+                        }
                     }
-                    None => {
-                        let metadata = (spec.metadata_of)(child, source);
-                        push_symbol(
-                            scan,
-                            kind,
-                            &name,
-                            &qualified,
-                            eff_parent.as_deref(),
-                            span,
-                            metadata,
-                        );
-                    }
-                }
-                // Heuristic call resolver: capture outbound call / reference
-                // identifiers from this callable's body, keyed by its
-                // qualified name. Done for tests too so a test seeds
-                // reachability into the code it exercises. No-op (empty) for
-                // languages that have not opted in via `call_idents_of`.
-                if let Some(body) = (spec.body_of)(child) {
-                    for (to_name, ref_kind) in (spec.call_idents_of)(body, source) {
-                        if !to_name.is_empty() {
-                            scan.references.push(ScannedRef {
-                                from_qualified: qualified.clone(),
-                                to_name,
-                                kind: ref_kind,
-                            });
+                    // Heuristic call resolver: capture outbound call / reference
+                    // identifiers from this callable's body, keyed by its
+                    // qualified name. Done for tests too so a test seeds
+                    // reachability into the code it exercises. No-op (empty) for
+                    // languages that have not opted in via `call_idents_of`.
+                    if let Some(body) = (spec.body_of)(child) {
+                        for (to_name, ref_kind) in (spec.call_idents_of)(body, source) {
+                            if !to_name.is_empty() {
+                                scan.references.push(ScannedRef {
+                                    from_qualified: qualified.clone(),
+                                    to_name,
+                                    kind: ref_kind,
+                                });
+                            }
                         }
                     }
                 }
                 // Optional: descend into the callable body so call-based tests
                 // hosted inside a function (Dart's `void main() { test(…); }`)
-                // are discovered. The body's nodes attach to *this callable's*
+                // and decorated nested handlers (Python app factories) are
+                // discovered. The body's nodes attach to *this callable's*
                 // parent (file / module), not to the callable, matching how the
                 // Dart analyzer files top-level `test(...)` nodes under the file.
                 if spec.recurse_callables {
                     if let Some(body) = (spec.body_of)(child) {
-                        walk(body, source, spec, parent_qualified, false, depth + 1, scan);
+                        walk(body, source, spec, parent_qualified, false, true, depth + 1, scan);
                     }
                 }
                 continue;
@@ -534,7 +563,7 @@ fn walk(
                     child,
                 );
                 if let Some(body) = hit.body {
-                    walk(body, source, spec, Some(&qualified), false, depth + 1, scan);
+                    walk(body, source, spec, Some(&qualified), false, false, depth + 1, scan);
                 }
                 continue;
             }
@@ -548,6 +577,7 @@ fn walk(
                 spec,
                 parent_qualified,
                 parent_is_type,
+                in_callable_body,
                 depth + 1,
                 scan,
             );
@@ -1569,6 +1599,39 @@ fn discover_files(
     Ok(out)
 }
 
+/// Directories that are never first-party source for *any* language and must
+/// be pruned by every walk: VCS metadata, agent worktrees (`.claude` holds full
+/// repo copies that would duplicate every symbol), vendored dependencies, and
+/// Python virtualenvs / installed packages / caches (an installed FastAPI's
+/// docstring examples would otherwise be parsed as real code). Shared by the
+/// tree-sitter discovery and the schema indexer so both see one file universe
+/// — the single source of truth for "noise" directories. Per-language
+/// `LangSpec::skip_dirs` adds only build-output dirs specific to that toolchain.
+pub const ALWAYS_SKIP_DIRS: &[&str] = &[
+    // VCS / tooling / agent worktrees
+    ".git",
+    ".hg",
+    ".svn",
+    ".specslice",
+    ".claude",
+    // Vendored dependencies
+    "node_modules",
+    "vendor",
+    "Pods",
+    "Carthage",
+    ".dart_tool",
+    // Python virtualenvs / installed packages / caches
+    ".venv",
+    "venv",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+];
+
 fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
     if !entry.file_type().is_dir() {
         return false;
@@ -1576,7 +1639,7 @@ fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
     let Some(name) = entry.file_name().to_str() else {
         return false;
     };
-    skip_dirs.contains(&name)
+    ALWAYS_SKIP_DIRS.contains(&name) || skip_dirs.contains(&name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1994,6 +2057,66 @@ describe('outer', () => {
         );
     }
 
+    #[test]
+    fn java_explicit_import_self_named_delegation_resolves_through_full_pass() {
+        // Reproduces the real platform miss through the WHOLE pass (resolve_import
+        // + import_targets + heuristic resolution), not a synthetic resolver call.
+        // `StyleInfoController.selectMeasuresInfo` does
+        // `return styleInfoService.selectMeasuresInfo(id)` — the called bare name
+        // equals the caller's own method name AND lives behind an *explicit*
+        // single-type import. The controller→interface Calls edge must exist so
+        // `trace <route>` doesn't dead-end at the controller.
+        use specslice_core::EdgeKind;
+        use specslice_store::Store;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("com/kutesmart/cloud/style/controller")).unwrap();
+        std::fs::create_dir_all(root.join("com/kutesmart/cloud/style/service")).unwrap();
+        std::fs::write(
+            root.join("com/kutesmart/cloud/style/service/IStyleInfoService.java"),
+            "package com.kutesmart.cloud.style.service;\npublic interface IStyleInfoService {\n    java.util.List<Object> selectMeasuresInfo(Integer id);\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("com/kutesmart/cloud/style/controller/StyleInfoController.java"),
+            "package com.kutesmart.cloud.style.controller;\nimport com.kutesmart.cloud.style.service.IStyleInfoService;\npublic class StyleInfoController {\n    private IStyleInfoService styleInfoService;\n    public java.util.List<Object> selectMeasuresInfo(Integer id) {\n        return styleInfoService.selectMeasuresInfo(id);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        index_repo_with_spec(
+            &mut store,
+            &crate::java_treesitter::JAVA_SPEC,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        let nodes = store.list_all_nodes().unwrap();
+        let find = |suffix: &str| {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::JavaMethod && n.id.as_str().ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing JavaMethod {suffix}: {nodes:?}"))
+                .id
+                .clone()
+        };
+        let ctrl = find("StyleInfoController.selectMeasuresInfo");
+        let svc = find("IStyleInfoService.selectMeasuresInfo");
+        let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
+        assert!(
+            calls.iter().any(|e| e.from_id == ctrl && e.to_id == svc),
+            "self-named delegation behind an explicit import must resolve \
+             controller->interface: {calls:?}"
+        );
+    }
+
     // --- Go cross-package calls into non-representative package files -----
     // A Go `import "mod/pkg"` resolves to a single *representative* file of
     // the package directory, but the package's symbols are spread across all
@@ -2204,6 +2327,54 @@ describe('outer', () => {
                 .to_string()
                 .ends_with("ui/builder.swift::Builder.build")),
             "an ambiguous name (2 defs) must not link module-wide: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn java_self_named_delegation_resolves_to_imported_interface() {
+        // Real platform bug: `StyleInfoController.selectMeasuresInfo` does
+        // `return styleInfoService.selectMeasuresInfo(...)`. The call's bare
+        // name (`selectMeasuresInfo`) collides with the caller's OWN method
+        // name, so the same-file lookup finds only the self (skipped). The
+        // import-target fallback to the service interface must still fire,
+        // otherwise `trace <route>` dead-ends at the controller.
+        let symbols = vec![
+            (
+                "c/StyleInfoController.java",
+                "selectMeasuresInfo",
+                "StyleInfoController.selectMeasuresInfo",
+            ),
+            (
+                "s/IStyleInfoService.java",
+                "selectMeasuresInfo",
+                "IStyleInfoService.selectMeasuresInfo",
+            ),
+        ];
+        let mut imports = HashMap::new();
+        imports.insert(
+            "c/StyleInfoController.java".to_string(),
+            vec!["s/IStyleInfoService.java".to_string()],
+        );
+        let pending = vec![(
+            "c/StyleInfoController.java".to_string(),
+            ScannedRef {
+                from_qualified: "StyleInfoController.selectMeasuresInfo".to_string(),
+                to_name: "selectMeasuresInfo".to_string(),
+                kind: RefKind::Call,
+            },
+        )];
+        let edges = resolve_heuristic_refs(
+            &crate::java_treesitter::JAVA_SPEC,
+            &symbols,
+            &imports,
+            &pending,
+        );
+        assert!(
+            edges.iter().any(|e| e
+                .to_symbol_id
+                .to_string()
+                .ends_with("s/IStyleInfoService.java::IStyleInfoService.selectMeasuresInfo")),
+            "self-named delegation must resolve to the imported interface: {edges:?}"
         );
     }
 

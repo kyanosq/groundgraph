@@ -250,8 +250,8 @@ fn resolve_scope(
             Ok((format!("path:{prefix}"), files))
         }
         FeaturePackSelector::Requirement(req) => {
-            let slice = slice_from_store(store, req)
-                .with_context(|| format!("解析需求 {req} 的切片"))?;
+            let slice =
+                slice_from_store(store, req).with_context(|| format!("解析需求 {req} 的切片"))?;
             let mut files = BTreeSet::new();
             for group in [
                 &slice.implementation,
@@ -416,11 +416,7 @@ mod tests {
             "class Scheduler {\n  int pick(int n) {\n    if (n >= 3) { return 3; }\n    return n;\n  }\n  Map toJson() => {'count': pick(0)};\n  factory Scheduler.fromJson(j) => Scheduler(c: j['count'] ?? 0);\n}",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("lib/other/util.dart"),
-            "int helper() => 7;",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("lib/other/util.dart"), "int helper() => 7;").unwrap();
 
         let mut store = Store::open(dir.path().join("graph.db")).unwrap();
         store.migrate().unwrap();

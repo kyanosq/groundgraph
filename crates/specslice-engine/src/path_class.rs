@@ -64,7 +64,9 @@ mod tests {
     #[test]
     fn detects_test_paths() {
         assert!(is_test_path("test/foo_test.dart"));
-        assert!(is_test_path("ShiftCore/Tests/ShiftCoreTests/AlarmTests.swift"));
+        assert!(is_test_path(
+            "ShiftCore/Tests/ShiftCoreTests/AlarmTests.swift"
+        ));
         assert!(is_test_path("src/__tests__/a.ts"));
         assert!(is_test_path("lib/a.spec.ts"));
         assert!(!is_test_path("lib/models/shift.dart"));
@@ -78,6 +80,8 @@ mod tests {
         assert!(is_generated_path("lib/l10n/app_localizations_en.dart"));
         assert!(is_generated_path("lib/generated/assets.dart"));
         assert!(!is_generated_path("lib/models/alarm.dart"));
-        assert!(!is_generated_path("ShiftCore/Sources/ShiftCore/Models/Alarm.swift"));
+        assert!(!is_generated_path(
+            "ShiftCore/Sources/ShiftCore/Models/Alarm.swift"
+        ));
     }
 }

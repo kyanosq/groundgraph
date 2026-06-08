@@ -22,10 +22,7 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
     let stats: SchemaIndexStats =
         index_schema(&args.repo_root).context("索引数据库表结构 (schema-index)")?;
     specslice_engine::stats::set_metric("tables", (stats.sql_tables + stats.orm_tables) as i64);
-    specslice_engine::stats::set_metric(
-        "implicit_orm_tables",
-        stats.implicit_orm_tables as i64,
-    );
+    specslice_engine::stats::set_metric("implicit_orm_tables", stats.implicit_orm_tables as i64);
     specslice_engine::stats::set_metric("external_tables", stats.external_tables as i64);
     specslice_engine::stats::set_metric("columns", stats.columns as i64);
     specslice_engine::stats::set_metric("mapper_stmts", stats.mapper_stmts as i64);
@@ -41,10 +38,7 @@ pub fn run(args: SchemaIndexRunArgs) -> Result<()> {
     specslice_engine::stats::set_metric("http_routes", stats.http_routes as i64);
     specslice_engine::stats::set_metric("route_method_edges", stats.route_method_edges as i64);
     specslice_engine::stats::set_metric("consumed_routes", stats.consumed_routes as i64);
-    specslice_engine::stats::set_metric(
-        "route_consumer_edges",
-        stats.route_consumer_edges as i64,
-    );
+    specslice_engine::stats::set_metric("route_consumer_edges", stats.route_consumer_edges as i64);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {

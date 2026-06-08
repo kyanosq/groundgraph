@@ -132,9 +132,7 @@ impl Default for TestSuggestionsOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_test_suggestions(
-    options: TestSuggestionsOptions,
-) -> Result<TestSuggestionsReport> {
+pub fn analyze_test_suggestions(options: TestSuggestionsOptions) -> Result<TestSuggestionsReport> {
     let config = load_config(&options.repo_root)?;
     let db_path = resolve_storage_path(&options.repo_root, &config);
     let store = Store::open(&db_path)
@@ -245,9 +243,7 @@ fn derive_suggestions(f: &SymbolFact, boundaries: &[String]) -> Vec<Suggestion> 
         let hints: Vec<String> = f
             .evidence
             .iter()
-            .filter(|e| {
-                e.tags.iter().any(|t| t == "branch" || t == "compare")
-            })
+            .filter(|e| e.tags.iter().any(|t| t == "branch" || t == "compare"))
             .take(6)
             .map(|e| format!("L{}: {}", e.line, e.text))
             .collect();
@@ -379,7 +375,8 @@ mod tests {
 
     #[test]
     fn pure_branchy_function_gets_branch_boundary_and_purity() {
-        let body = "fn f(n: i32) -> i32 {\n    if n >= 18 {\n        return 100;\n    }\n    return 0;\n}";
+        let body =
+            "fn f(n: i32) -> i32 {\n    if n >= 18 {\n        return 100;\n    }\n    return 0;\n}";
         let (store, dir) = setup(body, 1, 6);
         let report = analyze_test_suggestions_with_store(
             &store,

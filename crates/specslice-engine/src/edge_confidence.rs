@@ -248,7 +248,11 @@ mod tests {
         );
         // Per-language SCIP tags (`scip:rust`, `scip:go`, …) are also high.
         assert_eq!(
-            derive(EdgeKind::Calls, EdgeSource::LanguageAdapter, Some("scip:rust")),
+            derive(
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+                Some("scip:rust")
+            ),
             EdgeConfidence::High
         );
     }

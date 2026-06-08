@@ -282,7 +282,10 @@ mod tests {
             "line1\nfn foo() {\n    return 1;\n}\nline5",
         )
         .unwrap();
-        let mut node = Node::new(ArtifactId::new("rust::src/x.rs#foo"), NodeKind::RustFunction);
+        let mut node = Node::new(
+            ArtifactId::new("rust::src/x.rs#foo"),
+            NodeKind::RustFunction,
+        );
         node.path = Some(file.to_string());
         node.start_line = Some(2);
         node.end_line = Some(4);

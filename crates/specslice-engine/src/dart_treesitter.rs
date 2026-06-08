@@ -483,6 +483,7 @@ pub(crate) static DART_SPEC: LangSpec = LangSpec {
     src_roots_of: crate::treesitter::no_src_roots,
     resolve_import: dart_resolve_import,
     recurse_callables: true,
+    emit_nested_callables_with_metadata_only: false,
     call_idents_of: no_call_idents,
     module_scoped_resolution: false,
 };

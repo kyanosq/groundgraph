@@ -359,7 +359,12 @@ pub(crate) static PYTHON_SPEC: LangSpec = LangSpec {
     call_test_of: no_call_test,
     src_roots_of: python_src_roots,
     resolve_import: python_resolve_import,
-    recurse_callables: false,
+    // Descend into function bodies so a FastAPI handler defined inside an app
+    // factory (`def create_app(): @app.get(…) def handler(): …`) is reachable,
+    // but only emit nested defs that carry framework metadata (the decorator),
+    // so plain local closures stay invisible.
+    recurse_callables: true,
+    emit_nested_callables_with_metadata_only: true,
     call_idents_of: py_call_idents,
     module_scoped_resolution: false,
 };
@@ -494,9 +499,42 @@ def top_level():
     fn nested_function_in_method_is_not_a_top_level_symbol() {
         let src = "class A:\n    def outer(self):\n        def inner():\n            pass\n";
         let s = scan(src);
-        // inner() lives in a function body we deliberately don't descend.
+        // inner() is an undecorated local closure: descended for references but
+        // never emitted as a symbol.
         assert!(!qnames(&s, NodeKind::PythonFunction).contains(&"inner".to_string()));
         assert!(qnames(&s, NodeKind::PythonMethod).contains(&"A.outer".to_string()));
+    }
+
+    #[test]
+    fn decorated_nested_fastapi_handler_is_emitted_but_plain_closure_is_not() {
+        // FastAPI's app-factory pattern defines route handlers as nested
+        // functions inside `create_app()`. The decorated handler must surface
+        // as a symbol (so an HttpRoute can link to it by bare name), while an
+        // undecorated local helper stays invisible.
+        let src = "\
+def create_app():
+    app = FastAPI()
+
+    @app.get(\"/api/strategies\")
+    async def list_strategies():
+        return []
+
+    def _helper():
+        return 1
+
+    return app
+";
+        let s = scan(src);
+        let funcs = qnames(&s, NodeKind::PythonFunction);
+        assert!(funcs.contains(&"create_app".to_string()), "{funcs:?}");
+        assert!(
+            funcs.contains(&"list_strategies".to_string()),
+            "decorated nested handler should be emitted: {funcs:?}"
+        );
+        assert!(
+            !funcs.contains(&"_helper".to_string()),
+            "plain nested closure should stay invisible: {funcs:?}"
+        );
     }
 
     #[test]

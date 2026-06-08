@@ -233,11 +233,12 @@ pub fn analyze_port_coverage_with_stores(
     target: &Store,
     options: &PortCoverageOptions,
 ) -> Result<PortCoverageReport> {
-    let user_globs = build_globset(&options.exclude).context("compiling port-coverage exclude globs")?;
-    let source_include_globs =
-        build_globset(&options.source_include).context("compiling port-coverage --source-include globs")?;
-    let source_exclude_globs =
-        build_globset(&options.source_exclude).context("compiling port-coverage --source-exclude globs")?;
+    let user_globs =
+        build_globset(&options.exclude).context("compiling port-coverage exclude globs")?;
+    let source_include_globs = build_globset(&options.source_include)
+        .context("compiling port-coverage --source-include globs")?;
+    let source_exclude_globs = build_globset(&options.source_exclude)
+        .context("compiling port-coverage --source-exclude globs")?;
 
     let path_excluded = |path: Option<&str>| -> bool {
         let Some(p) = path else { return false };
@@ -516,12 +517,20 @@ mod tests {
         let (source, _s) = store_with(&[
             ("Shift", NodeKind::DartClass, "lib/models/shift.dart"),
             ("fromJson", NodeKind::DartMethod, "lib/models/shift.dart"),
-            ("computePayroll", NodeKind::DartFunction, "lib/logic/pay.dart"),
+            (
+                "computePayroll",
+                NodeKind::DartFunction,
+                "lib/logic/pay.dart",
+            ),
         ]);
         let (target, _t) = store_with(&[
             ("Shift", NodeKind::SwiftStruct, "Sources/Shift.swift"),
             ("fromJson", NodeKind::SwiftMethod, "Sources/Shift.swift"),
-            ("ExtraHelper", NodeKind::SwiftFunction, "Sources/Extra.swift"),
+            (
+                "ExtraHelper",
+                NodeKind::SwiftFunction,
+                "Sources/Extra.swift",
+            ),
         ]);
 
         let report = analyze_port_coverage_with_stores(
@@ -573,16 +582,32 @@ mod tests {
         // Real-world noise: freezed/g.dart codegen, l10n, a test file, and a
         // `<default>` constructor must not pollute the to-port universe.
         let (source, _s) = store_with(&[
-            ("computePayroll", NodeKind::DartFunction, "lib/logic/pay.dart"),
+            (
+                "computePayroll",
+                NodeKind::DartFunction,
+                "lib/logic/pay.dart",
+            ),
             ("Shift", NodeKind::DartClass, "lib/models/shift.dart"),
             // codegen — must be dropped
-            ("$ShiftCopyWith", NodeKind::DartClass, "lib/models/shift.freezed.dart"),
+            (
+                "$ShiftCopyWith",
+                NodeKind::DartClass,
+                "lib/models/shift.freezed.dart",
+            ),
             ("fromJson", NodeKind::DartMethod, "lib/models/shift.g.dart"),
-            ("greeting", NodeKind::DartMethod, "lib/l10n/app_localizations_en.dart"),
+            (
+                "greeting",
+                NodeKind::DartMethod,
+                "lib/l10n/app_localizations_en.dart",
+            ),
             // tests — must be dropped
             ("itComputes", NodeKind::DartFunction, "test/pay_test.dart"),
             // synthetic name — must be dropped
-            ("<default>", NodeKind::DartConstructor, "lib/models/shift.dart"),
+            (
+                "<default>",
+                NodeKind::DartConstructor,
+                "lib/models/shift.dart",
+            ),
         ]);
         let (target, _t) = store_with(&[("Shift", NodeKind::SwiftStruct, "Sources/Shift.swift")]);
 
@@ -641,11 +666,22 @@ mod tests {
         // port-map it is credited as ported (via_alias), and the aliased
         // target is not double-counted as `extra`.
         let (source, _s) = store_with(&[
-            ("nameInputUnits", NodeKind::DartFunction, "lib/utils/name_limits.dart"),
-            ("stillMissing", NodeKind::DartFunction, "lib/utils/name_limits.dart"),
+            (
+                "nameInputUnits",
+                NodeKind::DartFunction,
+                "lib/utils/name_limits.dart",
+            ),
+            (
+                "stillMissing",
+                NodeKind::DartFunction,
+                "lib/utils/name_limits.dart",
+            ),
         ]);
-        let (target, _t) =
-            store_with(&[("inputUnits", NodeKind::SwiftMethod, "Sources/NameLimits.swift")]);
+        let (target, _t) = store_with(&[(
+            "inputUnits",
+            NodeKind::SwiftMethod,
+            "Sources/NameLimits.swift",
+        )]);
 
         // No alias: missing.
         let plain = analyze_port_coverage_with_stores(
@@ -674,7 +710,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mapped.stats.ported_names, 1);
-        let ported = mapped.ported.iter().find(|p| p.name == "nameInputUnits").unwrap();
+        let ported = mapped
+            .ported
+            .iter()
+            .find(|p| p.name == "nameInputUnits")
+            .unwrap();
         assert_eq!(ported.via_alias.as_deref(), Some("inputUnits"));
         assert_eq!(ported.target_kinds, vec!["swift_method".to_string()]);
         // aliased target consumed → not reported as extra.
@@ -710,21 +750,48 @@ mod tests {
         // service makes the denominator 2 and coverage 100% — this is how you
         // measure progress on a single-service slice of a big monolith port.
         let (source, _s) = store_with(&[
-            ("selectCraftTree", NodeKind::JavaMethod, "rcmtm-cloud-craft/src/CraftController.java"),
-            ("getDictSystem", NodeKind::JavaMethod, "rcmtm-cloud-craft/src/DictController.java"),
-            ("createOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/src/OrderController.java"),
-            ("cancelOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/src/OrderController.java"),
+            (
+                "selectCraftTree",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-craft/src/CraftController.java",
+            ),
+            (
+                "getDictSystem",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-craft/src/DictController.java",
+            ),
+            (
+                "createOrder",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-order/src/OrderController.java",
+            ),
+            (
+                "cancelOrder",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-order/src/OrderController.java",
+            ),
         ]);
         let (target, _t) = store_with(&[
-            ("SelectCraftTree", NodeKind::GoFunction, "internal/craft/handler.go"),
-            ("GetDictSystem", NodeKind::GoFunction, "internal/craft/handler.go"),
+            (
+                "SelectCraftTree",
+                NodeKind::GoFunction,
+                "internal/craft/handler.go",
+            ),
+            (
+                "GetDictSystem",
+                NodeKind::GoFunction,
+                "internal/craft/handler.go",
+            ),
         ]);
 
         // Unscoped baseline: 2 of 4 ported (ignore_case maps Java->Go casing).
         let base = analyze_port_coverage_with_stores(
             &source,
             &target,
-            &PortCoverageOptions { ignore_case: true, ..Default::default() },
+            &PortCoverageOptions {
+                ignore_case: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(base.stats.source_distinct_names, 4);
@@ -744,7 +811,11 @@ mod tests {
         assert_eq!(scoped.stats.source_distinct_names, 2);
         assert_eq!(scoped.stats.ported_names, 2);
         assert!((scoped.stats.coverage - 1.0).abs() < 1e-9);
-        assert!(scoped.missing.is_empty(), "scoped missing must be empty: {:?}", scoped.missing);
+        assert!(
+            scoped.missing.is_empty(),
+            "scoped missing must be empty: {:?}",
+            scoped.missing
+        );
     }
 
     #[test]
@@ -752,12 +823,19 @@ mod tests {
         // source_exclude removes the order slice from the SOURCE denominator
         // without touching the target (unlike `exclude`, which applies to both).
         let (source, _s) = store_with(&[
-            ("selectCraftTree", NodeKind::JavaMethod, "rcmtm-cloud-craft/Craft.java"),
-            ("createOrder", NodeKind::JavaMethod, "rcmtm-cloud-order/Order.java"),
+            (
+                "selectCraftTree",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-craft/Craft.java",
+            ),
+            (
+                "createOrder",
+                NodeKind::JavaMethod,
+                "rcmtm-cloud-order/Order.java",
+            ),
         ]);
-        let (target, _t) = store_with(&[
-            ("selectCraftTree", NodeKind::GoFunction, "internal/craft.go"),
-        ]);
+        let (target, _t) =
+            store_with(&[("selectCraftTree", NodeKind::GoFunction, "internal/craft.go")]);
         let report = analyze_port_coverage_with_stores(
             &source,
             &target,
@@ -787,9 +865,15 @@ mod tests {
         )
         .unwrap();
         let map = load_port_map(&path).unwrap();
-        assert_eq!(map.aliases.get("nameInputUnits").map(String::as_str), Some("inputUnits"));
+        assert_eq!(
+            map.aliases.get("nameInputUnits").map(String::as_str),
+            Some("inputUnits")
+        );
         assert_eq!(map.aliases.len(), 2);
-        assert_eq!(map.ignore_names, vec!["createState".to_string(), "dispose".to_string()]);
+        assert_eq!(
+            map.ignore_names,
+            vec!["createState".to_string(), "dispose".to_string()]
+        );
         assert_eq!(map.ignore_name_prefixes, vec!["_build".to_string()]);
     }
 
@@ -799,13 +883,28 @@ mod tests {
         // helpers have no by-name SwiftUI counterpart; ignoring them keeps the
         // coverage number about portable logic, not host-framework plumbing.
         let (source, _s) = store_with(&[
-            ("computePayroll", NodeKind::DartFunction, "lib/logic/pay.dart"),
-            ("createState", NodeKind::DartMethod, "lib/home/home_page.dart"),
+            (
+                "computePayroll",
+                NodeKind::DartFunction,
+                "lib/logic/pay.dart",
+            ),
+            (
+                "createState",
+                NodeKind::DartMethod,
+                "lib/home/home_page.dart",
+            ),
             ("dispose", NodeKind::DartMethod, "lib/home/home_page.dart"),
-            ("_buildHeader", NodeKind::DartMethod, "lib/home/home_page.dart"),
+            (
+                "_buildHeader",
+                NodeKind::DartMethod,
+                "lib/home/home_page.dart",
+            ),
         ]);
-        let (target, _t) =
-            store_with(&[("computePayroll", NodeKind::SwiftFunction, "Sources/Pay.swift")]);
+        let (target, _t) = store_with(&[(
+            "computePayroll",
+            NodeKind::SwiftFunction,
+            "Sources/Pay.swift",
+        )]);
 
         let mut ignore_names = BTreeSet::new();
         ignore_names.insert("createState".to_string());
@@ -832,7 +931,11 @@ mod tests {
         // A Java→Go port capitalises exported identifiers:
         // selectTrademarkConflictListTreeByCloth ↔ SelectTrademarkConflictListTreeByCloth.
         let (source, _s) = store_with(&[
-            ("selectTrademarkConflictListTreeByCloth", NodeKind::JavaMethod, "C.java"),
+            (
+                "selectTrademarkConflictListTreeByCloth",
+                NodeKind::JavaMethod,
+                "C.java",
+            ),
             ("keepMissing", NodeKind::JavaMethod, "C.java"),
         ]);
         let (target, _t) = store_with(&[(

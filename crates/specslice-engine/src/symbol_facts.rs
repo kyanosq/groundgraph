@@ -256,7 +256,9 @@ fn language_token(kind: specslice_core::NodeKind) -> Option<String> {
     kind.language().map(|s| s.to_string())
 }
 
-const BRANCH_WORDS: &[&str] = &["if", "elif", "elsif", "switch", "case", "when", "guard", "match"];
+const BRANCH_WORDS: &[&str] = &[
+    "if", "elif", "elsif", "switch", "case", "when", "guard", "match",
+];
 const LOOP_WORDS: &[&str] = &["for", "while", "loop", "repeat", "foreach", "forEach"];
 const RETURN_WORDS: &[&str] = &["return"];
 const THROW_WORDS: &[&str] = &[
@@ -365,11 +367,45 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
     }
     // io / persistence / network
     const IO_MARKERS: &[&str] = &[
-        "print(", "println", "eprintln", "fmt.Print", "console.log", "fopen", "fwrite", "fread",
-        "File(", "open(", ".read(", ".write(", "readFile", "writeFile", "std::fs", "fs::", "fs.",
-        "ioutil", "os.Open", "http", "fetch(", "axios", "URLSession", "Socket", "reqwest", "dio",
-        "sqlite", "execute(", ".query(", "INSERT ", "SELECT ", "UPDATE ", "DELETE ", "prepare(",
-        "SharedPreferences", "UserDefaults", "localStorage", "getenv", "std::env",
+        "print(",
+        "println",
+        "eprintln",
+        "fmt.Print",
+        "console.log",
+        "fopen",
+        "fwrite",
+        "fread",
+        "File(",
+        "open(",
+        ".read(",
+        ".write(",
+        "readFile",
+        "writeFile",
+        "std::fs",
+        "fs::",
+        "fs.",
+        "ioutil",
+        "os.Open",
+        "http",
+        "fetch(",
+        "axios",
+        "URLSession",
+        "Socket",
+        "reqwest",
+        "dio",
+        "sqlite",
+        "execute(",
+        ".query(",
+        "INSERT ",
+        "SELECT ",
+        "UPDATE ",
+        "DELETE ",
+        "prepare(",
+        "SharedPreferences",
+        "UserDefaults",
+        "localStorage",
+        "getenv",
+        "std::env",
     ];
     if IO_MARKERS.iter().any(|m| stripped.contains(m)) {
         set.insert("io");
@@ -485,7 +521,10 @@ fn collect_evidence(src: &NodeSource, stripped: &str, max: usize) -> Vec<FactLin
 fn build_summary(counts: &BehaviorCounts, impurity: &[String], purity: Purity) -> Vec<String> {
     let mut out = Vec::new();
     if counts.branches > 0 {
-        out.push(format!("{} 个分支判定（if/switch/guard/match）", counts.branches));
+        out.push(format!(
+            "{} 个分支判定（if/switch/guard/match）",
+            counts.branches
+        ));
     }
     if counts.loops > 0 {
         out.push(format!("{} 个循环", counts.loops));
@@ -579,7 +618,11 @@ mod tests {
         let fact = build_fact(&n, &src, 60);
         assert_eq!(fact.purity, Purity::Pure);
         assert!(fact.impurity_signals.is_empty());
-        assert!(fact.counts.branches >= 2, "branches={}", fact.counts.branches);
+        assert!(
+            fact.counts.branches >= 2,
+            "branches={}",
+            fact.counts.branches
+        );
         assert_eq!(fact.counts.early_returns, 3);
         assert!(fact.counts.comparisons >= 2);
         // evidence captures the actual branch lines
@@ -607,7 +650,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // The only *real* keyword is the function itself; the `if`/`for`
         // hide in a comment and a string.
-        let body = "fn noop() {\n    // if for while return\n    let s = \"if for return throw\";\n}";
+        let body =
+            "fn noop() {\n    // if for while return\n    let s = \"if for return throw\";\n}";
         write(tmp.path(), "src/c.rs", body);
         let n = node("src/c.rs", "noop", 1, 4);
         let src = read_node_source(tmp.path(), &n).unwrap();

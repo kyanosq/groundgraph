@@ -23,17 +23,12 @@ use walkdir::WalkDir;
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
 use crate::source_text::read_node_source;
 
-/// Directory names never worth scanning for schema.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".specslice",
-    "target",
-    "build",
-    "node_modules",
-    "vendor",
-    ".dart_tool",
-    "Pods",
-];
+/// Build-output directories the schema walk skips *in addition* to the shared
+/// [`crate::treesitter::ALWAYS_SKIP_DIRS`] noise set (VCS, agent worktrees,
+/// vendored deps, Python virtualenvs/caches). Kept separate because these are
+/// build artifacts rather than universal noise; the union is the single source
+/// of truth shared with the tree-sitter symbol walk.
+const SCHEMA_SKIP_DIRS: &[&str] = &["target", "build", "dist", ".build"];
 
 // ---------------------------------------------------------------------------
 // Parsed model + node metadata
@@ -274,15 +269,22 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         // the handler method, even when the path segment != the Java method
         // name. Done before the table early-continue below because controllers
         // usually declare no `@TableName`, so they would otherwise be skipped.
-        if ext == "java" || ext == "go" {
+        let is_go_test = ext == "go" && path.to_string_lossy().ends_with("_test.go");
+        if (ext == "java" || ext == "go" || ext == "py") && !is_go_test {
             if let Ok(text) = std::fs::read_to_string(path) {
-                // Spring MVC annotations (Java) and net/http ServeMux registrations
-                // (Go) both land as HttpRoute nodes so the *URL path* tailorx calls
-                // resolves to its handler regardless of backend language.
-                let routes = if ext == "java" {
-                    parse_http_routes(&text)
-                } else {
-                    parse_go_routes(&text)
+                // Spring MVC annotations (Java), net/http + Gin registrations
+                // (Go) and FastAPI/Flask decorators (Python) all land as HttpRoute
+                // nodes so the *URL path* a client calls resolves to its handler
+                // regardless of backend language. Go scans both net/http and Gin
+                // since a service may mix them.
+                let routes = match ext.as_str() {
+                    "java" => parse_http_routes(&text),
+                    "go" => {
+                        let mut rs = parse_go_routes(&text);
+                        rs.extend(parse_gin_routes(&text));
+                        rs
+                    }
+                    _ => parse_python_routes(&text),
                 };
                 if !routes.is_empty() {
                     let rel = path
@@ -292,9 +294,11 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
                         .replace('\\', "/");
                     for r in &routes {
                         stats.http_routes += 1;
-                        store.upsert_node(&http_route_node(&rel, r)).with_context(|| {
-                            format!("upserting http route {} {} from {rel}", r.verb, r.path)
-                        })?;
+                        store
+                            .upsert_node(&http_route_node(&rel, r))
+                            .with_context(|| {
+                                format!("upserting http route {} {} from {rel}", r.verb, r.path)
+                            })?;
                     }
                 }
             }
@@ -621,9 +625,16 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         return Ok(());
     }
     let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
-    // Both Java (`JavaMethod`) and Go (`GoMethod`) handler nodes share the same
-    // id suffix shape `Type.method`, so one map serves Spring and net/http alike.
-    for kind in [NodeKind::JavaMethod, NodeKind::GoMethod] {
+    // Java (`JavaMethod`) and Go (`GoMethod`) handler nodes share the id suffix
+    // shape `Type.method`; Python handlers are module-level functions whose
+    // suffix is the bare function name (`list_strategies`). Indexing all of
+    // them lets one map serve Spring, net/http and FastAPI/Flask alike.
+    for kind in [
+        NodeKind::JavaMethod,
+        NodeKind::GoMethod,
+        NodeKind::PythonFunction,
+        NodeKind::PythonMethod,
+    ] {
         for m in store.list_nodes_by_kind(kind)? {
             if let Some(suffix) = m.id.as_str().rsplit("::").next() {
                 method_by_suffix
@@ -647,7 +658,13 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         if meta.handler_class.is_empty() && meta.handler_method.is_empty() {
             continue;
         }
-        let key = format!("{}.{}", meta.handler_class, meta.handler_method).to_ascii_lowercase();
+        // Classless handlers (Python module functions) match on the bare
+        // function name; class-based handlers (Java/Go) on `Type.method`.
+        let key = if meta.handler_class.is_empty() {
+            meta.handler_method.to_ascii_lowercase()
+        } else {
+            format!("{}.{}", meta.handler_class, meta.handler_method).to_ascii_lowercase()
+        };
         if let Some(method_ids) = method_by_suffix.get(&key) {
             for mid in method_ids {
                 edges.push(EdgeAssertion::fact(
@@ -942,7 +959,10 @@ fn collect_sql_fragments(text: &str, lower: &str) -> std::collections::HashMap<S
         let body_end = open_end + c_rel;
         from = body_end + close.len();
         if let Some(id) = id {
-            frags.insert(id.to_ascii_lowercase(), text[open_end..body_end].trim().to_string());
+            frags.insert(
+                id.to_ascii_lowercase(),
+                text[open_end..body_end].trim().to_string(),
+            );
         }
     }
     frags
@@ -1163,7 +1183,7 @@ fn extract_attr(text: &str, lower: &str, tag_start: usize, name: &str) -> Option
 }
 
 fn is_skipped_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
+    crate::treesitter::ALWAYS_SKIP_DIRS.contains(&name) || SCHEMA_SKIP_DIRS.contains(&name)
 }
 
 /// Whether the walk should prune this entry (and, for a directory, its whole
@@ -1181,9 +1201,7 @@ fn is_skipped_walk_entry(e: &walkdir::DirEntry) -> bool {
     if is_skipped_dir(e.file_name().to_str().unwrap_or("")) {
         return true;
     }
-    e.depth() > 0
-        && e.file_type().is_dir()
-        && e.path().join(DEFAULT_CONFIG_FILE_NAME).is_file()
+    e.depth() > 0 && e.file_type().is_dir() && e.path().join(DEFAULT_CONFIG_FILE_NAME).is_file()
 }
 
 /// Source-code extensions whose files may embed `CREATE TABLE` DDL as a string
@@ -1270,9 +1288,9 @@ pub fn external_db_table_node(name: &str) -> Node {
 /// scanner might mis-read as a table, blank/numeric tokens, and 1-char names.
 pub fn is_plausible_table_name(name: &str) -> bool {
     const NON_TABLES: &[&str] = &[
-        "select", "from", "where", "join", "on", "as", "set", "values", "value",
-        "into", "insert", "update", "delete", "dual", "and", "or", "by", "group",
-        "order", "limit", "having", "union", "case", "when", "then", "else", "end",
+        "select", "from", "where", "join", "on", "as", "set", "values", "value", "into", "insert",
+        "update", "delete", "dual", "and", "or", "by", "group", "order", "limit", "having",
+        "union", "case", "when", "then", "else", "end",
     ];
     if name.len() < 2 {
         return false;
@@ -1655,6 +1673,171 @@ pub fn parse_go_routes(text: &str) -> Vec<ParsedRoute> {
     routes
 }
 
+/// A Python route decorator's verb kind.
+enum PyVerb {
+    /// An explicit HTTP method decorator (`@app.get`, `@router.post`).
+    Method(String),
+    /// `@app.websocket("/ws")` — modelled with the synthetic verb `WS`.
+    Websocket,
+    /// Flask's `@app.route("/p", methods=[...])` — verb read from `methods=`.
+    Route,
+}
+
+/// Recover HTTP routes from Python web frameworks — the Python analogue of
+/// [`parse_http_routes`] (Spring) and [`parse_go_routes`] (net/http). Handles
+/// the decorator routing shared by FastAPI / Starlette / Flask:
+///
+/// ```python
+/// @app.get("/api/strategies")              # FastAPI / Starlette
+/// async def list_strategies(): ...
+///
+/// @router.post("/items", status_code=201)
+/// def create_item(): ...
+///
+/// @app.route("/legacy", methods=["POST"])  # Flask
+/// def legacy(): ...
+/// ```
+///
+/// Any `@<recv>.<verb>(...)` whose `<verb>` is an HTTP method (or `websocket`,
+/// or Flask's `route`) immediately preceding a `def` / `async def` is a route.
+/// The path is the first string-literal argument; the handler is the decorated
+/// function — matched later by its bare name, since FastAPI handlers are
+/// module-level functions. Flask's verb comes from the `methods=[...]` kwarg
+/// (default GET). A decorator whose path is not a string literal is skipped.
+/// A receiver segment is required, so a bare `@get(...)` or `@property` is not
+/// mistaken for a route.
+pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
+    if !text.contains('@') {
+        return Vec::new();
+    }
+    let b = text.as_bytes();
+    let mut routes = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        let (dotted, after) = read_dotted_ident(b, i + 1);
+        let Some(verb_kind) = python_decorator_verb(&dotted) else {
+            i = after;
+            continue;
+        };
+        let j = skip_ws(b, after);
+        if j >= b.len() || b[j] != b'(' {
+            i = after;
+            continue;
+        }
+        let Some((body, end)) = balanced_parens(b, j) else {
+            i = after;
+            continue;
+        };
+        let Some(path) = python_first_string(body) else {
+            i = end;
+            continue;
+        };
+        let verb = match verb_kind {
+            PyVerb::Method(v) => v,
+            PyVerb::Websocket => "WS".to_string(),
+            PyVerb::Route => python_methods_verb(body).unwrap_or_else(|| "GET".to_string()),
+        };
+        if let Some(method) = python_handler_after(b, end) {
+            routes.push(ParsedRoute {
+                verb,
+                path: normalize_route("", &path),
+                class: String::new(),
+                method,
+                line: line_of(text, i),
+            });
+        }
+        i = end;
+    }
+    routes
+}
+
+/// Read a dotted identifier (`app.get`, `router.post`) from `start`; returns
+/// the text and the byte offset just past it.
+fn read_dotted_ident(b: &[u8], start: usize) -> (String, usize) {
+    let mut i = start;
+    while i < b.len() && (is_ident_byte(b[i]) || b[i] == b'.') {
+        i += 1;
+    }
+    (String::from_utf8_lossy(&b[start..i]).into_owned(), i)
+}
+
+/// Classify a decorator's dotted name into a route verb. Requires a receiver
+/// segment (`app.get`, not `get`) so non-route decorators are ignored.
+fn python_decorator_verb(dotted: &str) -> Option<PyVerb> {
+    let (recv, last) = dotted.rsplit_once('.')?;
+    if recv.is_empty() {
+        return None;
+    }
+    match last.to_ascii_lowercase().as_str() {
+        "get" | "post" | "put" | "delete" | "patch" | "head" | "options" | "trace" => {
+            Some(PyVerb::Method(last.to_ascii_uppercase()))
+        }
+        "websocket" => Some(PyVerb::Websocket),
+        "route" => Some(PyVerb::Route),
+        _ => None,
+    }
+}
+
+/// First single- or double-quoted string literal in a decorator argument list.
+fn python_first_string(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != c {
+                j += 1;
+            }
+            return Some(body[start..j.min(body.len())].to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Flask verb from a `methods=["POST", ...]` kwarg — the first listed method,
+/// upper-cased. `None` when no `methods=` is present (caller defaults to GET).
+fn python_methods_verb(body: &str) -> Option<String> {
+    let p = body.find("methods")?;
+    let rest = &body[p + "methods".len()..];
+    let eq = rest.find('=')?;
+    let v = python_first_string(&rest[eq + 1..])?;
+    (!v.is_empty()).then(|| v.to_ascii_uppercase())
+}
+
+/// From just past a route decorator's `)`, skip blank / comment / stacked
+/// decorator lines and return the decorated function's name (`def NAME` /
+/// `async def NAME`). Returns `None` if a non-decorator statement appears
+/// before any `def`.
+fn python_handler_after(b: &[u8], start: usize) -> Option<String> {
+    let text = std::str::from_utf8(b).ok()?;
+    let rest = &text[start.min(text.len())..];
+    for line in rest.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with('@') {
+            continue;
+        }
+        let sig = t.strip_prefix("async ").unwrap_or(t);
+        if let Some(after_def) = sig.strip_prefix("def ") {
+            let name: String = after_def
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            return (!name.is_empty()).then_some(name);
+        }
+        // Any other statement before a `def` → the decorator was not on a
+        // function (e.g. a decorated assignment); not a route handler.
+        return None;
+    }
+    None
+}
+
 /// All method receivers in source order: `(byte offset of `func`, recv var,
 /// recv type)`. Plain functions (no `(recv ...)` clause) are skipped.
 fn collect_go_receivers(b: &[u8]) -> Vec<(usize, String, String)> {
@@ -1791,6 +1974,261 @@ fn parse_go_handler(arg: &str) -> Option<(String, String)> {
     None
 }
 
+/// Recover HTTP routes registered with the Gin web framework
+/// (`github.com/gin-gonic/gin`), the most common Go router — the framework
+/// analogue of [`parse_go_routes`] (stdlib `net/http`). Handles:
+///
+/// ```go
+/// func SetupRouter(appController *controller.AppController, …) *gin.Engine {
+///     r := gin.New()
+///     r.GET("/health", healthController.HealthCheck)
+///     v1 := r.Group("/api/v1")          // prefix chain
+///     apps := v1.Group("/apps")         // nested group → /api/v1/apps
+///     apps.GET("/:id", appController.GetApp)   // → GET /api/v1/apps/:id
+/// }
+/// ```
+///
+/// Group prefixes are resolved by following `child := parent.Group("/p")`
+/// chains from the `gin.New()` / `gin.Default()` root. The handler is the
+/// *last* call argument (Gin appends per-route middleware before it);
+/// `recv.Method` resolves its declaring type from the enclosing function's
+/// typed parameters (`appController *controller.AppController` → `AppController`)
+/// or a `controller.NewAppController(…)` constructor, so the route links to the
+/// `Type.Method` suffix of the indexed `GoMethod` node.
+pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
+    if !text.contains("gin.") && !text.contains("gin-gonic") {
+        return Vec::new();
+    }
+    let prefixes = collect_gin_group_prefixes(text);
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    let var_types = collect_go_var_types(text);
+    let b = text.as_bytes();
+    const VERBS: &[(&str, &str)] = &[
+        ("GET", "GET"),
+        ("POST", "POST"),
+        ("PUT", "PUT"),
+        ("DELETE", "DELETE"),
+        ("PATCH", "PATCH"),
+        ("HEAD", "HEAD"),
+        ("OPTIONS", "OPTIONS"),
+        ("Any", "ANY"),
+    ];
+    let mut routes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (token, verb) in VERBS {
+        let needle = format!(".{token}(");
+        for (pos, _) in text.match_indices(&needle) {
+            // Receiver is the identifier immediately before the `.`.
+            let Some(recv) = read_ident_backwards(b, pos) else {
+                continue;
+            };
+            let Some(base) = prefixes.get(&recv) else {
+                continue; // not a known router/group → not a Gin route call
+            };
+            let open = pos + needle.len() - 1;
+            let Some((body, _end)) = balanced_parens(b, open) else {
+                continue;
+            };
+            let args = split_top_level_commas(body);
+            if args.len() < 2 {
+                continue;
+            }
+            let path_lit = concat_string_literals(&args[0]);
+            // A route path is an absolute path or an empty string (group root).
+            if !path_lit.is_empty() && !path_lit.starts_with('/') {
+                continue;
+            }
+            let Some((recv_var, method)) = parse_go_handler(&args[args.len() - 1]) else {
+                continue;
+            };
+            if method.is_empty() {
+                continue;
+            }
+            // Resolve the handler's declaring type from the var→type map; an
+            // unresolved receiver leaves the class empty (route still indexed).
+            let class = var_types.get(&recv_var).cloned().unwrap_or_default();
+            let path = normalize_route(base, &path_lit);
+            if seen.insert((verb.to_string(), path.clone(), class.clone(), method.clone())) {
+                routes.push(ParsedRoute {
+                    verb: verb.to_string(),
+                    path,
+                    class,
+                    method,
+                    line: line_of(text, pos),
+                });
+            }
+        }
+    }
+    routes
+}
+
+/// Map every Gin router / route-group variable to its accumulated path prefix.
+/// `r := gin.New()` / `gin.Default()` seeds a root (empty prefix);
+/// `child := parent.Group("/p")` extends its parent's prefix. Processed in
+/// source order so a nested group sees its (already-declared) parent.
+fn collect_gin_group_prefixes(text: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut prefixes: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some((lhs, rhs)) = t.split_once(":=").or_else(|| t.split_once('=')) else {
+            continue;
+        };
+        let var = lhs.trim().trim_end_matches(':').trim();
+        if !is_ident(var) {
+            continue;
+        }
+        let rhs = rhs.trim();
+        if rhs.starts_with("gin.New(") || rhs.starts_with("gin.Default(") {
+            prefixes.insert(var.to_string(), String::new());
+            continue;
+        }
+        if let Some(gpos) = rhs.find(".Group(") {
+            let parent = read_ident_backwards(rhs.as_bytes(), gpos).unwrap_or_default();
+            let Some(base) = prefixes.get(&parent) else {
+                continue;
+            };
+            let open = gpos + ".Group".len();
+            if let Some((body, _)) = balanced_parens(rhs.as_bytes(), open) {
+                let lit = concat_string_literals(body);
+                let joined = normalize_route(base, &lit);
+                prefixes.insert(var.to_string(), joined);
+            }
+        }
+    }
+    prefixes
+}
+
+/// Best-effort `variable → simple type name` map for a Go file, used to resolve
+/// a Gin handler's declaring type. Covers (a) typed function parameters
+/// (`name *pkg.Type` → `Type`, including the `a, b T` group form) and (b)
+/// constructor locals (`name := pkg.NewType(…)` / `name := &pkg.Type{…}`).
+fn collect_go_var_types(text: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, String> = HashMap::new();
+    let b = text.as_bytes();
+    // (a) Function parameter lists.
+    for (idx, _) in text.match_indices("func") {
+        let before_ok = idx == 0 || !is_ident_byte(b[idx.saturating_sub(1)]);
+        let after = idx + 4;
+        if !before_ok || after >= b.len() || !b[after].is_ascii_whitespace() {
+            continue;
+        }
+        let mut p = skip_ws(b, after);
+        // Skip an optional method receiver `(recv T)` so the parameter list —
+        // not the receiver — is the `(` we parse.
+        if p < b.len() && b[p] == b'(' {
+            if let Some((_, end)) = balanced_parens(b, p) {
+                p = end;
+            }
+        }
+        // Advance to the parameter-list `(` (just past the function name).
+        while p < b.len() && b[p] != b'(' && b[p] != b'{' {
+            p += 1;
+        }
+        if p >= b.len() || b[p] != b'(' {
+            continue;
+        }
+        let Some((body, _)) = balanced_parens(b, p) else {
+            continue;
+        };
+        for frag in split_top_level_commas(body) {
+            record_go_param_type(&frag, &mut map);
+        }
+    }
+    // (b) Constructor / composite-literal locals.
+    for line in text.lines() {
+        let t = line.trim();
+        let Some((lhs, rhs)) = t.split_once(":=") else {
+            continue;
+        };
+        let var = lhs.trim();
+        if !is_ident(var) {
+            continue;
+        }
+        let rhs = rhs.trim();
+        if let Some(ty) = go_constructor_type(rhs) {
+            map.insert(var.to_string(), ty);
+        }
+    }
+    map
+}
+
+/// Record `name [*][pkg.]Type` (and the `a, b T` group form) into `map`.
+fn record_go_param_type(frag: &str, map: &mut std::collections::HashMap<String, String>) {
+    let frag = frag.trim();
+    let Some((names, ty)) = frag.rsplit_once(char::is_whitespace) else {
+        return;
+    };
+    let simple = go_simple_type(ty);
+    if simple.is_empty() {
+        return;
+    }
+    for name in names.split(',') {
+        let name = name.trim();
+        if is_ident(name) {
+            map.insert(name.to_string(), simple.clone());
+        }
+    }
+}
+
+/// `*controller.AppController` / `controller.AppController` / `AppController`
+/// → `AppController`. Strips leading `*`/`&`, slices, and package qualifier.
+fn go_simple_type(ty: &str) -> String {
+    let ty = ty.trim().trim_start_matches(['*', '&']);
+    let ty = ty.strip_prefix("[]").unwrap_or(ty).trim_start_matches(['*', '&']);
+    let last = ty.rsplit('.').next().unwrap_or(ty).trim();
+    if is_ident(last) {
+        last.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Type produced by a constructor RHS: `pkg.NewType(…)` / `NewType(…)` →
+/// `Type`; `&pkg.Type{…}` / `pkg.Type{…}` → `Type`.
+fn go_constructor_type(rhs: &str) -> Option<String> {
+    let rhs = rhs.trim_start_matches('&');
+    if let Some(paren) = rhs.find('(') {
+        let callee = rhs[..paren].rsplit('.').next().unwrap_or("");
+        if let Some(ty) = callee.strip_prefix("New") {
+            if is_ident(ty) {
+                return Some(ty.to_string());
+            }
+        }
+    }
+    if let Some(brace) = rhs.find('{') {
+        let head = rhs[..brace].trim();
+        let ty = head.rsplit('.').next().unwrap_or(head);
+        if is_ident(ty) {
+            return Some(ty.to_string());
+        }
+    }
+    None
+}
+
+/// Read the identifier ending just before byte `end` (e.g. the receiver before
+/// a `.GET(`). Returns `None` when the preceding byte is not an identifier.
+fn read_ident_backwards(b: &[u8], end: usize) -> Option<String> {
+    if end == 0 || end > b.len() {
+        return None;
+    }
+    let mut s = end;
+    while s > 0 && is_ident_byte(b[s - 1]) {
+        s -= 1;
+    }
+    if s == end {
+        return None;
+    }
+    let name = std::str::from_utf8(&b[s..end]).ok()?;
+    if name.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// One backend route a (Dart) client *consumes*, recovered from a route-table
 /// constant such as `class ApiEndpoints { static const String x = '/path'; }`.
 /// `class_name`/`name` are kept so a caller body referencing `ApiEndpoints.x`
@@ -1837,7 +2275,11 @@ pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
         }
         // The identifier just before `=` is the constant name; any preceding
         // tokens are its (optional) type.
-        let name = text[k..eq].split_whitespace().last().unwrap_or("").to_string();
+        let name = text[k..eq]
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
         if !is_ident(&name) {
             continue;
         }
@@ -2403,7 +2845,10 @@ public class StyleInfoController {
         let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name.as_deref(), Some("getMeasuresInfo"));
-        assert_eq!(routes[0].path.as_deref(), Some("/style-info/getMeasuresInfo"));
+        assert_eq!(
+            routes[0].path.as_deref(),
+            Some("/style-info/getMeasuresInfo")
+        );
 
         // route --references--> handler method.
         let from_route = store.list_edges_from(&routes[0].id).unwrap();
@@ -2457,6 +2902,150 @@ func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
         // path segments are still recovered from the literal concatenation parts.
         assert_eq!(design.path, "/app/craft/getDesignInfo");
         assert_eq!(design.class, "DesignHandler");
+    }
+
+    #[test]
+    fn parse_gin_routes_resolves_group_prefixes_and_handler_types() {
+        // Gin: nested route groups build a path prefix, the handler is the last
+        // call argument, and the handler's declaring type is recovered from the
+        // typed function parameters so the route can link to `Type.Method`.
+        let go = r#"
+package router
+
+import "github.com/gin-gonic/gin"
+
+func SetupRouter(appController *controller.AppController, healthController *controller.HealthController) *gin.Engine {
+	r := gin.New()
+	r.Use(middleware.Recovery())
+	r.GET("/health", healthController.HealthCheck)
+	v1 := r.Group("/api/v1")
+	{
+		apps := v1.Group("/apps")
+		{
+			apps.POST("", appController.CreateApp)
+			apps.GET("/:id", appController.GetApp)
+			apps.DELETE("/:id", appController.DeleteApp)
+		}
+	}
+	return r
+}
+"#;
+        let routes = parse_gin_routes(go);
+        assert_eq!(routes.len(), 4, "four routes parsed, got {routes:?}");
+
+        let health = routes
+            .iter()
+            .find(|r| r.method == "HealthCheck")
+            .expect("health route");
+        assert_eq!(health.verb, "GET");
+        assert_eq!(health.path, "/health");
+        assert_eq!(health.class, "HealthController");
+
+        let create = routes
+            .iter()
+            .find(|r| r.method == "CreateApp")
+            .expect("create route");
+        assert_eq!(create.verb, "POST");
+        assert_eq!(create.path, "/api/v1/apps", "group prefix + empty path");
+        assert_eq!(create.class, "AppController");
+
+        let get = routes.iter().find(|r| r.method == "GetApp").expect("get");
+        assert_eq!(get.verb, "GET");
+        assert_eq!(get.path, "/api/v1/apps/:id", "nested group + param path");
+        assert_eq!(get.class, "AppController");
+    }
+
+    #[test]
+    fn parse_gin_routes_ignores_non_gin_go() {
+        let go = r#"
+package service
+type S struct{}
+func (s *S) GET(id int) any { return s.repo.GET(id) }
+"#;
+        assert!(parse_gin_routes(go).is_empty());
+    }
+
+    #[test]
+    fn links_gin_http_route_to_handler_method() {
+        // A Gin router file + a pre-seeded handler GoMethod node must yield an
+        // HttpRoute node and a route--references-->method edge, matched by the
+        // `Type.Method` suffix recovered from the typed parameter.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("internal/router")).unwrap();
+        std::fs::write(
+            root.join("internal/router/router.go"),
+            r#"
+package router
+import "github.com/gin-gonic/gin"
+func SetupRouter(appController *controller.AppController) *gin.Engine {
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	apps := v1.Group("/apps")
+	apps.GET("/:id", appController.GetApp)
+	return r
+}
+"#,
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let method_id =
+            ArtifactId::new("go::internal/controller/app_controller.go::AppController.GetApp");
+        store
+            .upsert_node(&Node::new(method_id.clone(), NodeKind::GoMethod))
+            .unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.http_routes, 1, "one Gin route indexed");
+        assert_eq!(stats.route_method_edges, 1, "route->method edge linked");
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path.as_deref(), Some("/api/v1/apps/:id"));
+
+        let from_route = store.list_edges_from(&routes[0].id).unwrap();
+        assert!(
+            from_route
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.to_id == method_id),
+            "expected Gin route->method References edge, got {from_route:?}"
+        );
+    }
+
+    #[test]
+    fn schema_index_skips_python_venv_and_worktree_copies() {
+        // Installed dependencies (`.venv/.../site-packages/`) and tool worktree
+        // copies (`.claude/worktrees/`) must never be mined: a vendored FastAPI's
+        // docstring examples (`@app.get("/items") def read_items()`) would
+        // otherwise pollute the graph with phantom routes that link nowhere.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (rel, route) in [
+            ("src/api.py", "/real"),
+            (".venv/lib/python3.11/site-packages/fastapi/applications.py", "/items"),
+            (".claude/worktrees/exp/src/dup.py", "/dup"),
+            ("venv/site-packages/flask/app.py", "/vendored"),
+            ("__pycache__/cached.py", "/cached"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(
+                &p,
+                format!("@app.get(\"{route}\")\ndef handler():\n    return 1\n"),
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let stats = index_schema_into(&mut store, root).unwrap();
+
+        assert_eq!(stats.http_routes, 1, "only the first-party src/api.py route");
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        let paths: Vec<_> = routes.iter().filter_map(|n| n.path.clone()).collect();
+        assert_eq!(paths, vec!["/real".to_string()], "venv/worktree pruned");
     }
 
     #[test]
@@ -2526,6 +3115,138 @@ func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
     }
 
     #[test]
+    fn parse_python_routes_fastapi_and_flask() {
+        // FastAPI / Starlette method decorators, a websocket, and a Flask
+        // `route(..., methods=[...])`. Lifecycle decorators (`on_event`),
+        // non-route decorators (`@property`) and non-literal paths are ignored.
+        let py = r#"
+from fastapi import FastAPI, APIRouter
+
+app = FastAPI()
+router = APIRouter()
+
+@app.get("/api/strategies")
+async def list_strategies():
+    return []
+
+@router.post("/items", status_code=201)
+def create_item(payload):
+    return payload
+
+@app.websocket("/ws/feed")
+async def feed(ws):
+    await ws.accept()
+
+@app.route("/legacy", methods=["POST", "GET"])
+def legacy():
+    return "ok"
+
+@app.on_event("startup")
+async def startup():
+    pass
+
+@property
+def name(self):
+    return self._name
+
+@app.get(DYNAMIC_PATH)
+def dynamic():
+    return 1
+"#;
+        let routes = parse_python_routes(py);
+        assert_eq!(routes.len(), 4, "four real routes, got {routes:?}");
+
+        let ls = routes
+            .iter()
+            .find(|r| r.method == "list_strategies")
+            .expect("list_strategies route");
+        assert_eq!(ls.verb, "GET");
+        assert_eq!(ls.path, "/api/strategies");
+        assert!(ls.class.is_empty(), "module-level handler has no class");
+
+        let ci = routes
+            .iter()
+            .find(|r| r.method == "create_item")
+            .expect("create_item route");
+        assert_eq!(ci.verb, "POST");
+        assert_eq!(ci.path, "/items");
+
+        let feed = routes.iter().find(|r| r.method == "feed").expect("ws route");
+        assert_eq!(feed.verb, "WS");
+        assert_eq!(feed.path, "/ws/feed");
+
+        let legacy = routes
+            .iter()
+            .find(|r| r.method == "legacy")
+            .expect("flask route");
+        assert_eq!(legacy.verb, "POST", "first verb in methods=[...]");
+        assert_eq!(legacy.path, "/legacy");
+    }
+
+    #[test]
+    fn parse_python_routes_ignores_non_web_python() {
+        let py = r#"
+import dataclasses
+
+@dataclasses.dataclass
+class Strategy:
+    name: str
+
+@functools.cache
+def compute():
+    return 1
+"#;
+        assert!(parse_python_routes(py).is_empty());
+    }
+
+    #[test]
+    fn links_python_http_route_to_handler_function() {
+        // A FastAPI route file + a pre-seeded handler PythonFunction node must
+        // yield an HttpRoute node and a route--references-->function edge,
+        // matched by the bare function-name suffix (classless handler).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/api")).unwrap();
+        std::fs::write(
+            root.join("src/api/main.py"),
+            r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/api/strategies")
+async def list_strategies():
+    return []
+"#,
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        // Pre-seed the handler node (normally from the Python code indexer).
+        let fn_id = ArtifactId::new("python::src/api/main.py::list_strategies");
+        store
+            .upsert_node(&Node::new(fn_id.clone(), NodeKind::PythonFunction))
+            .unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.http_routes, 1, "one Python HTTP route indexed");
+        assert_eq!(stats.route_method_edges, 1, "route->function edge linked");
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path.as_deref(), Some("/api/strategies"));
+
+        let from_route = store.list_edges_from(&routes[0].id).unwrap();
+        assert!(
+            from_route
+                .iter()
+                .any(|e| e.kind == EdgeKind::References && e.to_id == fn_id),
+            "expected Python route->function References edge, got {from_route:?}"
+        );
+    }
+
+    #[test]
     fn reindex_prunes_stale_schema_nodes_and_edges() {
         // Re-indexing must not leave behind nodes/edges for source that no longer
         // exists. Like the language indexers, the schema pass must clear its own
@@ -2538,7 +3259,10 @@ func (h *DesignHandler) Register(mux *http.ServeMux, gatewayPrefix string) {
 
         let mut store = Store::open(root.join("graph.db")).unwrap();
         store.migrate().unwrap();
-        for m in ["DesignHandler.GetDesignInfo", "DesignHandler.SelectCraftTree"] {
+        for m in [
+            "DesignHandler.GetDesignInfo",
+            "DesignHandler.SelectCraftTree",
+        ] {
             let id = ArtifactId::new(format!("go::internal/craft/handler/h.go::{m}"));
             store
                 .upsert_node(&Node::new(id, NodeKind::GoMethod))
@@ -2560,7 +3284,10 @@ func (h *DesignHandler) Register(mux *http.ServeMux) {
         .unwrap();
         let s1 = index_schema_into(&mut store, root).unwrap();
         assert_eq!(s1.http_routes, 2, "first pass indexes both routes");
-        assert_eq!(store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap().len(), 2);
+        assert_eq!(
+            store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap().len(),
+            2
+        );
 
         // Drop the second route, then re-index the same store.
         std::fs::write(
@@ -2623,14 +3350,21 @@ class ApiEndpoints {
 "#;
         let routes = parse_dart_route_constants(dart);
         let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"/token/oauth/token"), "login path, got {paths:?}");
+        assert!(
+            paths.contains(&"/token/oauth/token"),
+            "login path, got {paths:?}"
+        );
         assert!(paths.contains(&"/style/app/style-info/getDesignDetail"));
         assert!(paths.contains(&"/member/member/markRead"));
         // base URL (https), storage key (no slash), numeric, and the whole
         // non-route AppConstants class are excluded.
         assert!(!paths.iter().any(|p| p.starts_with("https")));
         assert!(!paths.contains(&"access_token"));
-        assert_eq!(routes.len(), 3, "only the 3 ApiEndpoints paths, got {routes:?}");
+        assert_eq!(
+            routes.len(),
+            3,
+            "only the 3 ApiEndpoints paths, got {routes:?}"
+        );
 
         let sd = routes
             .iter()
@@ -3008,7 +3742,11 @@ public class SizeSysVO implements Serializable {
 </mapper>"#;
         let stmts = parse_mapper_stmts(xml);
         // The <sql> fragment is not itself a CRUD statement.
-        assert_eq!(stmts.len(), 1, "only the <select> is a statement: {stmts:?}");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "only the <select> is a statement: {stmts:?}"
+        );
         let s = &stmts[0];
         assert_eq!(s.id, "selectOrdenCraftByDetailId");
         assert!(
@@ -3049,20 +3787,28 @@ public class SizeSysVO implements Serializable {
         assert_eq!(t, vec!["a", "b"]);
 
         // A `from`/`join` embedded in an identifier or column name is not a hit.
-        assert!(extract_sql_table_refs("select date_from, transform_id from t").contains(&"t".to_string()));
-        assert_eq!(extract_sql_table_refs("select date_from, transform_id from t").len(), 1);
+        assert!(
+            extract_sql_table_refs("select date_from, transform_id from t")
+                .contains(&"t".to_string())
+        );
+        assert_eq!(
+            extract_sql_table_refs("select date_from, transform_id from t").len(),
+            1
+        );
     }
 
     #[test]
     fn extract_table_refs_handles_insert_without_into() {
         // MySQL allows `INSERT <table>` (no INTO); MyBatis batch inserts use it.
-        let t1 = extract_sql_table_refs("insert style_package_info ( category, style_code ) values");
+        let t1 =
+            extract_sql_table_refs("insert style_package_info ( category, style_code ) values");
         assert!(
             t1.contains(&"style_package_info".to_string()),
             "insert-without-into missed the table: {t1:?}"
         );
         // Classic `insert into x` still resolves to x (and never to `into`).
-        let t2 = extract_sql_table_refs("insert into v_image_post(string, time) value(#{s}, now())");
+        let t2 =
+            extract_sql_table_refs("insert into v_image_post(string, time) value(#{s}, now())");
         assert_eq!(t2, vec!["v_image_post"]);
     }
 
@@ -3071,16 +3817,24 @@ public class SizeSysVO implements Serializable {
         // `WITH RECURSIVE cte AS (…) … FROM cte`: `cte` is a CTE alias, not a
         // base table. The real table (`craft`) is kept; the CTE name is dropped
         // so it isn't mistaken for (or synthesized as) a table.
-        let sql = "WITH RECURSIVE cte AS ( SELECT id, pid FROM craft WHERE id = 1 ) SELECT * FROM cte";
+        let sql =
+            "WITH RECURSIVE cte AS ( SELECT id, pid FROM craft WHERE id = 1 ) SELECT * FROM cte";
         let t = extract_sql_table_refs(sql);
-        assert!(t.contains(&"craft".to_string()), "real base table kept: {t:?}");
+        assert!(
+            t.contains(&"craft".to_string()),
+            "real base table kept: {t:?}"
+        );
         assert!(!t.contains(&"cte".to_string()), "CTE alias excluded: {t:?}");
 
         // Multiple CTEs in one WITH.
         let multi = "with a as (select 1 from t1), b as (select 2 from t2) select * from a join b";
         let mut m = extract_sql_table_refs(multi);
         m.sort();
-        assert_eq!(m, vec!["t1", "t2"], "only base tables, no CTE aliases: {m:?}");
+        assert_eq!(
+            m,
+            vec!["t1", "t2"],
+            "only base tables, no CTE aliases: {m:?}"
+        );
     }
 
     #[test]
@@ -3091,7 +3845,10 @@ public class SizeSysVO implements Serializable {
         let sql = "insert into t (a, b) values (1, 2) on duplicate key update a = values(a)";
         let t = extract_sql_table_refs(sql);
         assert!(t.contains(&"t".to_string()), "{t:?}");
-        assert!(!t.contains(&"a".to_string()), "SET column must not be a table: {t:?}");
+        assert!(
+            !t.contains(&"a".to_string()),
+            "SET column must not be a table: {t:?}"
+        );
     }
 
     #[test]
@@ -3207,7 +3964,10 @@ public class SizeSysVO implements Serializable {
 
         // Idempotent: a second pass synthesizes nothing new (node reused).
         let stats2 = index_schema_into(&mut store, root).unwrap();
-        assert_eq!(stats2.external_tables, 1, "external count stable on re-index");
+        assert_eq!(
+            stats2.external_tables, 1,
+            "external count stable on re-index"
+        );
         let after: Vec<_> = store
             .list_nodes_by_kind(NodeKind::DbTable)
             .unwrap()

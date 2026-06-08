@@ -73,7 +73,10 @@ pub fn run(args: PortCoverageRunArgs) -> Result<()> {
 
 fn print_human(report: &PortCoverageReport) {
     let s = &report.stats;
-    println!("SpecSlice 移植覆盖率账本 (schema v{})", report.schema_version);
+    println!(
+        "SpecSlice 移植覆盖率账本 (schema v{})",
+        report.schema_version
+    );
     println!(
         "源符号 {} (去重名 {}) · 目标符号 {} (去重名 {})",
         s.source_symbols, s.source_distinct_names, s.target_symbols, s.target_distinct_names,
@@ -85,7 +88,11 @@ fn print_human(report: &PortCoverageReport) {
         s.extra_names,
         s.coverage * 100.0,
     );
-    let via_alias = report.ported.iter().filter(|p| p.via_alias.is_some()).count();
+    let via_alias = report
+        .ported
+        .iter()
+        .filter(|p| p.via_alias.is_some())
+        .count();
     if via_alias > 0 {
         println!("其中经移植映射(--port-map)命中 {via_alias} 个改名符号");
     }

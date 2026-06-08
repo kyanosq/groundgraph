@@ -165,15 +165,17 @@ pub fn summarize(stats: &[CommandStat]) -> StatsSummary {
         if !s.ok {
             total_errors += 1;
         }
-        let entry = by.entry(s.command.clone()).or_insert_with(|| CommandSummary {
-            command: s.command.clone(),
-            calls: 0,
-            errors: 0,
-            total_ms: 0,
-            avg_ms: 0.0,
-            max_ms: 0,
-            metrics: BTreeMap::new(),
-        });
+        let entry = by
+            .entry(s.command.clone())
+            .or_insert_with(|| CommandSummary {
+                command: s.command.clone(),
+                calls: 0,
+                errors: 0,
+                total_ms: 0,
+                avg_ms: 0.0,
+                max_ms: 0,
+                metrics: BTreeMap::new(),
+            });
         entry.calls += 1;
         if !s.ok {
             entry.errors += 1;
@@ -195,7 +197,11 @@ pub fn summarize(stats: &[CommandStat]) -> StatsSummary {
             c
         })
         .collect();
-    commands.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.command.cmp(&b.command)));
+    commands.sort_by(|a, b| {
+        b.calls
+            .cmp(&a.calls)
+            .then_with(|| a.command.cmp(&b.command))
+    });
     StatsSummary {
         total_calls,
         total_errors,

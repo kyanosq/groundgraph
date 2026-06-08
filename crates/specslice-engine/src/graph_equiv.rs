@@ -301,7 +301,10 @@ fn collect_side(store: &Store, scope: &[String], options: &GraphEquivOptions) ->
             }
         }
         counts.total += 1;
-        *counts.by_kind.entry(n.kind.as_str().to_string()).or_default() += 1;
+        *counts
+            .by_kind
+            .entry(n.kind.as_str().to_string())
+            .or_default() += 1;
         *counts
             .by_family
             .entry(family_of_kind(n).to_string())
@@ -324,7 +327,10 @@ fn collect_side(store: &Store, scope: &[String], options: &GraphEquivOptions) ->
     for e in store.list_all_edges().context("listing edges")? {
         if eligible_ids.contains(e.from_id.as_str()) && eligible_ids.contains(e.to_id.as_str()) {
             edges.total_internal += 1;
-            *edges.by_kind.entry(e.kind.as_str().to_string()).or_default() += 1;
+            *edges
+                .by_kind
+                .entry(e.kind.as_str().to_string())
+                .or_default() += 1;
         }
     }
 
@@ -514,11 +520,27 @@ mod tests {
         // Source = Java craft-conflict slice; target = Go craft slice.
         let (source, _s) = store_with(
             &[
-                ("selectTrademarkConflictListTreeByCloth", NodeKind::JavaMethod, "craft/CraftConflictServiceImpl.java"),
-                ("selectEmbConflictListTreeByCloth", NodeKind::JavaMethod, "craft/CraftConflictServiceImpl.java"),
-                ("CraftConflict", NodeKind::JavaClass, "craft/CraftConflict.java"),
+                (
+                    "selectTrademarkConflictListTreeByCloth",
+                    NodeKind::JavaMethod,
+                    "craft/CraftConflictServiceImpl.java",
+                ),
+                (
+                    "selectEmbConflictListTreeByCloth",
+                    NodeKind::JavaMethod,
+                    "craft/CraftConflictServiceImpl.java",
+                ),
+                (
+                    "CraftConflict",
+                    NodeKind::JavaClass,
+                    "craft/CraftConflict.java",
+                ),
                 // out of scope — must be ignored by the source scope glob.
-                ("payOrder", NodeKind::JavaMethod, "order/OrderServiceImpl.java"),
+                (
+                    "payOrder",
+                    NodeKind::JavaMethod,
+                    "order/OrderServiceImpl.java",
+                ),
             ],
             &[(
                 "selectTrademarkConflictListTreeByCloth",
@@ -528,8 +550,16 @@ mod tests {
         );
         let (target, _t) = store_with(
             &[
-                ("SelectTrademarkConflictListTreeByCloth", NodeKind::GoFunction, "internal/craft/service/conflict.go"),
-                ("CraftConflict", NodeKind::GoMethod, "internal/craft/model/models.go"),
+                (
+                    "SelectTrademarkConflictListTreeByCloth",
+                    NodeKind::GoFunction,
+                    "internal/craft/service/conflict.go",
+                ),
+                (
+                    "CraftConflict",
+                    NodeKind::GoMethod,
+                    "internal/craft/model/models.go",
+                ),
             ],
             &[],
         );
@@ -561,7 +591,10 @@ mod tests {
         assert_eq!(report.names.source_distinct, 3);
         assert_eq!(report.names.ported, 2);
         assert_eq!(report.names.missing, 1);
-        assert_eq!(report.names.missing_names, vec!["selectEmbConflictListTreeByCloth".to_string()]);
+        assert_eq!(
+            report.names.missing_names,
+            vec!["selectEmbConflictListTreeByCloth".to_string()]
+        );
         assert!((report.names.coverage - 2.0 / 3.0).abs() < 1e-6);
     }
 
@@ -634,10 +667,7 @@ mod tests {
 
     #[test]
     fn empty_scope_covers_whole_graph() {
-        let (source, _s) = store_with(
-            &[("A", NodeKind::JavaMethod, "x/A.java")],
-            &[],
-        );
+        let (source, _s) = store_with(&[("A", NodeKind::JavaMethod, "x/A.java")], &[]);
         let (target, _t) = store_with(&[("A", NodeKind::GoFunction, "y/a.go")], &[]);
         let report =
             analyze_graph_equiv_with_stores(&source, &target, &GraphEquivOptions::default())
