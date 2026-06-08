@@ -227,6 +227,9 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     // accumulated across the walk and turned into nodes/edges after it (needs the
     // language indexers' callable nodes to already exist in the store).
     let mut dart_route_consts: Vec<DartRouteConst> = Vec::new();
+    // Inline HTTP-client calls (`_dio.get('/v1/me')`) the Dart client makes, with
+    // their file so the consumed route links to the enclosing callable by line.
+    let mut dart_consumed_calls: Vec<(String, DartConsumedCall)> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !is_skipped_walk_entry(e))
@@ -310,6 +313,17 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         if ext == "dart" {
             if let Ok(text) = std::fs::read_to_string(path) {
                 dart_route_consts.extend(parse_dart_route_constants(&text));
+                let calls = parse_dart_consumed_calls(&text);
+                if !calls.is_empty() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    for c in calls {
+                        dart_consumed_calls.push((rel.clone(), c));
+                    }
+                }
             }
         }
         let tables = match ext.as_str() {
@@ -350,6 +364,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     link_inline_sql_edges(store, root, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
+    link_dart_inline_consumed_routes(store, &dart_consumed_calls, &mut stats)?;
     Ok(stats)
 }
 
@@ -762,6 +777,91 @@ fn link_dart_consumed_routes(
         store.upsert_edge(edge).with_context(|| {
             format!(
                 "linking dart route-consumer edge {} -> {}",
+                edge.from_id.as_str(),
+                edge.to_id.as_str()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Sibling of [`link_dart_consumed_routes`] for the inline-call shape recovered
+/// by [`parse_dart_consumed_calls`]: turn each `_dio.get('/v1/me')` into a
+/// consumed `HttpRoute` node and link the *enclosing* Dart callable to it with a
+/// `method --references--> route` edge. The consumer is the innermost callable
+/// whose line range contains the call, so the edge lands on the real API method
+/// rather than the file. Idempotent; each `(callable, route)` links at most once.
+fn link_dart_inline_consumed_routes(
+    store: &mut Store,
+    calls: &[(String, DartConsumedCall)],
+    stats: &mut SchemaIndexStats,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+    if calls.is_empty() {
+        return Ok(());
+    }
+    // Consumed-route nodes, keyed by path alone (verb-agnostic) so the served
+    // and consumed sides collapse to the same node identity for route-coverage.
+    let mut path_to_id: HashMap<String, ArtifactId> = HashMap::new();
+    for (_rel, call) in calls {
+        if !path_to_id.contains_key(&call.path) {
+            let node = consumed_route_node(&call.path);
+            let id = node.id.clone();
+            store
+                .upsert_node(&node)
+                .with_context(|| format!("upserting consumed route {}", call.path))?;
+            path_to_id.insert(call.path.clone(), id);
+            stats.consumed_routes += 1;
+        }
+    }
+    // file -> [(callable id, start, end)] for innermost-enclosing attribution.
+    let mut by_file: HashMap<String, Vec<(ArtifactId, u32, u32)>> = HashMap::new();
+    for &kind in NodeKind::ALL {
+        if !kind.is_callable() || kind.language() != Some("dart") {
+            continue;
+        }
+        for node in store.list_nodes_by_kind(kind)? {
+            let (Some(path), Some(start)) = (node.path.clone(), node.start_line) else {
+                continue;
+            };
+            let end = node.end_line.unwrap_or(start);
+            by_file
+                .entry(path)
+                .or_default()
+                .push((node.id.clone(), start, end));
+        }
+    }
+    let mut edges: Vec<EdgeAssertion> = Vec::new();
+    let mut seen: HashSet<(ArtifactId, ArtifactId)> = HashSet::new();
+    for (rel, call) in calls {
+        let Some(route_id) = path_to_id.get(&call.path) else {
+            continue;
+        };
+        let Some(cands) = by_file.get(rel) else {
+            continue;
+        };
+        let enclosing = cands
+            .iter()
+            .filter(|(_, start, end)| *start <= call.line && call.line <= *end)
+            .min_by_key(|(_, start, end)| end.saturating_sub(*start));
+        let Some((cid, _, _)) = enclosing else {
+            continue;
+        };
+        if seen.insert((cid.clone(), route_id.clone())) {
+            edges.push(EdgeAssertion::fact(
+                cid.clone(),
+                route_id.clone(),
+                EdgeKind::References,
+                EdgeSource::LanguageAdapter,
+            ));
+            stats.route_consumer_edges += 1;
+        }
+    }
+    for edge in &mut edges {
+        edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+        store.upsert_edge(edge).with_context(|| {
+            format!(
+                "linking dart inline route-consumer edge {} -> {}",
                 edge.from_id.as_str(),
                 edge.to_id.as_str()
             )
@@ -2417,6 +2517,126 @@ pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
     out
 }
 
+/// One inline HTTP call a Dart client makes — `verb` (upper-cased method name),
+/// the normalized route `path`, and the source `line` (1-based) used to attribute
+/// the call to its enclosing callable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DartConsumedCall {
+    pub verb: String,
+    pub path: String,
+    pub line: u32,
+}
+
+/// HTTP verbs Dart clients call as methods (Dio: `dio.get(path)`; `http`
+/// package: `client.post(Uri.parse(path))`).
+const DART_HTTP_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head"];
+
+/// Recover the backend routes a Dart client consumes by calling an HTTP client
+/// *inline* — `_dio.get<T>('/v1/me')`, `_dio.post('/v1/teams/$id/sync', …)` —
+/// the dominant real-world shape, which carries no `ApiEndpoints` constant table
+/// for [`parse_dart_route_constants`] to mine. A call qualifies only when the
+/// method is an HTTP verb and its first argument yields a string literal that is
+/// an absolute path (`/…`), which rejects collection/cache `.get('key')` calls.
+/// Path interpolation (`$id`, `${x}`) normalizes to a `:param` placeholder so the
+/// consumed path matches the server's `:id` under [`route_coverage::route_key`].
+pub fn parse_dart_consumed_calls(text: &str) -> Vec<DartConsumedCall> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for verb in DART_HTTP_VERBS {
+        let needle = format!(".{verb}");
+        for (pos, _) in text.match_indices(needle.as_str()) {
+            // A receiver must precede the dot (`recv.get`), and the verb must be
+            // a whole method name, not the prefix of a longer one (`.getter`).
+            if pos == 0 {
+                continue;
+            }
+            let prev = b[pos - 1];
+            if !(is_ident_byte(prev) || prev == b')' || prev == b']' || prev == b'>') {
+                continue;
+            }
+            let after = pos + needle.len();
+            if after < b.len() && is_ident_byte(b[after]) {
+                continue;
+            }
+            // Skip optional `<T>` type arguments between the method and the `(`.
+            let mut p = skip_ws(b, after);
+            if p < b.len() && b[p] == b'<' {
+                match skip_angle_generics(b, p) {
+                    Some(end) => p = skip_ws(b, end),
+                    None => continue,
+                }
+            }
+            if p >= b.len() || b[p] != b'(' {
+                continue;
+            }
+            let Some((body, _)) = balanced_parens(b, p) else {
+                continue;
+            };
+            let args = split_top_level_commas(body);
+            let Some(first) = args.first() else {
+                continue;
+            };
+            let Some(raw) = first_dart_string_literal(first) else {
+                continue;
+            };
+            if !raw.starts_with('/') || raw.len() < 2 {
+                continue;
+            }
+            let path = normalize_dart_route_path(&raw);
+            let line = line_of(text, pos);
+            if seen.insert((verb.to_string(), path.clone(), line)) {
+                out.push(DartConsumedCall {
+                    verb: verb.to_ascii_uppercase(),
+                    path,
+                    line,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Index just past the `>` matching the `<` at `open`, tracking nesting
+/// (`Map<String, List<int>>`). Bails (`None`) on a token that cannot appear in a
+/// type-argument list, so a stray `<` comparison is not mistaken for generics.
+fn skip_angle_generics(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b';' | b'{' | b'}' | b'(' | b')' => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Normalize a consumed route path: drop any query/fragment and map each
+/// interpolated segment (`$id`, `${x}`) to a `:param` placeholder so the path
+/// param drops out of the cross-graph match key the same way a server `:id` does.
+fn normalize_dart_route_path(raw: &str) -> String {
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    path.split('/')
+        .map(|seg| {
+            if seg.contains('$') {
+                ":param"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `(byte offset, class name)` for every `class <Name>` declaration, in source
 /// order — used to attribute a `static const` to its enclosing class.
 fn collect_dart_classes(text: &str) -> Vec<(usize, String)> {
@@ -3549,6 +3769,92 @@ class AssetPaths {
 }
 "#;
         assert!(parse_dart_route_constants(dart).is_empty());
+    }
+
+    #[test]
+    fn parse_dart_consumed_calls_extracts_dio_verbs_and_normalizes_interpolation() {
+        // The dominant real Dart client shape (Shift app `sync_api.dart`): a Dio
+        // client called inline with a path *literal*, no `ApiEndpoints` table.
+        // The verb is the method name, the path the first string argument (the
+        // `<T>` type args between method and `(` must be skipped), and `$id`
+        // interpolation must normalize to a `:param` placeholder so it matches
+        // the server's `:id` under `route_key`. Non-path `.get('key')` calls on
+        // maps/caches (arg without a leading `/`) must be ignored.
+        let dart = r#"
+class BackendClient {
+  Future<void> me() async {
+    final r = await _dio.get<Map<String, dynamic>>('/v1/me');
+  }
+  Future<void> deleteAccount() async {
+    await _dio.delete<void>('/v1/account');
+  }
+  Future<void> teamSync(String teamId) async {
+    await _dio.post<Map<String, dynamic>>('/v1/teams/$teamId/sync', data: {});
+  }
+  String local() => cache.get('local-key');
+  String header() => options.headers['x'];
+}
+"#;
+        let calls = parse_dart_consumed_calls(dart);
+        let got: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.verb.as_str(), c.path.as_str()))
+            .collect();
+        assert!(got.contains(&("GET", "/v1/me")), "GET /v1/me, got {got:?}");
+        assert!(
+            got.contains(&("DELETE", "/v1/account")),
+            "DELETE /v1/account, got {got:?}"
+        );
+        assert!(
+            got.contains(&("POST", "/v1/teams/:param/sync")),
+            "interpolation → :param, got {got:?}"
+        );
+        assert!(
+            !got.iter().any(|(_, p)| p.contains("local-key")),
+            "non-path .get('local-key') ignored, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn links_dart_inline_dio_consumer_to_consumed_route() {
+        // End-to-end of the inline-call path (the Shift-app shape): a Dart method
+        // calls `_dio.get('/v1/me')` directly — no constant table — and the full
+        // schema pass must emit a consumed HttpRoute node and a
+        // method--references-->route edge on the *enclosing* callable.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("lib/sync")).unwrap();
+        std::fs::write(
+            root.join("lib/sync/sync_api.dart"),
+            "class BackendClient {\n  Future<void> me() async {\n    await _dio.get<Map<String, dynamic>>('/v1/me');\n  }\n}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        // Pre-seed the consumer method node (normally from the Dart indexer).
+        let method_id = ArtifactId::new("dart_method::lib/sync/sync_api.dart#BackendClient.me");
+        let mut mnode = Node::new(method_id.clone(), NodeKind::DartMethod);
+        mnode.path = Some("lib/sync/sync_api.dart".to_string());
+        mnode.source_file = Some("lib/sync/sync_api.dart".to_string());
+        mnode.start_line = Some(2);
+        mnode.end_line = Some(4);
+        store.upsert_node(&mnode).unwrap();
+
+        let stats = index_schema_into(&mut store, root).unwrap();
+        assert_eq!(stats.consumed_routes, 1, "inline dio route indexed");
+        assert_eq!(stats.route_consumer_edges, 1, "one consumer->route edge");
+
+        let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
+        assert!(
+            routes.iter().any(|r| r.path.as_deref() == Some("/v1/me")),
+            "consumed /v1/me node, got {routes:?}"
+        );
+        let edges = store.list_edges_from(&method_id).unwrap();
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::References),
+            "me() references the consumed route"
+        );
     }
 
     #[test]
