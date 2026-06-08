@@ -1614,11 +1614,12 @@ pub const ALWAYS_SKIP_DIRS: &[&str] = &[
     ".svn",
     ".specslice",
     ".claude",
-    // Vendored dependencies
+    // Vendored dependencies / build caches (non-hidden names)
     "node_modules",
     "vendor",
     "Pods",
     "Carthage",
+    "DerivedData",
     ".dart_tool",
     // Python virtualenvs / installed packages / caches
     ".venv",
@@ -1639,6 +1640,14 @@ fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
     let Some(name) = entry.file_name().to_str() else {
         return false;
     };
+    // Hidden directories (below the root) are tooling / build / cache output —
+    // DerivedData variants (`.derivedData-codex`), SwiftPM `.build`/`.swiftpm`,
+    // `.venv`, `.gradle`, `.idea` … — never first-party source, exactly the
+    // default ripgrep / `ignore` apply. The depth>0 guard keeps a repository
+    // whose own root happens to be hidden (cloned into `.foo`) indexable.
+    if entry.depth() > 0 && name.starts_with('.') {
+        return true;
+    }
     ALWAYS_SKIP_DIRS.contains(&name) || skip_dirs.contains(&name)
 }
 
@@ -1990,6 +1999,56 @@ describe('outer', () => {
             .find(|n| n.kind == NodeKind::PythonClass && n.name.as_deref() == Some("Service"))
             .expect("Service node present");
         assert_eq!(service.metadata_json.as_deref(), Some(r#"{"tag":"py"}"#));
+    }
+
+    #[test]
+    fn discovery_prunes_hidden_build_and_cache_dirs() {
+        use specslice_store::Store;
+
+        // A real iOS repo (invis) hid 2368 SwiftPM/DerivedData sources under a
+        // `.derivedData-codex/` dir; the walker descended into it and indexed
+        // ~20x the first-party code. Hidden directories (`.`-prefixed) are
+        // tooling/build/cache output, never first-party source — pruned the same
+        // way ripgrep/`ignore` do by default.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def real():\n    return 1\n").unwrap();
+        for hidden in [".derivedData-codex/pkg", ".build/checkouts/dep", ".venv/lib"] {
+            std::fs::create_dir_all(root.join(hidden)).unwrap();
+            std::fs::write(
+                root.join(hidden).join("vendored.py"),
+                "def vendored():\n    return 2\n",
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let spec = py_cap_spec();
+        let result = index_repo_with_spec(
+            &mut store,
+            &spec,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files, 1,
+            "only src/app.py discovered; hidden build/cache dirs pruned: {result:?}"
+        );
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.name.as_deref() != Some("vendored")),
+            "no symbol may come from a hidden dir"
+        );
     }
 
     // --- Java wildcard package imports (`import pkg.*;`) -------------------

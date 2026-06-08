@@ -1198,7 +1198,14 @@ fn is_skipped_dir(name: &str) -> bool {
 ///    nodes with no parent code node to link to. The root workspace (depth 0)
 ///    is exempt so its own config never prunes the entire walk.
 fn is_skipped_walk_entry(e: &walkdir::DirEntry) -> bool {
-    if is_skipped_dir(e.file_name().to_str().unwrap_or("")) {
+    let name = e.file_name().to_str().unwrap_or("");
+    // Hidden dirs below the root are tooling/build/cache output (DerivedData
+    // variants, .build, .venv …), never first-party source — pruned like the
+    // tree-sitter discovery and ripgrep/`ignore` default.
+    if e.depth() > 0 && e.file_type().is_dir() && name.starts_with('.') {
+        return true;
+    }
+    if is_skipped_dir(name) {
         return true;
     }
     e.depth() > 0 && e.file_type().is_dir() && e.path().join(DEFAULT_CONFIG_FILE_NAME).is_file()

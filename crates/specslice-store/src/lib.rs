@@ -78,6 +78,20 @@ impl Store {
             path: path.clone(),
             source,
         })?;
+        // Write-ahead logging + synchronous=NORMAL: indexing upserts tens of
+        // thousands of rows in autocommit mode; the SQLite default (rollback
+        // journal + synchronous=FULL) fsyncs on every statement, which made a
+        // ~100-file repo take minutes (disk-bound, near-idle CPU). WAL+NORMAL
+        // drops the per-commit fsync while staying durable across app crashes —
+        // acceptable for a rebuildable index cache. busy_timeout avoids spurious
+        // "database is locked" under the WAL reader/writer split.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|source| StoreError::OpenDb {
+            path: path.clone(),
+            source,
+        })?;
         Ok(Self { conn, path })
     }
 
@@ -100,6 +114,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_enables_wal_and_normal_synchronous_for_bulk_write_throughput() {
+        // Indexing performs tens of thousands of node/edge upserts. Under the
+        // SQLite defaults (rollback journal + synchronous=FULL) every autocommit
+        // statement fsyncs twice, making a 100-file repo take minutes. WAL +
+        // synchronous=NORMAL removes the per-commit fsync (durable across app
+        // crashes, only at-risk on OS crash — acceptable for a rebuildable index
+        // cache), which is the single highest-leverage write-throughput fix.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("graph.db")).unwrap();
+        let journal: String = store
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "wal", "WAL journal expected");
+        let sync: i64 = store
+            .connection()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous=NORMAL (1) expected, got {sync}");
+    }
 
     fn migrated_store() -> (Store, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
