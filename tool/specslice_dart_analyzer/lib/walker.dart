@@ -1330,12 +1330,42 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
   /// Resolve a widget construction (`DestPage(...)`, possibly `const`) to its
   /// repo-local class graph id via the same `NamedType` → element → node map
   /// used for `references` edges; external/SDK widgets resolve to null.
-  String? _widgetClassId(Expression widgetExpr) {
+  ///
+  /// Sees through DI/provider wrappers — `BlocProvider(create: …, child:
+  /// DestPage())` and friends — to their `child:` so navigation lands on the
+  /// destination screen rather than the (often external) wrapper. Bounded
+  /// depth guards pathological nesting.
+  String? _widgetClassId(Expression widgetExpr, {int depth = 0}) {
     if (widgetExpr is! InstanceCreationExpression) return null;
+    final typeName = widgetExpr.constructorName.type.toSource().split('<').first;
+    if (depth < 3 && _isWrapperWidget(typeName)) {
+      for (final a in widgetExpr.argumentList.arguments) {
+        if (a is NamedExpression && a.name.label.name == 'child') {
+          final id = _widgetClassId(a.expression, depth: depth + 1);
+          if (id != null) return id;
+        }
+      }
+    }
     final el = widgetExpr.constructorName.type.element2;
     if (el == null) return null;
     return byElement[el];
   }
+
+  /// Provider/DI wrapper widgets whose real subject is their `child:`. Matched
+  /// by name (the types are external package classes, not repo-local), so the
+  /// navigation target is the wrapped page, not the wrapper.
+  bool _isWrapperWidget(String name) => const {
+        'BlocProvider',
+        'MultiBlocProvider',
+        'BlocListener',
+        'MultiBlocListener',
+        'BlocConsumer',
+        'Provider',
+        'MultiProvider',
+        'RepositoryProvider',
+        'ChangeNotifierProvider',
+        'ListenableProvider',
+      }.contains(name);
 
   String? _stringLiteralValue(AstNode? n) {
     if (n is SimpleStringLiteral) return n.value;

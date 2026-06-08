@@ -851,6 +851,77 @@ class ProductListPage {
     );
   });
 
+  test(
+      'walkRepository emits navigates_to through a BlocProvider wrapper in the route builder',
+      () async {
+    // A very common refinement of the inline push wraps the destination in a
+    // DI provider: `builder: (_) => BlocProvider(create: ..., child: Page())`.
+    // The builder then returns the *wrapper* (often an external package type),
+    // so resolving the returned widget directly misses the page. We must look
+    // through known provider/wrapper widgets to their `child:` to land the
+    // navigates_to edge on the real destination screen.
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+    final libDir = Directory(p.join(root.path, 'lib'));
+    libDir.createSync(recursive: true);
+    File(p.join(libDir.path, 'nav.dart')).writeAsStringSync('''
+class BuildContext {}
+
+class Route<T> {}
+
+class CupertinoPageRoute<T> extends Route<T> {
+  CupertinoPageRoute({required Object Function(BuildContext) builder});
+}
+
+class BlocProvider<T> {
+  const BlocProvider({required this.child});
+  final Object child;
+}
+
+class DetailPage {
+  const DetailPage();
+}
+
+class Navigator {
+  static void push(BuildContext context, Route<dynamic> route) {}
+}
+
+class ListPage {
+  void open(BuildContext context) {
+    Navigator.push(
+      context,
+      CupertinoPageRoute<void>(
+        builder: (_) => BlocProvider(child: const DetailPage()),
+      ),
+    );
+  }
+}
+''');
+
+    final response = await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+    final references =
+        (response.toJson()['references'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .toList();
+    bool hasEdge(String from, String to, String kind) => references.any((e) =>
+        e['from_symbol_id'] == from &&
+        e['to_symbol_id'] == to &&
+        e['kind'] == kind);
+
+    expect(
+      hasEdge(
+        'dart_method::lib/nav.dart#ListPage.open',
+        'dart_class::lib/nav.dart#DetailPage',
+        EdgeKindString.navigatesTo,
+      ),
+      isTrue,
+      reason: 'navigation must see through the BlocProvider wrapper to the '
+          'destination page: $references',
+    );
+  });
+
   group('resolveSdkPath', () {
     test('isValidSdk is false for a non-SDK directory', () {
       expect(isValidSdk('/definitely/not/an/sdk'), isFalse);
