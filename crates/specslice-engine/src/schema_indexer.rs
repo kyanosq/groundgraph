@@ -1811,6 +1811,17 @@ pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
     if !text.contains("static const") {
         return Vec::new();
     }
+    // A *client navigation* table (`AppRouter`, `AppRoutes`) holds the same
+    // `static const String x = '/path'` shape as a backend endpoint table and
+    // matches the name heuristic ("route"), but its paths are Flutter screen
+    // routes consumed by `Navigator`, not backend APIs. The reliable
+    // discriminator is the file's navigation machinery — `onGenerateRoute`,
+    // `Navigator`, a `*PageRoute`, `RouteObserver`, `NavigatorState` — which a
+    // pure API-endpoint constants file never carries. Skip such files so a
+    // client's own UI flow is not mis-reported as backend surface it consumes.
+    if is_navigation_router_source(text) {
+        return Vec::new();
+    }
     let classes = collect_dart_classes(text);
     let mut out = Vec::new();
     for (idx, _) in text.match_indices("static const") {
@@ -1888,6 +1899,25 @@ fn is_route_table_class(name: &str) -> bool {
     ["endpoint", "api", "route", "uri"]
         .iter()
         .any(|kw| lower.contains(kw))
+}
+
+/// True when a Dart source defines *client navigation* rather than a backend
+/// API endpoint table. Presence of any Flutter routing machinery is the tell:
+/// an API endpoint constants file is plain `static const String` declarations
+/// with none of these. Used to keep `AppRouter`-style screen routes out of the
+/// consumed-backend-route set.
+fn is_navigation_router_source(text: &str) -> bool {
+    [
+        "onGenerateRoute",
+        "Navigator",
+        "PageRoute", // MaterialPageRoute / CupertinoPageRoute / PageRouteBuilder
+        "RouteObserver",
+        "NavigatorState",
+        "GoRoute",
+        "GoRouter",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 /// Content of the first single- or double-quoted string literal in `s` (Dart
@@ -2620,6 +2650,41 @@ class AssetPaths {
 }
 "#;
         assert!(parse_dart_route_constants(dart).is_empty());
+    }
+
+    #[test]
+    fn parse_dart_route_constants_ignores_client_navigation_router() {
+        // `AppRouter` matches the name heuristic ("route"), but it is a *client*
+        // navigation table (named Flutter routes consumed by Navigator), not a
+        // backend API endpoint table. Its file carries navigation machinery
+        // (`onGenerateRoute` / `Navigator` / `*PageRoute`), the discriminator:
+        // an API endpoint constants file never does. Without this guard the
+        // client's own screen routes (`/login`, `/home`) get mis-emitted as
+        // backend routes it "consumes", conflating UI flow with API surface.
+        let dart = r#"
+class AppRouter {
+  const AppRouter._();
+  static const String login = '/login';
+  static const String home = '/home';
+  static const String productDetail = '/product-detail';
+
+  static Route<dynamic>? onGenerateRoute(RouteSettings settings) {
+    switch (settings.name) {
+      case login:
+        return CupertinoPageRoute<void>(builder: (_) => const LoginPage());
+    }
+    return null;
+  }
+
+  static void toHome(BuildContext context) {
+    Navigator.pushNamed(context, home);
+  }
+}
+"#;
+        assert!(
+            parse_dart_route_constants(dart).is_empty(),
+            "navigation router must not be treated as a backend endpoint table"
+        );
     }
 
     #[test]
