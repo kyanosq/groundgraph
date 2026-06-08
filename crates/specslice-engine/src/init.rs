@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::{EngineConfig, LanguageSelection, DEFAULT_CONFIG_FILE_NAME, DEFAULT_STORAGE_DIR};
+use crate::config::{
+    EngineConfig, LanguageSelection, DEFAULT_CONFIG_FILE_NAME, DEFAULT_STORAGE_DIR,
+};
 
 #[derive(Debug, Clone)]
 pub struct InitOptions {
@@ -209,6 +211,22 @@ fn ext_language(ext: &str) -> Option<&'static str> {
     })
 }
 
+/// C/C++ *header* extensions. A header declares but never defines: a directory
+/// of headers alone is not a translation unit and must not, by itself, elect a
+/// C/C++ project. This matters most for `.h`, which is ambiguous — in an
+/// Objective-C / Swift iOS app `.h` files are Obj-C headers (often a bridging
+/// header), so counting them as C would elect a phantom `c` project rooted at
+/// the Swift app and feed Obj-C headers to the C parser. A language is elected
+/// only by a real translation unit (`.c` / `.cc` / `.cpp` / `.cxx`); once
+/// elected, its source dirs are indexed normally, headers included.
+///
+/// Trade-off: a header-only C++ library (`.hpp` with no `.cpp`) no longer
+/// self-elects. Such repos almost always ship example/test translation units;
+/// if not, add the language to `languages:` manually.
+fn ext_is_header(ext: &str) -> bool {
+    matches!(ext, "h" | "hpp" | "hh" | "hxx")
+}
+
 /// Flutter / React-Native / desktop *platform-embedding* directories. They
 /// hold generated glue (`GeneratedPluginRegistrant.java`), native scaffolding
 /// (`AppDelegate.swift`, `MainActivity.kt`) and build manifests
@@ -276,14 +294,22 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
                     break 'walk;
                 }
                 let path = entry.path();
-                let Some(lang) = path
+                let Some(ext) = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .map(str::to_ascii_lowercase)
-                    .and_then(|e| ext_language(&e))
                 else {
                     continue;
                 };
+                let Some(lang) = ext_language(&ext) else {
+                    continue;
+                };
+                // Headers declare but do not define: they must not elect a
+                // language on their own (see `ext_is_header`). They are still
+                // indexed once a real translation unit elects the language.
+                if ext_is_header(&ext) {
+                    continue;
+                }
                 *counts.entry(lang).or_default() += 1;
                 if let Ok(rel) = path.strip_prefix(repo_root) {
                     let mut comps = rel.components();
@@ -371,14 +397,26 @@ mod tests {
         let root = dir.path();
         // Go modules.
         write(root, "backend/go.mod", "module x\n");
-        write(root, "backend/internal/api/server.go", "package api\nfunc Serve(){}\n");
+        write(
+            root,
+            "backend/internal/api/server.go",
+            "package api\nfunc Serve(){}\n",
+        );
         write(root, "piclient/go.mod", "module y\n");
-        write(root, "piclient/internal/m/run.go", "package m\nfunc Run(){}\n");
+        write(
+            root,
+            "piclient/internal/m/run.go",
+            "package m\nfunc Run(){}\n",
+        );
         // Dart app.
         write(root, "apps/app/pubspec.yaml", "name: app\n");
         write(root, "apps/app/lib/main.dart", "void main() {}\n");
         // Swift app (SwiftPM-style sources).
-        write(root, "apps/Studio/Sources/Core/model.swift", "struct M {}\n");
+        write(
+            root,
+            "apps/Studio/Sources/Core/model.swift",
+            "struct M {}\n",
+        );
         write(root, "apps/Studio/Sources/Core/view.swift", "struct V {}\n");
         // TypeScript admin web.
         write(root, "backend/web/package.json", "{}\n");
@@ -410,11 +448,23 @@ mod tests {
             "package io.flutter.plugins; class GeneratedPluginRegistrant {}\n",
         );
         // Flutter iOS/macOS embedding — scaffolding Swift.
-        write(root, "apps/app/ios/Runner/AppDelegate.swift", "import UIKit\n");
-        write(root, "apps/app/macos/Runner/AppDelegate.swift", "import Cocoa\n");
+        write(
+            root,
+            "apps/app/ios/Runner/AppDelegate.swift",
+            "import UIKit\n",
+        );
+        write(
+            root,
+            "apps/app/macos/Runner/AppDelegate.swift",
+            "import Cocoa\n",
+        );
 
         let sels = detect_language_selections(root);
-        assert_eq!(ids(&sels), vec!["dart"], "only the real Dart app, no phantom java/swift");
+        assert_eq!(
+            ids(&sels),
+            vec!["dart"],
+            "only the real Dart app, no phantom java/swift"
+        );
     }
 
     /// A pure-Dart repo still resolves to a single Dart selection scoped to its
@@ -442,5 +492,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "README.md", "# hi\n");
         assert!(detect_language_selections(dir.path()).is_empty());
+    }
+
+    /// An iOS / Swift app's Objective-C headers (`.h`, often a bridging header)
+    /// must NOT elect a phantom `c` project. Headers declare but never define;
+    /// a directory of `.h` alone is not a translation unit. The original bug:
+    /// a 1000-file Swift app with 11 Obj-C `.h` files elected `c` rooted at the
+    /// whole Swift source dir, and the C indexer then tried to parse Obj-C
+    /// headers as C.
+    #[test]
+    fn objc_headers_alone_do_not_elect_phantom_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Yolan/Sources/view.swift", "struct V {}\n");
+        write(root, "Yolan/Sources/model.swift", "struct M {}\n");
+        // Obj-C bridging header + Obj-C implementation (`.m` is unsupported and
+        // ignored). No `.c` translation unit anywhere.
+        write(
+            root,
+            "Yolan/OCFiles/Yolan-Bridging-Header.h",
+            "#import <Foundation/Foundation.h>\n",
+        );
+        write(
+            root,
+            "Yolan/OCFiles/Helper.m",
+            "@implementation Helper\n@end\n",
+        );
+
+        let sels = detect_language_selections(root);
+        assert_eq!(
+            ids(&sels),
+            vec!["swift"],
+            "Obj-C headers must not elect a phantom c project"
+        );
+    }
+
+    /// The header gate must not over-correct: a real C or C++ *translation
+    /// unit* (`.c` / `.cpp`) still elects its language, and its headers are
+    /// part of that project's source dirs.
+    #[test]
+    fn c_and_cpp_translation_units_still_elect() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "csrc/util.c", "int answer(void){return 42;}\n");
+        write(root, "csrc/util.h", "int answer(void);\n");
+        write(root, "cpp/calc.cpp", "int twice(int x){return x*2;}\n");
+        write(root, "cpp/calc.hpp", "int twice(int);\n");
+
+        let sels = detect_language_selections(root);
+        assert_eq!(
+            ids(&sels),
+            vec!["c", "cpp"],
+            "real .c / .cpp translation units still elect their language"
+        );
     }
 }
