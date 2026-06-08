@@ -1367,6 +1367,62 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
         'ListenableProvider',
       }.contains(name);
 
+  @override
+  void visitSwitchStatement(SwitchStatement node) {
+    // Inside the central `onGenerateRoute(settings)` dispatcher, each
+    // `case <RouteNameConst>: return XxxPageRoute(builder: (_) => Page())`
+    // maps a named route to its destination screen. Linking
+    // `route::<name> → Page` completes the named-route flow: the push side
+    // already emits `caller → route::<name>`, which otherwise dead-ended on a
+    // synthetic node disconnected from the real page.
+    final sym = _currentSymbolId;
+    if (sym != null && _isRouteGeneratorSymbol(sym)) {
+      _linkRouteGeneratorCases(node);
+    }
+    super.visitSwitchStatement(node);
+  }
+
+  bool _isRouteGeneratorSymbol(String id) =>
+      id.endsWith('.onGenerateRoute') || id.endsWith('#onGenerateRoute');
+
+  void _linkRouteGeneratorCases(SwitchStatement node) {
+    for (final member in node.members) {
+      final caseExpr = _switchCaseExpression(member);
+      if (caseExpr == null) continue;
+      final routeName = _stringLiteralValue(caseExpr);
+      if (routeName == null) continue;
+      for (final stmt in member.statements) {
+        if (stmt is! ReturnStatement) continue;
+        final expr = stmt.expression;
+        if (expr == null) continue;
+        final pageId = _pageIdFromRouteConstruction(expr);
+        if (pageId == null) continue;
+        final routeId = 'route::$routeName';
+        syntheticNodes.putIfAbsent(
+            routeId,
+            () => {
+                  'id': routeId,
+                  'kind': NodeKindString.route,
+                  'label': routeName,
+                });
+        _emit(routeId, pageId, EdgeKindString.navigatesTo, member.offset,
+            member.end);
+        break;
+      }
+    }
+  }
+
+  /// The constant a switch case matches: `case foo:` (classic) or the Dart 3
+  /// constant pattern `case foo:` (`SwitchPatternCase` → `ConstantPattern`).
+  Expression? _switchCaseExpression(SwitchMember member) {
+    if (member is SwitchCase) return member.expression;
+    if (member is SwitchPatternCase) {
+      final pattern = member.guardedPattern.pattern;
+      if (pattern is ConstantPattern) return pattern.expression;
+    }
+    return null;
+  }
+
   String? _stringLiteralValue(AstNode? n) {
     if (n is SimpleStringLiteral) return n.value;
     if (n is SimpleIdentifier) {

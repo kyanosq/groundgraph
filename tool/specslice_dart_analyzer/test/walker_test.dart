@@ -922,6 +922,73 @@ class ListPage {
     );
   });
 
+  test(
+      'walkRepository links a named route through onGenerateRoute to its destination page',
+      () async {
+    // Classic Flutter named-route navigation: callers `pushNamed(AppRouter.x)`
+    // and a central `onGenerateRoute` switch maps each route name to a page.
+    // The push side already emits caller→route::name, but the route node used
+    // to dead-end. Parsing the `onGenerateRoute` cases connects route::name to
+    // the real destination page so the named-route flow is a complete path.
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+    final libDir = Directory(p.join(root.path, 'lib'));
+    libDir.createSync(recursive: true);
+    File(p.join(libDir.path, 'nav.dart')).writeAsStringSync('''
+class BuildContext {}
+
+class Route<T> {}
+
+class RouteSettings {
+  const RouteSettings({this.name});
+  final String? name;
+}
+
+class CupertinoPageRoute<T> extends Route<T> {
+  CupertinoPageRoute({required Object Function(BuildContext) builder});
+}
+
+class DetailPage {
+  const DetailPage();
+}
+
+class AppRouter {
+  static const String detail = '/detail';
+
+  static Route<dynamic>? onGenerateRoute(RouteSettings settings) {
+    switch (settings.name) {
+      case detail:
+        return CupertinoPageRoute<void>(builder: (_) => const DetailPage());
+    }
+    return null;
+  }
+}
+''');
+
+    final response = await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+    final references =
+        (response.toJson()['references'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .toList();
+    bool hasEdge(String from, String to, String kind) => references.any((e) =>
+        e['from_symbol_id'] == from &&
+        e['to_symbol_id'] == to &&
+        e['kind'] == kind);
+
+    expect(
+      hasEdge(
+        'route::/detail',
+        'dart_class::lib/nav.dart#DetailPage',
+        EdgeKindString.navigatesTo,
+      ),
+      isTrue,
+      reason: 'onGenerateRoute must link the named route to its page: '
+          '$references',
+    );
+  });
+
   group('resolveSdkPath', () {
     test('isValidSdk is false for a non-SDK directory', () {
       expect(isValidSdk('/definitely/not/an/sdk'), isFalse);
