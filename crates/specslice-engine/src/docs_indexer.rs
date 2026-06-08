@@ -104,6 +104,18 @@ fn is_pruned_dir(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
+    // A nested SpecSlice workspace (a sub-directory, depth > 0, holding its own
+    // `.specslice.yaml`) is a separate project — vendored reference repos carry
+    // their own config — indexed by its own `index`, never folded into the
+    // parent doc graph. The doc root itself (depth 0) is exempt.
+    if entry.depth() > 0
+        && entry
+            .path()
+            .join(crate::config::DEFAULT_CONFIG_FILE_NAME)
+            .is_file()
+    {
+        return true;
+    }
     let Some(name) = entry.file_name().to_str() else {
         return false;
     };
@@ -359,6 +371,40 @@ mod tests {
                 .iter()
                 .all(|n| !n.id.to_string().contains("node_modules")),
             "vendored node_modules markdown must be pruned"
+        );
+    }
+
+    /// A vendored reference repo under a doc root carries its *own*
+    /// `.specslice.yaml`; it is a separate workspace, indexed by its own
+    /// `index`, and must not flood the parent graph with its README sections
+    /// (real dogfood bug: tailorx bundling the Java `platform` + `bp-web` under
+    /// `docs/references/source-repos/` leaked their READMEs into the doc graph).
+    #[test]
+    fn docs_walk_prunes_nested_specslice_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendored = root.join("docs/references/vendored");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# Guide\n\nbody\n").unwrap();
+        std::fs::write(vendored.join(".specslice.yaml"), "repo:\n  root: .\n").unwrap();
+        std::fs::write(vendored.join("README.md"), "# Vendor\n\nnoise\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec![],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        assert_eq!(
+            result.files, 1,
+            "only docs/guide.md, not the nested workspace README; got {result:?}"
+        );
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes.iter().all(|n| !n.id.to_string().contains("vendored")),
+            "nested-workspace markdown must be pruned"
         );
     }
 }
