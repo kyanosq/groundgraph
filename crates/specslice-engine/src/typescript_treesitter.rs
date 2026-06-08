@@ -357,6 +357,7 @@ const fn ts_family_spec(
         emit_nested_callables_with_metadata_only: false,
         call_idents_of: ts_call_idents,
         module_scoped_resolution: false,
+        recurse_declined_callables: true,
     }
 }
 
@@ -423,6 +424,34 @@ namespace Geo {
             "namespaced function should qualify"
         );
         assert!(s.imports.iter().any(|i| i.path == "./foo"));
+    }
+
+    #[test]
+    fn object_literal_methods_in_named_const_become_callables() {
+        // `export const api = { async login() {} }` — the service-object module
+        // shape behind most axios/fetch clients. The declarator is callable-kind
+        // (so `const f = () => {}` works) but *declines* its name when the value
+        // is an object, which previously stranded the methods two levels down
+        // (`lexical_declaration → variable_declarator → object → method`). They
+        // must surface as callables — matching `export default { … }` object
+        // methods — so call graphs and route-consumer links reach them.
+        let src = r#"
+const http = makeClient();
+export const api = {
+  async login(body: LoginBody) { return http.post("/admin/login", body); },
+  getUser(id: string) { return http.get(`/admin/users/${id}`); },
+};
+"#;
+        let s = scan(src);
+        let fns = qnames(&s, NodeKind::TypescriptFunction);
+        assert!(
+            fns.contains(&"login".to_string()),
+            "object-literal method `login` should be a callable: {fns:?}"
+        );
+        assert!(
+            fns.contains(&"getUser".to_string()),
+            "object-literal method `getUser` should be a callable: {fns:?}"
+        );
     }
 
     #[test]

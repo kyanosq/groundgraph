@@ -475,6 +475,7 @@ pub(crate) static SWIFT_SPEC: LangSpec = LangSpec {
     // Swift has a flat per-module namespace and no file→file imports, so a
     // bare type/constructor name resolves module-wide (unique-file only).
     module_scoped_resolution: true,
+    recurse_declined_callables: false,
 };
 
 #[cfg(test)]

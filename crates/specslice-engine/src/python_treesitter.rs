@@ -367,6 +367,7 @@ pub(crate) static PYTHON_SPEC: LangSpec = LangSpec {
     emit_nested_callables_with_metadata_only: true,
     call_idents_of: py_call_idents,
     module_scoped_resolution: false,
+    recurse_declined_callables: false,
 };
 
 #[cfg(test)]

@@ -185,6 +185,7 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     emit_nested_callables_with_metadata_only: false,
     call_idents_of: cpp_call_idents,
     module_scoped_resolution: false,
+    recurse_declined_callables: false,
 };
 
 #[cfg(test)]

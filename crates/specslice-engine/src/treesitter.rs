@@ -298,6 +298,16 @@ pub struct LangSpec {
     /// files together. Type/constructor names (usually unique) carry the
     /// signal that drives [`crate::feature_cluster`].
     pub module_scoped_resolution: bool,
+    /// Descend into a callable node that the spec *declined to name* (so its
+    /// nested symbols become reachable) instead of routing it straight to the
+    /// reference collector. Default `false` — declined callables stay refs-only
+    /// (Swift stored properties keep their type-position references attached to
+    /// the enclosing scope). TypeScript turns this on so a named object module
+    /// `const api = { login() {} }` reaches its methods: the declarator is
+    /// callable-kind (for `const f = () => {}`) yet declines its name when the
+    /// value is an object literal, which would otherwise strand the methods two
+    /// levels down (`variable_declarator → object → method_definition`).
+    pub recurse_declined_callables: bool,
 }
 
 /// Default [`LangSpec::call_idents_of`]: capture nothing. Languages that
@@ -548,6 +558,26 @@ fn walk(
             // `swift_name_of`). It is not a symbol; fall through to the general
             // reference collector (section 6) so its type-position references
             // stay attached to the enclosing scope instead of being dropped.
+            //
+            // Opt-in: a language may instead ask to *descend* into the declined
+            // callable so nested symbols become reachable. TypeScript uses this
+            // for `const api = { login() {} }` — the declarator declines its name
+            // (object value) but its methods, one transparent `object` level
+            // down, are real callables. Recursion stays in the enclosing scope
+            // and still collects the children's references via section 6.
+            if spec.recurse_declined_callables {
+                walk(
+                    child,
+                    source,
+                    spec,
+                    parent_qualified,
+                    parent_is_type,
+                    in_callable_body,
+                    depth + 1,
+                    scan,
+                );
+                continue;
+            }
         }
 
         // 4b. Call-based tests (`describe`/`it`, Dart `test`/`group`).

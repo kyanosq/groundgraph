@@ -248,6 +248,7 @@ pub(crate) static RUST_SPEC: LangSpec = LangSpec {
     emit_nested_callables_with_metadata_only: false,
     call_idents_of: rust_call_idents,
     module_scoped_resolution: false,
+    recurse_declined_callables: false,
 };
 
 /// Recognise `#[test]` functions (and derivatives such as `#[tokio::test]`)
