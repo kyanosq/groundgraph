@@ -427,6 +427,21 @@ func New() *Repo {
     }
 
     #[test]
+    fn generic_and_constraint_interfaces_behave() {
+        // A generic interface still has a method set; a constraint interface
+        // (type set, no methods) and an empty interface must yield no methods.
+        let src = "package p\n\
+                   type Container[T any] interface {\n\tGet() T\n\tPut(v T)\n}\n\
+                   type Number interface {\n\t~int | ~float64\n}\n\
+                   type Any interface{}\n";
+        let s = scan(src);
+        let methods = qnames(&s, NodeKind::GoMethod);
+        assert!(methods.contains(&"Container.Get".to_string()), "{methods:?}");
+        assert!(methods.contains(&"Container.Put".to_string()), "{methods:?}");
+        assert_eq!(methods.len(), 2, "constraint/empty interfaces add no methods: {methods:?}");
+    }
+
+    #[test]
     fn struct_fields_do_not_become_methods_or_functions() {
         // Descending into interface bodies must not also start emitting struct
         // fields as callables (fields are `field_declaration`, not callables).
