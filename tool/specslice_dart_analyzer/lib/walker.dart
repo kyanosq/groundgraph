@@ -1152,6 +1152,17 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
         const {'push', 'pushNamed', 'pushReplacementNamed', 'pushReplacement'}
             .contains(methodName);
     if (isContextNavigate || isNavigatorStatic) {
+      // (a) Inline page route — `Navigator.push(context, XxxPageRoute(builder:
+      //     (_) => DestPage()))`. The destination widget is constructed inside
+      //     the builder closure (not a string), so the named-route path below
+      //     misses it entirely. Link the caller straight to the destination
+      //     widget class so screen-to-screen flow is a real page→page edge.
+      final pageId = _inlineNavigationTargetId(node);
+      if (pageId != null) {
+        _emit(from, pageId, EdgeKindString.navigatesTo, node.offset, node.end);
+        return true;
+      }
+      // (b) Named route — `pushNamed(context, '/foo')` / `pushNamed(RouteName)`.
       final route =
           _extractRouteString(node, navigatorStyle: isNavigatorStatic);
       if (route != null) {
@@ -1269,6 +1280,61 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
     // Navigator.pushNamed(context, '/foo') — the route string is arg[1].
     final routeArg = navigatorStyle && args.length >= 2 ? args[1] : args.first;
     return _stringLiteralValue(routeArg);
+  }
+
+  /// For an inline page push — `Navigator.push(context, XxxPageRoute(builder:
+  /// (_) => DestPage()))` (the route may be a positional or named argument) —
+  /// return the graph id of the destination widget class, or null when no
+  /// argument is a page-route construction wrapping a repo-local widget.
+  String? _inlineNavigationTargetId(MethodInvocation node) {
+    for (final arg in node.argumentList.arguments) {
+      final expr = arg is NamedExpression ? arg.expression : arg;
+      final id = _pageIdFromRouteConstruction(expr);
+      if (id != null) return id;
+    }
+    return null;
+  }
+
+  /// `XxxPageRoute(builder: (ctx) => DestPage())` → the `DestPage` class id.
+  /// Matched structurally: any constructor whose type name ends in `Route`
+  /// (Material/Cupertino/PageRouteBuilder/custom) with a `builder`/`pageBuilder`
+  /// closure returning a repo-local widget.
+  String? _pageIdFromRouteConstruction(Expression expr) {
+    if (expr is! InstanceCreationExpression) return null;
+    if (!expr.constructorName.type.toSource().contains('Route')) return null;
+    for (final a in expr.argumentList.arguments) {
+      if (a is! NamedExpression) continue;
+      final name = a.name.label.name;
+      if (name != 'builder' && name != 'pageBuilder') continue;
+      final widget = _returnedWidgetExpression(a.expression);
+      if (widget == null) continue;
+      final id = _widgetClassId(widget);
+      if (id != null) return id;
+    }
+    return null;
+  }
+
+  /// The widget a builder closure returns: `(_) => W()` or `(_) { return W(); }`.
+  Expression? _returnedWidgetExpression(Expression builder) {
+    if (builder is! FunctionExpression) return null;
+    final body = builder.body;
+    if (body is ExpressionFunctionBody) return body.expression;
+    if (body is BlockFunctionBody) {
+      for (final stmt in body.block.statements) {
+        if (stmt is ReturnStatement) return stmt.expression;
+      }
+    }
+    return null;
+  }
+
+  /// Resolve a widget construction (`DestPage(...)`, possibly `const`) to its
+  /// repo-local class graph id via the same `NamedType` → element → node map
+  /// used for `references` edges; external/SDK widgets resolve to null.
+  String? _widgetClassId(Expression widgetExpr) {
+    if (widgetExpr is! InstanceCreationExpression) return null;
+    final el = widgetExpr.constructorName.type.element2;
+    if (el == null) return null;
+    return byElement[el];
   }
 
   String? _stringLiteralValue(AstNode? n) {

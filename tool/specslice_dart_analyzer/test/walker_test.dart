@@ -787,6 +787,70 @@ class _Delegate {
     );
   });
 
+  test(
+      'walkRepository emits navigates_to to the destination page for an inline Navigator.push route',
+      () async {
+    // Flutter's dominant navigation shape pushes a *PageRoute whose `builder`
+    // closure constructs the destination widget inline:
+    //   Navigator.push(context, CupertinoPageRoute(builder: (_) => DetailPage()))
+    // The route argument is not a string, so the old string-only path dropped
+    // it entirely — screen-to-screen flow was invisible. We must instead link
+    // the caller straight to the destination widget class.
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+    final libDir = Directory(p.join(root.path, 'lib'));
+    libDir.createSync(recursive: true);
+    File(p.join(libDir.path, 'nav.dart')).writeAsStringSync('''
+class BuildContext {}
+
+class Route<T> {}
+
+class CupertinoPageRoute<T> extends Route<T> {
+  CupertinoPageRoute({required Object Function(BuildContext) builder});
+}
+
+class Navigator {
+  static void push(BuildContext context, Route<dynamic> route) {}
+}
+
+class ProductDetailPage {
+  const ProductDetailPage();
+}
+
+class ProductListPage {
+  void openDetail(BuildContext context) {
+    Navigator.push(
+      context,
+      CupertinoPageRoute<void>(builder: (_) => const ProductDetailPage()),
+    );
+  }
+}
+''');
+
+    final response = await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+    final references =
+        (response.toJson()['references'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .toList();
+    bool hasEdge(String from, String to, String kind) => references.any((e) =>
+        e['from_symbol_id'] == from &&
+        e['to_symbol_id'] == to &&
+        e['kind'] == kind);
+
+    expect(
+      hasEdge(
+        'dart_method::lib/nav.dart#ProductListPage.openDetail',
+        'dart_class::lib/nav.dart#ProductDetailPage',
+        EdgeKindString.navigatesTo,
+      ),
+      isTrue,
+      reason: 'inline Navigator.push must link caller→destination page widget: '
+          '$references',
+    );
+  });
+
   group('resolveSdkPath', () {
     test('isValidSdk is false for a non-SDK directory', () {
       expect(isValidSdk('/definitely/not/an/sdk'), isFalse);
