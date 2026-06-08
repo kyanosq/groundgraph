@@ -40,6 +40,37 @@ fn cpp_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind>
         "struct_specifier" if has_body => Some(SymKind::Type(NodeKind::CppStruct)),
         "union_specifier" if has_body => Some(SymKind::Type(NodeKind::CppStruct)),
         "enum_specifier" if has_body => Some(SymKind::Type(NodeKind::CppEnum)),
+        // Recover `class MACRO Name { … }` (see [`cpp_macro_record_kind`]).
+        "function_definition" => cpp_macro_record_kind(node),
+        _ => None,
+    }
+}
+
+/// Recover an export-macro'd record: `class UTILS_PUBLIC Foo { … }`. An unknown
+/// macro between the `class`/`struct` keyword and the type name makes
+/// tree-sitter mis-parse the whole declaration as a `function_definition` whose
+/// `type` is a *bodyless* record specifier (the macro is read as that record's
+/// "name") and whose `declarator` is a plain `identifier` — the real type name.
+/// A genuine function never has a bare-identifier declarator (it has a
+/// `function_declarator` with a parameter list), so this shape is unambiguous.
+/// Re-label it as the record it is, so export-macro'd classes — ubiquitous in
+/// real C++ libraries (`*_PUBLIC`, `*_EXPORT`, `*_API`) — enter the graph
+/// instead of masquerading as free functions.
+fn cpp_macro_record_kind(node: tree_sitter::Node<'_>) -> Option<SymKind> {
+    let type_node = node.child_by_field_name("type")?;
+    // The record specifier must be bodyless — its body was stolen and reparsed
+    // as the (bogus) function body.
+    if type_node.child_by_field_name("body").is_some() {
+        return None;
+    }
+    // A real function's declarator carries a parameter list; the mis-parse
+    // leaves a bare identifier (the record's true name).
+    if node.child_by_field_name("declarator")?.kind() != "identifier" {
+        return None;
+    }
+    match type_node.kind() {
+        "class_specifier" => Some(SymKind::Type(NodeKind::CppClass)),
+        "struct_specifier" | "union_specifier" => Some(SymKind::Type(NodeKind::CppStruct)),
         _ => None,
     }
 }
@@ -221,6 +252,39 @@ mod tests {
             .iter()
             .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
             .collect()
+    }
+
+    #[test]
+    fn export_macro_between_keyword_and_name_recovers_the_record() {
+        // An unknown export macro (`UTILS_PUBLIC`, `*_API`, …) between the
+        // `class`/`struct` keyword and the type name makes tree-sitter mis-parse
+        // the whole declaration as a `function_definition`. The record must
+        // still enter the graph as a class/struct, not masquerade as a function.
+        let src = "class UTILS_PUBLIC Foo {\npublic:\n  void go() {}\n};\n\
+                   struct MYLIB_EXPORT Bar {\n  int x;\n};\n\
+                   class Plain {\npublic:\n  void ok() {}\n};\n";
+        let s = scan(src);
+        let classes = qnames(&s, NodeKind::CppClass);
+        let structs = qnames(&s, NodeKind::CppStruct);
+        let funcs = qnames(&s, NodeKind::CppFunction);
+
+        assert!(
+            classes.contains(&"Foo".to_string()),
+            "macro'd class must be recovered as CppClass: classes={classes:?} funcs={funcs:?}"
+        );
+        assert!(
+            structs.contains(&"Bar".to_string()),
+            "macro'd struct must be recovered as CppStruct: structs={structs:?} funcs={funcs:?}"
+        );
+        assert!(
+            classes.contains(&"Plain".to_string()),
+            "a plain class must still be a CppClass: {classes:?}"
+        );
+        // The macro'd record must NOT leak as a free function.
+        assert!(
+            !funcs.contains(&"Foo".to_string()) && !funcs.contains(&"Bar".to_string()),
+            "macro'd record leaked as a function: {funcs:?}"
+        );
     }
 
     #[test]
