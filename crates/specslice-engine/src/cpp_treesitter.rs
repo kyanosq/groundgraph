@@ -240,6 +240,12 @@ mod tests {
     fn scan(src: &str) -> Scan {
         extract(&CPP_SPEC, src)
     }
+    /// Scan the way the real file loop does: source preprocessing first (which
+    /// neutralises export macros) then `extract`.
+    fn scan_pp(src: &str) -> Scan {
+        let pp = crate::treesitter::preprocess_source("x.cpp", src);
+        extract(&CPP_SPEC, &pp)
+    }
     fn qnames(scan: &Scan, kind: NodeKind) -> Vec<String> {
         scan.symbols
             .iter()
@@ -252,6 +258,35 @@ mod tests {
             .iter()
             .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
             .collect()
+    }
+
+    #[test]
+    fn export_macro_record_recovers_members_through_preprocessing() {
+        // Through the real path (preprocessing blanks the macro) the *whole*
+        // class parses — its inline methods become real symbols, not just the
+        // class shell the AST-level fallback can recover.
+        let src = "class UTILS_PUBLIC Foo {\npublic:\n  int go(int a) { return a + 1; }\n  void run() {}\n};\n\
+                   struct MYLIB_EXPORT Bar : Base {\n  int area() const { return 0; }\n};\n";
+        let s = scan_pp(src);
+        let classes = qnames(&s, NodeKind::CppClass);
+        let methods = qnames(&s, NodeKind::CppMethod);
+        assert!(classes.contains(&"Foo".to_string()), "class: {classes:?}");
+        assert!(
+            methods.contains(&"Foo::go".to_string()) && methods.contains(&"Foo::run".to_string()),
+            "macro'd class inline methods must be recovered: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"Bar::area".to_string()),
+            "macro'd struct (with base clause) member must be recovered: {methods:?}"
+        );
+    }
+
+    #[test]
+    fn plain_class_is_untouched_by_macro_blanking() {
+        // A normal `class Foo {` (one identifier) must never be altered.
+        let s = scan_pp("class Foo {\npublic:\n  void ok() {}\n};\n");
+        assert!(qnames(&s, NodeKind::CppClass).contains(&"Foo".to_string()));
+        assert!(qnames(&s, NodeKind::CppMethod).contains(&"Foo::ok".to_string()));
     }
 
     #[test]

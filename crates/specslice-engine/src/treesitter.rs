@@ -379,10 +379,113 @@ pub fn extract(spec: &LangSpec, source: &str) -> Scan {
 /// the `LangSpec`s — and the generic file loop — unaware of any one format.
 pub(crate) fn preprocess_source<'a>(rel_path: &str, source: &'a str) -> std::borrow::Cow<'a, str> {
     if rel_path.ends_with(".vue") {
-        std::borrow::Cow::Owned(vue_script_only(source))
-    } else {
-        std::borrow::Cow::Borrowed(source)
+        return std::borrow::Cow::Owned(vue_script_only(source));
     }
+    // C/C++: neutralise an export macro between the `class`/`struct` keyword and
+    // the type name (`class UTILS_PUBLIC Foo {…}`) so the grammar parses the
+    // whole record — *with its members* — instead of mis-reading it as a
+    // function. Offsets are preserved, so a `.h` claimed by C (no `class`) is a
+    // no-op and never reallocates.
+    if is_c_family_path(rel_path) {
+        if let Some(blanked) = blank_cpp_export_macros(source) {
+            return std::borrow::Cow::Owned(blanked);
+        }
+    }
+    std::borrow::Cow::Borrowed(source)
+}
+
+/// Does this path belong to the C / C++ family (where an export macro can sit
+/// between `class`/`struct` and the type name)?
+fn is_c_family_path(rel_path: &str) -> bool {
+    matches!(
+        rel_path.rsplit('.').next(),
+        Some("c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ipp")
+    )
+}
+
+/// Blank an ALL-CAPS export macro wedged between a `class`/`struct` keyword and
+/// the type name — `class UTILS_PUBLIC Foo {` → `class              Foo {`.
+///
+/// Each blanked byte becomes an ASCII space, so byte length and every newline
+/// offset are preserved 1:1 and recovered spans still map onto the original
+/// file. Returns `None` when nothing matched (the overwhelmingly common case),
+/// so non-macro'd C/C++ files are never reallocated.
+///
+/// The pattern is intentionally narrow to avoid touching real code: a
+/// word-boundaried `class`/`struct`, then an identifier that is **all upper-case
+/// / digits / underscore** (the export-macro convention — real type names are
+/// not), then **another identifier** (the true type name), then `{` or `:`
+/// (definition / base-clause). A genuine `class Foo {` has only one identifier
+/// and never matches; `enum class FOO_T {` has no second identifier and is left
+/// alone.
+pub(crate) fn blank_cpp_export_macros(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let skip_ws = |mut i: usize| {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let ident_end = |mut i: usize| {
+        while i < n && is_ident(bytes[i]) {
+            i += 1;
+        }
+        i
+    };
+
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < n {
+        // Match a word-boundaried `class` / `struct` keyword.
+        let kw_len = if bytes[i..].starts_with(b"class") {
+            5
+        } else if bytes[i..].starts_with(b"struct") {
+            6
+        } else {
+            0
+        };
+        let boundary_before = i == 0 || !is_ident(bytes[i - 1]);
+        let boundary_after = i + kw_len < n && bytes[i + kw_len].is_ascii_whitespace();
+        if kw_len == 0 || !boundary_before || !boundary_after {
+            i += 1;
+            continue;
+        }
+        // id1: the candidate macro.
+        let id1_start = skip_ws(i + kw_len);
+        if id1_start >= n || !is_ident_start(bytes[id1_start]) {
+            i += kw_len;
+            continue;
+        }
+        let id1_end = ident_end(id1_start);
+        let id1 = &bytes[id1_start..id1_end];
+        let is_macroish = id1.len() >= 2
+            && id1.iter().all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            && id1.iter().any(|&b| b.is_ascii_uppercase());
+        // id2: the real type name, which must exist.
+        let id2_start = skip_ws(id1_end);
+        let has_id2 = id2_start < n && is_ident_start(bytes[id2_start]);
+        if !is_macroish || !has_id2 {
+            i += kw_len;
+            continue;
+        }
+        // After id2, the next significant byte must open a definition (`{`) or a
+        // base-clause (`:`) — never a `(`/`;` (that would be a declaration).
+        let after_id2 = skip_ws(ident_end(id2_start));
+        if after_id2 >= n || (bytes[after_id2] != b'{' && bytes[after_id2] != b':') {
+            i += kw_len;
+            continue;
+        }
+        // Blank id1 in place (lazily allocate the owned copy on first hit).
+        let buf = out.get_or_insert_with(|| bytes.to_vec());
+        for b in &mut buf[id1_start..id1_end] {
+            *b = b' ';
+        }
+        i = id1_end;
+    }
+    out.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// Blank everything outside `<script>…</script>` in a Vue SFC, preserving byte
@@ -1860,6 +1963,38 @@ mod driver_capability_tests {
             "the script's object shorthand method should be reachable: {:?}",
             scan.symbols
         );
+    }
+
+    #[test]
+    fn blank_cpp_export_macros_preserves_offsets_and_is_narrow() {
+        // Hits: macro between keyword and name, with `{` and with a base clause.
+        let src = "class UTILS_PUBLIC Foo {};\nstruct A_B2 Bar : Base {};\n";
+        let out = super::blank_cpp_export_macros(src).expect("a macro must be blanked");
+        assert_eq!(out.len(), src.len(), "byte length must be preserved");
+        assert_eq!(
+            out.bytes().filter(|&b| b == b'\n').count(),
+            src.bytes().filter(|&b| b == b'\n').count(),
+            "newline count preserved"
+        );
+        assert!(out.contains("class              Foo {};"), "Foo macro blanked: {out:?}");
+        assert!(out.contains("struct      Bar : Base {};"), "Bar macro blanked: {out:?}");
+
+        // Misses (return None — never reallocate): plain class, single token,
+        // `enum class` with an all-caps name, a macro'd forward declaration, and
+        // an identifier that is not all-caps.
+        for s in [
+            "class Foo {};",
+            "enum class FOO_T { A };",
+            "class FOO_API Bar;",        // forward decl → no `{`/`:`
+            "class Mixed_Case Bar {};",  // id1 not all-caps
+            "struct Plain { int x; };",
+            "int subclass_count = 0;",   // `class` only as a substring
+        ] {
+            assert!(
+                super::blank_cpp_export_macros(s).is_none(),
+                "must not rewrite: {s:?}"
+            );
+        }
     }
 
     #[test]
