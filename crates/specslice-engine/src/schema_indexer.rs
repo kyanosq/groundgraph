@@ -234,7 +234,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     let mut dart_route_consts: Vec<DartRouteConst> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !is_skipped_dir(e.file_name().to_str().unwrap_or("")))
+        .filter_entry(|e| !is_skipped_walk_entry(e))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -1164,6 +1164,26 @@ fn extract_attr(text: &str, lower: &str, tag_start: usize, name: &str) -> Option
 
 fn is_skipped_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
+}
+
+/// Whether the walk should prune this entry (and, for a directory, its whole
+/// subtree). Two reasons:
+///
+/// 1. Its name is a never-scan directory ([`SKIP_DIRS`]).
+/// 2. It is a **nested SpecSlice workspace** — a sub-directory (depth > 0) that
+///    holds its own `.specslice.yaml`. Vendored/reference repos (e.g. tailorx
+///    bundling the Java `platform` under `docs/references/source-repos/`) are
+///    self-contained workspaces indexed by *their own* `index`; folding their
+///    routes/tables/mappers into the parent graph creates thousands of phantom
+///    nodes with no parent code node to link to. The root workspace (depth 0)
+///    is exempt so its own config never prunes the entire walk.
+fn is_skipped_walk_entry(e: &walkdir::DirEntry) -> bool {
+    if is_skipped_dir(e.file_name().to_str().unwrap_or("")) {
+        return true;
+    }
+    e.depth() > 0
+        && e.file_type().is_dir()
+        && e.path().join(DEFAULT_CONFIG_FILE_NAME).is_file()
 }
 
 /// Source-code extensions whose files may embed `CREATE TABLE` DDL as a string
@@ -2656,6 +2676,54 @@ class ApiEndpoints {
                 .any(|e| e.kind == EdgeKind::References && e.to_id == route.id),
             "expected consumer->route References edge, got {edges:?}"
         );
+    }
+
+    #[test]
+    fn schema_index_skips_nested_specslice_workspaces() {
+        // A vendored reference repo carries its *own* `.specslice.yaml`; it is a
+        // separate SpecSlice workspace, indexed by its own `index`, never folded
+        // into the parent graph. Without this, a repo that vendors reference
+        // source (e.g. tailorx bundling the Java `platform` under
+        // `docs/references/source-repos/`) gets thousands of phantom
+        // routes/tables/mappers with no parent code node to link to.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The parent workspace's own schema + its own config.
+        std::fs::write(root.join(".specslice.yaml"), "repo:\n  root: .\n").unwrap();
+        std::fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE own_table (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        // A nested, self-contained workspace (vendored reference) with schema.
+        let nested = root.join("docs/references/vendored");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(".specslice.yaml"), "repo:\n  root: .\n").unwrap();
+        std::fs::write(
+            nested.join("vendored_schema.sql"),
+            "CREATE TABLE vendored_table (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let stats = index_schema_into(&mut store, root).unwrap();
+
+        let names: Vec<String> = store
+            .list_nodes_by_kind(NodeKind::DbTable)
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "own_table"),
+            "parent workspace table indexed, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "vendored_table"),
+            "nested workspace table must be skipped, got {names:?}"
+        );
+        assert_eq!(stats.sql_tables, 1, "only the parent's own table counts");
     }
 
     #[test]
