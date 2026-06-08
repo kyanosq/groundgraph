@@ -25,6 +25,17 @@ fn c_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind> {
             Some(SymKind::Type(NodeKind::CStruct))
         }
         "enum_specifier" if has_body => Some(SymKind::Type(NodeKind::CEnum)),
+        // `typedef struct/enum { … } Name;` — an anonymous record named only by
+        // the typedef (shared C-family handling).
+        "type_definition" => {
+            crate::treesitter::anon_typedef_record_specifier(node).map(|spec| {
+                if spec == "enum_specifier" {
+                    SymKind::Type(NodeKind::CEnum)
+                } else {
+                    SymKind::Type(NodeKind::CStruct)
+                }
+            })
+        }
         _ => None,
     }
 }
@@ -34,12 +45,24 @@ fn c_is_callable(kind: &str) -> bool {
 }
 
 fn c_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
-    if node.kind() == "function_definition" {
-        return node
+    match node.kind() {
+        "function_definition" => node
             .child_by_field_name("declarator")
-            .and_then(|d| declarator_name(d, src));
+            .and_then(|d| declarator_name(d, src)),
+        // An anonymous typedef record borrows its name from the typedef declarator.
+        "type_definition" => crate::treesitter::typedef_declarator_name(node, src),
+        _ => name_from_field(node, src),
     }
-    name_from_field(node, src)
+}
+
+/// Body to recurse into. For a typedef'd anonymous record the members live one
+/// level down, under the inner specifier's `body`; everything else uses the
+/// node's own `body` field.
+fn c_body_of(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.kind() == "type_definition" {
+        return crate::treesitter::typedef_record_body(node);
+    }
+    body_from_field(node)
 }
 
 fn c_import_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Vec<String> {
@@ -134,7 +157,7 @@ pub(crate) static C_SPEC: LangSpec = LangSpec {
     receiver_type_of: no_text,
     import_of: c_import_of,
     name_of: c_name_of,
-    body_of: body_from_field,
+    body_of: c_body_of,
     is_transparent_kind: c_is_transparent,
     metadata_of: no_text,
     test_of: no_test_of,
@@ -180,6 +203,32 @@ mod tests {
             .iter()
             .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
             .collect()
+    }
+
+    #[test]
+    fn anonymous_typedef_struct_and_enum_take_the_typedef_name() {
+        // The dominant C idiom: `typedef struct { … } Name;`. tree-sitter parses
+        // the record as a *nameless* specifier (which the driver drops), with the
+        // real name only on the typedef declarator. Recover it.
+        let src = "typedef struct { int x; int y; } Point;\n\
+                   typedef enum { A, B } Letter;\n\
+                   typedef union { int i; float f; } Value;\n\
+                   typedef struct Node { int v; } Node;\n\
+                   typedef int MyInt;\n";
+        let s = scan(src);
+        let structs = qnames(&s, NodeKind::CStruct);
+        let enums = qnames(&s, NodeKind::CEnum);
+        assert!(structs.contains(&"Point".to_string()), "anon typedef struct: {structs:?}");
+        assert!(structs.contains(&"Value".to_string()), "anon typedef union: {structs:?}");
+        assert!(enums.contains(&"Letter".to_string()), "anon typedef enum: {enums:?}");
+        // Named record typedef stays single (no duplicate from the typedef).
+        assert_eq!(
+            structs.iter().filter(|n| *n == "Node").count(),
+            1,
+            "named record typedef must emit exactly once: {structs:?}"
+        );
+        // A plain alias typedef is not a record and emits nothing.
+        assert!(!structs.contains(&"MyInt".to_string()) && !enums.contains(&"MyInt".to_string()));
     }
 
     #[test]

@@ -224,6 +224,48 @@ pub(crate) fn looks_like_cpp(head: &str) -> bool {
         || head.contains("private:")
         || head.contains("protected:")
         || head.contains("class ")
+        // `extern "C"` / `extern "C++"` linkage is C++-only syntax. tree-sitter's
+        // C grammar cannot parse the wrapping block and drops every declaration
+        // inside it, whereas the C++ grammar handles the linkage block *and* the
+        // C declarations within. So an `extern "C"`-guarded `.h` (the universal
+        // dual-use header idiom) must be routed to the C++ parser.
+        || head.contains("extern \"C")
+}
+
+/// For a `type_definition` that is `typedef struct/union/enum { … } Name;` — an
+/// **anonymous** record named only through the typedef — return the inner
+/// specifier's kind (`"struct_specifier"` / `"union_specifier"` /
+/// `"enum_specifier"`). tree-sitter parses the record as a *nameless* specifier
+/// (which the driver drops for lack of a name), leaving the real name on the
+/// typedef declarator. Shared by the C and C++ specs so the dominant C struct
+/// idiom enters the graph under its typedef name.
+///
+/// Returns `None` for a *named* record typedef (`typedef struct Node {…} Node;`,
+/// where the inner named specifier already emits it — avoiding a duplicate) and
+/// for plain alias typedefs (`typedef int MyInt;`, which name no record).
+pub(crate) fn anon_typedef_record_specifier(node: tree_sitter::Node<'_>) -> Option<&'static str> {
+    let ty = node.child_by_field_name("type")?;
+    if ty.child_by_field_name("body").is_none() || ty.child_by_field_name("name").is_some() {
+        return None;
+    }
+    match ty.kind() {
+        k @ ("struct_specifier" | "union_specifier" | "enum_specifier") => Some(k),
+        _ => None,
+    }
+}
+
+/// The name a typedef'd anonymous record borrows from its typedef declarator
+/// (`typedef struct { … } Point;` → `Point`). Shared by the C and C++ specs.
+pub(crate) fn typedef_declarator_name(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .and_then(|d| declarator_name(d, src))
+}
+
+/// The body to recurse into for a typedef'd anonymous record: its members live
+/// one level down, under the inner specifier's `body`. Shared by C and C++.
+pub(crate) fn typedef_record_body(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    node.child_by_field_name("type")
+        .and_then(|t| t.child_by_field_name("body"))
 }
 
 /// Everything the generic driver needs to index one language.

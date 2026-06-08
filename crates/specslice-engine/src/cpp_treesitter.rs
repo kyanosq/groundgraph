@@ -42,6 +42,16 @@ fn cpp_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind>
         "enum_specifier" if has_body => Some(SymKind::Type(NodeKind::CppEnum)),
         // Recover `class MACRO Name { … }` (see [`cpp_macro_record_kind`]).
         "function_definition" => cpp_macro_record_kind(node),
+        // `typedef struct/enum { … } Name;` — an anonymous record named only by
+        // the typedef (shared C-family handling). Common in C-style headers
+        // consumed by C++ (notably `extern "C"` interop headers).
+        "type_definition" => crate::treesitter::anon_typedef_record_specifier(node).map(|spec| {
+            if spec == "enum_specifier" {
+                SymKind::Type(NodeKind::CppEnum)
+            } else {
+                SymKind::Type(NodeKind::CppStruct)
+            }
+        }),
         _ => None,
     }
 }
@@ -80,12 +90,24 @@ fn cpp_is_callable(kind: &str) -> bool {
 }
 
 fn cpp_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
-    if node.kind() == "function_definition" {
-        return node
+    match node.kind() {
+        "function_definition" => node
             .child_by_field_name("declarator")
-            .and_then(|d| declarator_name(d, src));
+            .and_then(|d| declarator_name(d, src)),
+        // An anonymous typedef record borrows its name from the typedef declarator.
+        "type_definition" => crate::treesitter::typedef_declarator_name(node, src),
+        _ => name_from_field(node, src),
     }
-    name_from_field(node, src)
+}
+
+/// Body to recurse into. A typedef'd anonymous record keeps its members one
+/// level down under the inner specifier's `body`; everything else uses the
+/// node's own `body` field.
+fn cpp_body_of(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.kind() == "type_definition" {
+        return crate::treesitter::typedef_record_body(node);
+    }
+    body_from_field(node)
 }
 
 fn cpp_import_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Vec<String> {
@@ -205,7 +227,7 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     receiver_type_of: no_text,
     import_of: cpp_import_of,
     name_of: cpp_name_of,
-    body_of: body_from_field,
+    body_of: cpp_body_of,
     is_transparent_kind: cpp_is_transparent,
     metadata_of: no_text,
     test_of: no_test_of,
@@ -258,6 +280,28 @@ mod tests {
             .iter()
             .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
             .collect()
+    }
+
+    #[test]
+    fn anonymous_typedef_record_takes_the_typedef_name() {
+        // C-style headers consumed by C++ (e.g. `extern "C"` interop) lean on
+        // `typedef struct { … } Name;`. The record must enter the graph under
+        // its typedef name, just like in the C spec.
+        let src = "typedef struct { int x; } Point;\n\
+                   typedef enum { A, B } Letter;\n\
+                   typedef struct Node { int v; } Node;\n\
+                   typedef int MyInt;\n";
+        let s = scan(src);
+        let structs = qnames(&s, NodeKind::CppStruct);
+        let enums = qnames(&s, NodeKind::CppEnum);
+        assert!(structs.contains(&"Point".to_string()), "anon typedef struct: {structs:?}");
+        assert!(enums.contains(&"Letter".to_string()), "anon typedef enum: {enums:?}");
+        assert_eq!(
+            structs.iter().filter(|n| *n == "Node").count(),
+            1,
+            "named record typedef emits exactly once: {structs:?}"
+        );
+        assert!(!structs.contains(&"MyInt".to_string()));
     }
 
     #[test]

@@ -224,6 +224,45 @@ fn cpp_header_h_is_routed_to_cpp_not_c() {
     );
 }
 
+/// Regression: a `.h` guarded by `extern "C" { … }` (the universal dual-use
+/// header idiom) must route to the C++ parser — tree-sitter's C grammar cannot
+/// parse the linkage block and drops every declaration inside it, while the C++
+/// grammar handles both the block and the C declarations. The anonymous typedef
+/// record inside must also surface (shared C-family handling).
+#[test]
+fn extern_c_header_routes_to_cpp_and_recovers_symbols() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "src/api.h",
+        "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\
+         typedef struct { int x; } Handle;\n\
+         int api_open(const char* p);\n\
+         int api_run(Handle* h) { return 0; }\n\
+         #ifdef __cplusplus\n}\n#endif\n",
+    );
+    enable_treesitter(root, "c, cpp");
+    let _ = index(root);
+
+    let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    store.migrate().unwrap();
+    let nodes = store.list_all_nodes().unwrap();
+    let has = |kind: NodeKind, name: &str| {
+        nodes
+            .iter()
+            .any(|n| n.kind == kind && n.name.as_deref() == Some(name))
+    };
+    assert!(
+        has(NodeKind::CppStruct, "Handle"),
+        "anonymous typedef struct inside extern \"C\" must be recovered (via C++)"
+    );
+    assert!(
+        has(NodeKind::CppFunction, "api_run"),
+        "an inline function inside extern \"C\" must be recovered (via C++)"
+    );
+}
+
 #[test]
 fn unknown_languages_are_skipped_not_fatal() {
     let tmp = tempfile::tempdir().unwrap();
