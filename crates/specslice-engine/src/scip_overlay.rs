@@ -203,8 +203,14 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
     for path in scip_files {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("reading SCIP index {}", path.display()))?;
-        let index = parse_index(&bytes)
+        let mut index = parse_index(&bytes)
             .with_context(|| format!("parsing SCIP index {}", path.display()))?;
+        // A SCIP index produced by running the indexer inside a sub-module roots
+        // its document paths at `metadata.project_root` (e.g. `scip-go` run in
+        // `asc-cli/`, whose go.mod is not at the repo root). Rebase those onto
+        // repo-root-relative paths so they match the symbol ranges in the store;
+        // a no-op when the index is already rooted at the repo.
+        rebase_index_paths(&mut index, repo_root);
 
         // Load symbol ranges for exactly the files this index covers — no more,
         // so a huge multi-language repo only pays for the indexed slice.
@@ -257,6 +263,48 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
     Ok(result)
 }
 
+/// Rebase every document path in `index` from `metadata.project_root`-relative
+/// to `repo_root`-relative, so an index produced by running the indexer inside a
+/// sub-module (its `project_root` is a subdir of the repo) still matches the
+/// repo-root-relative symbol ranges in the store. A no-op when `project_root` is
+/// the repo root itself, absent, or not under `repo_root`.
+fn rebase_index_paths(index: &mut Index, repo_root: &Path) {
+    let Some(prefix) = project_root_prefix(index, repo_root) else {
+        return;
+    };
+    if prefix.is_empty() {
+        return;
+    }
+    for doc in &mut index.documents {
+        doc.relative_path = format!("{prefix}/{}", doc.relative_path);
+    }
+}
+
+/// `metadata.project_root` (a `file://` URI) expressed `repo_root`-relative with
+/// forward slashes. `Some("")` when they are the same directory (no rebasing
+/// needed); `None` when `project_root` is missing or not under `repo_root`. Tries
+/// the literal paths first, then a canonicalized pair, so it is robust both to
+/// unit-test temp dirs (whose sub-module may not exist on disk) and to real
+/// macOS `/var`→`/private/var` symlinked roots.
+fn project_root_prefix(index: &Index, repo_root: &Path) -> Option<String> {
+    let meta = index.metadata.as_ref()?;
+    let uri = meta.project_root.trim();
+    if uri.is_empty() {
+        return None;
+    }
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    let proj = Path::new(raw.trim_end_matches('/'));
+    if let Ok(rel) = proj.strip_prefix(repo_root) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    if let (Ok(pc), Ok(rc)) = (proj.canonicalize(), repo_root.canonicalize()) {
+        if let Ok(rel) = pc.strip_prefix(&rc) {
+            return Some(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
+}
+
 /// Sorted list of `*.scip` files directly under `dir` (non-recursive). Missing
 /// directory → empty list (the overlay is opt-in by the file's presence).
 fn collect_scip_files(dir: &Path) -> Vec<PathBuf> {
@@ -281,7 +329,7 @@ fn evidence_json(line: u32, resolver: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scip::types::{Document, Occurrence};
+    use scip::types::{Document, Metadata, Occurrence};
     use specslice_core::artifact_id::ArtifactId;
     use specslice_core::edge::EdgeKind;
     use specslice_core::NodeKind;
@@ -511,6 +559,83 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A SCIP index produced by running the indexer *inside a sub-module* — its
+    /// `metadata.project_root` is a subdir of the repo (e.g. `scip-go` run in
+    /// `asc-cli/` because go.mod is not at the repo root) — emits module-relative
+    /// document paths (`a.go`), but the store keys symbol ranges repo-root
+    /// relative (`asc-cli/a.go`). The overlay must rebase doc paths by
+    /// `project_root` so the precise edges still bind; without rebasing the
+    /// module is invisible and zero edges land.
+    #[test]
+    fn ingest_rebases_submodule_paths_by_project_root() {
+        use specslice_core::{Node, NodeKind};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let mut store = Store::open(repo.join("graph.db")).expect("open store");
+        store.migrate().expect("migrate");
+
+        for (id, kind) in [
+            ("S:caller", NodeKind::RustFunction),
+            ("S:run", NodeKind::RustMethod),
+        ] {
+            store
+                .upsert_node(&Node::new(ArtifactId::new(id), kind))
+                .expect("node");
+        }
+        // Ranges are keyed repo-root-relative: the module lives under `asc-cli/`.
+        store
+            .upsert_symbol_range(&range(
+                "asc-cli/a.go",
+                "S:caller",
+                8,
+                15,
+                NodeKind::RustFunction,
+            ))
+            .expect("range a");
+        store
+            .upsert_symbol_range(&range("asc-cli/b.go", "S:run", 5, 9, NodeKind::RustMethod))
+            .expect("range b");
+
+        // scip-go run in `asc-cli/`: project_root is the module dir and the
+        // document paths are module-relative (`b.go`, not `asc-cli/b.go`).
+        const RUN: &str = "scip-go gomod demo 0.1.0 demo/Svc#run().";
+        let mut metadata = Metadata::new();
+        metadata.project_root = format!("file://{}", repo.join("asc-cli").to_string_lossy());
+        let index = Index {
+            metadata: protobuf::MessageField::some(metadata),
+            documents: vec![
+                Document {
+                    relative_path: "b.go".into(),
+                    occurrences: vec![occ(4, RUN, true)],
+                    ..Default::default()
+                },
+                Document {
+                    relative_path: "a.go".into(),
+                    occurrences: vec![occ(9, RUN, false)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let scip_dir = repo.join(".specslice").join("scip");
+        std::fs::create_dir_all(&scip_dir).expect("mkdir scip");
+        std::fs::write(scip_dir.join("go.scip"), index.write_to_bytes().unwrap())
+            .expect("write scip");
+
+        let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
+        assert_eq!(
+            res.edges, 1,
+            "sub-module edge must bind after rebasing doc paths by project_root"
+        );
+        let edges = store
+            .list_edges_from(&ArtifactId::new("S:caller"))
+            .expect("edges");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_id.as_str(), "S:run");
+        assert_eq!(edges[0].kind, EdgeKind::Calls);
     }
 
     /// SCIP-authoritative gap-fill (ADR-0001 §3.2, D2). On a file SCIP covered,
