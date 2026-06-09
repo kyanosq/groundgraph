@@ -565,6 +565,9 @@ enum GraphFormatArg {
     Json,
     Html,
     Mermaid,
+    /// Self-contained WebGL force-directed "constellation" view of the full
+    /// graph topology (the `webui` viewer with the data baked in).
+    Web,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -581,6 +584,7 @@ impl From<GraphFormatArg> for commands::graph::GraphFormat {
             GraphFormatArg::Json => commands::graph::GraphFormat::Json,
             GraphFormatArg::Html => commands::graph::GraphFormat::Html,
             GraphFormatArg::Mermaid => commands::graph::GraphFormat::Mermaid,
+            GraphFormatArg::Web => commands::graph::GraphFormat::Web,
         }
     }
 }

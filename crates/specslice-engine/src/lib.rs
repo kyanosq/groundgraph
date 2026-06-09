@@ -42,6 +42,7 @@ pub mod logic_confidence;
 pub mod lsp_client;
 pub mod lsp_indexer;
 pub mod lsp_probe;
+pub mod network;
 pub mod path_class;
 pub mod port_coverage;
 pub mod python_frameworks;

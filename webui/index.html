@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SpecSlice · Code Constellation</title>
+<style>
+  :root {
+    --bg0: #05070f;
+    --bg1: #0a1024;
+    --ink: #e8eefc;
+    --muted: #8ea0c4;
+    --panel: rgba(12, 18, 38, 0.72);
+    --line: rgba(120, 150, 220, 0.16);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg0); color: var(--ink);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+    overflow: hidden; }
+  #scene { position: fixed; inset: 0;
+    background:
+      radial-gradient(1200px 800px at 70% 18%, #122046 0%, rgba(8,12,28,0) 60%),
+      radial-gradient(1000px 900px at 20% 90%, #0c1a3a 0%, rgba(6,9,20,0) 55%),
+      linear-gradient(180deg, var(--bg1), var(--bg0)); }
+  #graph { position: fixed; inset: 0; }
+
+  .glass { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.45); }
+
+  #hud { position: fixed; top: 18px; left: 18px; padding: 14px 16px; min-width: 210px; }
+  #hud .title { font-size: 12px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px; }
+  #hud .repo { font-size: 17px; font-weight: 650; letter-spacing: .01em;
+    background: linear-gradient(90deg,#7cc4ff,#9b8cff 60%,#ff8fc4);
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #hud .nums { display: flex; gap: 16px; margin-top: 10px; }
+  #hud .nums div { display: flex; flex-direction: column; }
+  #hud .nums b { font-size: 18px; font-variant-numeric: tabular-nums; }
+  #hud .nums span { font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+  #fps { margin-top: 10px; font-size: 10px; color: var(--muted); letter-spacing: .05em; }
+  #loadlink { display: inline-block; margin-top: 10px; font-size: 11px; color: #7cc4ff; cursor: pointer;
+    padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; transition: background .15s; }
+  #loadlink:hover { background: rgba(124,196,255,0.12); }
+
+  #legend { position: fixed; left: 18px; bottom: 18px; padding: 12px 14px; max-width: 220px; }
+  #legend h4 { margin: 0 0 8px; font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .lg-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; user-select: none; opacity: .95; }
+  .lg-row.off { opacity: .32; }
+  .lg-dot { width: 11px; height: 11px; border-radius: 50%; flex: none;
+    box-shadow: 0 0 9px currentColor; }
+  .lg-row .nm { flex: 1; white-space: nowrap; }
+  .lg-row .ct { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+
+  #tip { position: fixed; pointer-events: none; z-index: 9; padding: 9px 11px; max-width: 320px;
+    transform: translate(-50%, calc(-100% - 16px)); opacity: 0; transition: opacity .12s; }
+  #tip .nm { font-weight: 650; }
+  #tip .kd { color: #9fb4e0; font-size: 11px; }
+  #tip .pa { color: var(--muted); font-size: 10px; margin-top: 3px; word-break: break-all; }
+
+  #panel { position: fixed; top: 18px; right: 18px; width: 300px; padding: 16px; display: none; }
+  #panel.show { display: block; }
+  #panel .pnm { font-size: 15px; font-weight: 650; word-break: break-word; }
+  #panel .pkd { display: inline-block; margin-top: 6px; font-size: 11px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid currentColor; }
+  #panel .prow { display: grid; grid-template-columns: 64px 1fr; gap: 8px; padding: 5px 0; font-size: 12px;
+    border-bottom: 1px dashed var(--line); }
+  #panel .prow span:first-child { color: var(--muted); }
+  #panel .prow span:last-child { word-break: break-all; }
+  #panel h5 { margin: 13px 0 5px; font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+  #panel .nbr { display: flex; align-items: center; gap: 7px; padding: 3px 0; cursor: pointer; font-size: 12px; }
+  #panel .nbr:hover { color: #fff; }
+  #panel .nbr .d { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 7px currentColor; flex: none; }
+  #panel .nbr .ek { color: var(--muted); font-size: 10px; margin-left: auto; }
+  #panel .close { position: absolute; top: 12px; right: 14px; cursor: pointer; color: var(--muted); font-size: 16px; }
+
+  #hint { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    color: var(--muted); font-size: 11px; letter-spacing: .04em; opacity: .7; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); letter-spacing: .2em; text-transform: uppercase; font-size: 12px; }
+  #loading .spin { width: 22px; height: 22px; margin-right: 12px; border-radius: 50%;
+    border: 2px solid rgba(140,170,255,.25); border-top-color: #7cc4ff; animation: sp 0.9s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #loading.idle { flex-direction: column; text-transform: none; letter-spacing: normal; }
+  #loading .drop { text-align: center; padding: 40px 54px; border: 1.5px dashed rgba(140,170,255,.28);
+    border-radius: 18px; background: rgba(12,18,38,0.5); }
+  #loading .drop .ic { font-size: 40px; color: #6f8fdb; margin-bottom: 10px; }
+  #loading .drop .t { font-size: 17px; color: var(--ink); font-weight: 600; }
+  #loading .drop .s { margin-top: 8px; color: var(--muted); font-size: 13px; }
+  #loading .drop .hh { margin-top: 16px; color: #56688c; font-size: 11px; }
+  #loading .drop code { color: #9fb4e0; background: rgba(120,150,220,0.1); padding: 2px 6px; border-radius: 5px; }
+  #loading .lnk { color: #7cc4ff; cursor: pointer; text-decoration: underline; }
+  body.dragging #loading { display: flex; }
+  body.dragging #loading .drop { border-color: #7cc4ff; background: rgba(20,34,72,0.7); }
+</style>
+<!-- SS_VENDOR_SLOT: offline bundle (three + 3d-force-graph + UnrealBloomPass) as a single classic
+     IIFE so the viewer runs from file:// with no network. `specslice graph --format web` inlines
+     this file's contents in place of the <script src> below for a portable single-file export. -->
+<script src="./vendor/specslice-viewer.bundle.js"></script>
+</head>
+<body>
+  <div id="scene"></div>
+  <div id="graph"></div>
+
+  <div id="hud" class="glass">
+    <div class="title">SpecSlice · Graph</div>
+    <div class="repo" id="repo">—</div>
+    <div class="nums">
+      <div><b id="nNodes">0</b><span>nodes</span></div>
+      <div><b id="nLinks">0</b><span>edges</span></div>
+    </div>
+    <div id="fps">—</div>
+    <div id="capnote" style="margin-top:6px;font-size:10px;color:#ffb24d;letter-spacing:.02em;max-width:200px"></div>
+    <label for="filepick" id="loadlink">＋ load graph…</label>
+  </div>
+
+  <div id="legend" class="glass"><h4>Node kinds</h4><div id="lgrows"></div></div>
+  <div id="tip" class="glass"></div>
+  <div id="panel" class="glass"><div class="close" id="pclose">×</div><div id="pbody"></div></div>
+  <div id="hint">drag to orbit · scroll to zoom · hover to inspect · click to focus</div>
+  <div id="loading"><div class="spin"></div>loading constellation…</div>
+  <input type="file" id="filepick" accept=".json,application/json" style="display:none" />
+
+<!-- SS_DATA_SLOT: `specslice graph --format web` replaces this line with the inlined graph. -->
+<script>
+// THREE, ForceGraph3D and UnrealBloomPass are provided as globals by the offline
+// vendor bundle loaded above (a single classic IIFE, file:// friendly).
+const { THREE, ForceGraph3D, UnrealBloomPass } = window;
+
+const PALETTE = {
+  // functions / methods — cool blues & cyans
+  go_function:     '#4f9dff', dart_function: '#4f9dff',
+  go_method:       '#34e7d0', dart_method:   '#34e7d0',
+  // types — greens
+  go_struct:       '#7CFC8A', dart_class:    '#7CFC8A',
+  dart_constructor:'#52e0a4',
+  go_interface:    '#b98cff',
+  // entrypoints — amber; data sinks — pink
+  http_route:      '#ffb24d', route:         '#ffd27a',
+  db_table:        '#ff6b9d', storage:       '#ff8fae',
+  // tests & docs — muted
+  test_case:       '#5d6e93', test_group:    '#4a5a7a',
+  file:            '#3a4a6b', doc_section:   '#c9a45e',
+};
+const KIND_FALLBACK = '#8aa0cc';
+function colorFor(kind) { return PALETTE[kind] || KIND_FALLBACK; }
+const KIND_LABEL = {
+  go_function: 'function', dart_function: 'function',
+  go_method: 'method', dart_method: 'method',
+  go_struct: 'struct', dart_class: 'class', dart_constructor: 'ctor',
+  go_interface: 'interface', http_route: 'route', route: 'route',
+  db_table: 'table', storage: 'storage',
+  test_case: 'test', test_group: 'test grp', file: 'file', doc_section: 'doc',
+};
+// Heavy low-signal kinds hidden by default on very large graphs so the
+// first paint shows the meaningful call/type topology, not a test/doc haze.
+const BIG_HIDE = ['test_case', 'test_group', 'doc_section', 'file'];
+
+const params = new URLSearchParams(location.search);
+const dataUrl = params.get('data') || './data/platform-go.json';
+
+const elRepo = document.getElementById('repo');
+const elNodes = document.getElementById('nNodes');
+const elLinks = document.getElementById('nLinks');
+const elTip = document.getElementById('tip');
+const elPanel = document.getElementById('panel');
+const elPbody = document.getElementById('pbody');
+
+let Graph, data, byId = new Map(), adj = new Map();
+const disabledKinds = new Set();
+let BIG = false, renderCapped = 0;
+const VIS_CAP = 2600; // backbone size for very large graphs (keeps 60fps in 3D)
+
+init();
+
+// Try the configured/default dataset; fall back to a drop/open prompt so the
+// page is usable straight from file:// with no server.
+async function init() {
+  setupFileLoading();
+  // A CLI export (`specslice graph --format web`) inlines the graph as a global
+  // so the page needs no fetch and works straight from file:// offline.
+  if (window.__SS_DATA__) { boot(window.__SS_DATA__); return; }
+  try {
+    const res = await fetch(dataUrl);
+    if (!res.ok) throw new Error(res.status);
+    boot(await res.json());
+  } catch (e) {
+    showIdle();
+  }
+}
+
+function boot(loaded) {
+  if (!loaded || !Array.isArray(loaded.nodes)) { showIdle('That file has no nodes[].'); return; }
+  data = loaded;
+  data.meta = data.meta || { repo: 'graph', nodes: data.nodes.length, links: (data.links||[]).length };
+  data.links = data.links || [];
+  byId = new Map(data.nodes.map(n => [n.id, n]));
+  adj = new Map();
+  for (const n of data.nodes) adj.set(n.id, new Set());
+  for (const l of data.links) {
+    const s = typeof l.source === 'object' ? l.source.id : l.source;
+    const t = typeof l.target === 'object' ? l.target.id : l.target;
+    adj.get(s)?.add(t); adj.get(t)?.add(s);
+  }
+
+  elRepo.textContent = data.meta.repo;
+  elNodes.textContent = data.meta.nodes.toLocaleString();
+  elLinks.textContent = data.meta.links.toLocaleString();
+
+  // Adaptive budget: above ~6k nodes we trim layout iterations, sphere
+  // tessellation and link weight so the first paint stays interactive, hide
+  // low-signal kinds (tests/docs/files) by default, and render only the
+  // highest-degree backbone (per-node meshes cost one draw call each).
+  BIG = data.nodes.length > 6000;
+  if (BIG) BIG_HIDE.forEach(k => disabledKinds.add(k));
+  buildLegend();
+  const rd = computeRender();
+  updateHud();
+
+  Graph = ForceGraph3D({ controlType: 'orbit' })(document.getElementById('graph'))
+    .backgroundColor('#060912')
+    .graphData(rd)
+    .nodeId('id')
+    .nodeVal(n => 1.2 + Math.sqrt(n.deg || 0) * (BIG ? 1.3 : 2.0))
+    .nodeColor(n => colorFor(n.kind))
+    .nodeOpacity(0.95)
+    .nodeResolution(BIG ? 6 : 12)
+    .nodeRelSize(4)
+    .linkColor(l => colorFor((byId.get(idOf(l.source))||{}).kind))
+    .linkWidth(BIG ? 0 : 0.5)
+    .linkOpacity(BIG ? 0.14 : 0.26)
+    .linkDirectionalParticles(0)
+    .warmupTicks(BIG ? 8 : 50)
+    .cooldownTicks(BIG ? 60 : 140)
+    .onNodeHover(onHover)
+    .onNodeClick(onClick)
+    .onBackgroundClick(() => { selectNode(null); });
+
+  // Compact, breathing clusters. A mild charge keeps disconnected
+  // components from drifting to infinity, so the galaxy stays cohesive.
+  Graph.d3Force('charge').strength(BIG ? -28 : -42);
+  Graph.d3Force('link').distance(BIG ? 22 : 30);
+  // Radial gravity toward origin: pulls disconnected satellites inward so the
+  // whole graph reads as one galaxy instead of scattered islands. Kept gentle
+  // on big graphs so dense clusters spread instead of collapsing to a ball.
+  Graph.d3Force('gravity', radialGravity(BIG ? 0.03 : 0.10));
+
+  const mainComp = largestComponent();
+  setupBloom();
+  addSkydome();
+  addStarfield();
+  let fitted = false;
+  Graph.onEngineStop(() => {
+    if (fitted) return; fitted = true;
+    // Frame the main mass; outlier mini-clusters remain explorable by orbit.
+    Graph.zoomToFit(900, 70, n => mainComp.has(n.id));
+  });
+  document.getElementById('loading').style.display = 'none';
+  trackFps();
+  window.addEventListener('resize', () => {
+    Graph.width(innerWidth); Graph.height(innerHeight);
+  });
+}
+
+function idOf(x) { return typeof x === 'object' ? x.id : x; }
+
+// ---------- file loading (drag-drop / picker) ----------
+function showIdle(msg) {
+  const l = document.getElementById('loading');
+  l.classList.add('idle');
+  l.innerHTML = `<div class="drop">
+    <div class="ic">⬡</div>
+    <div class="t">Drop a graph JSON here</div>
+    <div class="s">${msg ? esc(msg) + ' · ' : ''}or <label for="filepick" class="lnk">browse…</label></div>
+    <div class="hh">export with <code>python3 export_graph.py &lt;graph.db&gt; graph.json</code></div>
+  </div>`;
+  l.style.display = 'flex';
+}
+function readFile(file) {
+  const r = new FileReader();
+  r.onload = () => { try { boot(JSON.parse(r.result)); } catch (e) { showIdle('Could not parse JSON.'); } };
+  r.readAsText(file);
+}
+function setupFileLoading() {
+  const pick = document.getElementById('filepick');
+  if (pick) pick.addEventListener('change', e => { if (e.target.files[0]) readFile(e.target.files[0]); });
+  addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragging'); });
+  addEventListener('dragleave', e => { if (e.relatedTarget === null) document.body.classList.remove('dragging'); });
+  addEventListener('drop', e => {
+    e.preventDefault(); document.body.classList.remove('dragging');
+    const f = e.dataTransfer.files[0]; if (f) readFile(f);
+  });
+}
+
+// Custom d3 force: pull every node toward the origin so disconnected
+// components gather into one cohesive cloud (the default 'center' force only
+// recentres the centroid, it does not draw islands together).
+function radialGravity(strength) {
+  let nodes = [];
+  function force(alpha) {
+    const k = strength * alpha;
+    for (const n of nodes) { n.vx -= n.x * k; n.vy -= n.y * k; n.vz -= (n.z || 0) * k; }
+  }
+  force.initialize = ns => { nodes = ns; };
+  return force;
+}
+
+// BFS to find the largest connected component, used to frame the camera on
+// the dense core rather than letting scattered mini-clusters shrink it.
+function largestComponent() {
+  const seen = new Set(); let best = new Set();
+  for (const n of data.nodes) {
+    if (seen.has(n.id)) continue;
+    const comp = new Set([n.id]); const q = [n.id]; seen.add(n.id);
+    while (q.length) { const cur = q.pop();
+      for (const nb of (adj.get(cur) || [])) if (!seen.has(nb)) { seen.add(nb); comp.add(nb); q.push(nb); } }
+    if (comp.size > best.size) best = comp;
+  }
+  return best;
+}
+
+function setupBloom() {
+  try {
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(innerWidth, innerHeight), 1.25, 0.62, 0.22);
+    Graph.postProcessingComposer().addPass(bloom);
+  } catch (e) { console.warn('bloom unavailable', e); }
+}
+
+// A large back-side sphere with a vertical gradient gives the scene depth
+// (the CSS gradient is hidden once the bloom composer renders opaque).
+function addSkydome() {
+  const geo = new THREE.SphereGeometry(6000, 32, 24);
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    uniforms: {
+      top:    { value: new THREE.Color('#0a1430') },
+      bottom: { value: new THREE.Color('#03050c') },
+      glow:   { value: new THREE.Color('#0c1838') },
+    },
+    vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `varying vec3 vP; uniform vec3 top; uniform vec3 bottom; uniform vec3 glow;
+      void main(){ float h = normalize(vP).y*0.5+0.5; vec3 c = mix(bottom, top, pow(h,1.4));
+        float r = smoothstep(0.8,0.0,length(normalize(vP).xy)); c = mix(c, glow, r*0.25);
+        gl_FragColor = vec4(c,1.0); }`,
+  });
+  Graph.scene().add(new THREE.Mesh(geo, mat));
+}
+
+function addStarfield() {
+  const scene = Graph.scene();
+  const N = 1400, pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const r = 1600 + Math.random() * 2600;
+    const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+    pos[i*3] = r * Math.sin(ph) * Math.cos(th);
+    pos[i*3+1] = r * Math.sin(ph) * Math.sin(th);
+    pos[i*3+2] = r * Math.cos(ph);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const m = new THREE.PointsMaterial({ color: 0x9fb6e8, size: 1.4, sizeAttenuation: true,
+    transparent: true, opacity: 0.55, depthWrite: false });
+  scene.add(new THREE.Points(g, m));
+}
+
+// ---------- interaction ----------
+let hoverNode = null;
+function onHover(node) {
+  hoverNode = node;
+  document.body.style.cursor = node ? 'pointer' : 'default';
+  if (!node) { elTip.style.opacity = 0; refreshDim(); return; }
+  elTip.innerHTML = `<div class="nm">${esc(node.name)}</div>`
+    + `<div class="kd">${KIND_LABEL[node.kind]||node.kind} · ${node.deg} links</div>`
+    + (node.path ? `<div class="pa">${esc(node.path)}${node.line?':'+node.line:''}</div>` : '');
+  refreshDim();
+}
+addEventListener('mousemove', e => {
+  if (elTip.style.opacity !== '0') { elTip.style.left = e.clientX+'px'; elTip.style.top = e.clientY+'px'; }
+  if (hoverNode) { elTip.style.left = e.clientX+'px'; elTip.style.top = e.clientY+'px'; elTip.style.opacity = 1; }
+});
+
+let selected = null;
+function onClick(node) {
+  selectNode(node);
+  // Dolly to a fixed standoff from the node along the current view direction.
+  // (The origin-ray recipe collapses to ~0 for hubs sitting near the centre.)
+  const CAM = 190;
+  const cam = Graph.camera();
+  const np = new THREE.Vector3(node.x || 0, node.y || 0, node.z || 0);
+  const dir = np.clone().sub(cam.position);
+  if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1);
+  dir.normalize();
+  const pos = np.clone().addScaledVector(dir, -CAM);
+  Graph.cameraPosition({ x: pos.x, y: pos.y, z: pos.z }, node, 900);
+}
+
+function selectNode(node) {
+  selected = node;
+  if (!node) { elPanel.classList.remove('show'); refreshDim(); return; }
+  const nbrs = [...(adj.get(node.id)||[])].map(id => byId.get(id)).filter(Boolean)
+    .sort((a,b) => b.deg - a.deg).slice(0, 24);
+  const col = colorFor(node.kind);
+  elPbody.innerHTML =
+    `<div class="pnm">${esc(node.name)}</div>`
+    + `<div class="pkd" style="color:${col}">${KIND_LABEL[node.kind]||node.kind}</div>`
+    + `<div style="margin-top:10px">`
+    + (node.path ? `<div class="prow"><span>path</span><span>${esc(node.path)}${node.line?':'+node.line:''}</span></div>` : '')
+    + `<div class="prow"><span>links</span><span>${node.deg}</span></div>`
+    + `<div class="prow"><span>id</span><span>${esc(node.id)}</span></div></div>`
+    + `<h5>Connected (${nbrs.length})</h5>`
+    + nbrs.map(nb => `<div class="nbr" data-id="${esc(nb.id)}"><span class="d" style="color:${colorFor(nb.kind)}"></span>${esc(nb.name)}<span class="ek">${KIND_LABEL[nb.kind]||nb.kind}</span></div>`).join('');
+  elPanel.classList.add('show');
+  elPbody.querySelectorAll('.nbr').forEach(el =>
+    el.addEventListener('click', () => { const n = byId.get(el.dataset.id); if (n) onClick(n); }));
+  refreshDim();
+}
+document.getElementById('pclose').addEventListener('click', () => selectNode(null));
+
+// Dim everything not connected to the focus (hover or selected).
+function refreshDim() {
+  const focus = hoverNode || selected;
+  if (!focus) {
+    Graph.nodeColor(n => kindOn(n) ? colorFor(n.kind) : 'rgba(40,52,82,0.15)')
+         .linkOpacity(0.22).linkColor(l => colorFor((byId.get(idOf(l.source))||{}).kind));
+    return;
+  }
+  const keep = adj.get(focus.id) || new Set();
+  Graph.nodeColor(n => {
+    if (!kindOn(n)) return 'rgba(40,52,82,0.12)';
+    if (n.id === focus.id) return '#ffffff';
+    return keep.has(n.id) ? colorFor(n.kind) : 'rgba(70,86,128,0.16)';
+  }).linkOpacity(0.05).linkColor(l => {
+    const s = idOf(l.source), t = idOf(l.target);
+    return (s === focus.id || t === focus.id) ? colorFor((byId.get(s)||{}).kind) : 'rgba(70,86,128,0.05)';
+  });
+}
+
+function kindOn(n) { return !disabledKinds.has(n.kind); }
+
+// ---------- legend / filtering ----------
+function buildLegend() {
+  const counts = {};
+  for (const n of data.nodes) counts[n.kind] = (counts[n.kind]||0)+1;
+  const order = Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
+  const host = document.getElementById('lgrows');
+  host.innerHTML = order.map(k =>
+    `<div class="lg-row${disabledKinds.has(k)?' off':''}" data-k="${k}"><span class="lg-dot" style="color:${colorFor(k)};background:${colorFor(k)}"></span>`
+    + `<span class="nm">${KIND_LABEL[k]||k}</span><span class="ct">${counts[k]}</span></div>`).join('');
+  host.querySelectorAll('.lg-row').forEach(row => row.addEventListener('click', () => {
+    const k = row.dataset.k;
+    if (disabledKinds.has(k)) { disabledKinds.delete(k); row.classList.remove('off'); }
+    else { disabledKinds.add(k); row.classList.add('off'); }
+    applyKindFilter();
+  }));
+}
+// Build the set actually handed to the renderer: kind-filtered, and on big
+// graphs capped to the top-degree backbone (with links among that set).
+function computeRender() {
+  let ns = data.nodes.filter(kindOn);
+  renderCapped = 0;
+  if (BIG && ns.length > VIS_CAP) {
+    ns = ns.slice().sort((a, b) => b.deg - a.deg);
+    renderCapped = ns.length - VIS_CAP;
+    ns = ns.slice(0, VIS_CAP);
+  }
+  const ids = new Set(ns.map(n => n.id));
+  const ls = data.links.filter(l => ids.has(idOf(l.source)) && ids.has(idOf(l.target)));
+  return { nodes: ns, links: ls };
+}
+function applyKindFilter() {
+  Graph.graphData(computeRender());
+  updateHud();
+  refreshDim();
+}
+function updateHud() {
+  if (renderCapped > 0) {
+    elNodes.innerHTML = VIS_CAP.toLocaleString()
+      + ` <span style="font-size:11px;color:var(--muted);font-weight:500">/ ${data.meta.nodes.toLocaleString()}</span>`;
+    document.getElementById('capnote').textContent =
+      `showing top ${VIS_CAP.toLocaleString()} hubs · ${renderCapped.toLocaleString()} more hidden for performance`;
+  } else {
+    elNodes.textContent = data.meta.nodes.toLocaleString();
+    document.getElementById('capnote').textContent = '';
+  }
+}
+
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// Debug hook for automated screenshots (harmless in normal use).
+window.__ss = {
+  graph: () => Graph,
+  topHub: () => data.nodes.slice().sort((a,b)=>b.deg-a.deg)[0]?.id,
+  select: id => { const n = byId.get(id); if (n) onClick(n); },
+  hover: id => { onHover(id ? byId.get(id) : null); },
+};
+
+function trackFps(){
+  let last = performance.now(), frames = 0;
+  const el = document.getElementById('fps');
+  (function loop(t){ frames++; if (t-last>=1000){ el.textContent = frames+' fps'; frames=0; last=t; } requestAnimationFrame(loop); })(last);
+}
+</script>
+</body>
+</html>
