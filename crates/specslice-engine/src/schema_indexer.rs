@@ -1702,6 +1702,10 @@ pub fn parse_http_routes(text: &str) -> Vec<ParsedRoute> {
     if !(text.contains("@RestController") || text.contains("@Controller")) {
         return Vec::new();
     }
+    // Strip comments so a commented-out `// @GetMapping("/x")` (or a block) in a
+    // live controller isn't read as a route. Strings (mapping paths) are kept.
+    let owned = blank_c_like_comments(text);
+    let text = owned.as_str();
     let Some((class_name, class_decl_at)) = find_controller_class(text) else {
         return Vec::new();
     };
@@ -3332,6 +3336,38 @@ public class StyleInfoController {
         let root = find("root").expect("root route");
         assert_eq!(root.path, "/style-info");
         assert_eq!(root.verb, "GET");
+    }
+
+    #[test]
+    fn parse_http_routes_ignores_commented_out_mappings() {
+        // Commented-out mappings — a `//` line and a `/* */` block — in a live
+        // controller must not mint phantom routes; only the real mapping counts.
+        let java = r#"
+@RestController
+@RequestMapping("/style-info")
+public class StyleInfoController {
+
+    // @GetMapping("/old")
+    // public RS<Void> old() { return null; }
+
+    /*
+    @PostMapping("/legacy")
+    public RS<Void> legacy() { return null; }
+    */
+
+    @GetMapping("/live")
+    public RS<Void> live() { return null; }
+}
+"#;
+        let routes = parse_http_routes(java);
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the live mapping counts; commented-out ones are ignored, got {routes:?}"
+        );
+        assert_eq!(routes[0].method, "live");
+        assert_eq!(routes[0].path, "/style-info/live");
+        assert_eq!(routes[0].verb, "GET");
     }
 
     #[test]
