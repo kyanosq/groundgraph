@@ -1851,28 +1851,22 @@ pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
     }
     let b = text.as_bytes();
     let mut routes = Vec::new();
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] != b'@' {
-            i += 1;
-            continue;
-        }
+    // Only treat `@` that sit at *code* level as decorators — a `@router.post`
+    // printed inside a docstring usage example or a `#` comment is documentation,
+    // not a route (atagent regression: phantom `POST /` with no real handler).
+    for i in python_decorator_offsets(b) {
         let (dotted, after) = read_dotted_ident(b, i + 1);
         let Some(verb_kind) = python_decorator_verb(&dotted) else {
-            i = after;
             continue;
         };
         let j = skip_ws(b, after);
         if j >= b.len() || b[j] != b'(' {
-            i = after;
             continue;
         }
         let Some((body, end)) = balanced_parens(b, j) else {
-            i = after;
             continue;
         };
         let Some(path) = python_first_string(body) else {
-            i = end;
             continue;
         };
         let verb = match verb_kind {
@@ -1889,9 +1883,69 @@ pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
                 line: line_of(text, i),
             });
         }
-        i = end;
     }
     routes
+}
+
+/// Byte offsets of every `@` that sits at Python *code* level — i.e. not inside
+/// a string literal (including triple-quoted docstrings) or a `#` comment. This
+/// keeps route detection from tripping over decorators shown as usage examples
+/// in documentation. Quote prefixes (`r"`, `f"`, `b"""`, …) need no special
+/// handling: the prefix letters scan as ordinary bytes and the quote that
+/// follows opens the string as usual.
+fn python_decorator_offsets(b: &[u8]) -> Vec<usize> {
+    let mut offs = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'\'' => i = skip_python_string(b, i),
+            b'@' => {
+                offs.push(i);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    offs
+}
+
+/// Advance past a Python string literal whose opening quote is at `start`,
+/// returning the offset just past its close (or end-of-input / newline for an
+/// unterminated single-line string). Handles triple quotes and backslash
+/// escapes; raw-string corner cases (a quote after a backslash) are irrelevant
+/// to whether a `@` is code-level.
+fn skip_python_string(b: &[u8], start: usize) -> usize {
+    let q = b[start];
+    let triple = start + 2 < b.len() && b[start + 1] == q && b[start + 2] == q;
+    if triple {
+        let mut i = start + 3;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == q && i + 2 < b.len() && b[i + 1] == q && b[i + 2] == q {
+                return i + 3;
+            }
+            i += 1;
+        }
+        return b.len();
+    }
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'\n' => return i, // unterminated single-line string
+            c if c == q => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
 }
 
 /// Read a dotted identifier (`app.get`, `router.post`) from `start`; returns
@@ -3733,6 +3787,48 @@ def compute():
     return 1
 "#;
         assert!(parse_python_routes(py).is_empty());
+    }
+
+    #[test]
+    fn parse_python_routes_ignores_decorators_in_docstrings_and_comments() {
+        // Regression (atagent backend/app/utils/http_dependencies.py): a
+        // `@router.post("/")` shown as a *usage example* inside a docstring —
+        // and one inside a `#` comment — were mistaken for real routes, minting
+        // a phantom `POST /` HttpRoute with no resolvable handler. Only genuine
+        // code-level decorators are routes.
+        let py = r#"
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+def get_request_id_header():
+    """FastAPI dependency: read or mint a Request ID.
+
+    Usage:
+        @router.post("/")
+        async def my_endpoint(request_id: str = Depends(get_request_id_header)):
+            pass
+    """
+    return "x"
+
+
+# Legacy example kept for docs: @app.get("/old") def old(): ...
+
+
+@router.get("/real")
+async def real_endpoint():
+    return {}
+"#;
+        let routes = parse_python_routes(py);
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the code-level route counts; docstring/comment examples are ignored, got {routes:?}"
+        );
+        assert_eq!(routes[0].method, "real_endpoint");
+        assert_eq!(routes[0].path, "/real");
+        assert_eq!(routes[0].verb, "GET");
     }
 
     #[test]
