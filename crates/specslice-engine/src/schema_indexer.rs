@@ -1758,10 +1758,89 @@ pub fn parse_http_routes(text: &str) -> Vec<ParsedRoute> {
 /// variable (`"GET "+prefix+"/p"` → path `/p`). The handler's declaring type is
 /// taken from the enclosing method receiver (`func (recv *Type) Register(...)`),
 /// so the route links to the `Type.Method` suffix of the indexed `GoMethod` node.
+/// Blank the *contents* of `//` line and `/* */` block comments (their bytes
+/// become spaces; newlines kept so byte offsets and line numbers are unchanged),
+/// leaving code and string / char / raw literals intact. String-aware, so a `//`
+/// inside a literal — e.g. a URL `"http://x"` — is never read as a comment.
+/// Covers the lexical forms shared by Go and Java: `"…"` (and Java text blocks
+/// `"""…"""`), `'…'`, and Go raw `` `…` ``. Keeps the route scanners from
+/// resurrecting commented-out registrations as phantom endpoints.
+fn blank_c_like_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], from: usize, to: usize| {
+        for byte in out.iter_mut().take(to).skip(from) {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0usize;
+    while i < n {
+        match b[i] {
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                let start = i;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                let start = i;
+                i += 2;
+                while i < n && !(b[i] == b'*' && i + 1 < n && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                blank(&mut out, start, i);
+            }
+            b'"' if i + 2 < n && b[i + 1] == b'"' && b[i + 2] == b'"' => {
+                i += 3;
+                while i + 2 < n && !(b[i] == b'"' && b[i + 1] == b'"' && b[i + 2] == b'"') {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 3).min(n);
+            }
+            b'"' => i = skip_c_quote(b, i, b'"'),
+            b'\'' => i = skip_c_quote(b, i, b'\''),
+            b'`' => {
+                i += 1;
+                while i < n && b[i] != b'`' {
+                    i += 1;
+                }
+                i = (i + 1).min(n);
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
+/// Advance past a `"`/`'`-delimited literal opened at `start`, honouring `\`
+/// escapes and stopping at an unescaped newline (defensive against an
+/// unterminated literal swallowing the rest of the file).
+fn skip_c_quote(b: &[u8], start: usize, q: u8) -> usize {
+    let n = b.len();
+    let mut i = start + 1;
+    while i < n {
+        match b[i] {
+            b'\\' => i += 2,
+            b'\n' => return i,
+            c if c == q => return i + 1,
+            _ => i += 1,
+        }
+    }
+    n
+}
+
 pub fn parse_go_routes(text: &str) -> Vec<ParsedRoute> {
     if !text.contains("HandleFunc") && !text.contains(".Handle(") {
         return Vec::new();
     }
+    // Strip comments so commented-out `mux.HandleFunc(...)` lines aren't routes.
+    let owned = blank_c_like_comments(text);
+    let text = owned.as_str();
     let b = text.as_bytes();
     let receivers = collect_go_receivers(b);
     let mut routes = Vec::new();
@@ -2192,6 +2271,10 @@ pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
     if !text.contains("gin.") && !text.contains("gin-gonic") {
         return Vec::new();
     }
+    // Strip comments first so commented-out `r.GET(...)` lines (and any group /
+    // router declarations inside them) don't register as phantom routes.
+    let owned = blank_c_like_comments(text);
+    let text = owned.as_str();
     let prefixes = collect_gin_group_prefixes(text);
     if prefixes.is_empty() {
         return Vec::new();
@@ -3424,6 +3507,34 @@ type S struct{}
 func (s *S) GET(id int) any { return s.repo.GET(id) }
 "#;
         assert!(parse_gin_routes(go).is_empty());
+    }
+
+    #[test]
+    fn parse_gin_routes_ignores_commented_out_routes() {
+        // Commented-out registrations — a `//` line and a `/* */` block — are
+        // dead code, not routes: scanning them would mint phantom endpoints.
+        // The string-awareness guard: a URL literal containing `//` must NOT be
+        // read as a comment, so the live route after it survives.
+        let go = r#"
+package main
+import "github.com/gin-gonic/gin"
+func main() {
+    r := gin.Default()
+    _ = "http://example.com/x" // base url, then a real trailing comment
+    // r.GET("/debug", h.Debug)
+    /* r.POST("/legacy", h.Legacy) */
+    r.GET("/health", h.Health)
+}
+"#;
+        let routes = parse_gin_routes(go);
+        assert_eq!(
+            routes.len(),
+            1,
+            "only the live route counts; commented-out ones are ignored, got {routes:?}"
+        );
+        assert_eq!(routes[0].verb, "GET");
+        assert_eq!(routes[0].path, "/health");
+        assert_eq!(routes[0].method, "Health");
     }
 
     #[test]
