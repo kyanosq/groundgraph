@@ -2978,7 +2978,16 @@ fn scan_inline_consumed_calls(text: &str, allow_backtick: bool) -> Vec<InlineCon
                 continue;
             }
             let prev = b[pos - 1];
-            if !(is_ident_byte(prev) || prev == b')' || prev == b']' || prev == b'>') {
+            // `$` is a valid JS/TS/Dart identifier char (ECMAScript
+            // IdentifierStart), so receivers like jQuery `$` or an RxJS-style
+            // `http$` end in `$`; without it `$.get('/p')` / `http$.post('/p')`
+            // would be dropped as non-calls.
+            if !(is_ident_byte(prev)
+                || prev == b'$'
+                || prev == b')'
+                || prev == b']'
+                || prev == b'>')
+            {
                 continue;
             }
             // `app.get("/p", handler)` is a *server* route, not a client call.
@@ -4500,6 +4509,35 @@ export async function f(id: string) {
             got,
             vec![("GET", "/admin/users/:param")],
             "only the live call counts; commented-out ones are ignored, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ts_consumed_calls_handles_dollar_receivers() {
+        // jQuery `$.get(...)` and RxJS-style `http$.post(...)` receivers both end
+        // in `$`, a valid JS/TS identifier char (ECMAScript IdentifierStart). They
+        // consume backend routes like any other client call, so the `$` preceding
+        // the verb must not drop the call. Real vub admin JS does exactly this:
+        // `$.get("/admin/attachment/" + id, ...)`.
+        let js = r#"
+function load() {
+  $.get("/admin/attachment/list", function (r) { vm.x = r; });
+  this.http$.post("/api/v2/orders", body);
+}
+"#;
+        let calls = parse_ts_consumed_calls(js);
+        let mut got: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.verb.as_str(), c.path.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("GET", "/admin/attachment/list"),
+                ("POST", "/api/v2/orders"),
+            ],
+            "$-receivers ($.get, http$.post) must be detected, got {got:?}"
         );
     }
 
