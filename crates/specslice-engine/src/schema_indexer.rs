@@ -347,7 +347,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
             }
         }
         let tables = match ext.as_str() {
-            "sql" => read_and(path, parse_sql_tables),
+            "sql" => read_and(path, parse_sql_tables_from_sql_file),
             "java" => read_and(path, parse_java_entity_tables),
             // Backends that keep their schema as an embedded string literal
             // (Go `migrations.go`, Rust/Python/TS migration modules, …) define
@@ -1443,6 +1443,71 @@ pub fn is_plausible_table_name(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // SQL: CREATE TABLE
 // ---------------------------------------------------------------------------
+
+/// `.sql`-file entry point: strip SQL comments first so a commented-out
+/// `-- CREATE TABLE old (…)` (or a `/* … */` block) is not minted as a phantom
+/// table, and `-- column note` lines inside a table body don't become bogus
+/// columns. Embedded SQL in *source* files keeps the raw scanner: there a `--`
+/// is ambiguous (Go `i--`) and the DDL already lives inside a string literal.
+fn parse_sql_tables_from_sql_file(text: &str) -> Vec<ParsedTable> {
+    parse_sql_tables(&blank_sql_comments(text))
+}
+
+/// Blank SQL `--` line and `/* */` block comment contents with spaces (newlines
+/// kept so offsets/line numbers are stable), leaving string literals (`'…'`) and
+/// quoted identifiers (`"…"`) — where `''`/`""` are escaped quotes — intact, so a
+/// `--` inside a literal is never read as a comment.
+fn blank_sql_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut out = b.to_vec();
+    let blank = |out: &mut [u8], from: usize, to: usize| {
+        for byte in out.iter_mut().take(to).skip(from) {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let skip_quoted = |b: &[u8], start: usize, q: u8| -> usize {
+        let mut i = start + 1;
+        while i < n {
+            if b[i] == q {
+                if i + 1 < n && b[i + 1] == q {
+                    i += 2; // doubled quote escape (`''` / `""`)
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        n
+    };
+    let mut i = 0usize;
+    while i < n {
+        match b[i] {
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                let start = i;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                let start = i;
+                i += 2;
+                while i < n && !(b[i] == b'*' && i + 1 < n && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                blank(&mut out, start, i);
+            }
+            b'\'' => i = skip_quoted(b, i, b'\''),
+            b'"' => i = skip_quoted(b, i, b'"'),
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
 
 pub fn parse_sql_tables(text: &str) -> Vec<ParsedTable> {
     let lower = text.to_ascii_lowercase();
@@ -2742,6 +2807,10 @@ pub fn parse_ts_consumed_calls(text: &str) -> Vec<InlineConsumedCall> {
 /// [`crate::route_coverage::route_key`]. `allow_backtick` admits TS/JS template
 /// literals; Dart has none so it is disabled there.
 fn scan_inline_consumed_calls(text: &str, allow_backtick: bool) -> Vec<InlineConsumedCall> {
+    // Strip comments so a commented-out `// http.get('/x')` isn't read as a
+    // consumed route. Backtick template paths are kept (preserved as raw strings).
+    let owned = blank_c_like_comments(text);
+    let text = owned.as_str();
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4247,6 +4316,31 @@ export async function grant(id: string, body: GrantBody) {
     }
 
     #[test]
+    fn parse_ts_consumed_calls_ignores_commented_out_calls() {
+        // Commented-out client calls (a `//` line and a `/* */` block) are dead
+        // code, not consumed routes. The live call — even on a backtick template
+        // path — still resolves.
+        let ts = r#"
+const http = axios.create({ baseURL });
+export async function f(id: string) {
+  // const a = await http.get('/admin/legacy');
+  /* const b = await http.post('/admin/old', body); */
+  const { data } = await http.get(`/admin/users/${id}`);
+}
+"#;
+        let calls = parse_ts_consumed_calls(ts);
+        let got: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.verb.as_str(), c.path.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("GET", "/admin/users/:param")],
+            "only the live call counts; commented-out ones are ignored, got {got:?}"
+        );
+    }
+
+    #[test]
     fn links_dart_inline_dio_consumer_to_consumed_route() {
         // End-to-end of the inline-call path (the Shift-app shape): a Dart method
         // calls `_dio.get('/v1/me')` directly — no constant table — and the full
@@ -4480,6 +4574,32 @@ class ApiEndpoints {
         assert_eq!(t.name, "craft_conflict");
         let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "category_id", "craft_id", "type"]);
+    }
+
+    #[test]
+    fn sql_file_scanner_skips_commented_out_tables_and_inline_notes() {
+        // A `.sql` file: a `--` and a `/* */` commented-out CREATE TABLE must not
+        // mint phantom tables, and a `-- note` inside the live table body must not
+        // become a bogus column.
+        let sql = r#"
+-- CREATE TABLE old_users (id BIGINT);
+/* CREATE TABLE legacy (
+     id BIGINT
+   ); */
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY, -- internal id, do not expose
+    email TEXT NOT NULL
+);
+"#;
+        let tables = parse_sql_tables_from_sql_file(sql);
+        assert_eq!(
+            tables.len(),
+            1,
+            "only the live table; commented-out DDL is ignored, got {tables:?}"
+        );
+        assert_eq!(tables[0].name, "users");
+        let cols: Vec<&str> = tables[0].columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["id", "email"], "the `-- note` is not a column");
     }
 
     #[test]
