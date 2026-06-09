@@ -1337,6 +1337,13 @@ fn is_skipped_walk_entry(e: &walkdir::DirEntry) -> bool {
     if is_skipped_dir(name) {
         return true;
     }
+    // An embedded git repository (depth>0 dir with its own `.git/`) is a
+    // different project — vendored upstream / reference clone — whose source
+    // git does not track here; prune it like the tree-sitter discovery does so
+    // its tables/routes never become phantom nodes in the parent graph.
+    if e.depth() > 0 && e.file_type().is_dir() && e.path().join(".git").is_dir() {
+        return true;
+    }
     e.depth() > 0 && e.file_type().is_dir() && e.path().join(DEFAULT_CONFIG_FILE_NAME).is_file()
 }
 

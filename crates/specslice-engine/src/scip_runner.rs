@@ -284,6 +284,11 @@ fn is_skipped_module_scan_dir(e: &walkdir::DirEntry) -> bool {
     if e.depth() > 0 && name.starts_with('.') {
         return true;
     }
+    // An embedded git repo (depth>0 dir with its own `.git/`) is a different
+    // project; its `go.mod` is not ours, so never spawn a `scip-go` there.
+    if e.depth() > 0 && e.path().join(".git").is_dir() {
+        return true;
+    }
     crate::treesitter::ALWAYS_SKIP_DIRS.contains(&name)
 }
 

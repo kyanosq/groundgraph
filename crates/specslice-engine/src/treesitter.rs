@@ -1891,6 +1891,14 @@ fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
     if entry.depth() > 0 && name.starts_with('.') {
         return true;
     }
+    // An embedded git repository (a sub-dir holding its own `.git/` dir, below
+    // the root) is a *different project* — vendored upstreams, reference clones
+    // — whose files git does not even track here. Prune the whole subtree so its
+    // symbols never masquerade as first-party. Only a `.git` *directory* counts:
+    // a submodule's `.git` *file* (a gitlink the parent declares) stays indexed.
+    if entry.depth() > 0 && entry.path().join(".git").is_dir() {
+        return true;
+    }
     ALWAYS_SKIP_DIRS.contains(&name) || skip_dirs.contains(&name)
 }
 
@@ -2323,6 +2331,58 @@ describe('outer', () => {
                 .iter()
                 .all(|n| n.name.as_deref() != Some("vendored")),
             "no symbol may come from a hidden dir"
+        );
+    }
+
+    #[test]
+    fn discovery_prunes_embedded_git_repositories() {
+        use specslice_store::Store;
+
+        // A real repo (nest) vendored two full upstream repos under
+        // `references/<dep>/` — each keeping its own `.git/` directory. Git does
+        // not track files inside an embedded repo, so they are not this repo's
+        // source at all, yet the walker descended in and indexed ~1000 foreign
+        // symbols as first-party. A subdirectory that *is itself* a git repo
+        // (has a `.git/` dir) is a different project → prune its whole subtree.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // The root being indexed is itself a repo — must stay indexable.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def real():\n    return 1\n").unwrap();
+        // An embedded upstream repo under references/dep/.
+        std::fs::create_dir_all(root.join("references/dep/.git")).unwrap();
+        std::fs::write(
+            root.join("references/dep/vendored.py"),
+            "def vendored():\n    return 2\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let spec = py_cap_spec();
+        let result = index_repo_with_spec(
+            &mut store,
+            &spec,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.files, 1,
+            "only src/app.py discovered; embedded git repo pruned: {result:?}"
+        );
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.name.as_deref() != Some("vendored")),
+            "no symbol may come from an embedded git repo"
         );
     }
 
