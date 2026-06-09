@@ -276,13 +276,18 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
         // name. Done before the table early-continue below because controllers
         // usually declare no `@TableName`, so they would otherwise be skipped.
         let is_go_test = ext == "go" && path.to_string_lossy().ends_with("_test.go");
-        if (ext == "java" || ext == "go" || ext == "py") && !is_go_test {
+        let is_route_lang = matches!(
+            ext.as_str(),
+            "java" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs"
+        );
+        if is_route_lang && !is_go_test {
             if let Ok(text) = std::fs::read_to_string(path) {
                 // Spring MVC annotations (Java), net/http + Gin registrations
-                // (Go) and FastAPI/Flask decorators (Python) all land as HttpRoute
-                // nodes so the *URL path* a client calls resolves to its handler
-                // regardless of backend language. Go scans both net/http and Gin
-                // since a service may mix them.
+                // (Go), FastAPI/Flask decorators (Python) and Express/Hono
+                // registrations (TS/JS) all land as HttpRoute nodes so the *URL
+                // path* a client calls resolves to its handler regardless of
+                // backend language. Go scans both net/http and Gin since a
+                // service may mix them.
                 let routes = match ext.as_str() {
                     "java" => parse_http_routes(&text),
                     "go" => {
@@ -290,7 +295,8 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
                         rs.extend(parse_gin_routes(&text));
                         rs
                     }
-                    _ => parse_python_routes(&text),
+                    "py" => parse_python_routes(&text),
+                    _ => parse_ts_server_routes(&text),
                 };
                 if !routes.is_empty() {
                     let rel = path
@@ -1960,6 +1966,147 @@ pub fn parse_go_routes(text: &str) -> Vec<ParsedRoute> {
     routes
 }
 
+/// Variable / parameter names bound to an Express (or Hono) app or router, so
+/// `<name>.get("/p", …)` can be told apart from a same-shaped client call
+/// (`http.get("/p")`). Recognises constructor bindings (`x = express()`,
+/// `x = express.Router()`, `x = Router()`, `x = new Hono()`) and TypeScript type
+/// annotations (`app: Express`, `r: Router`, …) — the latter matters because
+/// route files usually receive the app as a parameter (`registerRoutes(app: Express)`).
+fn collect_express_routers(text: &str) -> std::collections::HashSet<String> {
+    let mut routers = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(eq) = line.find('=') {
+            let rhs = line[eq + 1..].trim_start();
+            let is_ctor = rhs.starts_with("express()")
+                || rhs.starts_with("express.Router(")
+                || rhs.starts_with("Router(")
+                || rhs.starts_with("new Hono(")
+                || rhs.starts_with("Hono(");
+            if is_ctor {
+                if let Some(name) = trailing_ident(&line[..eq]) {
+                    routers.insert(name);
+                }
+            }
+        }
+        // Type annotations `name: Express | Application | Router | Hono`.
+        let lb = line.as_bytes();
+        for (c, _) in line.match_indices(':') {
+            let after = line[c + 1..].trim_start();
+            if after.starts_with("Express")
+                || after.starts_with("Application")
+                || after.starts_with("Router")
+                || after.starts_with("Hono")
+            {
+                let name_end = {
+                    let mut k = c;
+                    while k > 0 && (lb[k - 1] as char).is_whitespace() {
+                        k -= 1;
+                    }
+                    k
+                };
+                if let Some(name) = trailing_ident(&line[..name_end]) {
+                    routers.insert(name);
+                }
+            }
+        }
+    }
+    routers
+}
+
+/// The trailing identifier of `s` (e.g. `"const app"` → `"app"`), or `None`.
+fn trailing_ident(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut end = b.len();
+    while end > 0 && (b[end - 1] as char).is_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && is_ident_byte(b[start - 1]) {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(s[start..end].to_string())
+}
+
+/// Recover HTTP routes from an Express / Hono server — the TS/JS analogue of
+/// [`parse_gin_routes`]. Matches `<router>.<verb>("/path", …handler)` where the
+/// receiver is a known app/router (see [`collect_express_routers`]) and the verb
+/// is an HTTP method. Inline arrow / `function` handlers leave the handler empty
+/// (the path is still indexed, like a Gin closure); a bare-identifier handler is
+/// kept as the method name so the linker can resolve it. Comments are stripped
+/// first so commented-out registrations don't become phantom routes.
+pub fn parse_ts_server_routes(text: &str) -> Vec<ParsedRoute> {
+    let routers = collect_express_routers(text);
+    if routers.is_empty() {
+        return Vec::new();
+    }
+    let owned = blank_c_like_comments(text);
+    let text = owned.as_str();
+    let b = text.as_bytes();
+    const VERBS: &[&str] = &["get", "post", "put", "delete", "patch"];
+    let mut routes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for verb in VERBS {
+        let needle = format!(".{verb}(");
+        for (pos, _) in text.match_indices(needle.as_str()) {
+            let Some(recv) = read_ident_backwards(b, pos) else {
+                continue;
+            };
+            if !routers.contains(&recv) {
+                continue;
+            }
+            let open = pos + needle.len() - 1;
+            let Some((body, _end)) = balanced_parens(b, open) else {
+                continue;
+            };
+            let args = split_top_level_commas(body);
+            if args.len() < 2 {
+                continue; // a route needs a path *and* a handler
+            }
+            let path_lit = concat_string_literals(&args[0]);
+            if !path_lit.starts_with('/') {
+                continue; // rejects settings reads like `app.get("env")`
+            }
+            // Closure handler (`(req,res) => …` / `async … =>` / `function`) →
+            // empty handler; a trailing bare identifier → named handler.
+            let method = if is_js_closure_arg(&args[1]) {
+                String::new()
+            } else if is_plain_ident(args[args.len() - 1].trim()) {
+                args[args.len() - 1].trim().to_string()
+            } else {
+                String::new()
+            };
+            let verb_up = verb.to_ascii_uppercase();
+            let path = normalize_route("", &path_lit);
+            if seen.insert((verb_up.clone(), path.clone(), method.clone())) {
+                routes.push(ParsedRoute {
+                    verb: verb_up,
+                    path,
+                    class: String::new(),
+                    method,
+                    line: line_of(text, pos),
+                });
+            }
+        }
+    }
+    routes
+}
+
+/// A JS/TS handler argument that is an inline closure: an arrow function
+/// (`(req, res) => …`), an `async` arrow / function, or a `function` literal.
+fn is_js_closure_arg(arg: &str) -> bool {
+    let t = arg.trim();
+    t.contains("=>") || t.starts_with("function") || t.starts_with("async")
+}
+
+/// `true` when `s` is a single bare identifier (a named handler reference), i.e.
+/// no dots, parens or whitespace — distinguishing `getUsers` from `(req)=>…`.
+fn is_plain_ident(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_ident_byte)
+}
+
 /// A Python route decorator's verb kind.
 enum PyVerb {
     /// An explicit HTTP method decorator (`@app.get`, `@router.post`).
@@ -2812,6 +2959,14 @@ fn scan_inline_consumed_calls(text: &str, allow_backtick: bool) -> Vec<InlineCon
     let owned = blank_c_like_comments(text);
     let text = owned.as_str();
     let b = text.as_bytes();
+    // A server route definition (`app.get("/p", handler)`) has the same
+    // `recv.verb("/p")` shape as a client call; exclude Express/Hono routers so
+    // those are counted as *served* routes, not *consumed* ones. (TS/JS only.)
+    let routers = if allow_backtick {
+        collect_express_routers(text)
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for verb in INLINE_HTTP_VERBS {
@@ -2825,6 +2980,14 @@ fn scan_inline_consumed_calls(text: &str, allow_backtick: bool) -> Vec<InlineCon
             let prev = b[pos - 1];
             if !(is_ident_byte(prev) || prev == b')' || prev == b']' || prev == b'>') {
                 continue;
+            }
+            // `app.get("/p", handler)` is a *server* route, not a client call.
+            if !routers.is_empty() {
+                if let Some(recv) = read_ident_backwards(b, pos) {
+                    if routers.contains(&recv) {
+                        continue;
+                    }
+                }
             }
             let after = pos + needle.len();
             if after < b.len() && is_ident_byte(b[after]) {
@@ -4337,6 +4500,68 @@ export async function f(id: string) {
             got,
             vec![("GET", "/admin/users/:param")],
             "only the live call counts; commented-out ones are ignored, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ts_server_routes_express_app_param_and_router() {
+        // CraftAI shape: routes registered on an `app: Express` *parameter* with
+        // inline arrow handlers, plus a `router = express.Router()` with a named
+        // handler. `app.get("env")` (a settings read) and a client `http.get`
+        // must NOT be treated as served routes.
+        let ts = r#"
+import type { Express } from "express";
+export async function registerRoutes(app: Express) {
+  if (app.get("env") === "development") {}
+  app.post("/api/auth/login", async (req, res) => { res.json({ ok: true, n: 1 }); });
+  app.get("/api/screens/:id", async (req, res) => { res.json({}); });
+  // app.delete("/api/screens/:id", async (req, res) => {});
+}
+const router = express.Router();
+router.get("/api/health", healthHandler);
+const http = axios.create({ baseURL });
+async function client() { await http.get("/api/remote"); }
+"#;
+        let routes = parse_ts_server_routes(ts);
+        let got: Vec<(&str, &str, &str)> = routes
+            .iter()
+            .map(|r| (r.verb.as_str(), r.path.as_str(), r.method.as_str()))
+            .collect();
+        assert_eq!(
+            routes.len(),
+            3,
+            "login + screens/:id + health; settings read, client call & commented route excluded, got {got:?}"
+        );
+        assert!(got.contains(&("POST", "/api/auth/login", "")), "closure handler → empty: {got:?}");
+        assert!(got.contains(&("GET", "/api/screens/:id", "")), "{got:?}");
+        assert!(
+            got.contains(&("GET", "/api/health", "healthHandler")),
+            "named handler kept for linking: {got:?}"
+        );
+    }
+
+    #[test]
+    fn ts_consumed_scanner_excludes_express_server_routes() {
+        // The disambiguation: `app.get("/p", handler)` (server) and
+        // `http.get("/p")` (client) share a shape; only the client call is a
+        // consumed route.
+        let ts = r#"
+import type { Express } from "express";
+export function reg(app: Express) {
+  app.get("/api/users", async (req, res) => { res.json([]); });
+}
+const http = axios.create({ baseURL });
+export async function fetchUsers() { return await http.get("/api/users"); }
+"#;
+        let calls = parse_ts_consumed_calls(ts);
+        let consumed: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.verb.as_str(), c.path.as_str()))
+            .collect();
+        assert_eq!(
+            consumed,
+            vec![("GET", "/api/users")],
+            "only the client http.get is consumed; the express app.get is a server route, got {consumed:?}"
         );
     }
 
