@@ -59,10 +59,26 @@ const SPECS: &[IndexerSpec] = &[
         args: &["index", "--infer-tsconfig", "--output", "{out}"],
         writes_cwd_index: false,
     },
+    // `--project-name`/`--project-version` are pinned to stable placeholders so
+    // scip-python never falls back to the git revision (absent in non-git or
+    // vendored trees) and crashes on `normalizeNameOrVersion(undefined)`. These
+    // only appear inside scip-python symbol ids, which the overlay never
+    // surfaces (it maps edges by document path + range), so fixed values are
+    // harmless and keep the run deterministic.
     IndexerSpec {
         language: "python",
         binary: "scip-python",
-        args: &["index", "--cwd", "{root}", "--output", "{out}"],
+        args: &[
+            "index",
+            "--cwd",
+            "{root}",
+            "--project-name",
+            "specslice-local",
+            "--project-version",
+            "0",
+            "--output",
+            "{out}",
+        ],
         writes_cwd_index: false,
     },
     // Dart's `scip_dart` ignores `--output` and writes `index.scip` into the
@@ -533,6 +549,28 @@ mod tests {
         let scip = repo.join(".specslice/scip");
         let plan = plan_with("haskell", &repo, &scip, &*always_found("/x"));
         assert!(matches!(plan, ScipRunPlan::Unsupported { .. }));
+    }
+
+    #[test]
+    fn python_plan_passes_project_version_to_avoid_undefined_crash() {
+        // scip-python defaults `--project-version` to the git revision; in a repo
+        // with no `.git` and no `pyproject.toml` that version is `undefined` and it
+        // crashes (`normalizeNameOrVersion` reads `indexOf` of undefined). Always
+        // passing an explicit version keeps the indexer from aborting the whole
+        // Python layer over an upstream NPE.
+        let repo = PathBuf::from("/repo");
+        let scip = repo.join(".specslice/scip");
+        let plan = plan_with("python", &repo, &scip, &*always_found("/usr/bin/scip-python"));
+        match plan {
+            ScipRunPlan::Runnable { args, .. } => {
+                let v = args.iter().position(|a| a == "--project-version");
+                assert!(
+                    v.is_some_and(|i| args.get(i + 1).is_some_and(|s| !s.is_empty())),
+                    "python plan must pass a non-empty --project-version: {args:?}"
+                );
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
     }
 
     fn runnable_cwds_outs(plans: &[ScipRunPlan]) -> (Vec<PathBuf>, Vec<PathBuf>) {
