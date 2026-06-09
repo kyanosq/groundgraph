@@ -1785,18 +1785,27 @@ pub fn parse_go_routes(text: &str) -> Vec<ParsedRoute> {
         let Some((verb, path)) = parse_go_route_pattern(&args[0]) else {
             continue;
         };
-        let Some((handler_recv, handler_method)) = parse_go_handler(&args[args.len() - 1]) else {
-            continue;
+        let handler = &args[args.len() - 1];
+        let (class, method) = match parse_go_handler(handler) {
+            Some((recv, m)) if !m.is_empty() => {
+                let class = resolve_go_receiver_type(&receivers, open, &recv);
+                // A named free function with no recoverable receiver type stays
+                // unlinkable noise — keep dropping it.
+                if class.is_empty() {
+                    continue;
+                }
+                (class, m)
+            }
+            // Inline closure handler (`func(w, r){…}`): a real served path with
+            // no named handler. Index it with an empty handler (no edge linked).
+            _ if is_go_closure_literal(handler) => (String::new(), String::new()),
+            _ => continue,
         };
-        let class = resolve_go_receiver_type(&receivers, open, &handler_recv);
-        if class.is_empty() || handler_method.is_empty() {
-            continue;
-        }
         routes.push(ParsedRoute {
             verb,
             path: normalize_route("", &path),
             class,
-            method: handler_method,
+            method,
             line: line_of(text, open),
         });
     }
@@ -2174,14 +2183,16 @@ pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
             // Resolve the handler's declaring type through the receiver chain
             // (`d.Auth.Me`: var `d`→`Deps`, field `Deps.Auth`→`AuthHandler`); an
             // unresolved receiver leaves the class empty (route still indexed).
-            let Some((class, method)) =
-                resolve_go_handler(&args[args.len() - 1], &var_types, &struct_fields)
-            else {
-                continue;
+            let handler = &args[args.len() - 1];
+            let (class, method) = match resolve_go_handler(handler, &var_types, &struct_fields) {
+                Some((c, m)) if !m.is_empty() => (c, m),
+                // Inline closure handler (`func(c *gin.Context){…}`): a real
+                // served path (health/readiness probes) with no `Type.Method`
+                // to link. Index it with an empty handler so route-coverage
+                // sees the path; the route→method linker then emits no edge.
+                _ if is_go_closure_literal(handler) => (String::new(), String::new()),
+                _ => continue,
             };
-            if method.is_empty() {
-                continue;
-            }
             let path = normalize_route(base, &path_lit);
             if seen.insert((verb.to_string(), path.clone(), class.clone(), method.clone())) {
                 routes.push(ParsedRoute {
@@ -2445,6 +2456,19 @@ fn resolve_go_handler(
             Some((ty, method.to_string()))
         }
     }
+}
+
+/// True when a Go route-handler argument is an inline function literal
+/// (`func(c *gin.Context) { … }`) rather than a named handler. Such routes have
+/// no `Type.Method` to link but are still real served paths — health/readiness
+/// probes are the canonical case — so the caller indexes them with an empty
+/// handler instead of dropping them. `func` must be the keyword (immediately
+/// followed by the parameter-list `(`), never the prefix of a name like
+/// `funcHandler`.
+fn is_go_closure_literal(arg: &str) -> bool {
+    arg.trim()
+        .strip_prefix("func")
+        .is_some_and(|rest| rest.trim_start().starts_with('('))
 }
 
 /// Read the identifier ending just before byte `end` (e.g. the receiver before
@@ -3396,6 +3420,85 @@ func NewRouter(d Deps) *gin.Engine {
         let get = routes.iter().find(|r| r.method == "Get").expect("get route");
         assert_eq!(get.path, "/v1/teams/:id");
         assert_eq!(get.class, "TeamHandler", "d.Team → Deps.Team field type");
+    }
+
+    #[test]
+    fn parse_gin_routes_indexes_inline_closure_handlers() {
+        // Health / readiness probes are routinely registered with an inline
+        // function literal instead of a named handler
+        // (`r.GET("/healthz", func(c *gin.Context){…})`). The path is still a
+        // real served route that `route-coverage` must account for, so it is
+        // indexed with an *empty* handler (there is no `Type.Method` to link).
+        // Real repo: Shift backend `internal/api/router.go` (/healthz, /readyz)
+        // — previously dropped, making the served-route set under-count by 2.
+        let go = r#"
+package api
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+func NewRouter() *gin.Engine {
+	r := gin.New()
+	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/readyz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+	return r
+}
+"#;
+        let routes = parse_gin_routes(go);
+
+        let healthz = routes
+            .iter()
+            .find(|r| r.path == "/healthz")
+            .expect("/healthz indexed despite closure handler");
+        assert_eq!(healthz.verb, "GET");
+        assert!(
+            healthz.class.is_empty() && healthz.method.is_empty(),
+            "closure handler has no Type.Method to link, got {healthz:?}"
+        );
+
+        assert!(
+            routes.iter().any(|r| r.path == "/readyz"),
+            "multi-line closure route indexed too, got {routes:?}"
+        );
+
+        // Named-handler routes must still resolve normally (no regression).
+        assert!(
+            !routes.iter().any(|r| r.path == "/healthz" && !r.method.is_empty()),
+            "closure route must not invent a handler method"
+        );
+    }
+
+    #[test]
+    fn parse_go_routes_indexes_inline_closure_handlers() {
+        // net/http analogue: a closure registered on a ServeMux is a served
+        // path even though there is no named handler method to link.
+        let go = r#"
+package main
+
+import "net/http"
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+}
+"#;
+        let routes = parse_go_routes(go);
+        let healthz = routes
+            .iter()
+            .find(|r| r.path == "/healthz")
+            .expect("/healthz indexed despite closure handler");
+        assert_eq!(healthz.verb, "GET");
+        assert!(
+            healthz.class.is_empty() && healthz.method.is_empty(),
+            "closure handler has no Type.Method to link, got {healthz:?}"
+        );
     }
 
     #[test]
