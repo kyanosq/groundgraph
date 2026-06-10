@@ -55,7 +55,25 @@ pub struct DocsIndexOptions {
 pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsIndexResult> {
     let mut result = DocsIndexResult::default();
     let mut visited = Vec::new();
+
+    // Configured roots split in two: a *bare directory name* (`docs`, `doc`)
+    // matches that directory anywhere in the tree — monorepo members keep
+    // real design docs in their own `docs/` (tokio's only design doc is
+    // `tokio/docs/reactor-refactor.md`, invisible from the root) — while an
+    // entry containing `/` stays an explicit repo-root-relative root.
+    let mut bare_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut path_roots: Vec<PathBuf> = Vec::new();
     for root in &options.doc_roots {
+        let raw = root.to_string_lossy().replace('\\', "/");
+        let trimmed = raw.trim_matches('/');
+        if !trimmed.is_empty() && !trimmed.contains('/') {
+            bare_names.insert(trimmed.to_string());
+        } else {
+            path_roots.push(root.clone());
+        }
+    }
+
+    for root in &path_roots {
         let abs_root = options.repo_root.join(root);
         if !abs_root.exists() {
             continue;
@@ -69,11 +87,7 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
                 continue;
             }
             let path = entry.path();
-            let is_doc = matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("md") | Some("mdx") | Some("markdown") | Some("rst")
-            );
-            if !is_doc {
+            if !has_doc_extension(path) {
                 continue;
             }
             let rel = path
@@ -90,6 +104,54 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             visited.push(rel.clone());
             index_one_file(store, &rel, path, &mut result)
                 .with_context(|| format!("indexing markdown file {rel}"))?;
+        }
+    }
+
+    // One repo-wide walk covers the two discovery rules that path roots
+    // cannot express: (a) doc files under a directory whose *name* matches a
+    // bare doc root, at any depth; (b) well-known docs (README & co) sitting
+    // next to a package manifest — workspace members are products of their
+    // own, and `tokio-stream/README.md` is the only document tokio-stream
+    // has. Vendored trees stay out via the same prune filter.
+    if !bare_names.is_empty() || !options.doc_roots.is_empty() {
+        for entry in walkdir::WalkDir::new(&options.repo_root)
+            .into_iter()
+            .filter_entry(|e| !is_pruned_dir(e))
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(&options.repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let in_doc_dir = has_doc_extension(path)
+                && rel.rsplit_once('/').is_some_and(|(dirs, _)| {
+                    dirs.split('/').any(|seg| bare_names.contains(seg))
+                });
+            let take = if in_doc_dir {
+                matches_include_globs(&options.include_globs, &rel)?
+            } else {
+                // Package-root doc: well-known name + manifest sibling. The
+                // extension allowlist lives in `is_well_known_root_doc`.
+                is_well_known_root_doc(name)
+                    && path.parent().is_some_and(has_package_manifest)
+            };
+            if !take {
+                continue;
+            }
+            if visited.iter().any(|v| v == &rel) {
+                continue;
+            }
+            visited.push(rel.clone());
+            index_one_file(store, &rel, path, &mut result)
+                .with_context(|| format!("indexing document {rel}"))?;
         }
     }
 
@@ -119,6 +181,35 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             .with_context(|| format!("indexing root document {rel}"))?;
     }
     Ok(result)
+}
+
+/// Prose document by file extension.
+fn has_doc_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("md") | Some("mdx") | Some("markdown") | Some("rst")
+    )
+}
+
+/// Whether `dir` is a *package root*: it holds a build-system manifest that
+/// declares a unit of distribution. Deliberately conservative — generic
+/// build files (Makefile, CMakeLists.txt) appear in nearly every
+/// subdirectory of C projects and would drag in incidental READMEs.
+fn has_package_manifest(dir: &Path) -> bool {
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "go.mod",
+        "pubspec.yaml",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "composer.json",
+        "Gemfile",
+    ];
+    MANIFESTS.iter().any(|m| dir.join(m).is_file())
 }
 
 /// Conventional top-level documents that double as a project's de-facto
@@ -629,6 +720,102 @@ mod tests {
                 .iter()
                 .all(|n| n.id.to_string() != "file::notes.md"),
             "arbitrary root markdown must stay out"
+        );
+    }
+
+    /// Monorepos keep design docs inside member packages, not at the
+    /// workspace root: tokio's only real design doc is
+    /// `tokio/docs/reactor-refactor.md`, two levels below the root, and the
+    /// configured `docs` root only covers the top-level `docs/contributing`
+    /// tree. A bare directory-name entry in `doc_roots` (no `/`) must match
+    /// that directory name *anywhere* in the repo, not only at the root.
+    #[test]
+    fn bare_doc_root_names_match_nested_package_doc_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("tokio/docs")).unwrap();
+        std::fs::create_dir_all(root.join("tokio/src")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# Guide\n\nbody\n").unwrap();
+        std::fs::write(
+            root.join("tokio/docs/reactor-refactor.md"),
+            "# Refactor I/O driver\n\nbody\n",
+        )
+        .unwrap();
+        // Markdown *outside* any docs dir must stay out of the walk.
+        std::fs::write(root.join("tokio/src/notes.md"), "# Notes\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id.to_string() == "file::tokio/docs/reactor-refactor.md"),
+            "nested package docs dir must be discovered; got {result:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.id.to_string() != "file::tokio/src/notes.md"),
+            "markdown outside doc dirs must stay out"
+        );
+    }
+
+    /// Workspace members are products of their own: `tokio-stream/README.md`
+    /// describes the tokio-stream crate exactly like a root README describes
+    /// the repo. A directory holding a package manifest (Cargo.toml,
+    /// package.json, …) is a *package root*, and its well-known docs must be
+    /// indexed. Plain subdirectories without a manifest keep their READMEs
+    /// out (they are usually vendored or incidental).
+    #[test]
+    fn package_root_readmes_are_indexed_like_repo_root_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tokio-stream")).unwrap();
+        std::fs::create_dir_all(root.join("misc")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("tokio-stream/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            root.join("tokio-stream/README.md"),
+            "# tokio-stream\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("misc/README.md"), "# Misc\n\nbody\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/package.json"), "{}").unwrap();
+        std::fs::write(root.join("node_modules/pkg/README.md"), "# Vendor\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id.to_string() == "file::tokio-stream/README.md"),
+            "package-root README must be indexed; got {result:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.id.to_string() != "file::misc/README.md"),
+            "README in a manifest-less directory must stay out"
+        );
+        assert!(
+            nodes.iter().all(|n| !n.id.to_string().contains("node_modules")),
+            "vendored package READMEs must stay pruned"
         );
     }
 

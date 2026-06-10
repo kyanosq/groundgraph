@@ -181,6 +181,11 @@ pub struct BusinessPack {
     pub stats: BusinessPackStats,
     pub modules: Vec<ModuleEvidence>,
     pub module_dependencies: Vec<ModuleDependency>,
+    /// Product-level documents that describe the repo or a whole package
+    /// (READMEs, ARCHITECTURE) rather than any single module. Global context
+    /// for the AI; forcing them onto one module would mislead.
+    #[serde(default)]
+    pub key_docs: Vec<EvidenceRef>,
     /// Chinese instructions for the external AI that turns this pack into
     /// `business_logic.yaml` candidates.
     pub prompt: String,
@@ -314,6 +319,8 @@ fn build_pack(
     // Fed from every placed code path (symbols *and* File nodes — symbol-only
     // graphs exist in unit fixtures and File-less language drivers).
     let mut stem_owner: HashMap<String, Option<String>> = HashMap::new();
+    // symbol name → owning module, for the heading-mention vote of pass 2c.
+    let mut symbol_name_owner: HashMap<String, Option<String>> = HashMap::new();
 
     for node in nodes {
         let is_symbol =
@@ -376,18 +383,37 @@ fn build_pack(
             if let Some(family) = framework_family(node) {
                 acc.framework_roles.insert(family);
             }
+            // Distinctive symbol names give pass 2c its vote table. Same
+            // ambiguity rule as stems: a name claimed by two modules votes
+            // for neither.
+            if !is_test_path(path) {
+                if let Some(token) = identifier_token(node.name.as_deref().unwrap_or("")) {
+                    symbol_name_owner
+                        .entry(token)
+                        .and_modify(|owner| {
+                            if owner.as_deref() != Some(slug.as_str()) {
+                                *owner = None;
+                            }
+                        })
+                        .or_insert_with(|| Some(slug.clone()));
+                }
+            }
         }
     }
 
-    // Docs may only associate with *business* module slugs. The scaffolding
-    // buckets (`docs`, `tests`, …) exist as accumulators, but letting the
-    // segment matcher resolve `docs/blueprints.rst` to the `docs` bucket
-    // captures every doc into a module that is never reported (real flask
-    // bug: all stem-matched docs vanished into the `docs` path-bucket).
+    // Docs may only associate with module slugs that will actually be
+    // *reported*: non-scaffolding AND code-bearing. Scaffolding buckets
+    // (`docs`, `tests`, …) and symbol-less File buckets both exist as
+    // accumulators yet never reach the report, so a doc matched into one
+    // vanishes (real flask bug: stem-matched docs swallowed by the `docs`
+    // bucket; real tokio bug: `tokio/README.md` swallowed by the
+    // symbol-less `tokio` path-bucket instead of reaching key_docs).
     let known_slugs: BTreeSet<String> = modules
-        .keys()
-        .filter(|slug| !NON_BUSINESS_BUCKETS.contains(&slug.as_str()))
-        .cloned()
+        .iter()
+        .filter(|(slug, acc)| {
+            !NON_BUSINESS_BUCKETS.contains(&slug.as_str()) && !acc.symbols.is_empty()
+        })
+        .map(|(slug, _)| slug.clone())
         .collect();
 
     // ---- 2. associate docs --------------------------------------------
@@ -400,6 +426,13 @@ fn build_pack(
     //     that equals a source-file stem owned by exactly one module is
     //     that module's documentation; ambiguous or generic stems
     //     (`index`, `init`) attach nowhere rather than wrongly.
+    // (c) heading-mention vote: design docs often sit at a names-free
+    //     location (tokio's `tokio/docs/reactor-refactor.md`) but cite code
+    //     identifiers in their headings (`Registration`, `ScheduledIo`).
+    //     Each cited identifier owned by exactly one module is a vote; a
+    //     file attaches to a clear winner only (≥2 votes, strictly ahead),
+    //     so a README touching every module attaches nowhere.
+    let mut unmatched_doc_files: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
     for node in nodes {
         if node.kind != NodeKind::DocSection {
             continue;
@@ -407,15 +440,76 @@ fn build_pack(
         let Some(path) = node.path.as_deref() else {
             continue;
         };
-        let slug = match_doc_to_module(path, &known_slugs).or_else(|| {
-            source_stem_token(path).and_then(|stem| stem_owner.get(&stem).cloned().flatten())
-        });
+        let slug = match_doc_to_module(path, &known_slugs)
+            .or_else(|| {
+                source_stem_token(path).and_then(|stem| stem_owner.get(&stem).cloned().flatten())
+            })
+            // The stem fallback consults `stem_owner`, which is fed before
+            // module symbol counts are known — re-check that the owner is a
+            // reportable module, not a symbol-less bucket.
+            .filter(|slug| known_slugs.contains(slug));
         if let Some(slug) = slug {
             if let Some(acc) = modules.get_mut(&slug) {
                 acc.docs.push(node);
             }
+        } else {
+            unmatched_doc_files.entry(path).or_default().push(node);
         }
     }
+
+    let mut key_doc_files: Vec<(&str, &Node)> = Vec::new();
+    for (path, sections) in unmatched_doc_files {
+        let mut votes: BTreeMap<&str, usize> = BTreeMap::new();
+        for section in &sections {
+            for token in heading_identifier_tokens(section.name.as_deref().unwrap_or("")) {
+                if let Some(Some(owner)) = symbol_name_owner.get(&token) {
+                    if known_slugs.contains(owner) {
+                        *votes.entry(owner.as_str()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        // Clear winner(s): ≥2 votes. A tie at the top is a doc that
+        // genuinely spans the tied subsystems (tokio's reactor-refactor doc
+        // cites runtime-io and io types alike) — attach to each. Scattered
+        // single mentions stay unattached.
+        let top = votes.values().copied().max().unwrap_or(0);
+        let winners: Vec<String> = if top >= 2 {
+            votes
+                .iter()
+                .filter(|(_, n)| **n == top)
+                .map(|(slug, _)| (*slug).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !winners.is_empty() {
+            for slug in &winners {
+                if let Some(acc) = modules.get_mut(slug.as_str()) {
+                    acc.docs.extend(sections.iter().copied());
+                }
+            }
+            continue;
+        }
+        // Still unattached: product-level documents (READMEs, ARCHITECTURE)
+        // become pack-level key docs instead of disappearing.
+        if is_product_level_doc(path) {
+            if let Some(first) = sections.first() {
+                key_doc_files.push((path, first));
+            }
+        }
+    }
+    // Shallowest first: the repo README outranks nested package READMEs.
+    key_doc_files.sort_by_key(|(path, _)| (path.matches('/').count(), path.to_string()));
+    let key_docs: Vec<EvidenceRef> = key_doc_files
+        .into_iter()
+        .take(12)
+        .map(|(path, node)| EvidenceRef {
+            id: node.id.to_string(),
+            path: path.to_string(),
+            name: node.name.clone().unwrap_or_else(|| path.to_string()),
+        })
+        .collect();
 
     // ---- 3. roll up semantic signals + dependencies from edges ----------
     let mut dependency_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -574,6 +668,7 @@ fn build_pack(
         },
         modules: reports,
         module_dependencies,
+        key_docs,
         prompt: prompt_text(),
     }
 }
@@ -1667,6 +1762,90 @@ fn normalise_token(s: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// Distinctive identifier token from a symbol name, or `None` when it
+/// carries no identity (too short, generic verb, etc.). Length ≥ 4: 3-char
+/// names (`map`, `get`, `run`) collide with everyday prose words in
+/// headings.
+fn identifier_token(name: &str) -> Option<String> {
+    let norm = normalise_token(name);
+    if norm.len() < 4 || GENERIC_NAMES.contains(&norm.as_str()) {
+        return None;
+    }
+    Some(norm)
+}
+
+/// Code identifiers cited by a doc heading. Two sources, both precise:
+/// backtick spans (`` `Registration` ``) and bare CamelCase words with ≥2
+/// uppercase letters (`ScheduledIo`). Plain capitalised prose (`Overview`,
+/// `Goals`) matches neither, so ordinary headings cast no votes.
+fn heading_identifier_tokens(heading: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = heading;
+    while let Some(start) = rest.find('`') {
+        let Some(len) = rest[start + 1..].find('`') else {
+            break;
+        };
+        let span = &rest[start + 1..start + 1 + len];
+        // `a::b` / `a.b` paths cite the leaf identifier.
+        for part in span.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if part.chars().any(|c| c.is_ascii_alphabetic()) {
+                if let Some(token) = identifier_token(part) {
+                    out.push(token);
+                }
+            }
+        }
+        rest = &rest[start + 1 + len + 1..];
+    }
+    for word in heading.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        let uppers = word.chars().filter(|c| c.is_ascii_uppercase()).count();
+        let has_lower = word.chars().any(|c| c.is_ascii_lowercase());
+        let is_camel = uppers >= 2 && has_lower;
+        let is_snake = word.contains('_') && word.chars().any(|c| c.is_ascii_alphabetic());
+        if is_camel || is_snake {
+            if let Some(token) = identifier_token(word) {
+                out.push(token);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Product-level document: a README/ARCHITECTURE/DESIGN anywhere in the
+/// tree, any document at the repo root, or a document at the *top level of
+/// a documentation root* (leveldb's `doc/impl.md`, flask's
+/// `docs/design.rst`). These describe the product or a whole package, and
+/// surface as pack-level `key_docs` when no module claims them.
+fn is_product_level_doc(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let stem = file.split('.').next().unwrap_or(file).to_ascii_lowercase();
+    // Process docs carry no business knowledge: changelogs, contribution
+    // guides, licensing, codes of conduct.
+    if matches!(
+        stem.as_str(),
+        "changelog" | "changes" | "contributing" | "license" | "code_of_conduct" | "security"
+    ) {
+        return false;
+    }
+    if !normalized.contains('/') {
+        return true;
+    }
+    if matches!(stem.as_str(), "readme" | "architecture" | "design") {
+        return true;
+    }
+    if let Some((dir, _)) = normalized.rsplit_once('/') {
+        if matches!(
+            dir,
+            "doc" | "docs" | "documentation" | "specs" | "spec" | "adr" | "rfcs" | "wiki"
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the path is a prose document (by extension) rather than code.
@@ -2874,6 +3053,274 @@ mod tests {
         assert!(
             module.docs.iter().all(|d| d.path != "docs/index.rst"),
             "generic-stem docs must not attach"
+        );
+    }
+
+    /// tokio dogfood: design docs live in a *names-free* location
+    /// (`tokio/docs/reactor-refactor.md`) — no path segment and no file stem
+    /// bridges to any module. But their headings cite code identifiers
+    /// (`Registration`, `ScheduledIo`); each identifier owned by exactly one
+    /// module is a vote, and a file whose votes pick a single clear winner
+    /// (≥2 votes, strictly ahead) attaches there. One stray mention must NOT
+    /// attach — a README citing one type from every module would otherwise
+    /// glue itself to an arbitrary module.
+    #[test]
+    fn doc_heading_symbol_mentions_attach_doc_to_owning_module() {
+        let (mut store, _dir) = empty_store();
+        let reg = "rust_struct::tokio/src/io/registration.rs#Registration";
+        let sched = "rust_struct::tokio/src/io/scheduled_io.rs#ScheduledIo";
+        let tcp = "rust_struct::tokio/src/net/tcp.rs#TcpStream";
+        let udp = "rust_struct::tokio/src/net/udp.rs#UdpSocket";
+        store
+            .upsert_node(&node(
+                reg,
+                NodeKind::RustStruct,
+                "tokio/src/io/registration.rs",
+                "Registration",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                sched,
+                NodeKind::RustStruct,
+                "tokio/src/io/scheduled_io.rs",
+                "ScheduledIo",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                tcp,
+                NodeKind::RustStruct,
+                "tokio/src/net/tcp.rs",
+                "TcpStream",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                udp,
+                NodeKind::RustStruct,
+                "tokio/src/net/udp.rs",
+                "UdpSocket",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(reg, sched, EdgeKind::Calls)).unwrap();
+        store.upsert_edge(&edge(tcp, udp, EdgeKind::Calls)).unwrap();
+
+        // Two votes for the io module via backtick-quoted identifiers.
+        for (id, name) in [
+            (
+                "doc_section::tokio/docs/reactor-refactor.md#Reworking the `Registration` type",
+                "Reworking the `Registration` type",
+            ),
+            (
+                "doc_section::tokio/docs/reactor-refactor.md#Reworking the `ScheduledIo` type",
+                "Reworking the `ScheduledIo` type",
+            ),
+        ] {
+            store
+                .upsert_node(&node(
+                    id,
+                    NodeKind::DocSection,
+                    "tokio/docs/reactor-refactor.md",
+                    name,
+                ))
+                .unwrap();
+        }
+        // A single mention: must stay unattached.
+        store
+            .upsert_node(&node(
+                "doc_section::tokio/docs/random.md#About `TcpStream`",
+                NodeKind::DocSection,
+                "tokio/docs/random.md",
+                "About `TcpStream`",
+            ))
+            .unwrap();
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let io_module = pack
+            .modules
+            .iter()
+            .find(|m| {
+                m.entry_points.iter().any(|e| e.name.contains("Registration"))
+                    || m.path_prefix.contains("io")
+            })
+            .expect("io module exists");
+        assert!(
+            io_module
+                .docs
+                .iter()
+                .any(|d| d.path == "tokio/docs/reactor-refactor.md"),
+            "doc citing two io-owned identifiers must attach to the io module; docs={:?}",
+            io_module.docs
+        );
+        for m in &pack.modules {
+            assert!(
+                m.docs.iter().all(|d| d.path != "tokio/docs/random.md"),
+                "single-mention doc must not attach anywhere; module {} got it",
+                m.id
+            );
+        }
+    }
+
+    /// A design doc spanning two subsystems (tokio's reactor-refactor doc
+    /// cites both `Registration`/`ScheduledIo` of runtime-io and
+    /// `AsyncRead`/`AsyncWrite` of io) ties the vote. A tie at ≥2 votes
+    /// means the doc genuinely describes all tied modules — attach to each,
+    /// rather than dropping the doc.
+    #[test]
+    fn tied_heading_votes_attach_doc_to_all_tied_modules() {
+        let (mut store, _dir) = empty_store();
+        let r1 = "rust_struct::a/src/registration.rs#Registration";
+        let r2 = "rust_struct::a/src/scheduled.rs#ScheduledIo";
+        let i1 = "rust_struct::b/src/async_read.rs#AsyncRead";
+        let i2 = "rust_struct::b/src/async_write.rs#AsyncWrite";
+        for (id, path, name) in [
+            (r1, "a/src/registration.rs", "Registration"),
+            (r2, "a/src/scheduled.rs", "ScheduledIo"),
+            (i1, "b/src/async_read.rs", "AsyncRead"),
+            (i2, "b/src/async_write.rs", "AsyncWrite"),
+        ] {
+            store
+                .upsert_node(&node(id, NodeKind::RustStruct, path, name))
+                .unwrap();
+        }
+        store.upsert_edge(&edge(r1, r2, EdgeKind::Calls)).unwrap();
+        store.upsert_edge(&edge(i1, i2, EdgeKind::Calls)).unwrap();
+        for (id, name) in [
+            ("doc_section::docs/refactor.md#`Registration` and `ScheduledIo`", "`Registration` and `ScheduledIo`"),
+            ("doc_section::docs/refactor.md#`AsyncRead` / `AsyncWrite`", "`AsyncRead` / `AsyncWrite`"),
+        ] {
+            store
+                .upsert_node(&node(id, NodeKind::DocSection, "docs/refactor.md", name))
+                .unwrap();
+        }
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let holders: Vec<&str> = pack
+            .modules
+            .iter()
+            .filter(|m| m.docs.iter().any(|d| d.path == "docs/refactor.md"))
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(
+            holders.len(),
+            2,
+            "a 2-2 tied design doc must attach to both modules; holders={holders:?}"
+        );
+    }
+
+    /// tokio dogfood, second bug: `tokio/README.md` segment-matched the
+    /// symbol-less `tokio` path-bucket (File nodes only), which pass-4
+    /// filtering then discarded — the README vanished entirely instead of
+    /// reaching `key_docs`. Docs may only attach to modules that *hold
+    /// code*; matches into symbol-less buckets must fall through.
+    #[test]
+    fn docs_never_attach_to_symbolless_file_buckets() {
+        let (mut store, _dir) = empty_store();
+        let a = "rust_fn::core/src/engine.rs#start_engine";
+        let b = "rust_fn::core/src/engine_util.rs#stop_engine";
+        store
+            .upsert_node(&node(a, NodeKind::RustFunction, "core/src/engine.rs", "start_engine"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::RustFunction,
+                "core/src/engine_util.rs",
+                "stop_engine",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        // A symbol-less bucket: only File nodes under `web/`.
+        store
+            .upsert_node(&node(
+                "file::web/app.js",
+                NodeKind::File,
+                "web/app.js",
+                "app.js",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::web/README.md#Web frontend",
+                NodeKind::DocSection,
+                "web/README.md",
+                "Web frontend",
+            ))
+            .unwrap();
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "web/README.md"),
+            "README matching a symbol-less bucket must fall through to key_docs; got {:?}",
+            pack.key_docs
+        );
+    }
+
+    /// Package READMEs (`tokio-stream/README.md`) and the repo README often
+    /// describe a *whole product*, not one module — forcing them onto a
+    /// single module would mislead. They must surface at the pack level as
+    /// `key_docs` so the AI still receives them as global context.
+    #[test]
+    fn unattached_readmes_surface_as_pack_key_docs() {
+        let (mut store, _dir) = empty_store();
+        let a = "rust_fn::src/stream/map.rs#map";
+        let b = "rust_fn::src/stream/filter.rs#filter";
+        store
+            .upsert_node(&node(a, NodeKind::RustFunction, "src/stream/map.rs", "map"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::RustFunction,
+                "src/stream/filter.rs",
+                "filter",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::README.md#Overview",
+                NodeKind::DocSection,
+                "README.md",
+                "Overview",
+            ))
+            .unwrap();
+        // leveldb pattern: implementation notes at the top level of the doc
+        // root (`doc/impl.md`) — product-level documentation even though the
+        // stem is not "readme".
+        store
+            .upsert_node(&node(
+                "doc_section::doc/impl.md#Files",
+                NodeKind::DocSection,
+                "doc/impl.md",
+                "Files",
+            ))
+            .unwrap();
+        // Deep non-well-known doc must NOT become a key doc.
+        store
+            .upsert_node(&node(
+                "doc_section::docs/contributing/style.md#Style",
+                NodeKind::DocSection,
+                "docs/contributing/style.md",
+                "Style",
+            ))
+            .unwrap();
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "README.md"),
+            "unattached README must appear in pack-level key_docs; got {:?}",
+            pack.key_docs
+        );
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "doc/impl.md"),
+            "top-level docs under a doc root are product-level; got {:?}",
+            pack.key_docs
+        );
+        assert!(
+            pack.key_docs.iter().all(|d| d.path != "docs/contributing/style.md"),
+            "nested non-well-known docs must stay out of key_docs"
         );
     }
 

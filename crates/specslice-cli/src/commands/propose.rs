@@ -138,6 +138,15 @@ fn render_markdown(pack: &BusinessPack) -> String {
     }
     s.push_str("```\n\n");
 
+    // product-level docs that no single module claims
+    if !pack.key_docs.is_empty() {
+        s.push_str("## 全局关键文档（产品级，未归属单一模块）\n\n");
+        for d in &pack.key_docs {
+            s.push_str(&format!("- `{}` — {}\n", d.path, d.name));
+        }
+        s.push('\n');
+    }
+
     // module evidence sections
     s.push_str("## 模块证据\n\n");
     for m in &pack.modules {
@@ -293,6 +302,17 @@ fn render_text(pack: &BusinessPack) -> String {
             s.push_str(&format!("   依赖: {}\n", m.depends_on.join(", ")));
         }
     }
+    if !pack.key_docs.is_empty() {
+        s.push_str(&format!(
+            "\n全局关键文档 ({}): {}\n",
+            pack.key_docs.len(),
+            pack.key_docs
+                .iter()
+                .map(|d| d.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     s.push_str("\n下一步: `specslice propose --format markdown --out .specslice/export/business-pack.md` 再喂给 AI 生成 business_logic.yaml。\n");
     s
 }
@@ -409,6 +429,11 @@ mod tests {
                 to: "auth".into(),
                 weight: 3,
             }],
+            key_docs: vec![EvidenceRef {
+                id: "doc_section::README.md#Overview".into(),
+                path: "README.md".into(),
+                name: "Overview".into(),
+            }],
             prompt: "你是 SpecSlice 的业务逻辑提炼器。输出 business_logic.yaml。".into(),
         }
     }
@@ -423,6 +448,10 @@ mod tests {
         assert!(md.contains("路由 (navigates_to): /login"));
         assert!(md.contains("候选骨架"));
         assert!(md.contains("business_logic.yaml"), "prompt embedded");
+        assert!(
+            md.contains("全局关键文档") && md.contains("`README.md`"),
+            "pack-level key docs rendered"
+        );
         assert!(
             md.contains("dart_class::lib/features/auth/auth_bloc.dart#AuthBloc"),
             "evidence id surfaced for copy-paste"
@@ -493,6 +522,7 @@ mod tests {
             },
             modules: module_evs,
             module_dependencies: deps,
+            key_docs: vec![],
             prompt: "prompt".into(),
         }
     }
