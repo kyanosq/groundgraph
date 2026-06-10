@@ -159,8 +159,10 @@ fn default_config_for(repo_root: &Path) -> EngineConfig {
     if selections.iter().all(|s| s.id == "dart") {
         return EngineConfig::default();
     }
-    let mut cfg = EngineConfig::default();
-    cfg.languages = selections;
+    let mut cfg = EngineConfig {
+        languages: selections,
+        ..EngineConfig::default()
+    };
     // Zero external dependencies out of the box; the per-language LSP adapters
     // can be opted back in by flipping this flag.
     cfg.enrichment.lsp = false;
@@ -193,6 +195,24 @@ const DETECT_SKIP_DIRS: &[&str] = &[
     ".idea",
     ".vscode",
     ".gradle",
+    // Documentation and vendored-reference trees hold *citation* code —
+    // third-party source copies, spike notes, framework excerpts. Indexing
+    // them as first-party roots floods dead-code / similarity / search with
+    // someone else's symbols.
+    "docs",
+    "doc",
+    "vendor",
+    "third_party",
+    "thirdparty",
+    "external",
+    "references",
+    // C-ecosystem convention (Redis, many Makefile projects): bundled
+    // third-party sources live under `deps/`.
+    "deps",
+    // Go toolchain convention: `testdata/` is invisible to the compiler —
+    // its .go files are fixtures (often intentionally broken or generated)
+    // and must never elect a language or become an indexing root.
+    "testdata",
 ];
 
 /// Map a lower-case file extension to its canonical SpecSlice language id.
@@ -267,6 +287,12 @@ fn language_build_excludes(lang: &str) -> Vec<String> {
 fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut topdirs: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    // Header-rich dirs (fmt's `include/`): headers never *elect* a language,
+    // but once a real translation unit elects C/C++, the header dirs must
+    // join its roots or a header-only library body is silently skipped.
+    // `.h` is ambiguous between C and C++, so it accrues to both candidates;
+    // only elected languages consume the set.
+    let mut header_topdirs: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
 
     let mut stack: Vec<(PathBuf, usize)> = vec![(repo_root.to_path_buf(), 0)];
     let mut visited_files = 0usize;
@@ -304,21 +330,36 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
                 let Some(lang) = ext_language(&ext) else {
                     continue;
                 };
-                // Headers declare but do not define: they must not elect a
-                // language on their own (see `ext_is_header`). They are still
-                // indexed once a real translation unit elects the language.
-                if ext_is_header(&ext) {
-                    continue;
-                }
-                *counts.entry(lang).or_default() += 1;
-                if let Ok(rel) = path.strip_prefix(repo_root) {
+                let topdir_of = |path: &Path| -> Option<String> {
+                    let rel = path.strip_prefix(repo_root).ok()?;
                     let mut comps = rel.components();
                     let first = comps.next();
                     let has_more = comps.next().is_some();
-                    let topdir = match (first, has_more) {
+                    Some(match (first, has_more) {
                         (Some(c), true) => c.as_os_str().to_string_lossy().into_owned(),
                         _ => ".".to_string(), // file directly at the repo root
-                    };
+                    })
+                };
+                // Headers declare but do not define: they must not elect a
+                // language on their own (see `ext_is_header`), but their dirs
+                // are recorded so an *elected* C/C++ still indexes them.
+                if ext_is_header(&ext) {
+                    if let Some(topdir) = topdir_of(&path) {
+                        if ext == "h" {
+                            // Ambiguous: claimable by either C or C++.
+                            header_topdirs
+                                .entry("c")
+                                .or_default()
+                                .insert(topdir.clone());
+                            header_topdirs.entry("cpp").or_default().insert(topdir);
+                        } else {
+                            header_topdirs.entry("cpp").or_default().insert(topdir);
+                        }
+                    }
+                    continue;
+                }
+                *counts.entry(lang).or_default() += 1;
+                if let Some(topdir) = topdir_of(&path) {
                     topdirs.entry(lang).or_default().insert(topdir);
                 }
             }
@@ -331,12 +372,14 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
         .into_iter()
         .filter(|(_, c)| *c > 0)
         .map(|(lang, _)| {
-            let mut paths: Vec<String> = topdirs
-                .get(lang)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+            let mut roots = topdirs.get(lang).cloned().unwrap_or_default();
+            // Elected C/C++ also owns its header-rich dirs (fmt's
+            // header-only `include/`). Unelected languages never get here,
+            // so Obj-C headers still cannot create a phantom C project.
+            if let Some(hdrs) = header_topdirs.get(lang) {
+                roots.extend(hdrs.iter().cloned());
+            }
+            let mut paths: Vec<String> = roots.into_iter().collect();
             paths.sort();
             LanguageSelection {
                 id: lang.to_string(),
@@ -483,6 +526,72 @@ mod tests {
         let mut paths = dart.paths.clone();
         paths.sort();
         assert_eq!(paths, vec!["lib", "test"]);
+    }
+
+    /// Code that lives under documentation / vendored-reference directories
+    /// is citation material, not first-party source: a `docs/references/`
+    /// copy of a third-party framework must not elect `docs` as a Python
+    /// code root (dogfooding MetaQuant indexed a vendored rqalpha tree and
+    /// reported 880 dead symbols from it).
+    #[test]
+    fn docs_and_vendored_dirs_do_not_elect_code_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/app.py", "def main():\n    pass\n");
+        write(
+            root,
+            "docs/references/rqalpha-source/rqalpha/api.py",
+            "def order_shares():\n    pass\n",
+        );
+        write(root, "vendor/lib/util.py", "def helper():\n    pass\n");
+        write(root, "third_party/sdk/sdk.py", "def sdk():\n    pass\n");
+        write(
+            root,
+            "references/spike/proto.py",
+            "def proto():\n    pass\n",
+        );
+        // Redis-style C project: bundled third-party sources under `deps/`.
+        write(
+            root,
+            "deps/jemalloc/src/arena.c",
+            "int arena(void) { return 0; }\n",
+        );
+        write(root, "deps/lua/src/lvm.c", "int lvm(void) { return 0; }\n");
+
+        let sels = detect_language_selections(root);
+        assert_eq!(ids(&sels), vec!["python"]);
+        let py = sels.iter().find(|s| s.id == "python").unwrap();
+        assert_eq!(
+            py.paths,
+            vec!["src"],
+            "docs/vendor/third_party/references/deps must not become code roots"
+        );
+    }
+
+    /// fmt-shaped C++ library: the entire public surface lives in
+    /// header-only `include/fmt/*.h`, with only a couple of `.cc`
+    /// translation units under `src/`. Headers must not *elect* a language
+    /// (Obj-C protection below), but once real TUs elect it, the
+    /// header-rich dirs must join the roots — otherwise the library body
+    /// is silently skipped (fmt: 0 of ~20k header lines indexed).
+    #[test]
+    fn header_dirs_join_roots_once_a_translation_unit_elects_the_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/format.cc", "int x;\n");
+        write(root, "include/fmt/format.h", "class Formatter {};\n");
+        write(root, "include/fmt/base.h", "class Base {};\n");
+
+        let sels = detect_language_selections(root);
+        let cpp = sels.iter().find(|s| s.id == "cpp").expect("cpp elected");
+        assert!(
+            cpp.paths.contains(&"include".to_string()),
+            "header-only include/ must join cpp roots: {:?}",
+            cpp.paths
+        );
+        assert!(cpp.paths.contains(&"src".to_string()));
+        // Headers alone still must not elect C.
+        assert!(!sels.iter().any(|s| s.id == "c"), "no phantom c project");
     }
 
     /// An empty / unrecognised tree yields no selections (caller falls back to

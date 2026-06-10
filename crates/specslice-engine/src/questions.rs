@@ -135,12 +135,19 @@ pub fn analyze_questions_with_store(
     // --- 1. orphan symbols (no incoming Calls/References/Imports,
     //         no framework role) -------------------------------
     {
+        // Shared with dead-code: lifecycle callbacks, per-language entry
+        // names, framework-instantiated Swift types, Python framework roles.
+        // Anything a framework drives is not an orphan worth asking about.
+        let implicit_entries = crate::dead_code::implicit_entry_ids(&nodes, &edges);
         let mut count = 0usize;
         for node in &nodes {
             if !is_code_symbol(node.kind) {
                 continue;
             }
             if has_framework_role(node) {
+                continue;
+            }
+            if implicit_entries.contains(node.id.as_str()) {
                 continue;
             }
             let inc = incoming_kinds.get(&node.id);
@@ -440,6 +447,52 @@ mod tests {
             EdgeSource::LanguageAdapter,
         );
         store.upsert_edge(&e).unwrap();
+    }
+
+    #[test]
+    fn framework_driven_symbols_are_not_orphans() {
+        // SwiftUI runtime instantiates `ContentView: View` and calls `body`;
+        // `go test` invokes `TestParse` by reflection. None of these leave an
+        // in-repo edge. dead-code already knows this; questions must agree
+        // instead of asking the operator about every framework callback.
+        let (mut store, _d) = empty_store();
+        let mut view = Node::new(
+            ArtifactId::new("swift::a.swift::ContentView"),
+            NodeKind::SwiftStruct,
+        );
+        view.path = Some("a.swift".into());
+        view.name = Some("ContentView".into());
+        view.metadata_json = Some(r#"{"swift_inherits":["View"]}"#.into());
+        store.upsert_node(&view).unwrap();
+        upsert(
+            &mut store,
+            "swift::a.swift::ContentView.body",
+            NodeKind::SwiftMethod,
+            Some("a.swift"),
+            Some("body"),
+        );
+        upsert_edge(
+            &mut store,
+            "swift::a.swift::ContentView",
+            "swift::a.swift::ContentView.body",
+            EdgeKind::Contains,
+        );
+        upsert(
+            &mut store,
+            "go::p/x_test.go::TestParse",
+            NodeKind::GoFunction,
+            Some("p/x_test.go"),
+            Some("TestParse"),
+        );
+
+        let r = analyze_questions_with_store(&store, &QuestionsOptions::default()).unwrap();
+        let orphan_ids: Vec<_> = r
+            .questions
+            .iter()
+            .filter(|q| q.category == "orphan_symbol")
+            .filter_map(|q| q.artifact_id.clone())
+            .collect();
+        assert!(orphan_ids.is_empty(), "orphans={orphan_ids:?}");
     }
 
     #[test]

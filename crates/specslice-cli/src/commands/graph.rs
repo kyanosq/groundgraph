@@ -96,7 +96,11 @@ fn emit_json(view: &GraphViewModel, out: Option<&Path>, pretty: bool) -> Result<
     }
     .context("serialising graph view to JSON")?;
     match out {
-        Some(path) => write_to(path, &json),
+        Some(path) => {
+            write_to(path, &json)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
         None => {
             println!("{json}");
             Ok(())
@@ -107,7 +111,11 @@ fn emit_json(view: &GraphViewModel, out: Option<&Path>, pretty: bool) -> Result<
 fn emit_mermaid(view: &GraphViewModel, out: Option<&Path>) -> Result<()> {
     let body = render_mermaid(view);
     match out {
-        Some(path) => write_to(path, &body),
+        Some(path) => {
+            write_to(path, &body)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
         None => {
             println!("{body}");
             Ok(())
@@ -231,7 +239,8 @@ mod tests {
 
     #[test]
     fn render_web_html_inlines_data_and_keeps_viewer() {
-        let json = r#"{"meta":{"repo":"demo","nodes":1,"links":0},"nodes":[{"id":"a"}],"links":[]}"#;
+        let json =
+            r#"{"meta":{"repo":"demo","nodes":1,"links":0},"nodes":[{"id":"a"}],"links":[]}"#;
         let html = render_web_html(json);
         assert!(
             html.contains("window.__SS_DATA__ = {\"meta\":{\"repo\":\"demo\""),
@@ -242,7 +251,10 @@ mod tests {
             html.contains("ForceGraph3D({ controlType: 'orbit' })"),
             "viewer code preserved"
         );
-        assert!(!html.contains("SS_DATA_SLOT"), "marker replaced, not left behind");
+        assert!(
+            !html.contains("SS_DATA_SLOT"),
+            "marker replaced, not left behind"
+        );
     }
 
     #[test]
@@ -264,7 +276,10 @@ mod tests {
         // tag; it is escaped to the JSON-valid `<\/script>`.
         let json = r#"{"nodes":[{"id":"x","name":"</script><b>"}]}"#;
         let html = render_web_html(json);
-        assert!(html.contains("<\\/script><b>"), "`</` escaped inside payload");
+        assert!(
+            html.contains("<\\/script><b>"),
+            "`</` escaped inside payload"
+        );
         assert!(
             !html.contains("\"name\":\"</script>"),
             "raw </script> from data must not survive"

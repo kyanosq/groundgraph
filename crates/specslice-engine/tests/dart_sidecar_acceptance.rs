@@ -72,6 +72,7 @@ fn sidecar_source_present() -> bool {
 fn p7_fallback_path_still_indexes_when_sidecar_disabled() {
     // Make sure the env explicitly disables the sidecar so this test is
     // deterministic regardless of host configuration.
+    let _serial = env_lock();
     let _guard = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("0"));
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -131,6 +132,7 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
         eprintln!("skipping P7 happy-path: `dart` not on PATH");
         return;
     }
+    let _serial = env_lock();
     let _guard = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -231,6 +233,15 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
     );
 }
 
+/// Process-wide env mutations race between parallel tests (both tests here
+/// flip `SPECSLICE_DART_ANALYZER` in opposite directions), so each test takes
+/// this lock for its whole body before touching the environment.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct EnvGuard {
     key: String,
     prev: Option<String>,
@@ -240,9 +251,6 @@ impl EnvGuard {
     fn set(key: &str, value: Option<&str>) -> Self {
         let prev = std::env::var(key).ok();
         match value {
-            // SAFETY: cargo runs tests in the same process and each test
-            // restores its own var; we keep them serial via a single
-            // env_lock module only when truly contended.
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }

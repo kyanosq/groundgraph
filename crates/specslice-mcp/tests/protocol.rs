@@ -89,7 +89,7 @@ fn dispatcher_notifications_initialized_returns_no_response() {
 }
 
 #[test]
-fn dispatcher_tools_list_advertises_six_tools_with_input_schemas() {
+fn dispatcher_tools_list_advertises_seven_tools_with_input_schemas() {
     let server = Server::new(PathBuf::from("."));
     let raw = r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#;
     let response_line = server.dispatch(raw).expect("response expected");
@@ -103,6 +103,7 @@ fn dispatcher_tools_list_advertises_six_tools_with_input_schemas() {
         "impact",
         "dead_code",
         "context_pack",
+        "check_drift",
     ];
     assert_eq!(names, expected, "tools list must match the canonical order");
     for tool in tools {

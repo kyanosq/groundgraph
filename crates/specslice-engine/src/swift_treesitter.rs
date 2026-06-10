@@ -502,6 +502,66 @@ mod tests {
     }
 
     #[test]
+    fn module_resolution_links_unique_multiword_methods_across_files() {
+        use crate::treesitter::{resolve_heuristic_refs, RefKind, ScannedRef};
+        use std::collections::HashMap;
+
+        // `MainViewModel` calls `introductionManager.checkFirstLaunchIntroduction()`;
+        // the only definition lives in another file. Swift imports name modules,
+        // not files, so this must resolve module-wide even for a lowerCamel
+        // method — uniqueness plus a multi-word name keeps platform-API
+        // collisions out.
+        let symbols = vec![
+            (
+                "App/IntroductionManager.swift",
+                "IntroductionManager",
+                "IntroductionManager",
+            ),
+            (
+                "App/IntroductionManager.swift",
+                "checkFirstLaunchIntroduction",
+                "IntroductionManager.checkFirstLaunchIntroduction",
+            ),
+            ("App/MainViewModel.swift", "MainViewModel", "MainViewModel"),
+            ("App/MainViewModel.swift", "start", "MainViewModel.start"),
+            // a single generic word defined uniquely elsewhere — must NOT link
+            ("App/Saver.swift", "save", "Saver.save"),
+        ];
+        let pending = vec![
+            (
+                "App/MainViewModel.swift".to_string(),
+                ScannedRef {
+                    from_qualified: "MainViewModel.start".into(),
+                    to_name: "checkFirstLaunchIntroduction".into(),
+                    kind: RefKind::Call,
+                },
+            ),
+            (
+                "App/MainViewModel.swift".to_string(),
+                ScannedRef {
+                    from_qualified: "MainViewModel.start".into(),
+                    to_name: "save".into(),
+                    kind: RefKind::Call,
+                },
+            ),
+        ];
+        let edges = resolve_heuristic_refs(&SWIFT_SPEC, &symbols, &HashMap::new(), &pending);
+        assert!(
+            edges.iter().any(|e| e
+                .to_symbol_id
+                .to_string()
+                .contains("IntroductionManager.checkFirstLaunchIntroduction")),
+            "unique multi-word method must link module-wide: {edges:?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.to_symbol_id.to_string().contains("Saver.save")),
+            "single generic word must stay unresolved: {edges:?}"
+        );
+    }
+
+    #[test]
     fn captures_bare_navigation_and_construction_calls() {
         let src = r#"
 class Greeter {

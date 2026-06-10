@@ -298,7 +298,7 @@ fn scoped_constants(
         .into_iter()
         .filter_map(|mut e| {
             e.sites
-                .retain(|s| s.path.as_deref().map_or(false, |p| scope_files.contains(p)));
+                .retain(|s| s.path.as_deref().is_some_and(|p| scope_files.contains(p)));
             if e.sites.is_empty() {
                 None
             } else {

@@ -366,6 +366,9 @@ fn print_human(r: &SearchResult) {
             if let Some(role) = &m.framework_role {
                 println!("      框架角色: {role}");
             }
+            if let Some(snippet) = &m.snippet {
+                println!("      片段: {snippet}");
+            }
             if !m.match_reasons.is_empty() {
                 println!("      命中原因:");
                 for reason in &m.match_reasons {
@@ -511,6 +514,7 @@ mod tests {
                 source: None,
                 match_reasons: vec![],
                 framework_role: None,
+                snippet: None,
             }],
             subgraph: SearchSubgraph {
                 nodes: vec![

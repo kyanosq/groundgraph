@@ -64,6 +64,21 @@ pub const SCORE_EDGE_EVIDENCE: i32 = 30;
 pub const SCORE_NEIGHBOR: i32 = 20;
 /// Weak substring match against id, path or badge text.
 pub const SCORE_WEAK_SUBSTRING: i32 = 10;
+/// Node *content* (code span / doc body, via the FTS5 layer) contains **all**
+/// query tokens. Sits between [`SCORE_PATH_SEGMENT`] and [`SCORE_NAME_TOKEN`]:
+/// a body mentioning the whole phrase is as strong a signal as one name
+/// token, and concept queries whose words never appear in identifiers
+/// (`byte boundary panic`, `错位竞争`) become findable at all.
+pub const SCORE_CONTENT_ALL: i32 = 55;
+/// Node content contains **some** of the query tokens — a weak hint, just
+/// above [`SCORE_WEAK_SUBSTRING`] so it orders ties without drowning
+/// structural matches.
+pub const SCORE_CONTENT_ANY: i32 = 15;
+
+/// How many BM25-ranked fulltext rows each content pass considers. Bounds the
+/// per-query `find_node` lookups exactly like `boost_window` bounds the boost
+/// passes.
+const CONTENT_FTS_WINDOW: usize = 256;
 
 /// Maximum number of matches returned by default. Operator can lift
 /// with `--limit`.
@@ -185,6 +200,13 @@ pub struct SearchMatch {
     /// having to re-parse the raw `metadata_json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework_role: Option<String>,
+    /// One source line proving the hit — the first line in the symbol's span
+    /// (leading doc comments included) that contains a query token, falling
+    /// back to the declaration line. `L<line>: <text>`. Attached to the final
+    /// (post-ranking) matches only, so agents get grounding without an extra
+    /// `context` round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -468,6 +490,14 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
 
     let mut warnings: Vec<String> = Vec::new();
 
+    // Content layer (FTS5/BM25): make comment-only and doc-body-only phrases
+    // findable. Runs before the boost-window sort so content hits compete in
+    // (and benefit from) the same evidence/neighbour boosts as structural
+    // hits. Positional queries are already anchored to a symbol — skip.
+    if !matches!(options.query, SearchQuery::Position { .. }) {
+        apply_content_layer(store, &query_text, &kinds_set, &mut matches, &mut warnings);
+    }
+
     // Bound the expensive per-hit boost passes to a top-by-base-score
     // window. Each pass issues a DB round-trip per hit, so running them
     // over the full (untruncated) match set is what made common
@@ -489,10 +519,36 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
     apply_evidence_boost(store, &mut matches, &mut warnings);
     apply_neighbor_boost(store, &mut matches, &hit_ids, &mut warnings);
 
+    // Path-class demotion — last, so it scales the TOTAL relevance
+    // (structural + content + evidence + neighbor). Tests / tools /
+    // benchmarks / examples are real code but virtually never what an issue
+    // or a feature question is about; a multiplicative decay (not a filter)
+    // keeps them findable while production symbols win equal-match ties.
+    // (Redis dogfood: `tools/array-bench.py::parse_qps` outranked
+    // `genericZrangebyscoreCommand` for an actual zset issue query.)
+    for hit in matches.iter_mut() {
+        let Some(path) = hit.path.as_deref() else {
+            continue;
+        };
+        let aux = crate::path_class::is_auxiliary_path(path);
+        let test = crate::path_class::is_test_path(path);
+        if (aux || test) && hit.score > 0 {
+            hit.score = hit.score * 3 / 4;
+            hit.match_reasons.push(if aux {
+                "工具/示例/基准代码，排序降权".to_string()
+            } else {
+                "测试代码，排序降权".to_string()
+            });
+        }
+    }
+
     matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     if matches.len() > limit {
         matches.truncate(limit);
     }
+
+    // Snippets last — only the final (≤ limit) hits pay the file reads.
+    attach_snippets(&options.repo_root, &mut matches, &tokens, &query_text);
 
     let mut subgraph = expand_subgraph(store, &matches, options.depth, options.include_noise)?;
     let direct_match_ids: BTreeSet<String> = matches.iter().map(|m| m.id.clone()).collect();
@@ -507,6 +563,184 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
         graph_commands,
         warnings,
     })
+}
+
+/// Cap on a single snippet line (chars) so generated/minified lines can't
+/// flood CLI / JSON output.
+const SNIPPET_MAX_CHARS: usize = 200;
+
+/// Attach one grounding source line to each final match (see
+/// [`SearchMatch::snippet`]). Files are read once per distinct path; missing
+/// or shifted files degrade to "no snippet", never an error — the snippet is
+/// a convenience, the path+line_range stay authoritative.
+fn attach_snippets(repo_root: &Path, matches: &mut [SearchMatch], tokens: &[String], raw: &str) {
+    // Tokens to look for inside the span: structural tokens + FTS query
+    // tokens (the latter give CJK bigrams so Chinese queries find their line).
+    let mut needles: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+    needles.extend(crate::fts_text::fts_query_tokens(raw));
+    needles.sort();
+    needles.dedup();
+
+    let mut cache: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+    for m in matches.iter_mut() {
+        let Some(path) = m.path.clone() else { continue };
+        let Some((start, end)) = m.line_range else {
+            continue;
+        };
+        let lines = cache.entry(path.clone()).or_insert_with(|| {
+            std::fs::read_to_string(repo_root.join(&path))
+                .ok()
+                .map(|c| c.lines().map(String::from).collect())
+        });
+        let Some(lines) = lines else { continue };
+        let decl_idx = (start.max(1) as usize - 1).min(lines.len().saturating_sub(1));
+        let ext_start =
+            crate::fulltext_indexer::extend_over_leading_comments(lines.as_slice(), start);
+        let start_idx = (ext_start.max(1) as usize - 1).min(lines.len());
+        let end_idx = (end as usize).min(lines.len());
+        if lines.is_empty() || start_idx >= end_idx {
+            continue;
+        }
+        // Best line = the one containing the most query tokens (earliest on
+        // ties) — "multi-byte" must not steal the snippet from the line that
+        // says "byte boundary panic". No token anywhere → declaration line.
+        let mut best: Option<(usize, usize)> = None; // (count, idx)
+        for (off, line) in lines[start_idx..end_idx].iter().enumerate() {
+            let low = line.to_lowercase();
+            let count = needles.iter().filter(|n| low.contains(n.as_str())).count();
+            if count > 0 && best.map(|(c, _)| count > c).unwrap_or(true) {
+                best = Some((count, start_idx + off));
+            }
+        }
+        let chosen = best.map(|(_, idx)| idx).unwrap_or(decl_idx);
+        let text: String = lines[chosen]
+            .trim()
+            .chars()
+            .take(SNIPPET_MAX_CHARS)
+            .collect();
+        if text.is_empty() {
+            continue;
+        }
+        m.snippet = Some(format!("L{}: {}", chosen + 1, text));
+    }
+}
+
+/// Content layer — fold BM25-ranked FTS5 body hits into the match set.
+///
+/// Two passes against `node_fts`: an **all-tokens** match (strong,
+/// [`SCORE_CONTENT_ALL`]) and, for multi-token queries, an **any-token**
+/// match (weak, [`SCORE_CONTENT_ANY`]). A hit that already matched
+/// structurally gets the score added; an unseen node is loaded and appended
+/// as a new match, still subject to the caller's `kinds` filter. A database
+/// built before migration 003 degrades with an actionable warning — never an
+/// error — matching the SCIP layer's "graceful precision" contract.
+fn apply_content_layer(
+    store: &Store,
+    raw_query: &str,
+    kinds: &HashSet<NodeKind>,
+    matches: &mut Vec<SearchMatch>,
+    warnings: &mut Vec<String>,
+) {
+    let available = match store.fulltext_available() {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!("warn: 内容层可用性探测失败：{e}"));
+            return;
+        }
+    };
+    if !available {
+        warnings.push(
+            "warn: 当前索引缺少全文内容层（由旧版本生成）。重新运行 `specslice index` 后，\
+             代码正文/注释/文档内容才会参与搜索排序。"
+                .to_string(),
+        );
+        return;
+    }
+    let toks = crate::fts_text::fts_query_tokens(raw_query);
+    if toks.is_empty() {
+        return;
+    }
+
+    let all_hits =
+        match store.fulltext_match(&crate::fts_text::fts_all_expr(&toks), CONTENT_FTS_WINDOW) {
+            Ok(hits) => hits,
+            Err(e) => {
+                warnings.push(format!("warn: 全文层 ALL 查询失败：{e}"));
+                return;
+            }
+        };
+    let any_hits = if toks.len() > 1 {
+        match store.fulltext_match(&crate::fts_text::fts_any_expr(&toks), CONTENT_FTS_WINDOW) {
+            Ok(hits) => hits,
+            Err(e) => {
+                warnings.push(format!("warn: 全文层 ANY 查询失败：{e}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut index_of: BTreeMap<String, usize> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.clone(), i))
+        .collect();
+    let all_ids: BTreeSet<&str> = all_hits.iter().map(|h| h.node_id.as_str()).collect();
+    for hit in &all_hits {
+        add_content_hit(
+            store,
+            kinds,
+            matches,
+            &mut index_of,
+            &hit.node_id,
+            SCORE_CONTENT_ALL,
+            "content matches all query tokens（正文/注释命中全部词）",
+        );
+    }
+    for hit in &any_hits {
+        if all_ids.contains(hit.node_id.as_str()) {
+            continue;
+        }
+        add_content_hit(
+            store,
+            kinds,
+            matches,
+            &mut index_of,
+            &hit.node_id,
+            SCORE_CONTENT_ANY,
+            "content matches part of the query（正文/注释命中部分词）",
+        );
+    }
+}
+
+/// Add one content hit: boost it if it already matched structurally, else
+/// load the node (respecting the `kinds` filter) and append a fresh match. A
+/// fulltext row whose node has since vanished is skipped silently — the table
+/// is rebuilt on every `index`, so staleness is bounded to "edited since last
+/// index", same as every other layer.
+fn add_content_hit(
+    store: &Store,
+    kinds: &HashSet<NodeKind>,
+    matches: &mut Vec<SearchMatch>,
+    index_of: &mut BTreeMap<String, usize>,
+    node_id: &str,
+    score: i32,
+    reason: &str,
+) {
+    if let Some(&i) = index_of.get(node_id) {
+        matches[i].score += score;
+        matches[i].match_reasons.push(reason.to_string());
+        return;
+    }
+    let Ok(Some(node)) = store.find_node(&ArtifactId::new(node_id)) else {
+        return;
+    };
+    if !kinds.contains(&node.kind) {
+        return;
+    }
+    index_of.insert(node_id.to_string(), matches.len());
+    matches.push(make_match(&node, score, vec![reason.to_string()]));
 }
 
 /// v0.3.0-A Pass A — boost each hit whose outbound edges carry
@@ -1252,6 +1486,7 @@ fn keyword_matches(
                 source: Some("business_logic.yaml".into()),
                 match_reasons: reasons,
                 framework_role: None,
+                snippet: None,
             });
         }
     }
@@ -1438,6 +1673,7 @@ fn make_match(node: &Node, score: i32, reasons: Vec<String>) -> SearchMatch {
         source: node.indexer.clone(),
         match_reasons: reasons,
         framework_role,
+        snippet: None,
     }
 }
 
@@ -1488,6 +1724,7 @@ fn position_matches(store: &Store, path: &str, line: u32) -> Result<Vec<SearchMa
                 source: None,
                 match_reasons: vec![format!("symbol at {path}:{line}")],
                 framework_role: None,
+                snippet: None,
             });
         }
     }
@@ -1838,7 +2075,7 @@ mod tests {
         let kinds: HashSet<_> = default_search_kinds().into_iter().collect();
         let tokens = vec![exact_id.to_ascii_lowercase()];
         let mut hits = keyword_matches(&store, Path::new("."), &tokens, &kinds).unwrap();
-        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.sort_by_key(|h| std::cmp::Reverse(h.score));
         assert_eq!(hits[0].id, exact_id);
         assert!(
             hits[0].match_reasons.iter().any(|r| r.starts_with("id ")),
@@ -1862,7 +2099,7 @@ mod tests {
         let kinds: HashSet<_> = default_search_kinds().into_iter().collect();
         let tokens = vec!["auth".into(), "signin".into()];
         let mut hits = keyword_matches(&store, Path::new("."), &tokens, &kinds).unwrap();
-        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.sort_by_key(|h| std::cmp::Reverse(h.score));
         let top = &hits[0];
         assert!(top.id.contains("AuthService.signIn"));
         // Two reasons expected: path segment + name token.
@@ -1950,6 +2187,48 @@ mod tests {
             .find(|m| m.id == id)
             .expect("framework-decorated symbol still matches search");
         assert_eq!(hit.framework_role.as_deref(), Some("fastapi_route"));
+    }
+
+    #[test]
+    fn business_code_outranks_test_and_tool_code_on_equal_match() {
+        // Issue-locating regression (Redis #15078 / #15320): a benchmark
+        // script's `parse_qps` and a test helper `blpop_and_set_multiple_keys`
+        // outranked the real `genericZrangebyscoreCommand` / `msetCommand`
+        // because path class carried no weight. On an equal structural match,
+        // code under tools/ / tests/ must rank BELOW the production symbol —
+        // an issue is virtually always about production code.
+        let (mut store, _dir) = empty_store();
+        let aux = insert_method(&mut store, "tools/bench.dart", "parseRange", (5, 9));
+        let test = insert_method(&mut store, "test/range_test.dart", "parseRange", (12, 19));
+        let core = insert_method(&mut store, "lib/zset.dart", "parseRange", (40, 80));
+
+        let result = run_search_with_store(
+            &store,
+            SearchOptions {
+                repo_root: PathBuf::from("."),
+                query: SearchQuery::Keywords("parseRange".into()),
+                depth: 0,
+                kinds: Vec::new(),
+                limit: 10,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        let score_of = |id: &str| {
+            result
+                .matches
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} missing from matches"))
+                .score
+        };
+        assert!(
+            score_of(&core) > score_of(&aux) && score_of(&core) > score_of(&test),
+            "production symbol must score strictly above tools/ and test/ on equal match: core={} aux={} test={}",
+            score_of(&core),
+            score_of(&aux),
+            score_of(&test)
+        );
     }
 
     #[test]

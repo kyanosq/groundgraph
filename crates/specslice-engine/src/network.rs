@@ -153,7 +153,12 @@ pub fn build_network_graph(options: NetworkOptions) -> Result<NetworkGraph> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
     let repo = repo_name(&options.repo_root);
-    Ok(network_from_graph(&repo, &nodes, &edges, options.keep_isolated))
+    Ok(network_from_graph(
+        &repo,
+        &nodes,
+        &edges,
+        options.keep_isolated,
+    ))
 }
 
 /// Human-friendly repo label: the canonical directory name, falling back to the
@@ -234,7 +239,10 @@ mod tests {
         assert_eq!(a.kind, "go_method");
         assert!(g.nodes.iter().all(|n| n.id != "c"), "c is isolated");
         let l = &g.links[0];
-        assert_eq!((l.source.as_str(), l.target.as_str(), l.kind.as_str()), ("a", "b", "calls"));
+        assert_eq!(
+            (l.source.as_str(), l.target.as_str(), l.kind.as_str()),
+            ("a", "b", "calls")
+        );
     }
 
     #[test]
@@ -252,14 +260,17 @@ mod tests {
             node("b", NodeKind::GoMethod, "B", "b.go", 2),
         ];
         let edges = vec![
-            edge("a", "a", EdgeKind::Calls),       // self-loop → dropped
-            edge("a", "ghost", EdgeKind::Calls),   // dangling target → dropped
-            edge("a", "b", EdgeKind::Calls),       // kept
-            edge("a", "b", EdgeKind::Calls),       // parallel duplicate → collapsed
-            edge("a", "b", EdgeKind::References),  // different kind → kept
+            edge("a", "a", EdgeKind::Calls),      // self-loop → dropped
+            edge("a", "ghost", EdgeKind::Calls),  // dangling target → dropped
+            edge("a", "b", EdgeKind::Calls),      // kept
+            edge("a", "b", EdgeKind::Calls),      // parallel duplicate → collapsed
+            edge("a", "b", EdgeKind::References), // different kind → kept
         ];
         let g = network_from_graph("demo", &nodes, &edges, false);
-        assert_eq!(g.meta.links, 2, "one calls + one references, dups/self/dangling removed");
+        assert_eq!(
+            g.meta.links, 2,
+            "one calls + one references, dups/self/dangling removed"
+        );
         let a = g.nodes.iter().find(|n| n.id == "a").expect("a");
         // a–b counted twice (two distinct-kind links); degree is over links.
         assert_eq!(a.deg, 2);
@@ -267,7 +278,10 @@ mod tests {
 
     #[test]
     fn name_falls_back_to_last_id_segment_when_missing() {
-        let mut n = Node::new(ArtifactId::new("http_route::f.go::GET /x".to_string()), NodeKind::HttpRoute);
+        let mut n = Node::new(
+            ArtifactId::new("http_route::f.go::GET /x".to_string()),
+            NodeKind::HttpRoute,
+        );
         n.name = None;
         n.path = None;
         let g = network_from_graph("demo", &[n], &[], true);

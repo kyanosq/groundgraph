@@ -8,7 +8,7 @@
 mod migrations;
 mod repositories;
 
-pub use repositories::FileIndexEntry;
+pub use repositories::{FileIndexEntry, FulltextHit, FulltextRow};
 
 use std::path::{Path, PathBuf};
 
@@ -92,7 +92,37 @@ impl Store {
             path: path.clone(),
             source,
         })?;
-        Ok(Self { conn, path })
+        let store = Self { conn, path };
+        // Read-only commands open the store but never run `migrate()`. After a
+        // binary upgrade adds adjacency indexes, those commands would scan
+        // unindexed tables until the next `index`. Restore the perf indexes on
+        // every open — idempotently, and only once the tables exist. WAL above
+        // already requires a writable directory, so this adds no new constraint.
+        store.ensure_query_indexes()?;
+        Ok(store)
+    }
+
+    /// Idempotently (re)create the query-path performance indexes when the
+    /// underlying tables already exist. Safe to call on every `open`: it is a
+    /// no-op before the schema is migrated (no tables) and a cheap catalog
+    /// check once the indexes are present. It never changes data shape — only
+    /// migrations do that — so it is safe on read-only command paths.
+    pub fn ensure_query_indexes(&self) -> StoreResult<()> {
+        if !self.table_exists("edge_assertions")? {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(include_str!("./migrations_sql/002_edge_indexes.sql"))
+            .map_err(StoreError::sqlite)
+    }
+
+    fn table_exists(&self, name: &str) -> StoreResult<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Idempotently apply all schema migrations.
@@ -181,5 +211,57 @@ mod tests {
     fn migrate_is_idempotent() {
         let (mut store, _dir) = migrated_store();
         store.migrate().unwrap();
+    }
+
+    /// Read-only commands (`search`/`slice`/`dead-code`/…) open the store but
+    /// never call `migrate()`. After a binary upgrade that adds adjacency
+    /// indexes, those commands must still get fast, index-backed queries — so
+    /// `open` itself idempotently restores the perf indexes when the tables
+    /// already exist. Here we drop the indexes (simulating a pre-002 DB) and
+    /// assert a plain `open` brings them back, without a migration.
+    #[test]
+    fn open_restores_query_indexes_for_a_pre_index_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        {
+            let (store, _d) = {
+                let mut s = Store::open(&path).unwrap();
+                s.migrate().unwrap();
+                (s, ())
+            };
+            store
+                .connection()
+                .execute_batch(
+                    "DROP INDEX idx_edge_assertions_from;\
+                     DROP INDEX idx_edge_assertions_to;\
+                     DROP INDEX idx_edge_assertions_kind;\
+                     DROP INDEX idx_evidence_artifact;",
+                )
+                .unwrap();
+        }
+        // A read-command path: open only, no migrate.
+        let store = Store::open(&path).unwrap();
+        let count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' \
+                 AND name IN ('idx_edge_assertions_from','idx_edge_assertions_to',\
+                 'idx_edge_assertions_kind','idx_evidence_artifact')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "open must restore all 4 perf indexes for read commands"
+        );
+    }
+
+    /// `open` runs before `migrate` on first init, when no tables exist yet —
+    /// ensuring indexes must be a safe no-op, never an error.
+    #[test]
+    fn open_on_tableless_db_is_a_noop_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Store::open(dir.path().join("fresh.db")).is_ok());
     }
 }

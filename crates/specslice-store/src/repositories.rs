@@ -319,6 +319,87 @@ impl Store {
         tx.commit().map_err(StoreError::sqlite)?;
         Ok(removed)
     }
+
+    // -----------------------------------------------------------------------
+    // Fulltext (FTS5) content layer
+    // -----------------------------------------------------------------------
+
+    /// Whether the FTS5 content table exists. Databases created before
+    /// migration 003 (or opened without `migrate()`) lack it; callers degrade
+    /// to structural-only search instead of erroring.
+    pub fn fulltext_available(&self) -> StoreResult<bool> {
+        self.table_exists("node_fts")
+    }
+
+    /// Replace the entire fulltext index with `rows`. Called once per
+    /// `specslice index` run after every structural pass, so the content layer
+    /// always mirrors the current node set — no per-indexer ownership needed.
+    pub fn rebuild_fulltext(&mut self, rows: &[FulltextRow]) -> StoreResult<usize> {
+        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
+        tx.execute("DELETE FROM node_fts", [])
+            .map_err(StoreError::sqlite)?;
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO node_fts (node_id, body) VALUES (?1, ?2)")
+                .map_err(StoreError::sqlite)?;
+            for row in rows {
+                if row.body.trim().is_empty() {
+                    continue;
+                }
+                stmt.execute(params![row.node_id, row.body])
+                    .map_err(StoreError::sqlite)?;
+                inserted += 1;
+            }
+        }
+        tx.commit().map_err(StoreError::sqlite)?;
+        Ok(inserted)
+    }
+
+    /// BM25-ranked fulltext match. `match_expr` must be a well-formed FTS5
+    /// query (the engine builds it from quoted tokens — never raw user input).
+    /// Best match first; at most `limit` hits.
+    pub fn fulltext_match(&self, match_expr: &str, limit: usize) -> StoreResult<Vec<FulltextHit>> {
+        if match_expr.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT node_id, bm25(node_fts) AS rank FROM node_fts \
+                 WHERE node_fts MATCH ?1 ORDER BY rank, node_id LIMIT ?2",
+            )
+            .map_err(StoreError::sqlite)?;
+        let rows = stmt
+            .query_map(params![match_expr, limit as i64], |row| {
+                Ok(FulltextHit {
+                    node_id: row.get(0)?,
+                    rank: row.get(1)?,
+                })
+            })
+            .map_err(StoreError::sqlite)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row.map_err(StoreError::sqlite)?);
+        }
+        Ok(hits)
+    }
+}
+
+/// One row of the fulltext content layer: a node id plus its pre-tokenised
+/// body text (see `003_fulltext.sql` for the tokenisation contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextRow {
+    pub node_id: String,
+    pub body: String,
+}
+
+/// One BM25-ranked fulltext hit. Lower `rank` = more relevant (SQLite's
+/// `bm25()` returns negated scores).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FulltextHit {
+    pub node_id: String,
+    pub rank: f64,
 }
 
 fn opt_u32(row: &Row<'_>, idx: usize) -> Result<Option<u32>, rusqlite::Error> {

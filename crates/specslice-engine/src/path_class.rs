@@ -6,7 +6,8 @@
 
 /// Heuristic: does this path live in test / spec scaffolding?
 pub fn is_test_path(path: &str) -> bool {
-    let p = path.replace('\\', "/").to_ascii_lowercase();
+    let norm = path.replace('\\', "/");
+    let p = norm.to_ascii_lowercase();
     let in_test_dir = p.split('/').any(|seg| {
         matches!(
             seg,
@@ -20,12 +21,59 @@ pub fn is_test_path(path: &str) -> bool {
                 | "specs"
         )
     });
-    in_test_dir
+    if in_test_dir
         || p.ends_with("_test.dart")
         || p.contains("_test.")
         || p.contains(".test.")
         || p.contains(".spec.")
         || p.contains("_spec.")
+    {
+        return true;
+    }
+    // Xcode / SPM target dirs (`CleanerTests/`, `AppUITests/`) and
+    // XCTest / JUnit file names (`FooTests.swift`, `FooTest.java`). The
+    // uppercase `Test` requires a CamelCase word boundary, so business
+    // words that merely end in "test(s)" (`contests/`, `latest.rs`) and
+    // lowercase stems never match.
+    let camel_test_suffix = |s: &str| s.ends_with("Tests") || s.ends_with("Test");
+    if norm.split('/').rev().skip(1).any(&camel_test_suffix) {
+        return true;
+    }
+    let stem = norm
+        .rsplit('/')
+        .next()
+        .map(|base| base.split('.').next().unwrap_or(base))
+        .unwrap_or(&norm);
+    camel_test_suffix(stem)
+}
+
+/// Heuristic: auxiliary (non-production) code — developer tools, benchmarks,
+/// examples, demo apps. Real code, but not the product: when ranking search
+/// hits or naming business modules, production sources should outrank these.
+/// Distinct from [`is_test_path`] so callers can treat tests separately.
+pub fn is_auxiliary_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    p.split('/').any(|seg| {
+        matches!(
+            seg,
+            "tools"
+                | "tool"
+                | "scripts"
+                | "script"
+                | "bench"
+                | "benches"
+                | "benchmark"
+                | "benchmarks"
+                | "examples"
+                | "example"
+                | "demo"
+                | "demos"
+                | "samples"
+                | "sample"
+                | "fixtures"
+                | "playground"
+        )
+    })
 }
 
 /// Heuristic: is this a generated / codegen file? Such symbols (freezed
@@ -71,6 +119,28 @@ mod tests {
         assert!(is_test_path("lib/a.spec.ts"));
         assert!(!is_test_path("lib/models/shift.dart"));
         assert!(!is_test_path("App/Views/Home/HomeView.swift"));
+        // Xcode / SPM / JUnit conventions: `<Target>Tests/` target dirs and
+        // `FooTests.swift` / `FooTest.java` files outside any `test/` dir.
+        assert!(is_test_path(
+            "CleanerTests/SimilarityAnalysisServiceTests.swift"
+        ));
+        assert!(is_test_path("CleanerUITests/CleanerUITests.swift"));
+        assert!(is_test_path("src/main/java/ManifestTest.java"));
+        // CamelCase boundary required — these are business files.
+        assert!(!is_test_path("docs/contests/rules.md"));
+        assert!(!is_test_path("lib/latest.rs"));
+    }
+
+    #[test]
+    fn detects_auxiliary_paths() {
+        assert!(is_auxiliary_path("tools/array-bench.py"));
+        assert!(is_auxiliary_path("scripts/create-cluster/clean.sh"));
+        assert!(is_auxiliary_path("examples/http/main.go"));
+        assert!(is_auxiliary_path("benchmarks/run.py"));
+        assert!(!is_auxiliary_path("src/networking.c"));
+        assert!(!is_auxiliary_path("lib/services/auth.dart"));
+        // `test` dirs are NOT auxiliary — they have their own classifier.
+        assert!(!is_auxiliary_path("test/foo_test.dart"));
     }
 
     #[test]

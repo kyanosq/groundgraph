@@ -27,21 +27,23 @@ fn c_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind> {
         "enum_specifier" if has_body => Some(SymKind::Type(NodeKind::CEnum)),
         // `typedef struct/enum { … } Name;` — an anonymous record named only by
         // the typedef (shared C-family handling).
-        "type_definition" => {
-            crate::treesitter::anon_typedef_record_specifier(node).map(|spec| {
-                if spec == "enum_specifier" {
-                    SymKind::Type(NodeKind::CEnum)
-                } else {
-                    SymKind::Type(NodeKind::CStruct)
-                }
-            })
-        }
+        "type_definition" => crate::treesitter::anon_typedef_record_specifier(node).map(|spec| {
+            if spec == "enum_specifier" {
+                SymKind::Type(NodeKind::CEnum)
+            } else {
+                SymKind::Type(NodeKind::CStruct)
+            }
+        }),
         _ => None,
     }
 }
 
 fn c_is_callable(kind: &str) -> bool {
-    kind == "function_definition"
+    // Function-like macros behave as (textually inlined) functions: they are
+    // called like functions and call functions from their body. Modelling
+    // them keeps macro-mediated families (`serverAssert` → `_serverAssert`)
+    // reachable in the call graph.
+    kind == "function_definition" || kind == "preproc_function_def"
 }
 
 fn c_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -51,6 +53,14 @@ fn c_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
             .and_then(|d| declarator_name(d, src)),
         // An anonymous typedef record borrows its name from the typedef declarator.
         "type_definition" => crate::treesitter::typedef_declarator_name(node, src),
+        // `typedef struct _Tag { … } Name;` — users refer to the typedef
+        // name; the tag only appears in internal self-references. Prefer the
+        // typedef name so the symbol matches how the codebase spells it.
+        "struct_specifier" | "union_specifier" | "enum_specifier" => node
+            .parent()
+            .filter(|p| p.kind() == "type_definition")
+            .and_then(|p| crate::treesitter::typedef_declarator_name(p, src))
+            .or_else(|| name_from_field(node, src)),
         _ => name_from_field(node, src),
     }
 }
@@ -61,6 +71,11 @@ fn c_name_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
 fn c_body_of(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if node.kind() == "type_definition" {
         return crate::treesitter::typedef_record_body(node);
+    }
+    if node.kind() == "preproc_function_def" {
+        // The macro replacement text: a flat `preproc_arg` token, scanned
+        // textually by `c_call_idents`.
+        return node.child_by_field_name("value");
     }
     body_from_field(node)
 }
@@ -98,8 +113,63 @@ fn c_is_transparent(kind: &str) -> bool {
 /// resolve to nothing — the noise floor stays bounded.
 pub(crate) fn c_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
+    if body.kind() == "preproc_arg" {
+        // Macro replacement text is a flat token: the preprocessor has no
+        // AST. Extract `ident(` textually; keywords are filtered.
+        if let Some(text) = node_text(body, src) {
+            collect_macro_calls(text, &mut out);
+        }
+        return out;
+    }
     collect_c_calls(body, src, &mut out, 0);
     out
+}
+
+/// C keywords (and preprocessor operators) that read as `word(` inside a
+/// macro body but are never callees.
+const C_NON_CALLEES: &[&str] = &[
+    "if",
+    "while",
+    "for",
+    "switch",
+    "return",
+    "sizeof",
+    "defined",
+    "void",
+    "do",
+    "else",
+    "case",
+    "typeof",
+    "alignof",
+    "_Alignof",
+    "_Static_assert",
+];
+
+/// Extract `identifier(` occurrences from raw macro replacement text.
+fn collect_macro_calls(text: &str, out: &mut Vec<(String, RefKind)>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let mut j = i;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' && !C_NON_CALLEES.contains(&word) {
+                out.push((word.to_string(), RefKind::Call));
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn collect_c_calls(
@@ -167,7 +237,11 @@ pub(crate) static C_SPEC: LangSpec = LangSpec {
     recurse_callables: false,
     emit_nested_callables_with_metadata_only: false,
     call_idents_of: c_call_idents,
-    module_scoped_resolution: false,
+    // C has one flat namespace and splits declaration (`.h`) from definition
+    // (`.c`): the definition is never in the caller's include targets, so
+    // import-scoped resolution loses the cross-TU call graph. Module-wide
+    // resolution applies the same uniqueness/multi-word/hub gates as Swift.
+    module_scoped_resolution: true,
     recurse_declined_callables: false,
     // `.h` is shared with C++: claim a header only when it does NOT look like
     // C++ (no `namespace` / `class` / `::`). A `.c` file always reads true.
@@ -206,6 +280,94 @@ mod tests {
     }
 
     #[test]
+    fn tagged_typedef_struct_takes_the_typedef_name() {
+        // Redis idiom: `typedef struct _clusterNode { … } clusterNode;`.
+        // Every user refers to the typedef name; the `_`-prefixed tag only
+        // appears in internal self-references (`struct _clusterNode *next`).
+        // Naming the symbol after the tag strands it (dead-code false
+        // positive); the typedef name is the public identity.
+        let s = scan("typedef struct _clusterNode { struct _clusterNode *next; } clusterNode;\n");
+        assert_eq!(qnames(&s, NodeKind::CStruct), vec!["clusterNode"]);
+        // Plain tagged structs (no typedef) keep the tag name.
+        let s2 = scan("struct dictEntry { int v; };\n");
+        assert_eq!(qnames(&s2, NodeKind::CStruct), vec!["dictEntry"]);
+    }
+
+    #[test]
+    fn function_like_macros_are_callable_symbols_with_outbound_calls() {
+        // `#define serverAssert(e) _serverAssert(...)`: the macro is the
+        // only caller of `_serverAssert`, and ordinary functions call the
+        // macro. Without modelling the macro as a callable, the whole
+        // assert/panic family looks dead.
+        let s = scan(
+            "void _serverAssert(char *e, char *f, int l);\n\
+             #define serverAssert(_e) ((_e)?(void)0 : (_serverAssert(#_e,__FILE__,__LINE__),redis_unreachable()))\n",
+        );
+        assert_eq!(qnames(&s, NodeKind::CFunction), vec!["serverAssert"]);
+        let r = refs(&s);
+        assert!(
+            r.iter()
+                .any(|(from, to, _)| from == "serverAssert" && to == "_serverAssert"),
+            "macro body must yield outbound call idents: {r:?}"
+        );
+        assert!(
+            !r.iter().any(|(_, to, _)| to == "if" || to == "void"),
+            "keywords must not leak as callees: {r:?}"
+        );
+    }
+
+    #[test]
+    fn module_resolution_links_definitions_across_translation_units() {
+        use crate::treesitter::{resolve_heuristic_refs, RefKind, ScannedRef};
+        use std::collections::HashMap;
+
+        // The C compilation model: `dict.h` declares, `dict.c` defines, and
+        // `server.c` includes only the header. The definition is *not* in any
+        // import target, so import-scoped resolution loses the whole
+        // cross-file call graph (Redis: 6965 symbols, only 127 reachable).
+        // C has one flat namespace — a unique multi-word name resolves
+        // module-wide, same policy as Swift.
+        let symbols = vec![
+            ("src/dict.c", "dictAdd", "dictAdd"),
+            ("src/dict.c", "dictCreate", "dictCreate"),
+            ("src/server.c", "initServer", "initServer"),
+            // single generic word defined elsewhere must NOT link
+            ("src/util.c", "send", "send"),
+        ];
+        let pending = vec![
+            (
+                "src/server.c".to_string(),
+                ScannedRef {
+                    from_qualified: "initServer".into(),
+                    to_name: "dictCreate".into(),
+                    kind: RefKind::Call,
+                },
+            ),
+            (
+                "src/server.c".to_string(),
+                ScannedRef {
+                    from_qualified: "initServer".into(),
+                    to_name: "send".into(),
+                    kind: RefKind::Call,
+                },
+            ),
+        ];
+        let edges = resolve_heuristic_refs(&C_SPEC, &symbols, &HashMap::new(), &pending);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.to_symbol_id.to_string().contains("dictCreate")),
+            "unique multi-word C function must resolve across translation units: {edges:?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.to_symbol_id.to_string().contains("send")),
+            "single generic word must stay unresolved (libc collision): {edges:?}"
+        );
+    }
+
+    #[test]
     fn anonymous_typedef_struct_and_enum_take_the_typedef_name() {
         // The dominant C idiom: `typedef struct { … } Name;`. tree-sitter parses
         // the record as a *nameless* specifier (which the driver drops), with the
@@ -218,9 +380,18 @@ mod tests {
         let s = scan(src);
         let structs = qnames(&s, NodeKind::CStruct);
         let enums = qnames(&s, NodeKind::CEnum);
-        assert!(structs.contains(&"Point".to_string()), "anon typedef struct: {structs:?}");
-        assert!(structs.contains(&"Value".to_string()), "anon typedef union: {structs:?}");
-        assert!(enums.contains(&"Letter".to_string()), "anon typedef enum: {enums:?}");
+        assert!(
+            structs.contains(&"Point".to_string()),
+            "anon typedef struct: {structs:?}"
+        );
+        assert!(
+            structs.contains(&"Value".to_string()),
+            "anon typedef union: {structs:?}"
+        );
+        assert!(
+            enums.contains(&"Letter".to_string()),
+            "anon typedef enum: {enums:?}"
+        );
         // Named record typedef stays single (no duplicate from the typedef).
         assert_eq!(
             structs.iter().filter(|n| *n == "Node").count(),

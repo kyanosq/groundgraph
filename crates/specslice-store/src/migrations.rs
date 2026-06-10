@@ -26,6 +26,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("./migrations_sql/002_edge_indexes.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("./migrations_sql/003_fulltext.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(conn: &mut Connection) -> StoreResult<()> {

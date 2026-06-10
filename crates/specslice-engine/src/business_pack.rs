@@ -1151,6 +1151,72 @@ fn name_module(
         }
     }
 
+    // (a2) dominant file. In a flat layout (Redis's `src/`, any C project)
+    //     there are no feature directories at all, and the central-symbol
+    //     rule below surfaces whichever internal struct happens to be most
+    //     referenced (`AutoMemEntry`). But the *file* concentration of
+    //     inbound references is a stronger author signal: `dict.c` IS the
+    //     module named "dict". Only fires when one file clearly dominates
+    //     (≥2× the runner-up and a minimum absolute weight), so feature-
+    //     shaped communities with evenly spread references fall through.
+    {
+        // Test scaffolding can never be the author's module name — shared
+        // test helpers attract huge in-degree (every test case calls them)
+        // and would otherwise name the module "binding_test" (gin dogfood).
+        // Dunder files (`__init__.py` re-export hubs) likewise attract the
+        // most references while being pure package plumbing (django dogfood).
+        let mut scores: Vec<(usize, usize)> = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .filter(|&&fi| {
+                let stem = files[fi]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.split('.').next())
+                    .unwrap_or_default();
+                !(stem.starts_with("__") && stem.ends_with("__"))
+            })
+            .map(|&fi| {
+                let s = file_symbols
+                    .get(&fi)
+                    .map(|syms| {
+                        syms.iter()
+                            .map(|s| sym_indegree.get(&s.id).copied().unwrap_or(0))
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+                (fi, s)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.cmp(&a.1).then(files[a.0].cmp(&files[b.0])));
+        if let Some(&(top_fi, top)) = scores.first() {
+            let second = scores.get(1).map(|&(_, s)| s).unwrap_or(0);
+            // Large communities (>15 files) can never be honestly named by
+            // one struct, so the top file's stem wins outright; smaller ones
+            // need clear dominance before overriding the symbol rule.
+            let dominant = if file_idxs.len() > 15 {
+                top >= 8
+            } else {
+                top >= 8 && top >= second * 2
+            };
+            if file_idxs.len() > 1 && dominant {
+                let stem = files[top_fi]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.split('.').next())
+                    .unwrap_or_default();
+                // Only GENERIC_NAMES filters here. LAYER_DIRS describes
+                // *directory* layers (`lib/networking/` files things by
+                // kind); a file STEM like `networking.c` is the author's
+                // own module name and must survive.
+                if !stem.is_empty() && !GENERIC_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+                {
+                    return (stem.to_string(), production_dir_prefix(file_idxs, files));
+                }
+            }
+        }
+    }
+
     // (b) central business symbol. A *type* (class/struct/enum) names a
     //     module far better than a method, so any referenced type outranks
     //     every callable regardless of degree — otherwise a ubiquitous method
@@ -1159,6 +1225,9 @@ fn name_module(
     //     name. Generic names are skipped so we never surface "load"/"state".
     let mut best: Option<(bool, usize, String)> = None; // (is_type, indegree, name)
     for &fi in file_idxs {
+        if is_test_path(&files[fi]) {
+            continue;
+        }
         if let Some(syms) = file_symbols.get(&fi) {
             for s in syms {
                 let Some(nm) = s.name.as_deref() else {
@@ -1191,14 +1260,17 @@ fn name_module(
         // business concept; such clusters — extension files, lone test files —
         // are named by their directory in step (c) instead.
         if is_ty {
-            return (strip_role_suffix(&nm), common_dir_prefix(file_idxs, files));
+            return (
+                strip_role_suffix(&nm),
+                production_dir_prefix(file_idxs, files),
+            );
         }
     }
 
     // (c) fallback: deepest *non-layer* segment of the common directory prefix
     //     (a structural layer like `viewmodel`/`ui` names *how* code is filed,
     //     not the feature). Fall back to the last segment if all are layers.
-    let pfx = common_dir_prefix(file_idxs, files);
+    let pfx = production_dir_prefix(file_idxs, files);
     let disp = pfx
         .rsplit('/')
         .find(|s| !s.is_empty() && !LAYER_DIRS.contains(&s.to_ascii_lowercase().as_str()))
@@ -1234,6 +1306,8 @@ fn strip_role_suffix(name: &str) -> String {
         "Store",
         "Client",
         "Impl",
+        "Error",
+        "Exception",
     ];
     for suf in SUFFIXES {
         if name.len() > suf.len() && name.ends_with(suf) {
@@ -1241,6 +1315,28 @@ fn strip_role_suffix(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Common directory prefix anchored to PRODUCTION files. A community that
+/// spans `django/forms/**` and `tests/forms_tests/**` has an empty plain
+/// common prefix; the production subset ("where the feature lives") is the
+/// useful answer. Falls back to all files when everything is tests.
+fn production_dir_prefix(file_idxs: &[usize], files: &[String]) -> String {
+    let prod: Vec<usize> = file_idxs
+        .iter()
+        .copied()
+        .filter(|&fi| !is_test_path(&files[fi]))
+        .collect();
+    let pfx = if prod.is_empty() {
+        String::new()
+    } else {
+        common_dir_prefix(&prod, files)
+    };
+    if pfx.is_empty() {
+        common_dir_prefix(file_idxs, files)
+    } else {
+        pfx
+    }
 }
 
 /// Longest common directory prefix (filename dropped) across files.
@@ -1380,6 +1476,18 @@ fn fallback_feature_token(path: &str) -> (String, String) {
     // Drop the repo-root segment, then take the first non-layer segment.
     for (i, seg) in dirs.iter().enumerate().skip(1) {
         if !LAYER_DIRS.contains(&seg.to_ascii_lowercase().as_str()) {
+            // A source root inside a multi-module repo (`extras/src/...`):
+            // pierce the Maven/Gradle chain so the bucket is named by the
+            // first business package, never "src" / "main".
+            if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) {
+                let j = pierce_jvm_layout(dirs, i);
+                if j < dirs.len() {
+                    return (dirs[j].to_string(), dirs[..=j].join("/"));
+                }
+                if i + 1 < dirs.len() {
+                    return (dirs[i + 1].to_string(), dirs[..=i + 1].join("/"));
+                }
+            }
             return (seg.to_string(), dirs[..=i].join("/"));
         }
     }
@@ -1388,6 +1496,43 @@ fn fallback_feature_token(path: &str) -> (String, String) {
     // the app/source root rather than leaking a layer name (`UI`, `ViewModel`)
     // as if it were a feature.
     (dirs[0].to_string(), dirs[0].to_string())
+}
+
+/// Given `dirs` and the index of a matched source root (`src`), return the
+/// index of the first *business* segment after piercing the Maven/Gradle
+/// source-set chain (`src/{main,test,commonMain,…}/{java,kotlin,…}`) and the
+/// JVM reverse-domain package prefix (`com/google/gson` → its sub-package,
+/// or the product segment for package-root files). Returns an index ==
+/// `dirs.len()` when nothing remains (caller falls back).
+fn pierce_jvm_layout(dirs: &[&str], src_idx: usize) -> usize {
+    const JVM_LANGS: &[&str] = &["java", "kotlin", "scala", "groovy"];
+    const TLDS: &[&str] = &["com", "org", "net", "io", "dev", "me", "co", "edu", "gov"];
+    let set = match dirs.get(src_idx + 1) {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return dirs.len(),
+    };
+    if !(set.ends_with("main") || set.ends_with("test") || set == "androidtest") {
+        return dirs.len();
+    }
+    let lang_idx = src_idx + 2;
+    if !dirs
+        .get(lang_idx)
+        .is_some_and(|s| JVM_LANGS.contains(&s.to_ascii_lowercase().as_str()))
+    {
+        return dirs.len();
+    }
+    // Package segments after the language dir.
+    let mut i = lang_idx + 1;
+    // Reverse-domain prefix: TLD + organisation.
+    if dirs.len() - i >= 2 && TLDS.contains(&dirs[i].to_ascii_lowercase().as_str()) {
+        i += 2;
+        // Product segment: only skipped when a deeper sub-package exists
+        // (`com/google/gson/stream` → stream; `com/google/gson` → gson).
+        if dirs.len() - i >= 2 {
+            i += 1;
+        }
+    }
+    i
 }
 
 /// Derive the business module a code/test path belongs to. Returns `None`
@@ -1414,9 +1559,16 @@ fn feature_key(path: &str) -> Option<FeatureKey> {
             return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
         }
     }
-    // 2) segment after a source root.
+    // 2) segment after a source root. Maven/Gradle structural chains
+    //    (`src/main/java`, `src/test/kotlin`, KMP's `src/commonMain/kotlin`)
+    //    and the JVM reverse-domain package prefix (`com/google/gson`) are
+    //    pierced first — "main" / "com" are never business tokens.
     for (i, seg) in dirs.iter().enumerate() {
         if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
+            let j = pierce_jvm_layout(&dirs, i);
+            if j < dirs.len() {
+                return Some(make_key(dirs[j], &dirs[..=j], true));
+            }
             return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
         }
     }
@@ -1779,6 +1931,197 @@ mod tests {
     }
 
     #[test]
+    fn name_module_prefers_dominant_file_stem_in_flat_layout() {
+        // Regression (Redis): a flat `src/` C codebase has no feature
+        // directories, so naming fell through to the highest-indegree
+        // *struct* — an internal data carrier like `AutoMemEntry` — which
+        // reads as noise. When one file in the community dominates the
+        // inbound references, its stem (`dict.c` → "dict") IS the module
+        // name the authors chose; prefer it over any symbol.
+        let files = vec!["src/dict.c".to_string(), "src/adlist.c".to_string()];
+        let n_core = node("c1", NodeKind::CFunction, &files[0], "dictAdd");
+        let n_core2 = node("c2", NodeKind::CFunction, &files[0], "dictCreate");
+        let n_struct = node("c3", NodeKind::CStruct, &files[1], "AutoMemEntry");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_core, &n_core2]);
+        file_symbols.insert(1, vec![&n_struct]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_core.id, 30);
+        indeg.insert(&n_core2.id, 12);
+        indeg.insert(&n_struct.id, 6);
+        let (disp, _pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "dict",
+            "dominant file stem must outrank an internal struct name: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_never_names_after_test_files_or_test_symbols() {
+        // Regression (gin): communities containing both production and test
+        // files got named "binding_test" / "teststruct" — the test file had
+        // the highest inbound-reference concentration (shared helpers), and
+        // its stem leaked into the business module name. Test scaffolding can
+        // never be the author's module name: prefer the busiest NON-test file
+        // (and never a struct that only lives in tests).
+        let files = vec![
+            "binding/binding_test.go".to_string(),
+            "binding/binding.go".to_string(),
+        ];
+        let n_helper = node("g1", NodeKind::GoFunction, &files[0], "createTestForm");
+        let n_struct = node("g2", NodeKind::GoStruct, &files[0], "TestStruct");
+        let n_core = node("g3", NodeKind::GoInterface, &files[1], "Binding");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_helper, &n_struct]);
+        file_symbols.insert(1, vec![&n_core]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        // Test helpers are referenced from dozens of test cases — far more
+        // than the production interface.
+        indeg.insert(&n_helper.id, 40);
+        indeg.insert(&n_struct.id, 25);
+        indeg.insert(&n_core.id, 9);
+        let (disp, _pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("binding"),
+            "module name must come from production code (binding.go / Binding), \
+             not test scaffolding: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_skips_python_dunder_files() {
+        // Regression (django): `django/forms/__init__.py` style re-export
+        // hubs attract the highest inbound-reference concentration in the
+        // community, so the dominant-file rule named a 2900-symbol module
+        // "Init". A dunder file is package plumbing, never the author's
+        // module name — the busiest real file must win instead.
+        let files = vec![
+            "django/forms/__init__.py".to_string(),
+            "django/forms/fields.py".to_string(),
+        ];
+        let n_hub = node("p1", NodeKind::PythonFunction, &files[0], "lazy_import");
+        let n_field = node("p2", NodeKind::PythonClass, &files[1], "CharField");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_hub]);
+        file_symbols.insert(1, vec![&n_field]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_hub.id, 50);
+        indeg.insert(&n_field.id, 20);
+        let (disp, pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("fields") || disp.eq_ignore_ascii_case("charfield"),
+            "dunder file must never name a module: got {disp}"
+        );
+        assert_eq!(pfx, "django/forms");
+    }
+
+    #[test]
+    fn feature_key_pierces_maven_layout_and_jvm_package_prefix() {
+        // Regression (gson): `gson/src/main/java/com/google/gson/stream/…`
+        // hit the SOURCE_ROOTS rule at `src` and took the next segment —
+        // "main" — as a trusted business token, naming a 728-symbol module
+        // "Main". The Maven/Gradle structural chain (`src/<set>/<lang>`) and
+        // the JVM reverse-domain package prefix must both be pierced.
+        let k = feature_key("gson/src/main/java/com/google/gson/stream/JsonReader.java")
+            .expect("feature key");
+        assert_eq!(k.display, "stream", "got {k:?}");
+        // Package-root files anchor to the product segment.
+        let k2 = feature_key("gson/src/main/java/com/google/gson/Gson.java").expect("feature key");
+        assert_eq!(k2.display, "gson", "got {k2:?}");
+        // Test sets pierce the same way.
+        let k3 = feature_key("gson/src/test/java/com/google/gson/functional/MapTest.java")
+            .expect("feature key");
+        assert_eq!(k3.display, "functional", "got {k3:?}");
+        // Non-JVM layouts keep the existing behaviour.
+        let k4 = feature_key("src/network/http.c").expect("feature key");
+        assert_eq!(k4.display, "network");
+        // The isolated-file fallback pierces the same way: a multi-module
+        // Maven repo (`extras/src/main/java/...`) must not name its bucket
+        // "src".
+        let (disp, _pfx) = fallback_feature_token(
+            "extras/src/main/java/com/google/gson/interceptors/Intercept.java",
+        );
+        assert_eq!(disp, "interceptors");
+    }
+
+    #[test]
+    fn production_dir_prefix_ignores_test_trees() {
+        // django: a community spanning `django/forms/**` and
+        // `tests/forms_tests/**` must report `django/forms`, not "".
+        let files = vec![
+            "django/forms/fields.py".to_string(),
+            "django/forms/widgets.py".to_string(),
+            "tests/forms_tests/test_fields.py".to_string(),
+        ];
+        assert_eq!(production_dir_prefix(&[0, 1, 2], &files), "django/forms");
+        // All-tests community still gets its honest common prefix.
+        let only_tests = vec![
+            "tests/forms_tests/test_a.py".to_string(),
+            "tests/forms_tests/test_b.py".to_string(),
+        ];
+        assert_eq!(
+            production_dir_prefix(&[0, 1], &only_tests),
+            "tests/forms_tests"
+        );
+    }
+
+    #[test]
+    fn name_module_large_community_uses_top_file_even_without_clear_dominance() {
+        // Redis's core community spans 40 files / 1789 symbols; references
+        // are spread out, so no file is 2× the runner-up. One struct
+        // (`AutoMemEntry`) still must not name 40 files — the busiest file
+        // (`server.c`) is the honest anchor.
+        let files: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 0 {
+                    "src/server.c".to_string()
+                } else {
+                    format!("src/f{i}.c")
+                }
+            })
+            .collect();
+        let nodes_owned: Vec<Node> = (0..20)
+            .map(|i| {
+                if i == 0 {
+                    node("s0", NodeKind::CFunction, &files[0], "initServer")
+                } else {
+                    node(
+                        &format!("s{i}"),
+                        if i == 1 {
+                            NodeKind::CStruct
+                        } else {
+                            NodeKind::CFunction
+                        },
+                        &files[i],
+                        if i == 1 { "AutoMemEntry" } else { "fn" },
+                    )
+                }
+            })
+            .collect();
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        for (i, n) in nodes_owned.iter().enumerate() {
+            file_symbols.insert(i, vec![n]);
+        }
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&nodes_owned[0].id, 10);
+        indeg.insert(&nodes_owned[1].id, 9); // struct close behind: no 2× dominance
+        let idxs: Vec<usize> = (0..20).collect();
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "server",
+            "large community must take top file stem: got {disp}"
+        );
+    }
+
+    #[test]
     fn name_module_never_names_a_module_after_a_callable() {
         // Regression (tailorx `FindNodeById`): a community whose only symbols are
         // callables — a Dart extension file's methods, or a lone test file's
@@ -1869,6 +2212,16 @@ mod tests {
         assert_eq!(slugify("ai-tryon"), "ai_tryon");
         assert_eq!(slugify("123abc"), "123abc");
         assert_eq!(slugify("!!!"), "module");
+    }
+
+    #[test]
+    fn strip_role_suffix_drops_error_and_exception() {
+        // A widely-thrown error enum has sky-high in-degree, but the business
+        // concept is the prefix, not the `Error` role.
+        assert_eq!(strip_role_suffix("PhotoCleanerError"), "PhotoCleaner");
+        assert_eq!(strip_role_suffix("AuthException"), "Auth");
+        // A type literally named `Error` keeps its name (length guard).
+        assert_eq!(strip_role_suffix("Error"), "Error");
     }
 
     #[test]

@@ -588,7 +588,12 @@ mod tests {
         // The symbol's `path` does not appear in `sources` — we must not
         // panic, just return no edges for it.
         let pay = method("lib/pay.dart", "Pay", "go", 1, 3);
-        let edges = compute_references(&[], &[pay.clone()], &[range_for(&pay)], &BTreeMap::new());
+        let edges = compute_references(
+            &[],
+            std::slice::from_ref(&pay),
+            &[range_for(&pay)],
+            &BTreeMap::new(),
+        );
         assert!(edges.is_empty());
     }
 

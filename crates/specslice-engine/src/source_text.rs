@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use specslice_core::language_traits::{language_of, Language};
+use specslice_core::language_traits::{language_of, lex_syntax, Language};
 use specslice_core::Node;
 
 /// The recovered source span of a graph node.
@@ -63,12 +63,6 @@ pub fn read_node_source(repo_root: &Path, node: &Node) -> Option<NodeSource> {
     })
 }
 
-/// True when this language uses `#` for line comments (Python). Everything
-/// else SpecSlice indexes uses `//` + `/* */`.
-fn uses_hash_comments(lang: Language) -> bool {
-    matches!(lang, Language::Python)
-}
-
 /// Replace comment and string-literal *contents* with spaces, preserving
 /// every `\n` (so the result has the same number of lines as the input and
 /// `out.lines().nth(i)` aligns with `src.lines().nth(i)`). Delimiters and
@@ -92,7 +86,10 @@ pub fn strip_noise(src: &str, lang: Language) -> String {
         Triple(char),
     }
 
-    let hash = uses_hash_comments(lang);
+    // Comment syntax comes from the central lexical descriptor (see
+    // `language_traits::lex_syntax`) so this stripper and the literal scanner
+    // agree on which languages use `#`.
+    let hash = lex_syntax(lang).uses_hash_comments();
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut state = State::Code;
@@ -192,6 +189,24 @@ pub fn strip_noise(src: &str, lang: Language) -> String {
         }
     }
     out
+}
+
+/// `snake_case` or `camelCase` with at least two words — enough signal to
+/// distinguish project code from ubiquitous platform API names. Shared by
+/// doc-drift verification and cross-file heuristic resolution, which both
+/// need the same "is this name project-specific?" judgement.
+pub fn is_multi_word_identifier(name: &str) -> bool {
+    if name.contains('_') {
+        return true;
+    }
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if prev_lower && c.is_ascii_uppercase() {
+            return true; // camelCase boundary
+        }
+        prev_lower = c.is_ascii_lowercase();
+    }
+    false
 }
 
 /// Split text into identifier tokens (`[A-Za-z0-9_]+`), in order. Used for

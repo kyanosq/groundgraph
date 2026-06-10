@@ -692,10 +692,8 @@ fn update_depth(line: &str, depth: &mut usize) {
             }
             '/' if chars.peek() == Some(&'/') => break, // line comment
             '{' => *depth += 1,
-            '}' => {
-                if *depth > 0 {
-                    *depth -= 1;
-                }
+            '}' if *depth > 0 => {
+                *depth -= 1;
             }
             _ => {}
         }

@@ -237,7 +237,10 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     recurse_callables: false,
     emit_nested_callables_with_metadata_only: false,
     call_idents_of: cpp_call_idents,
-    module_scoped_resolution: false,
+    // Same declaration/definition split as C (`.hpp` declares, `.cpp`
+    // defines), same flat-namespace fallback with uniqueness/multi-word/hub
+    // gates. Namespaced/qualified calls still resolve through the dotted path.
+    module_scoped_resolution: true,
     recurse_declined_callables: false,
     // `.h` is shared with C: claim a header only when it carries C++ constructs
     // (`namespace` / `class` / `::` / templates / access specifiers). The
@@ -294,8 +297,14 @@ mod tests {
         let s = scan(src);
         let structs = qnames(&s, NodeKind::CppStruct);
         let enums = qnames(&s, NodeKind::CppEnum);
-        assert!(structs.contains(&"Point".to_string()), "anon typedef struct: {structs:?}");
-        assert!(enums.contains(&"Letter".to_string()), "anon typedef enum: {enums:?}");
+        assert!(
+            structs.contains(&"Point".to_string()),
+            "anon typedef struct: {structs:?}"
+        );
+        assert!(
+            enums.contains(&"Letter".to_string()),
+            "anon typedef enum: {enums:?}"
+        );
         assert_eq!(
             structs.iter().filter(|n| *n == "Node").count(),
             1,

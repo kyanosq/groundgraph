@@ -76,6 +76,9 @@ enum Commands {
     GraphDiff(GraphDiffArgs),
     /// AI 澄清问题包 — 列出代码图里需要人 / Agent 确认的事实 (P19)。
     Questions(QuestionsArgs),
+    /// 管理面板 — 把概览 / 业务模块 / 功能簇 / 检查 / 死代码 / 待澄清 /
+    /// 纯度聚合成一个自包含的离线 HTML 文件，浏览器直接打开即可。
+    Dashboard(DashboardArgs),
     /// 行为事实抽取 (P24) — 从每个代码符号体里确定性地抽出分支 / 循环 /
     /// return / 比较 / 空值 / 抛出 / await 计数与「决策证据行」，并标注纯度。
     /// 重构 / 移植时用来补足「图里没有的行为」。
@@ -420,9 +423,16 @@ struct QuestionsArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct DashboardArgs {
+    /// 输出文件路径（默认 `.specslice/export/dashboard.html`）。
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
 struct FeaturesArgs {
-    /// 输出的最大簇数（默认 20）。
-    #[arg(long, value_name = "N", default_value_t = 20)]
+    /// 输出的最大簇数。0 = 按仓库规模自适应（约每 250 个符号 1 簇，20–80）。
+    #[arg(long, value_name = "N", default_value_t = 0)]
     max_clusters: usize,
     /// 标签传播的最大 BFS 深度（默认 3）。
     #[arg(long, value_name = "N", default_value_t = 3)]
@@ -1060,6 +1070,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Features(_) => "features",
         Commands::GraphDiff(_) => "graph-diff",
         Commands::Questions(_) => "questions",
+        Commands::Dashboard(_) => "dashboard",
         Commands::Facts(_) => "facts",
         Commands::Purity(_) => "purity",
         Commands::Constants(_) => "constants",
@@ -1290,6 +1301,13 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 repo_root: cli.repo_root.clone(),
                 max_per_category: args.max_per_category,
                 format: args.format,
+            })
+            .map(|()| 0)
+        }
+        Commands::Dashboard(args) => {
+            commands::dashboard::run(commands::dashboard::DashboardRunArgs {
+                repo_root: cli.repo_root.clone(),
+                out: args.out,
             })
             .map(|()| 0)
         }

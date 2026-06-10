@@ -57,7 +57,9 @@ impl Default for FeatureMapOptions {
     fn default() -> Self {
         Self {
             repo_root: PathBuf::from("."),
-            max_clusters: 20,
+            // 0 = auto: scale with repo size (~1 cluster / 250 code
+            // symbols, clamped to [20, 80]).
+            max_clusters: 0,
             max_propagation_depth: 3,
             min_cluster_size: 3,
         }
@@ -138,6 +140,11 @@ pub fn analyze_feature_map_with_store(
         in_edges.entry(&edge.to_id).or_default().push(edge);
     }
 
+    let code_node_count = nodes
+        .iter()
+        .filter(|n| specslice_core::is_code_symbol(n.kind))
+        .count();
+
     // ---- score every potential seed ---------------------------
     let mut seeds: Vec<(ArtifactId, u32, String, Vec<String>)> = Vec::new();
     for node in &nodes {
@@ -151,35 +158,65 @@ pub fn analyze_feature_map_with_store(
         let Some(path) = node.path.clone() else {
             continue;
         };
-        // Each file's score = sum of framework roles inside it, plus a small
-        // bump per test (a file with 10 tests probably represents a coherent
-        // feature surface). Both come from one descendant walk.
+        // Test files consume features, they are not features: a test file
+        // dense with TestCases used to outscore every business file and
+        // cluster #1 became `test/...`. Tests still join clusters as
+        // members through the BFS; they just never anchor one.
+        if crate::path_class::is_test_path(&path) {
+            continue;
+        }
+        // Each file's score = sum of framework roles inside it, plus how
+        // referenced the file (or anything in it) is from *other* files —
+        // graph centrality, not directory shape, marks a feature core.
         let descendants = collect_descendants(&out_edges, &node.id);
+        let mut inside: BTreeSet<&ArtifactId> = descendants.iter().copied().collect();
+        inside.insert(&node.id);
         let mut score: u32 = 1;
         let mut roles: BTreeSet<String> = BTreeSet::new();
-        let mut test_count: usize = 0;
-        for &d in &descendants {
-            let Some(desc) = nodes_by_id.get(d).copied() else {
-                continue;
-            };
-            if let Some(metadata) = &desc.metadata_json {
-                if let Some(family) = framework_family(metadata) {
-                    score += 5;
-                    roles.insert(family);
+        let mut external_refs: usize = 0;
+        for &d in inside.iter() {
+            if let Some(desc) = nodes_by_id.get(d).copied() {
+                if let Some(metadata) = &desc.metadata_json {
+                    if let Some(family) = framework_family(metadata) {
+                        score += 5;
+                        roles.insert(family);
+                    }
                 }
             }
-            if matches!(desc.kind, NodeKind::TestCase | NodeKind::TestGroup) {
-                test_count += 1;
+            if let Some(ins) = in_edges.get(d) {
+                for e in ins {
+                    if matches!(
+                        e.kind,
+                        EdgeKind::Calls | EdgeKind::References | EdgeKind::Imports
+                    ) && !inside.contains(&e.from_id)
+                    {
+                        external_refs += 1;
+                    }
+                }
             }
         }
-        score += u32::try_from(test_count.min(20)).unwrap_or(20);
+        score += u32::try_from(external_refs.min(20)).unwrap_or(20);
         seeds.push((node.id.clone(), score, path, roles.into_iter().collect()));
     }
     let total_seeds = seeds.len();
 
     // Sort by score descending, then path ascending for stable output.
     seeds.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-    seeds.truncate(options.max_clusters);
+    // One seed per file: a file node and a class inside it would otherwise
+    // both anchor near-identical clusters under the same name.
+    {
+        let mut seen_paths: BTreeSet<String> = BTreeSet::new();
+        seeds.retain(|(_, _, path, _)| seen_paths.insert(path.clone()));
+    }
+    // `max_clusters == 0` means auto: scale with repo size so a 200k-line
+    // codebase is not squeezed into the same 20 clusters as a toy app.
+    // ~1 cluster per 250 code symbols, clamped to [20, 80].
+    let max_clusters = if options.max_clusters == 0 {
+        (code_node_count / 250).clamp(20, 80)
+    } else {
+        options.max_clusters
+    };
+    seeds.truncate(max_clusters);
 
     // ---- propagate labels --------------------------------------
     // Each assignment carries (cluster_idx, seed_score, distance_from_seed).
@@ -390,6 +427,163 @@ fn derive_cluster_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use specslice_core::EdgeSource;
+    use tempfile::TempDir;
+
+    fn store_with(
+        nodes: &[(&str, NodeKind, &str)],
+        edges: &[(&str, &str, EdgeKind)],
+    ) -> (Store, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        for (id, kind, path) in nodes {
+            let mut n = Node::new(ArtifactId::new(*id), *kind);
+            n.path = Some((*path).to_string());
+            n.name = Some(id.rsplit("::").next().unwrap_or(id).to_string());
+            store.upsert_node(&n).unwrap();
+        }
+        for (from, to, kind) in edges {
+            let e = EdgeAssertion::fact(
+                ArtifactId::new(*from),
+                ArtifactId::new(*to),
+                *kind,
+                EdgeSource::LanguageAdapter,
+            );
+            store.upsert_edge(&e).unwrap();
+        }
+        (store, dir)
+    }
+
+    #[test]
+    fn max_clusters_zero_scales_with_repo_size() {
+        // 0 = auto. A large repo (Redis: ~7k symbols) must not be squeezed
+        // into 20 clusters; a small repo keeps the floor of 20.
+        let mut nodes: Vec<(String, NodeKind, String)> = Vec::new();
+        let mut edges: Vec<(String, String, EdgeKind)> = Vec::new();
+        // 30 files × 250 symbols each = 7500 code symbols → cap 30 clusters.
+        for f in 0..30 {
+            let file = format!("file::src/m{f}.c");
+            nodes.push((file.clone(), NodeKind::File, format!("src/m{f}.c")));
+            for s in 0..250 {
+                let id = format!("c::src/m{f}.c::fn{s}");
+                nodes.push((id.clone(), NodeKind::CFunction, format!("src/m{f}.c")));
+                edges.push((file.clone(), id, EdgeKind::Contains));
+            }
+        }
+        let node_refs: Vec<(&str, NodeKind, &str)> = nodes
+            .iter()
+            .map(|(id, k, p)| (id.as_str(), *k, p.as_str()))
+            .collect();
+        let edge_refs: Vec<(&str, &str, EdgeKind)> = edges
+            .iter()
+            .map(|(f, t, k)| (f.as_str(), t.as_str(), *k))
+            .collect();
+        let (store, _dir) = store_with(&node_refs, &edge_refs);
+        let map = analyze_feature_map_with_store(
+            &store,
+            &FeatureMapOptions {
+                max_clusters: 0,
+                ..FeatureMapOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            map.stats.clusters_reported > 20,
+            "7500-symbol repo must report more than the legacy 20 clusters, got {}",
+            map.stats.clusters_reported
+        );
+    }
+
+    #[test]
+    fn test_files_never_seed_clusters() {
+        // A test file stuffed with TestCases used to outscore every business
+        // file (its own cases counted as "coverage"), so cluster #1 became
+        // `test/...`. Test files are consumers of features, not features.
+        let mut nodes: Vec<(String, NodeKind, String)> = vec![
+            (
+                "file::test/a_test.dart".into(),
+                NodeKind::File,
+                "test/a_test.dart".into(),
+            ),
+            (
+                "file::lib/core.dart".into(),
+                NodeKind::File,
+                "lib/core.dart".into(),
+            ),
+            (
+                "dart::lib/core.dart::Core".into(),
+                NodeKind::DartClass,
+                "lib/core.dart".into(),
+            ),
+            (
+                "file::lib/user.dart".into(),
+                NodeKind::File,
+                "lib/user.dart".into(),
+            ),
+            (
+                "dart::lib/user.dart::Usage".into(),
+                NodeKind::DartFunction,
+                "lib/user.dart".into(),
+            ),
+        ];
+        let mut edges: Vec<(String, String, EdgeKind)> = vec![
+            (
+                "file::lib/core.dart".into(),
+                "dart::lib/core.dart::Core".into(),
+                EdgeKind::Contains,
+            ),
+            (
+                "file::lib/user.dart".into(),
+                "dart::lib/user.dart::Usage".into(),
+                EdgeKind::Contains,
+            ),
+            // external usage makes lib/core.dart the natural top seed
+            (
+                "dart::lib/user.dart::Usage".into(),
+                "dart::lib/core.dart::Core".into(),
+                EdgeKind::Calls,
+            ),
+        ];
+        for i in 0..10 {
+            let id = format!("test::test/a_test.dart::case{i}");
+            nodes.push((id.clone(), NodeKind::TestCase, "test/a_test.dart".into()));
+            edges.push(("file::test/a_test.dart".into(), id, EdgeKind::Contains));
+        }
+        let node_refs: Vec<(&str, NodeKind, &str)> = nodes
+            .iter()
+            .map(|(a, k, p)| (a.as_str(), *k, p.as_str()))
+            .collect();
+        let edge_refs: Vec<(&str, &str, EdgeKind)> = edges
+            .iter()
+            .map(|(f, t, k)| (f.as_str(), t.as_str(), *k))
+            .collect();
+        let (store, _dir) = store_with(&node_refs, &edge_refs);
+
+        let map = analyze_feature_map_with_store(
+            &store,
+            &FeatureMapOptions {
+                min_cluster_size: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            map.clusters
+                .iter()
+                .all(|c| !crate::path_class::is_test_path(&c.seed_path)),
+            "seeds={:?}",
+            map.clusters
+                .iter()
+                .map(|c| c.seed_path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            map.clusters.first().map(|c| c.seed_path.as_str()),
+            Some("lib/core.dart"),
+            "referenced business file should rank first"
+        );
+    }
 
     #[test]
     fn derive_cluster_name_drops_outer_dirs_and_extensions() {

@@ -436,9 +436,19 @@ func New() *Repo {
                    type Any interface{}\n";
         let s = scan(src);
         let methods = qnames(&s, NodeKind::GoMethod);
-        assert!(methods.contains(&"Container.Get".to_string()), "{methods:?}");
-        assert!(methods.contains(&"Container.Put".to_string()), "{methods:?}");
-        assert_eq!(methods.len(), 2, "constraint/empty interfaces add no methods: {methods:?}");
+        assert!(
+            methods.contains(&"Container.Get".to_string()),
+            "{methods:?}"
+        );
+        assert!(
+            methods.contains(&"Container.Put".to_string()),
+            "{methods:?}"
+        );
+        assert_eq!(
+            methods.len(),
+            2,
+            "constraint/empty interfaces add no methods: {methods:?}"
+        );
     }
 
     #[test]
@@ -447,8 +457,14 @@ func New() *Repo {
         // fields as callables (fields are `field_declaration`, not callables).
         let src = "package p\ntype T struct {\n\tName string\n\tFn func() int\n}\n";
         let s = scan(src);
-        assert!(qnames(&s, NodeKind::GoMethod).is_empty(), "no methods from a struct");
-        assert!(qnames(&s, NodeKind::GoFunction).is_empty(), "no functions from struct fields");
+        assert!(
+            qnames(&s, NodeKind::GoMethod).is_empty(),
+            "no methods from a struct"
+        );
+        assert!(
+            qnames(&s, NodeKind::GoFunction).is_empty(),
+            "no functions from struct fields"
+        );
         assert!(qnames(&s, NodeKind::GoStruct).contains(&"T".to_string()));
     }
 

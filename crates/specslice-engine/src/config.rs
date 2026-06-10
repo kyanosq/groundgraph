@@ -537,6 +537,19 @@ pub struct ChecksConfig {
     pub missing_linked_test_level: String,
     #[serde(default = "default_orphan_requirement_level")]
     pub orphan_requirement_level: String,
+    /// `doc_stale_code_ref` — doc body references a missing path/symbol.
+    #[serde(default = "default_stale_doc_ref_level")]
+    pub stale_doc_ref_level: String,
+    /// `requirement_implementation_hint` — orphan requirements get graph
+    /// suggestions (or a likely-gap callout).
+    #[serde(default = "default_requirement_hint_level")]
+    pub requirement_hint_level: String,
+    /// Glob patterns suppressing `doc_stale_code_ref`. A pattern is matched
+    /// against the *referenced* path and against the *document's own* path,
+    /// so `legacy/**` mutes refs into legacy code and `docs/external/**`
+    /// mutes whole documents that narrate another repository.
+    #[serde(default)]
+    pub doc_drift_ignore: Vec<String>,
 }
 
 impl Default for ChecksConfig {
@@ -545,6 +558,9 @@ impl Default for ChecksConfig {
             broken_link_level: default_broken_link_level(),
             missing_linked_test_level: default_missing_linked_test_level(),
             orphan_requirement_level: default_orphan_requirement_level(),
+            stale_doc_ref_level: default_stale_doc_ref_level(),
+            requirement_hint_level: default_requirement_hint_level(),
+            doc_drift_ignore: Vec::new(),
         }
     }
 }
@@ -557,6 +573,12 @@ fn default_missing_linked_test_level() -> String {
 }
 fn default_orphan_requirement_level() -> String {
     "warning".into()
+}
+fn default_stale_doc_ref_level() -> String {
+    "warning".into()
+}
+fn default_requirement_hint_level() -> String {
+    "info".into()
 }
 
 /// Configuration consumed by `specslice dead-code` (P7).

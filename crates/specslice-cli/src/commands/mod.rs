@@ -5,6 +5,7 @@ pub mod connect;
 pub mod constants;
 pub mod context;
 pub mod contract;
+pub mod dashboard;
 pub mod dead_code;
 pub mod export;
 pub mod facts;

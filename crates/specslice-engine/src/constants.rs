@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use specslice_core::language_traits::{is_callable, is_type, Language};
+use specslice_core::language_traits::{is_callable, is_type, lex_syntax, Language};
 use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
@@ -227,11 +227,12 @@ const MAX_STR_LEN: usize = 120;
 /// (string vs char/lifetime) and comment syntax. Heuristic, deterministic,
 /// dependency-free.
 pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
-    let hash = matches!(lang, Language::Python);
-    let single_is_string = matches!(
-        lang,
-        Language::Dart | Language::Python | Language::Typescript
-    );
+    // Lexical facts (which langs use `#` comments / treat `'…'` as a string)
+    // live in `language_traits::lex_syntax` — the single source of truth — so
+    // this scanner and `source_text::strip_noise` can never drift apart.
+    let lex = lex_syntax(lang);
+    let hash = lex.uses_hash_comments();
+    let single_is_string = lex.single_quote_is_string();
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
@@ -369,7 +370,7 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
         }
         // Numbers --------------------------------------------------------
         let starts_number = (c.is_ascii_digit() && !prev_word)
-            || (c == '.' && !prev_word && next.map_or(false, |x| x.is_ascii_digit()));
+            || (c == '.' && !prev_word && next.is_some_and(|x| x.is_ascii_digit()));
         if starts_number {
             let start = i;
             let mut seen_dot = c == '.';
@@ -384,7 +385,7 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
                     i += 1;
                 } else if d == '.'
                     && !seen_dot
-                    && chars.get(i + 1).map_or(false, |x| x.is_ascii_digit())
+                    && chars.get(i + 1).is_some_and(|x| x.is_ascii_digit())
                 {
                     seen_dot = true;
                     i += 1;

@@ -21,3 +21,18 @@ languages:
 enrichment:
   lsp: false
   analyzer: false
+
+checks:
+  # doc→code 漂移检查的豁免清单：
+  # - docs/plans/**、docs/superpowers/**、docs/implementation-plan.md 是阶段
+  #   日志/历史档案，记录的是"当时"的文件名与路径，不随重构改写。
+  # - docs/sourcecode/**、docs/codegraph-benchmark-and-roadmap.md 是对外部
+  #   仓库的分析笔记，引用的是别人仓库的文件。
+  # - docs/watermark.md 是 PRD 中 PixCraft 示例仓库的假想路径。
+  doc_drift_ignore:
+    - "docs/plans/**"
+    - "docs/superpowers/**"
+    - "docs/implementation-plan.md"
+    - "docs/sourcecode/**"
+    - "docs/codegraph-benchmark-and-roadmap.md"
+    - "docs/watermark.md"

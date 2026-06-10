@@ -4,7 +4,7 @@ use specslice_core::{
     ArtifactId, EdgeAssertion, EdgeKind, EdgeSource, Evidence, EvidenceKind, Node, NodeKind,
     SymbolRange,
 };
-use specslice_store::{FileIndexEntry, Store};
+use specslice_store::{FileIndexEntry, FulltextRow, Store};
 use tempfile::TempDir;
 
 fn fresh_store() -> (TempDir, Store) {
@@ -419,5 +419,79 @@ fn decoding_a_corrupted_line_number_returns_an_error_not_silent_wrap() {
     assert!(
         msg_lc.contains("line") || msg_lc.contains("range") || msg_lc.contains("u32"),
         "unexpected error: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fulltext (FTS5) content layer — the search engine's BM25-ranked body index.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fulltext_rebuild_then_match_ranks_bodies_by_bm25() {
+    let (_tmp, mut store) = fresh_store();
+    assert!(
+        store.fulltext_available().expect("availability probe"),
+        "after migrate() the FTS5 table must exist"
+    );
+    store
+        .rebuild_fulltext(&[
+            FulltextRow {
+                node_id: "rust::a.rs::parse_sql_tables".into(),
+                body: "advance past whole parens byte boundary panic fix".into(),
+            },
+            FulltextRow {
+                node_id: "rust::b.rs::unrelated".into(),
+                body: "completely different words about routing".into(),
+            },
+            FulltextRow {
+                node_id: "doc::guide.md#搜索".into(),
+                body: "错位 位竞 竞争 strategy notes".into(),
+            },
+        ])
+        .expect("rebuild fulltext");
+
+    // Single-token match hits exactly the body that contains it, best first.
+    let hits = store
+        .fulltext_match("\"boundary\"", 10)
+        .expect("match boundary");
+    assert_eq!(hits.len(), 1, "exactly one body mentions `boundary`");
+    assert_eq!(hits[0].node_id, "rust::a.rs::parse_sql_tables");
+
+    // AND expression must require all tokens.
+    let hits = store
+        .fulltext_match("\"byte\" \"boundary\" \"panic\"", 10)
+        .expect("AND match");
+    assert_eq!(hits.len(), 1);
+
+    // Pre-tokenised CJK bigrams round-trip.
+    let hits = store
+        .fulltext_match("\"错位\" \"竞争\"", 10)
+        .expect("cjk bigram match");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node_id, "doc::guide.md#搜索");
+
+    // Rebuild replaces all prior rows (no stale leftovers).
+    store
+        .rebuild_fulltext(&[FulltextRow {
+            node_id: "rust::c.rs::fresh".into(),
+            body: "fresh only".into(),
+        }])
+        .expect("second rebuild");
+    let hits = store.fulltext_match("\"boundary\"", 10).expect("match");
+    assert!(hits.is_empty(), "old rows must be gone after rebuild");
+}
+
+#[test]
+fn fulltext_match_is_unavailable_not_an_error_on_a_pre_fts_database() {
+    // A database that never ran migration 003 (e.g. created by an older
+    // binary) has no `node_fts`. Read commands must degrade ("no content
+    // layer"), never crash. `Store::open` without `migrate()` gives exactly
+    // that shape.
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("graph.db");
+    let store = Store::open(&path).expect("open pre-fts db");
+    assert!(
+        !store.fulltext_available().expect("probe"),
+        "node_fts absent → content layer unavailable"
     );
 }

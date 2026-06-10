@@ -506,7 +506,7 @@ fn only_a_helper() {}
         // Calls / References overlay is available uniformly across the
         // tree-sitter backends.
         use crate::treesitter::{no_call_idents, LangSpec};
-        let default = no_call_idents as usize;
+        let default = no_call_idents as *const () as usize;
         let specs: [(&str, &LangSpec); 9] = [
             ("rust", &RUST_SPEC),
             ("python", &crate::python_treesitter::PYTHON_SPEC),

@@ -304,10 +304,12 @@ fn clear_language_outputs(scip_dir: &Path, language: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let is_output = name == exact
-            || (name.starts_with(&numbered)
-                && name.ends_with(".scip")
-                && name[numbered.len()..name.len() - ".scip".len()]
+        // `.scip` outputs plus their `.scip.inputs` staleness sidecars.
+        let stem = name.strip_suffix(".inputs").unwrap_or(name);
+        let is_output = stem == exact
+            || (stem.starts_with(&numbered)
+                && stem.ends_with(".scip")
+                && stem[numbered.len()..stem.len() - ".scip".len()]
                     .chars()
                     .all(|c| c.is_ascii_digit()));
         if is_output {
@@ -339,6 +341,11 @@ fn binary_on_path(name: &str) -> Option<PathBuf> {
 pub enum ScipRunStatus {
     /// The indexer ran and wrote its `.scip`.
     Generated,
+    /// Sources unchanged since the last successful run — the existing
+    /// `.scip` was reused without spawning the indexer. SCIP indexers are
+    /// full type-checkers (scip-python on django: ~4 min / 3.9 GB), so this
+    /// is the difference between "re-index is free" and "re-index hurts".
+    UpToDate,
     /// Binary absent / not configured — structure-only for this language.
     Skipped(String),
     /// No auto-invoke spec (ingest a hand-placed `.scip` instead).
@@ -376,13 +383,40 @@ pub fn run_indexers(repo_root: &Path, languages: &[String]) -> Vec<ScipRunOutcom
             continue;
         }
         let plans = plan_language(language, repo_root, &scip_dir, &|b| binary_on_path(b));
+        // Incremental gate: when EVERY runnable plan's source digest matches
+        // the digest recorded by the last successful run (and its `.scip` is
+        // still on disk), reuse the whole language's outputs without spawning
+        // anything. Mixed staleness re-runs everything for the language —
+        // half-old half-new outputs would be confusing to debug.
+        let runnable: Vec<&ScipRunPlan> = plans
+            .iter()
+            .filter(|p| matches!(p, ScipRunPlan::Runnable { .. }))
+            .collect();
+        let all_up_to_date = !runnable.is_empty()
+            && runnable.iter().all(|p| {
+                let ScipRunPlan::Runnable { cwd, out, .. } = p else {
+                    return false;
+                };
+                out.is_file()
+                    && stored_inputs_digest(out)
+                        .is_some_and(|prev| prev == inputs_digest(cwd, language))
+            });
+        if all_up_to_date {
+            for plan in plans {
+                if let ScipRunPlan::Runnable { language, out, .. } = plan {
+                    outcomes.push(ScipRunOutcome {
+                        language,
+                        status: ScipRunStatus::UpToDate,
+                        output: Some(out),
+                    });
+                }
+            }
+            continue;
+        }
         // Clear this language's prior outputs before regenerating, but only when
         // we actually have a runnable plan — an absent indexer (all-Skipped)
         // leaves any previously generated index untouched.
-        if plans
-            .iter()
-            .any(|p| matches!(p, ScipRunPlan::Runnable { .. }))
-        {
+        if !runnable.is_empty() {
             clear_language_outputs(&scip_dir, language);
         }
         for plan in plans {
@@ -416,13 +450,93 @@ pub fn run_indexers(repo_root: &Path, languages: &[String]) -> Vec<ScipRunOutcom
                         });
                         continue;
                     }
-                    execute(&program, &args, &cwd, &out, writes_cwd_index, language)
+                    let digest = inputs_digest(&cwd, &language);
+                    let outcome = execute(&program, &args, &cwd, &out, writes_cwd_index, language);
+                    if matches!(outcome.status, ScipRunStatus::Generated) {
+                        store_inputs_digest(&out, digest);
+                    }
+                    outcome
                 }
             };
             outcomes.push(outcome);
         }
     }
     outcomes
+}
+
+/// File extensions whose content feeds each language's SCIP indexer. Only
+/// these participate in the staleness digest.
+fn language_source_exts(language: &str) -> &'static [&'static str] {
+    match language {
+        "rust" => &["rs"],
+        "go" => &["go", "mod", "sum"],
+        "typescript" => &["ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "json"],
+        "python" => &["py", "pyi", "toml", "cfg"],
+        "dart" => &["dart", "yaml"],
+        _ => &[],
+    }
+}
+
+/// Digest of every relevant source file under `cwd` for `language`:
+/// `(relative path, length, mtime)` tuples hashed in sorted order — the same
+/// staleness contract `make`/`ninja` use. Content is NOT read: a digest of a
+/// 3 000-file tree costs milliseconds. Collisions (touch without change)
+/// only cause a redundant re-run, never a stale overlay.
+fn inputs_digest(cwd: &Path, language: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let exts = language_source_exts(language);
+    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    for entry in walkdir::WalkDir::new(cwd)
+        .into_iter()
+        .filter_entry(|e| !is_skipped_module_scan_dir(e))
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !exts.contains(&ext.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let rel = path
+            .strip_prefix(cwd)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        entries.push((rel, meta.len(), mtime));
+    }
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    language.hash(&mut hasher);
+    entries.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `<out>.inputs` sidecar holding the digest of the run that produced `out`.
+fn inputs_sidecar(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_owned();
+    s.push(".inputs");
+    PathBuf::from(s)
+}
+
+fn stored_inputs_digest(out: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(inputs_sidecar(out)).ok()?;
+    u64::from_str_radix(text.trim(), 16).ok()
+}
+
+fn store_inputs_digest(out: &Path, digest: u64) {
+    // Best-effort: a failed write only means the next run is not skipped.
+    let _ = std::fs::write(inputs_sidecar(out), format!("{digest:x}"));
 }
 
 /// Run one indexer subprocess and classify the result.
@@ -465,11 +579,14 @@ fn execute(
             }
         }
         Ok(o) => {
-            let tail = String::from_utf8_lossy(&o.stderr);
-            let tail = tail.lines().last().unwrap_or("").trim().to_string();
+            let summary = summarize_stderr(&o.stderr);
+            let mut msg = format!("退出码 {}: {summary}", o.status);
+            if let Some(hint) = scip_failure_hint(program, &summary) {
+                msg.push_str(&format!("（{hint}）"));
+            }
             ScipRunOutcome {
                 language,
-                status: ScipRunStatus::Failed(format!("退出码 {}: {tail}", o.status)),
+                status: ScipRunStatus::Failed(msg),
                 output: None,
             }
         }
@@ -481,16 +598,148 @@ fn execute(
     }
 }
 
+/// Distil an indexer's stderr into one actionable line. Indexers print the real
+/// cause first and then a stack trace, so the *last* line is often a useless
+/// frame (`9: _main`); prefer the first line that mentions an error, falling
+/// back to the first non-empty line. Capped so a wall of output never floods the
+/// `index` summary.
+fn summarize_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let pick = text
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let low = l.to_ascii_lowercase();
+            low.starts_with("error") || low.contains("error:")
+        })
+        .or_else(|| text.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("");
+    const MAX: usize = 240;
+    if pick.chars().count() > MAX {
+        let truncated: String = pick.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        pick.to_string()
+    }
+}
+
+/// A targeted, actionable hint for well-known indexer failures, appended to the
+/// summary. Today: the rustup `rust-analyzer` proxy failing because the repo's
+/// pinned toolchain lacks the component — common in Rust repos with a
+/// `rust-toolchain.toml`. The structural graph is unaffected either way.
+fn scip_failure_hint(program: &str, summary: &str) -> Option<String> {
+    let low = summary.to_ascii_lowercase();
+    if program.contains("rust-analyzer")
+        && (low.contains("unknown binary")
+            || low.contains("toolchain")
+            || low.contains("no such")
+            || low.contains("not found"))
+    {
+        return Some(
+            "精确层可选：`rustup component add rust-analyzer`，或装独立 rust-analyzer 后设 \
+             SPECSLICE_SCIP_RUST_BIN 指向它；结构图不受影响"
+                .to_string(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn always_found(path: &str) -> Box<dyn Fn(&str) -> Option<PathBuf>> {
+    /// Stub binary resolver used by the planner tests.
+    type BinFinder = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
+    #[test]
+    fn summarize_stderr_prefers_the_error_line_over_a_backtrace_tail() {
+        // rust-analyzer prints the cause first, then a panic backtrace whose
+        // last line (`9: _main`) is useless — the old `lines().last()` surfaced
+        // exactly that.
+        let stderr = b"error: could not find Cargo.toml\n   1: foo\n   9: _main\n";
+        let s = summarize_stderr(stderr);
+        assert!(s.contains("could not find Cargo.toml"), "got: {s}");
+        assert!(
+            !s.contains("_main"),
+            "must not surface the backtrace tail: {s}"
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_toolchain_failure_gets_an_actionable_hint() {
+        let summary = "error: Unknown binary 'rust-analyzer' in official toolchain '1.96.0'.";
+        let hint = scip_failure_hint("/home/u/.cargo/bin/rust-analyzer", summary)
+            .expect("rust-analyzer toolchain error must yield a hint");
+        assert!(hint.contains("rustup component add rust-analyzer"));
+        // An unrelated indexer error gets no (misleading) hint.
+        assert!(scip_failure_hint("/usr/bin/scip-go", "error: boom").is_none());
+    }
+
+    fn always_found(path: &str) -> BinFinder {
         let path = path.to_string();
         Box::new(move |_bin: &str| Some(PathBuf::from(&path)))
     }
 
-    fn never_found() -> Box<dyn Fn(&str) -> Option<PathBuf>> {
+    #[test]
+    fn second_run_with_unchanged_sources_is_up_to_date_and_does_not_respawn() {
+        // scip-python on django costs ~4 minutes / 3.9 GB; an unchanged tree
+        // must reuse the previous `.scip` instead of paying that again.
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("a.py"), "def f():\n    return 1\n").unwrap();
+        // Fake indexer: appends one line to `calls.log`, writes the output
+        // file given as the last argv (mirrors `--output <out>`).
+        let fake = repo.join("fake-scip.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho run >> \"$(dirname \"$0\")/calls.log\"\n\
+             for last; do :; done\necho scip > \"$last\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env_key = env_override_for("python");
+        std::env::set_var(&env_key, &fake);
+
+        let calls = || {
+            std::fs::read_to_string(repo.join("calls.log"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let r1 = run_indexers(repo, &["python".to_string()]);
+        assert!(
+            matches!(r1[0].status, ScipRunStatus::Generated),
+            "first run generates: {:?}",
+            r1[0].status
+        );
+        assert_eq!(calls(), 1);
+
+        let r2 = run_indexers(repo, &["python".to_string()]);
+        assert!(
+            matches!(r2[0].status, ScipRunStatus::UpToDate),
+            "unchanged tree reuses the output: {:?}",
+            r2[0].status
+        );
+        assert_eq!(calls(), 1, "indexer must not respawn on an unchanged tree");
+        assert!(r2[0].output.as_ref().is_some_and(|p| p.is_file()));
+
+        // Touching a source invalidates the digest and re-runs the indexer.
+        std::fs::write(repo.join("a.py"), "def f():\n    return 2\n").unwrap();
+        let r3 = run_indexers(repo, &["python".to_string()]);
+        assert!(
+            matches!(r3[0].status, ScipRunStatus::Generated),
+            "changed tree regenerates: {:?}",
+            r3[0].status
+        );
+        assert_eq!(calls(), 2);
+
+        std::env::remove_var(&env_key);
+    }
+
+    fn never_found() -> BinFinder {
         Box::new(|_bin: &str| None)
     }
 
@@ -565,7 +814,12 @@ mod tests {
         // Python layer over an upstream NPE.
         let repo = PathBuf::from("/repo");
         let scip = repo.join(".specslice/scip");
-        let plan = plan_with("python", &repo, &scip, &*always_found("/usr/bin/scip-python"));
+        let plan = plan_with(
+            "python",
+            &repo,
+            &scip,
+            &*always_found("/usr/bin/scip-python"),
+        );
         match plan {
             ScipRunPlan::Runnable { args, .. } => {
                 let v = args.iter().position(|a| a == "--project-version");
@@ -605,9 +859,7 @@ mod tests {
         let plans = plan_language("go", repo, &scip, &*always_found("/usr/bin/scip-go"));
         assert_eq!(plans.len(), 1, "one module → one plan");
         match &plans[0] {
-            ScipRunPlan::Runnable {
-                cwd, out, args, ..
-            } => {
+            ScipRunPlan::Runnable { cwd, out, args, .. } => {
                 assert_eq!(cwd, &repo.join("asc-cli"), "scip-go runs in the module dir");
                 assert_eq!(out, &scip.join("go.scip"));
                 assert_eq!(
@@ -689,7 +941,12 @@ mod tests {
         std::fs::write(repo.join("sub/go.mod"), "module x\n").unwrap();
         let scip = repo.join(".specslice/scip");
 
-        let plans = plan_language("python", repo, &scip, &*always_found("/usr/bin/scip-python"));
+        let plans = plan_language(
+            "python",
+            repo,
+            &scip,
+            &*always_found("/usr/bin/scip-python"),
+        );
         assert_eq!(plans.len(), 1);
         let (cwds, outs) = runnable_cwds_outs(&plans);
         assert_eq!(cwds, vec![repo.to_path_buf()]);

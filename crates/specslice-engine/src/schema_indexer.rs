@@ -1274,8 +1274,7 @@ pub fn extract_sql_table_refs(sql: &str) -> Vec<String> {
                 while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                     j += 1;
                 }
-                if lower[j..].starts_with("into")
-                    && bytes.get(j + 4).map_or(true, |c| !is_ident(*c))
+                if lower[j..].starts_with("into") && bytes.get(j + 4).is_none_or(|c| !is_ident(*c))
                 {
                     i = j + 4;
                 }
@@ -1541,11 +1540,11 @@ pub fn parse_sql_tables(text: &str) -> Vec<ParsedTable> {
             continue;
         }
         // Find the opening paren of the column list.
-        let mut j = skip_ws(bytes, after_name);
+        let j = skip_ws(bytes, after_name);
         if j >= bytes.len() || bytes[j] != b'(' {
             continue;
         }
-        let Some((body, _end)) = balanced_parens(bytes, j) else {
+        let Some((body, end)) = balanced_parens(bytes, j) else {
             continue;
         };
         let columns = parse_sql_columns(body);
@@ -1555,8 +1554,11 @@ pub fn parse_sql_tables(text: &str) -> Vec<ParsedTable> {
             source: "sql",
             line: line_of(text, header),
         });
-        j += body.len();
-        search_from = search_from.max(j);
+        // Advance past the whole `(...)` using the closing-paren index returned
+        // by `balanced_parens`. Computing `j + body.len()` instead landed one
+        // byte before `)` — inside the body's last char when it was multi-byte —
+        // making the next `lower[search_from..]` slice mid-char and panic.
+        search_from = search_from.max(end);
     }
     out
 }
@@ -1612,8 +1614,8 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
 
     for (idx, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        let opens = line.matches('{').count() as i32;
-        let closes = line.matches('}').count() as i32;
+        let opens = i32::try_from(line.matches('{').count()).unwrap_or(i32::MAX);
+        let closes = i32::try_from(line.matches('}').count()).unwrap_or(i32::MAX);
         if line.is_empty() || line.starts_with("//") || line.starts_with('*') {
             depth += opens - closes;
             continue;
@@ -1626,12 +1628,12 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
             {
                 if let Some(v) = first_quoted(line) {
                     table_name = Some(v);
-                    table_line = (idx + 1) as u32;
+                    table_line = u32::try_from(idx + 1).unwrap_or(u32::MAX);
                 }
             } else if class_name.is_none() {
                 if let Some(name) = class_name_from_decl(line) {
                     class_name = Some(name);
-                    class_line = (idx + 1) as u32;
+                    class_line = u32::try_from(idx + 1).unwrap_or(u32::MAX);
                 }
             }
         } else if depth == 1 {
@@ -2554,7 +2556,12 @@ pub fn parse_gin_routes(text: &str) -> Vec<ParsedRoute> {
                 _ => continue,
             };
             let path = normalize_route(base, &path_lit);
-            if seen.insert((verb.to_string(), path.clone(), class.clone(), method.clone())) {
+            if seen.insert((
+                verb.to_string(),
+                path.clone(),
+                class.clone(),
+                method.clone(),
+            )) {
                 routes.push(ParsedRoute {
                     verb: verb.to_string(),
                     path,
@@ -2682,7 +2689,10 @@ fn record_go_param_type(frag: &str, map: &mut std::collections::HashMap<String, 
 /// → `AppController`. Strips leading `*`/`&`, slices, and package qualifier.
 fn go_simple_type(ty: &str) -> String {
     let ty = ty.trim().trim_start_matches(['*', '&']);
-    let ty = ty.strip_prefix("[]").unwrap_or(ty).trim_start_matches(['*', '&']);
+    let ty = ty
+        .strip_prefix("[]")
+        .unwrap_or(ty)
+        .trim_start_matches(['*', '&']);
     let last = ty.rsplit('.').next().unwrap_or(ty).trim();
     if is_ident(last) {
         last.to_string()
@@ -3342,8 +3352,7 @@ fn normalize_route(base: &str, method: &str) -> String {
 /// segment, so `search getMeasuresInfo` resolves `/style-info/getMeasuresInfo`.
 fn route_search_name(path: &str) -> String {
     path.split('/')
-        .filter(|s| !s.is_empty() && !s.starts_with('{'))
-        .next_back()
+        .rfind(|s| !s.is_empty() && !s.starts_with('{'))
         .unwrap_or(path)
         .to_string()
 }
@@ -3497,11 +3506,13 @@ fn is_ident(s: &str) -> bool {
 }
 
 fn line_of(text: &str, byte_idx: usize) -> u32 {
-    text[..byte_idx.min(text.len())]
+    let newlines = text[..byte_idx.min(text.len())]
         .bytes()
         .filter(|b| *b == b'\n')
-        .count() as u32
-        + 1
+        .count();
+    u32::try_from(newlines)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
 fn to_snake_case(s: &str) -> String {
@@ -3866,7 +3877,10 @@ func NewRouter(d Deps) *gin.Engine {
         assert_eq!(me.path, "/v1/me", "empty-prefix group inherits /v1");
         assert_eq!(me.class, "AuthHandler");
 
-        let get = routes.iter().find(|r| r.method == "Get").expect("get route");
+        let get = routes
+            .iter()
+            .find(|r| r.method == "Get")
+            .expect("get route");
         assert_eq!(get.path, "/v1/teams/:id");
         assert_eq!(get.class, "TeamHandler", "d.Team → Deps.Team field type");
     }
@@ -3917,7 +3931,9 @@ func NewRouter() *gin.Engine {
 
         // Named-handler routes must still resolve normally (no regression).
         assert!(
-            !routes.iter().any(|r| r.path == "/healthz" && !r.method.is_empty()),
+            !routes
+                .iter()
+                .any(|r| r.path == "/healthz" && !r.method.is_empty()),
             "closure route must not invent a handler method"
         );
     }
@@ -4009,7 +4025,10 @@ func SetupRouter(appController *controller.AppController) *gin.Engine {
         let root = dir.path();
         for (rel, route) in [
             ("src/api.py", "/real"),
-            (".venv/lib/python3.11/site-packages/fastapi/applications.py", "/items"),
+            (
+                ".venv/lib/python3.11/site-packages/fastapi/applications.py",
+                "/items",
+            ),
             (".claude/worktrees/exp/src/dup.py", "/dup"),
             ("venv/site-packages/flask/app.py", "/vendored"),
             ("__pycache__/cached.py", "/cached"),
@@ -4027,7 +4046,10 @@ func SetupRouter(appController *controller.AppController) *gin.Engine {
         store.migrate().unwrap();
         let stats = index_schema_into(&mut store, root).unwrap();
 
-        assert_eq!(stats.http_routes, 1, "only the first-party src/api.py route");
+        assert_eq!(
+            stats.http_routes, 1,
+            "only the first-party src/api.py route"
+        );
         let routes = store.list_nodes_by_kind(NodeKind::HttpRoute).unwrap();
         let paths: Vec<_> = routes.iter().filter_map(|n| n.path.clone()).collect();
         assert_eq!(paths, vec!["/real".to_string()], "venv/worktree pruned");
@@ -4156,7 +4178,10 @@ def dynamic():
         assert_eq!(ci.verb, "POST");
         assert_eq!(ci.path, "/items");
 
-        let feed = routes.iter().find(|r| r.method == "feed").expect("ws route");
+        let feed = routes
+            .iter()
+            .find(|r| r.method == "feed")
+            .expect("ws route");
         assert_eq!(feed.verb, "WS");
         assert_eq!(feed.path, "/ws/feed");
 
@@ -4577,7 +4602,10 @@ async function client() { await http.get("/api/remote"); }
             3,
             "login + screens/:id + health; settings read, client call & commented route excluded, got {got:?}"
         );
-        assert!(got.contains(&("POST", "/api/auth/login", "")), "closure handler → empty: {got:?}");
+        assert!(
+            got.contains(&("POST", "/api/auth/login", "")),
+            "closure handler → empty: {got:?}"
+        );
         assert!(got.contains(&("GET", "/api/screens/:id", "")), "{got:?}");
         assert!(
             got.contains(&("GET", "/api/health", "healthHandler")),
@@ -4844,6 +4872,23 @@ class ApiEndpoints {
         assert_eq!(t.name, "craft_conflict");
         let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "category_id", "craft_id", "type"]);
+    }
+
+    /// Regression: `parse_sql_tables` must not panic when a column body ends on
+    /// a multi-byte UTF-8 char. The loop advanced `search_from` by `body.len()`,
+    /// landing one byte *before* the closing paren — inside the last char — so
+    /// the next `lower[search_from..]` sliced mid-char and panicked
+    /// (`byte index N is not a char boundary`). Indexing SpecSlice's own source
+    /// (a doc string containing '…') tripped this in the wild.
+    #[test]
+    fn parse_sql_tables_does_not_panic_on_multibyte_char_at_body_end() {
+        // 3-byte '…' immediately before ')': the exact shape that crashed index.
+        let tables = parse_sql_tables("create table a(note …)");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "a");
+        // A trailing table forces the re-slice that actually panicked.
+        let two = parse_sql_tables("create table a(x é) and create table b(id int)");
+        assert!(two.iter().any(|t| t.name == "b"), "second table must parse");
     }
 
     #[test]

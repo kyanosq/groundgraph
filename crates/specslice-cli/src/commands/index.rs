@@ -213,6 +213,14 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
         if ts.heuristic_references > 0 {
             writeln!(out, "  References (heuristic): {}", ts.heuristic_references).ok();
         }
+        if ts.parse_timeouts > 0 {
+            writeln!(
+                out,
+                "  warn: {} 个文件解析超出预算被跳过（多为含故意语法错误的 fixture；可用 SPECSLICE_PARSE_BUDGET_MS 调整）",
+                ts.parse_timeouts
+            )
+            .ok();
+        }
         if !ts.resolver_used.is_empty() {
             writeln!(out, "  Resolver: {}", ts.resolver_used).ok();
         }
@@ -248,6 +256,14 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
                 lang.language, lang.files, lang.symbols, lang.imports, lang.resolver_used
             )
             .ok();
+            if lang.parse_timeouts > 0 {
+                writeln!(
+                    out,
+                    "  warn: {} 个 {} 文件解析超出预算被跳过（多为含故意语法错误的 fixture；可用 SPECSLICE_PARSE_BUDGET_MS 调整）",
+                    lang.parse_timeouts, lang.language
+                )
+                .ok();
+            }
         }
     }
     {
@@ -266,6 +282,14 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
                 match &run.status {
                     ScipRunStatus::Generated => {
                         writeln!(out, "  {}: generated", run.language).ok();
+                    }
+                    ScipRunStatus::UpToDate => {
+                        writeln!(
+                            out,
+                            "  {}: up-to-date (sources unchanged, reused)",
+                            run.language
+                        )
+                        .ok();
                     }
                     ScipRunStatus::Skipped(reason) => {
                         writeln!(out, "  {}: skipped ({reason})", run.language).ok();
@@ -313,6 +337,19 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
             if reqs.unresolved > 0 {
                 writeln!(out, "  Unresolved refs: {}", reqs.unresolved).ok();
             }
+        }
+    }
+    if let Some(fulltext) = &result.fulltext {
+        writeln!(out, "Fulltext content layer:").ok();
+        writeln!(out, "  Nodes: {}", fulltext.nodes_indexed).ok();
+        writeln!(out, "  Files read: {}", fulltext.files_read).ok();
+        if fulltext.skipped_unreadable > 0 {
+            writeln!(
+                out,
+                "  Skipped (unreadable): {}",
+                fulltext.skipped_unreadable
+            )
+            .ok();
         }
     }
     out
@@ -492,6 +529,7 @@ mod tests {
                 tests: 2,
                 imports: 5,
                 heuristic_references: 6,
+                parse_timeouts: 0,
                 resolver_used: "typescript_treesitter".into(),
             }),
             ..IndexResult::default()
@@ -671,6 +709,7 @@ mod tests {
                     files: 8,
                     symbols: 64,
                     imports: 30,
+                    parse_timeouts: 0,
                     resolver_used: "typescript_treesitter".into(),
                 },
                 specslice_engine::TreeSitterLangResult {
@@ -678,6 +717,7 @@ mod tests {
                     files: 3,
                     symbols: 21,
                     imports: 5,
+                    parse_timeouts: 0,
                     resolver_used: "cpp_treesitter".into(),
                 },
             ],

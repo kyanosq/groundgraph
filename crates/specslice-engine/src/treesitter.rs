@@ -160,6 +160,9 @@ pub struct Scan {
     pub tests: Vec<ScannedTest>,
     /// Heuristic body-level call/reference identifiers (see [`ScannedRef`]).
     pub references: Vec<ScannedRef>,
+    /// The parse exceeded the per-file budget and was abandoned (the scan is
+    /// empty). Counted by the file loop and surfaced as an index warning.
+    pub parse_timed_out: bool,
 }
 
 // Function-pointer hook types. Using fn pointers (not trait objects)
@@ -387,21 +390,62 @@ pub fn no_call_idents(_body: tree_sitter::Node<'_>, _source: &[u8]) -> Vec<(Stri
     Vec::new()
 }
 
+/// Per-file parse budget. Clean source parses in single-digit milliseconds;
+/// what blows past a budget is tree-sitter's error-recovery on files that are
+/// not really code (compiler test fixtures with intentional syntax errors —
+/// the TypeScript repo's `tests/cases` pushed a structural index from ~3 min
+/// to 20+ min). A timed-out file is skipped, not failed: one fixture must
+/// never stall the whole index run.
+const DEFAULT_PARSE_BUDGET_MS: u64 = 2_000;
+
+fn parse_budget() -> std::time::Duration {
+    let ms = std::env::var("SPECSLICE_PARSE_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_PARSE_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Parse `source` with `spec`'s grammar and return its structural symbols
 /// and imports. Total and panic-free: any parser failure yields an empty
-/// scan rather than aborting the index run.
+/// scan rather than aborting the index run. Files whose parse exceeds the
+/// budget yield an empty scan with [`Scan::parse_timed_out`] set so the
+/// caller can surface a count.
 pub fn extract(spec: &LangSpec, source: &str) -> Scan {
     let mut scan = Scan::default();
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&(spec.grammar)()).is_err() {
         return scan;
     }
-    let Some(tree) = parser.parse(source.as_bytes(), None) else {
+    let bytes = source.as_bytes();
+    let start = std::time::Instant::now();
+    let budget = parse_budget();
+    let mut on_progress = move |_state: &tree_sitter::ParseState| {
+        if start.elapsed() > budget {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let tree = parser.parse_with_options(
+        &mut |offset, _point| {
+            if offset < bytes.len() {
+                &bytes[offset..]
+            } else {
+                &[]
+            }
+        },
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut on_progress)),
+    );
+    let Some(tree) = tree else {
+        scan.parse_timed_out = true;
         return scan;
     };
     walk(
         tree.root_node(),
-        source.as_bytes(),
+        bytes,
         spec,
         None,
         false,
@@ -504,7 +548,9 @@ pub(crate) fn blank_cpp_export_macros(source: &str) -> Option<String> {
         let id1_end = ident_end(id1_start);
         let id1 = &bytes[id1_start..id1_end];
         let is_macroish = id1.len() >= 2
-            && id1.iter().all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            && id1
+                .iter()
+                .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             && id1.iter().any(|&b| b.is_ascii_uppercase());
         // id2: the real type name, which must exist.
         let id2_start = skip_ws(id1_end);
@@ -605,7 +651,16 @@ fn walk(
         if let Some(type_name) = (spec.impl_type_of)(child, source) {
             let nested = combine(parent_qualified, &type_name, spec.separator);
             if let Some(body) = (spec.body_of)(child) {
-                walk(body, source, spec, Some(&nested), true, false, depth + 1, scan);
+                walk(
+                    body,
+                    source,
+                    spec,
+                    Some(&nested),
+                    true,
+                    false,
+                    depth + 1,
+                    scan,
+                );
             }
             continue;
         }
@@ -722,7 +777,16 @@ fn walk(
                 // Dart analyzer files top-level `test(...)` nodes under the file.
                 if spec.recurse_callables {
                     if let Some(body) = (spec.body_of)(child) {
-                        walk(body, source, spec, parent_qualified, false, true, depth + 1, scan);
+                        walk(
+                            body,
+                            source,
+                            spec,
+                            parent_qualified,
+                            false,
+                            true,
+                            depth + 1,
+                            scan,
+                        );
                     }
                 }
                 continue;
@@ -767,7 +831,16 @@ fn walk(
                     child,
                 );
                 if let Some(body) = hit.body {
-                    walk(body, source, spec, Some(&qualified), false, false, depth + 1, scan);
+                    walk(
+                        body,
+                        source,
+                        spec,
+                        Some(&qualified),
+                        false,
+                        false,
+                        depth + 1,
+                        scan,
+                    );
                 }
                 continue;
             }
@@ -1219,6 +1292,10 @@ pub struct TsIndexResult {
     /// on an LSP / analyzer sidecar for semantic edges.
     #[serde(default)]
     pub references: usize,
+    /// Files whose parse blew the per-file budget (error-recovery on
+    /// fixture/corpus files) and were skipped. Surfaced as a CLI warning.
+    #[serde(default)]
+    pub parse_timeouts: usize,
     /// `<language_id>_treesitter` when anything was produced.
     pub resolver_used: String,
 }
@@ -1342,118 +1419,138 @@ fn index_repo_with_spec_impl(
     let mut import_targets: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    for file in &files {
-        let Ok(source) = std::fs::read_to_string(&file.absolute) else {
-            continue; // non-UTF-8 / unreadable: skip, never abort.
-        };
-        // Container formats (Vue SFCs) wrap parseable code in a `<script>` block;
-        // hand the grammar only that region (offsets preserved) so the rest of
-        // the file — `<template>` HTML, `<style>` CSS — never reaches the parser.
-        let parse_source = preprocess_source(&file.relative, &source);
-        let scanned = extract(spec, &parse_source);
-        result.files += 1;
-
-        let file_artifact_id = file_id(&file.relative);
-        batch.files.push(FileArtifact {
-            id: file_artifact_id.clone(),
-            path: file.relative.clone(),
-            language: spec.language_id.into(),
-            content_hash: sha256_hex(source.as_bytes()),
-        });
-
-        // Only link to a parent we actually emitted in *this* file so we
-        // never create a dangling `contains` edge. Tests can parent onto
-        // either a structural symbol (JUnit `@Test` in a class) or another
-        // test (a pytest method in a `Test*` group), so both sets count.
-        let emitted: std::collections::BTreeSet<&str> = scanned
-            .symbols
-            .iter()
-            .map(|s| s.qualified_name.as_str())
+    // Parse in parallel, merge serially. Parsing is pure CPU (tree-sitter is
+    // reentrant per-parser) and dominates wall time on big repos; the merge
+    // below mutates shared batch state and stays single-threaded. Chunking
+    // bounds peak memory: only one chunk's sources are alive at a time.
+    use rayon::prelude::*;
+    const PARSE_CHUNK: usize = 256;
+    let mut parse_timeouts: usize = 0;
+    for chunk in files.chunks(PARSE_CHUNK) {
+        let parsed: Vec<(&DiscoveredFile, String, Scan)> = chunk
+            .par_iter()
+            .filter_map(|file| {
+                let source = std::fs::read_to_string(&file.absolute).ok()?;
+                // Container formats (Vue SFCs) wrap parseable code in a
+                // `<script>` block; hand the grammar only that region
+                // (offsets preserved) so the rest of the file — `<template>`
+                // HTML, `<style>` CSS — never reaches the parser.
+                let parse_source = preprocess_source(&file.relative, &source);
+                let scanned = extract(spec, &parse_source);
+                Some((file, source, scanned))
+            })
             .collect();
-        let emitted_tests: std::collections::BTreeSet<&str> = scanned
-            .tests
-            .iter()
-            .map(|t| t.qualified_name.as_str())
-            .collect();
-        let parent_id = |p: &str| -> Option<ArtifactId> {
-            (emitted.contains(p) || emitted_tests.contains(p))
-                .then(|| symbol_id(spec, &file.relative, p))
-        };
+        for (file, source, scanned) in parsed {
+            if scanned.parse_timed_out {
+                parse_timeouts += 1;
+            }
+            result.files += 1;
 
-        for sym in &scanned.symbols {
-            let id = symbol_id(spec, &file.relative, &sym.qualified_name);
-            let parent_symbol_id = sym.parent_qualified_name.as_deref().and_then(parent_id);
-            batch.symbols.push(SymbolArtifact {
-                id,
-                kind: sym.kind,
+            let file_artifact_id = file_id(&file.relative);
+            batch.files.push(FileArtifact {
+                id: file_artifact_id.clone(),
                 path: file.relative.clone(),
-                name: sym.name.clone(),
-                qualified_name: sym.qualified_name.clone(),
-                start_line: sym.start_line,
-                end_line: sym.end_line,
-                parent_symbol_id,
-                metadata_json: sym.metadata.clone(),
+                language: spec.language_id.into(),
+                content_hash: sha256_hex(source.as_bytes()),
             });
-            result.symbols += 1;
-        }
 
-        for t in &scanned.tests {
-            let id = symbol_id(spec, &file.relative, &t.qualified_name);
-            let parent_symbol_id = t.parent_qualified_name.as_deref().and_then(parent_id);
-            batch.tests.push(TestArtifact {
-                id,
-                kind: t.kind.node_kind(),
-                path: file.relative.clone(),
-                name: t.name.clone(),
-                start_line: t.start_line,
-                end_line: t.end_line,
-                parent_symbol_id,
-            });
-            result.tests += 1;
-        }
+            // Only link to a parent we actually emitted in *this* file so we
+            // never create a dangling `contains` edge. Tests can parent onto
+            // either a structural symbol (JUnit `@Test` in a class) or another
+            // test (a pytest method in a `Test*` group), so both sets count.
+            let emitted: std::collections::BTreeSet<&str> = scanned
+                .symbols
+                .iter()
+                .map(|s| s.qualified_name.as_str())
+                .collect();
+            let emitted_tests: std::collections::BTreeSet<&str> = scanned
+                .tests
+                .iter()
+                .map(|t| t.qualified_name.as_str())
+                .collect();
+            let parent_id = |p: &str| -> Option<ArtifactId> {
+                (emitted.contains(p) || emitted_tests.contains(p))
+                    .then(|| symbol_id(spec, &file.relative, p))
+            };
 
-        for imp in &scanned.imports {
-            if let Some(target) =
-                (spec.resolve_import)(&imp.path, &file.relative, &all_files, &src_roots)
-            {
-                if !scanned.references.is_empty() {
-                    let entry = import_targets.entry(file.relative.clone()).or_default();
-                    if spec.language_id == "go" {
-                        // A Go import names a *package* (directory); the resolved
-                        // representative is one of its files. Feed every sibling
-                        // file of that package into the resolution scope so a
-                        // bare cross-package call reaches a method defined in any
-                        // of them (resolution only — the ImportEdge below keeps
-                        // the single representative, so import stats are unchanged).
-                        entry.extend(go_package_sibling_files(&target, &all_files));
-                    } else {
-                        entry.push(target.clone());
+            for sym in &scanned.symbols {
+                let id = symbol_id(spec, &file.relative, &sym.qualified_name);
+                let parent_symbol_id = sym.parent_qualified_name.as_deref().and_then(parent_id);
+                batch.symbols.push(SymbolArtifact {
+                    id,
+                    kind: sym.kind,
+                    path: file.relative.clone(),
+                    name: sym.name.clone(),
+                    qualified_name: sym.qualified_name.clone(),
+                    start_line: sym.start_line,
+                    end_line: sym.end_line,
+                    parent_symbol_id,
+                    metadata_json: sym.metadata.clone(),
+                });
+                result.symbols += 1;
+            }
+
+            for t in &scanned.tests {
+                let id = symbol_id(spec, &file.relative, &t.qualified_name);
+                let parent_symbol_id = t.parent_qualified_name.as_deref().and_then(parent_id);
+                batch.tests.push(TestArtifact {
+                    id,
+                    kind: t.kind.node_kind(),
+                    path: file.relative.clone(),
+                    name: t.name.clone(),
+                    start_line: t.start_line,
+                    end_line: t.end_line,
+                    parent_symbol_id,
+                });
+                result.tests += 1;
+            }
+
+            for imp in &scanned.imports {
+                if let Some(target) =
+                    (spec.resolve_import)(&imp.path, &file.relative, &all_files, &src_roots)
+                {
+                    if !scanned.references.is_empty() {
+                        let entry = import_targets.entry(file.relative.clone()).or_default();
+                        if spec.language_id == "go" {
+                            // A Go import names a *package* (directory); the resolved
+                            // representative is one of its files. Feed every sibling
+                            // file of that package into the resolution scope so a
+                            // bare cross-package call reaches a method defined in any
+                            // of them (resolution only — the ImportEdge below keeps
+                            // the single representative, so import stats are unchanged).
+                            entry.extend(go_package_sibling_files(&target, &all_files));
+                        } else {
+                            entry.push(target.clone());
+                        }
+                    }
+                    batch.imports.push(ImportEdge {
+                        from_file: file_artifact_id.clone(),
+                        to_path: target,
+                    });
+                    result.imports += 1;
+                } else if spec.language_id == "java" && !scanned.references.is_empty() {
+                    // `import a.b.c.*;` — a wildcard package import resolves to no
+                    // single file, but the package's symbols ARE in scope: a bare
+                    // call (`baseMapper.selectX()` collects `selectX`) must reach a
+                    // method defined in any `…/a/b/c/<Name>.java`. Feed those files
+                    // into name resolution ONLY (no file→file ImportEdge, so the
+                    // file graph and import stats stay byte-identical to before).
+                    for target in java_wildcard_package_files(&imp.path, &all_files) {
+                        import_targets
+                            .entry(file.relative.clone())
+                            .or_default()
+                            .push(target);
                     }
                 }
-                batch.imports.push(ImportEdge {
-                    from_file: file_artifact_id.clone(),
-                    to_path: target,
-                });
-                result.imports += 1;
-            } else if spec.language_id == "java" && !scanned.references.is_empty() {
-                // `import a.b.c.*;` — a wildcard package import resolves to no
-                // single file, but the package's symbols ARE in scope: a bare
-                // call (`baseMapper.selectX()` collects `selectX`) must reach a
-                // method defined in any `…/a/b/c/<Name>.java`. Feed those files
-                // into name resolution ONLY (no file→file ImportEdge, so the
-                // file graph and import stats stay byte-identical to before).
-                for target in java_wildcard_package_files(&imp.path, &all_files) {
-                    import_targets
-                        .entry(file.relative.clone())
-                        .or_default()
-                        .push(target);
-                }
+            }
+
+            for r in &scanned.references {
+                pending_refs.push((file.relative.clone(), r.clone()));
             }
         }
-
-        for r in &scanned.references {
-            pending_refs.push((file.relative.clone(), r.clone()));
-        }
+    }
+    if parse_timeouts > 0 {
+        result.parse_timeouts = parse_timeouts;
     }
 
     // Resolve captured body identifiers to concrete in-repo symbols and
@@ -1653,14 +1750,17 @@ pub(crate) fn resolve_heuristic_refs(
                 }
             }
             // Flat-namespace fallback (Swift): resolve module-wide, but only
-            // for a name that is (1) PascalCase — a type/constructor by Swift
-            // convention, since lowercase method names collide with
-            // stdlib/UIKit; (2) defined in exactly one *other* file — unique;
-            // and (3) not a high fan-in hub. These together keep the edges
-            // feature-shaped instead of gluing every file to shared infra.
+            // for a name that is (1) project-shaped — PascalCase (a type or
+            // constructor) or a multi-word lowerCamel method
+            // (`checkFirstLaunchIntroduction`); single generic words (`save`,
+            // `update`) collide with stdlib/UIKit and stay local; (2) defined
+            // in exactly one *other* file — unique; and (3) not a high fan-in
+            // hub. These together keep the edges feature-shaped instead of
+            // gluing every file to shared infra.
             if targets.is_empty()
                 && spec.module_scoped_resolution
-                && name.chars().next().is_some_and(char::is_uppercase)
+                && (name.chars().next().is_some_and(char::is_uppercase)
+                    || crate::source_text::is_multi_word_identifier(name))
                 && !module_hubs.contains(name)
             {
                 if let Some(defs) = module_index.get(name) {
@@ -1738,19 +1838,17 @@ pub fn discover_relative_paths(
     extensions: &[&str],
     skip_dirs: &[&str],
 ) -> Result<Vec<String>> {
-    Ok(
-        discover_files(
-            repo_root,
-            code_roots,
-            exclude_globs,
-            extensions,
-            skip_dirs,
-            None,
-        )?
-        .into_iter()
-        .map(|f| f.relative)
-        .collect(),
-    )
+    Ok(discover_files(
+        repo_root,
+        code_roots,
+        exclude_globs,
+        extensions,
+        skip_dirs,
+        None,
+    )?
+    .into_iter()
+    .map(|f| f.relative)
+    .collect())
 }
 
 /// How many leading bytes of a file a [`PathClaimFn`] sniffs. Generous enough
@@ -1864,6 +1962,10 @@ pub const ALWAYS_SKIP_DIRS: &[&str] = &[
     "Carthage",
     "DerivedData",
     ".dart_tool",
+    // Go toolchain convention (adopted industry-wide): `testdata/` holds
+    // fixtures — often intentionally malformed or generated source — that
+    // the compiler itself ignores. Indexing them floods dead-code/search.
+    "testdata",
     // Python virtualenvs / installed packages / caches
     ".venv",
     "venv",
@@ -2026,8 +2128,14 @@ mod driver_capability_tests {
             src.bytes().filter(|&b| b == b'\n').count(),
             "newline count preserved"
         );
-        assert!(out.contains("class              Foo {};"), "Foo macro blanked: {out:?}");
-        assert!(out.contains("struct      Bar : Base {};"), "Bar macro blanked: {out:?}");
+        assert!(
+            out.contains("class              Foo {};"),
+            "Foo macro blanked: {out:?}"
+        );
+        assert!(
+            out.contains("struct      Bar : Base {};"),
+            "Bar macro blanked: {out:?}"
+        );
 
         // Misses (return None — never reallocate): plain class, single token,
         // `enum class` with an all-caps name, a macro'd forward declaration, and
@@ -2035,10 +2143,10 @@ mod driver_capability_tests {
         for s in [
             "class Foo {};",
             "enum class FOO_T { A };",
-            "class FOO_API Bar;",        // forward decl → no `{`/`:`
-            "class Mixed_Case Bar {};",  // id1 not all-caps
+            "class FOO_API Bar;",       // forward decl → no `{`/`:`
+            "class Mixed_Case Bar {};", // id1 not all-caps
             "struct Plain { int x; };",
-            "int subclass_count = 0;",   // `class` only as a substring
+            "int subclass_count = 0;", // `class` only as a substring
         ] {
             assert!(
                 super::blank_cpp_export_macros(s).is_none(),
@@ -2297,7 +2405,11 @@ describe('outer', () => {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/app.py"), "def real():\n    return 1\n").unwrap();
-        for hidden in [".derivedData-codex/pkg", ".build/checkouts/dep", ".venv/lib"] {
+        for hidden in [
+            ".derivedData-codex/pkg",
+            ".build/checkouts/dep",
+            ".venv/lib",
+        ] {
             std::fs::create_dir_all(root.join(hidden)).unwrap();
             std::fs::write(
                 root.join(hidden).join("vendored.py"),
@@ -2327,9 +2439,7 @@ describe('outer', () => {
         );
         let nodes = store.list_all_nodes().unwrap();
         assert!(
-            nodes
-                .iter()
-                .all(|n| n.name.as_deref() != Some("vendored")),
+            nodes.iter().all(|n| n.name.as_deref() != Some("vendored")),
             "no symbol may come from a hidden dir"
         );
     }
@@ -2379,9 +2489,7 @@ describe('outer', () => {
         );
         let nodes = store.list_all_nodes().unwrap();
         assert!(
-            nodes
-                .iter()
-                .all(|n| n.name.as_deref() != Some("vendored")),
+            nodes.iter().all(|n| n.name.as_deref() != Some("vendored")),
             "no symbol may come from an embedded git repo"
         );
     }

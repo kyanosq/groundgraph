@@ -53,6 +53,9 @@ pub struct TypescriptIndexResult {
     /// `.ts` + `.tsx` symbol set. SCIP supersedes these on the files it covers.
     #[serde(default)]
     pub heuristic_references: usize,
+    /// Files skipped because their parse exceeded the per-file budget.
+    #[serde(default)]
+    pub parse_timeouts: usize,
     /// `typescript_treesitter` when the structural pass produced anything,
     /// empty when no TypeScript files were found.
     pub resolver_used: String,
@@ -90,6 +93,7 @@ pub fn index_typescript(
     let mut symbols = 0usize;
     let mut tests = 0usize;
     let mut imports = 0usize;
+    let mut parse_timeouts = 0usize;
     // Defer heuristic resolution: `.ts` and `.tsx` need separate grammars
     // (the `<T>` generic / JSX ambiguity) but share one symbol namespace, so a
     // call in `app.js` to a `helper` declared in `util.ts` only resolves when
@@ -111,6 +115,7 @@ pub fn index_typescript(
         symbols += r.symbols;
         tests += r.tests;
         imports += r.imports;
+        parse_timeouts += r.parse_timeouts;
         merged.symbols.extend(inputs.symbols);
         for (file, targets) in inputs.import_targets {
             merged
@@ -160,6 +165,7 @@ pub fn index_typescript(
         tests,
         imports,
         heuristic_references,
+        parse_timeouts,
         resolver_used,
     })
 }

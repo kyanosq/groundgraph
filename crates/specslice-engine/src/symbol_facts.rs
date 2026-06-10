@@ -22,12 +22,13 @@
 //! Everything is computed by cheap lexical scanning over comment/string-
 //! stripped text, so two runs on the same source always agree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use specslice_core::language_traits::{is_callable, is_type};
+use specslice_core::EdgeKind;
 use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
@@ -212,18 +213,20 @@ pub fn analyze_symbol_facts_with_store(
             },
         };
 
+        facts.push(fact);
+    }
+
+    propagate_impurity(store, &mut facts)?;
+
+    for fact in &facts {
         match fact.purity {
             Purity::Pure => stats.pure += 1,
             Purity::Impure => stats.impure += 1,
             Purity::Unknown => stats.unknown += 1,
         }
-
-        if let Some(filter) = options.purity_filter {
-            if fact.purity != filter {
-                continue;
-            }
-        }
-        facts.push(fact);
+    }
+    if let Some(filter) = options.purity_filter {
+        facts.retain(|f| f.purity == filter);
     }
 
     facts.sort_by(|a, b| a.id.cmp(&b.id));
@@ -239,6 +242,55 @@ pub fn analyze_symbol_facts_with_store(
         stats,
         facts,
     })
+}
+
+/// Graph-level purity refinement: a symbol that *calls* an impure symbol is
+/// itself impure — the side effect executes on its call path. Text-level
+/// probes only see one body at a time; the `Calls` edges close that gap.
+/// `References` edges do not propagate (mentioning is not executing).
+fn propagate_impurity(store: &Store, facts: &mut [SymbolFact]) -> Result<()> {
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
+    for (i, f) in facts.iter().enumerate() {
+        index_of.insert(f.id.as_str(), i);
+    }
+    let mut callers_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut worklist: Vec<usize> = Vec::new();
+    for edge in store.list_all_edges()? {
+        if edge.kind != EdgeKind::Calls {
+            continue;
+        }
+        let (Some(&from), Some(&to)) = (
+            index_of.get(edge.from_id.as_str()),
+            index_of.get(edge.to_id.as_str()),
+        ) else {
+            continue;
+        };
+        if from != to {
+            callers_of.entry(to).or_default().push(from);
+        }
+    }
+    for (i, f) in facts.iter().enumerate() {
+        if f.purity == Purity::Impure {
+            worklist.push(i);
+        }
+    }
+    while let Some(callee) = worklist.pop() {
+        let Some(callers) = callers_of.get(&callee) else {
+            continue;
+        };
+        for &caller in callers.clone().iter() {
+            let f = &mut facts[caller];
+            if f.purity == Purity::Impure {
+                continue;
+            }
+            f.purity = Purity::Impure;
+            f.impurity_signals.push("calls_impure".to_string());
+            f.summary
+                .push("有副作用：调用链上存在副作用符号".to_string());
+            worklist.push(caller);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +402,32 @@ fn count_substr(haystack: &str, needle: &str) -> u32 {
     u32::try_from(haystack.matches(needle).count()).unwrap_or(u32::MAX)
 }
 
+/// Standard lowerCamel instance name for a type name: `UserDefaults` →
+/// `userDefaults`, `URLSession` → `urlSession`, `HTTPClient` → `httpClient`.
+/// The leading uppercase run is lowercased, except its last letter when it
+/// starts the next word.
+fn lower_camel(type_name: &str) -> String {
+    let chars: Vec<char> = type_name.chars().collect();
+    let upper_run = chars.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    if upper_run == 0 {
+        return type_name.to_string();
+    }
+    let boundary = if upper_run < chars.len() {
+        upper_run.saturating_sub(1).max(1)
+    } else {
+        upper_run
+    };
+    let mut out = String::with_capacity(type_name.len());
+    for (i, c) in chars.iter().enumerate() {
+        if i < boundary {
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
 /// Curated side-effect markers. `async` is decided from tokens + await
 /// count; the rest are substring probes on stripped text.
 fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String> {
@@ -365,7 +443,8 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
     {
         set.insert("async");
     }
-    // io / persistence / network
+    // io / persistence / network — syntax-shaped probes (call sites, module
+    // paths, SQL verbs) stay substring matches on the stripped text.
     const IO_MARKERS: &[&str] = &[
         "print(",
         "println",
@@ -389,8 +468,6 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
         "http",
         "fetch(",
         "axios",
-        "URLSession",
-        "Socket",
         "reqwest",
         "dio",
         "sqlite",
@@ -401,13 +478,31 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
         "UPDATE ",
         "DELETE ",
         "prepare(",
-        "SharedPreferences",
-        "UserDefaults",
         "localStorage",
         "getenv",
         "std::env",
+        "malloc(",
+        "calloc(",
     ];
-    if IO_MARKERS.iter().any(|m| stripped.contains(m)) {
+    // Identifier-shaped IO types (persistence handles, network sessions).
+    // These hide behind instance fields named by the lowerCamel convention
+    // (`UserDefaults` → `userDefaults`), so besides the literal substring we
+    // match the instance-name token derived from each type name.
+    const IO_TYPE_MARKERS: &[&str] = &[
+        "URLSession",
+        "Socket",
+        "SharedPreferences",
+        "UserDefaults",
+        "ModelContext",
+        "ModelContainer",
+        "NSManagedObjectContext",
+        "DynamicLibrary",
+    ];
+    if IO_MARKERS.iter().any(|m| stripped.contains(m))
+        || IO_TYPE_MARKERS
+            .iter()
+            .any(|m| stripped.contains(m) || tokset.contains(lower_camel(m).as_str()))
+    {
         set.insert("io");
     }
     // ui
@@ -420,6 +515,9 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
         "some View",
         ".draw(",
         "render(",
+        "runApp(",
+        "UIApplication",
+        "NSApplication",
     ];
     if UI_MARKERS.iter().any(|m| stripped.contains(m)) {
         set.insert("ui");
@@ -674,6 +772,117 @@ mod tests {
         assert!(fact.impurity_signals.contains(&"async".to_string()));
         assert!(fact.impurity_signals.contains(&"io".to_string()));
         assert_eq!(fact.counts.awaits, 1);
+    }
+
+    #[test]
+    fn instance_named_side_effect_receiver_is_impure() {
+        // Convention across Swift/Java/Kotlin/TS: type `UserDefaults` is held
+        // in an instance named `userDefaults`. The body never spells the type
+        // name, but the side effect is the same.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "func setSeen(_ v: Bool) {\n    userDefaults.set(v, forKey: kSeen)\n}";
+        write(tmp.path(), "src/prefs.swift", body);
+        let mut n = node("src/prefs.swift", "setSeen", 1, 3);
+        n.kind = NodeKind::SwiftMethod;
+        let src = read_node_source(tmp.path(), &n).unwrap();
+        let fact = build_fact(&n, &src, 60);
+        assert_eq!(
+            fact.purity,
+            Purity::Impure,
+            "signals={:?}",
+            fact.impurity_signals
+        );
+        assert!(fact.impurity_signals.contains(&"io".to_string()));
+    }
+
+    #[test]
+    fn persistence_context_types_are_impure() {
+        // SwiftData / CoreData contexts are persistence handles; saving
+        // through an instance (`modelContext`) is IO.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body =
+            "func save(_ item: Item) {\n    modelContext.insert(item)\n    try? modelContext.save()\n}";
+        write(tmp.path(), "src/store.swift", body);
+        let mut n = node("src/store.swift", "save", 1, 4);
+        n.kind = NodeKind::SwiftMethod;
+        let src = read_node_source(tmp.path(), &n).unwrap();
+        let fact = build_fact(&n, &src, 60);
+        assert_eq!(
+            fact.purity,
+            Purity::Impure,
+            "signals={:?}",
+            fact.impurity_signals
+        );
+        assert!(fact.impurity_signals.contains(&"io".to_string()));
+    }
+
+    #[test]
+    fn flutter_run_app_is_ui() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "void main() {\n  runApp(const MyApp());\n}";
+        write(tmp.path(), "lib/main.dart", body);
+        let mut n = node("lib/main.dart", "main", 1, 3);
+        n.kind = NodeKind::DartFunction;
+        let src = read_node_source(tmp.path(), &n).unwrap();
+        let fact = build_fact(&n, &src, 60);
+        assert_eq!(
+            fact.purity,
+            Purity::Impure,
+            "signals={:?}",
+            fact.impurity_signals
+        );
+        assert!(fact.impurity_signals.contains(&"ui".to_string()));
+    }
+
+    #[test]
+    fn impurity_propagates_through_call_edges() {
+        use specslice_core::{EdgeAssertion, EdgeKind, EdgeSource};
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "fn orchestrate() {\n    helper();\n}\nfn helper() {\n    println!(\"x\");\n}\nfn unrelated(a: i32) -> i32 {\n    return a + 1;\n}",
+        );
+        let mut store = Store::open(tmp.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let a = node("src/lib.rs", "orchestrate", 1, 3);
+        let b = node("src/lib.rs", "helper", 4, 6);
+        let c = node("src/lib.rs", "unrelated", 7, 9);
+        for n in [&a, &b, &c] {
+            store.upsert_node(n).unwrap();
+        }
+        let e = EdgeAssertion::fact(
+            a.id.clone(),
+            b.id.clone(),
+            EdgeKind::Calls,
+            EdgeSource::LanguageAdapter,
+        );
+        store.upsert_edge(&e).unwrap();
+
+        let opts = SymbolFactsOptions {
+            repo_root: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let report = analyze_symbol_facts_with_store(&store, &opts).unwrap();
+        let by_name = |nm: &str| {
+            report
+                .facts
+                .iter()
+                .find(|f| f.name.as_deref() == Some(nm))
+                .unwrap()
+        };
+        let orch = by_name("orchestrate");
+        assert_eq!(
+            orch.purity,
+            Purity::Impure,
+            "signals={:?}",
+            orch.impurity_signals
+        );
+        assert!(orch.impurity_signals.contains(&"calls_impure".to_string()));
+        assert_eq!(by_name("unrelated").purity, Purity::Pure);
+        // stats reflect post-propagation purity
+        assert_eq!(report.stats.impure, 2);
+        assert_eq!(report.stats.pure, 1);
     }
 
     #[test]

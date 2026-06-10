@@ -98,6 +98,11 @@ pub struct IndexResult {
     /// indexing is skipped or `enrichment.scip = false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scip_runs: Vec<crate::scip_runner::ScipRunOutcome>,
+    /// Fulltext content layer (FTS5/BM25) rebuild stats — what makes
+    /// comment-only / doc-body-only phrases searchable. Runs on every
+    /// `index`, mirroring the final node set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulltext: Option<crate::fulltext_indexer::FulltextIndexResult>,
 }
 
 /// Per-language outcome of the unified tree-sitter pass.
@@ -107,6 +112,10 @@ pub struct TreeSitterLangResult {
     pub files: usize,
     pub symbols: usize,
     pub imports: usize,
+    /// Files skipped because parsing exceeded the per-file budget
+    /// (tree-sitter error recovery on fixture corpora).
+    #[serde(default)]
+    pub parse_timeouts: usize,
     pub resolver_used: String,
 }
 
@@ -323,6 +332,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
                     files: ts.files,
                     symbols: ts.symbols,
                     imports: ts.imports,
+                    parse_timeouts: ts.parse_timeouts,
                     resolver_used: ts.resolver_used,
                 });
             }
@@ -337,7 +347,17 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         // structural pass, so the precise edges bind to symbols that already
         // exist. A no-op when no indexer is installed and no `.scip` is present.
         if config.enrichment.scip {
-            let languages = indexed_languages(&config);
+            // Only auto-invoke a language's SCIP indexer when that language
+            // actually contributed files this run. A repo selecting several
+            // `treesitter.languages` but holding only Rust would otherwise spawn
+            // `scip-go` / `scip-python` / `scip-typescript` on an empty tree —
+            // wasted subprocesses that emit empty `.scip` and noisy "generated"
+            // lines. Filtering by real file counts keeps `index` fast and its
+            // output honest.
+            let languages: Vec<String> = indexed_languages(&config)
+                .into_iter()
+                .filter(|lang| language_file_count(&result, lang) > 0)
+                .collect();
             result.scip_runs = crate::scip_runner::run_indexers(&options.repo_root, &languages);
             let scip = crate::scip_overlay::ingest_scip_overlay(&mut store, &options.repo_root)
                 .context("ingesting SCIP overlay")?;
@@ -376,6 +396,15 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         .context("indexing markdown requirements")?;
         result.requirements_md = Some(requirements_md);
     }
+
+    // Content layer LAST: it mirrors whatever node set the passes above just
+    // produced (docs sections, code symbols, requirements), reading each
+    // source file once and rebuilding `node_fts` wholesale. This is what lets
+    // `search` rank comment-only / doc-body-only phrases (BM25) instead of
+    // being blind to anything outside ids/names/paths.
+    let fulltext = crate::fulltext_indexer::rebuild_fulltext_index(&mut store, &options.repo_root)
+        .context("rebuilding fulltext content layer")?;
+    result.fulltext = Some(fulltext);
 
     Ok(result)
 }
@@ -449,6 +478,31 @@ fn indexed_languages(config: &EngineConfig) -> Vec<String> {
     langs
 }
 
+/// Number of files actually indexed for canonical `lang` this run, summed over
+/// the dedicated adapter result and the unified tree-sitter pass (a language's
+/// `language_id` in `treesitter` equals its canonical id). Used to gate SCIP
+/// auto-invocation so a 0-file language never spawns an indexer subprocess.
+fn language_file_count(result: &IndexResult, lang: &str) -> usize {
+    let dedicated = match lang {
+        "dart" => result.code.as_ref().map(|r| r.files),
+        "rust" => result.rust.as_ref().map(|r| r.files),
+        "go" => result.go.as_ref().map(|r| r.files),
+        "python" => result.python.as_ref().map(|r| r.files),
+        "typescript" => result.typescript.as_ref().map(|r| r.files),
+        "swift" => result.swift.as_ref().map(|r| r.files),
+        "java" => result.java.as_ref().map(|r| r.files),
+        _ => None,
+    }
+    .unwrap_or(0);
+    let from_treesitter: usize = result
+        .treesitter
+        .iter()
+        .filter(|t| t.language == lang)
+        .map(|t| t.files)
+        .sum();
+    dedicated + from_treesitter
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +541,39 @@ mod tests {
         assert!(
             langs.contains(&"dart".to_string()),
             "scip_dart should fill the precision gap when the sidecar is disabled: {langs:?}"
+        );
+    }
+
+    /// SCIP auto-invoke is gated on real file counts: a language that indexed 0
+    /// files this run must report 0 (so it is filtered out and never spawns an
+    /// indexer subprocess), while one with files reports its count.
+    #[test]
+    fn language_file_count_gates_scip_on_real_files() {
+        let mut result = IndexResult::default();
+        result.treesitter.push(TreeSitterLangResult {
+            language: "rust".to_string(),
+            files: 171,
+            ..Default::default()
+        });
+        result.treesitter.push(TreeSitterLangResult {
+            language: "go".to_string(),
+            files: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            language_file_count(&result, "rust"),
+            171,
+            "rust has files → SCIP runs"
+        );
+        assert_eq!(
+            language_file_count(&result, "go"),
+            0,
+            "empty go → SCIP skipped"
+        );
+        assert_eq!(
+            language_file_count(&result, "python"),
+            0,
+            "absent language → skipped"
         );
     }
 }

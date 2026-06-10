@@ -197,74 +197,8 @@ pub fn analyze_dead_code_with_store(
     // Entry points.
     let mut entry_ids: BTreeSet<String> = BTreeSet::new();
     seed_config_entrypoints(&config.entrypoints, &nodes, &mut entry_ids);
+    entry_ids.extend(implicit_entry_ids(&nodes, &edges));
     for n in &nodes {
-        match n.kind {
-            NodeKind::Route | NodeKind::DartProvider | NodeKind::TestCase | NodeKind::TestGroup => {
-                entry_ids.insert(n.id.to_string());
-            }
-            NodeKind::DartMethod => {
-                if is_lifecycle_method_name(n.name.as_deref()) {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            NodeKind::DartFunction => {
-                if n.path.as_deref().is_some_and(is_test_path)
-                    && is_lifecycle_method_name(n.name.as_deref())
-                {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            // Go: `main` and `init` are the language's hard entry points.
-            // Treat `Test*` / `Benchmark*` / `Example*` exported functions as
-            // entry points too because the `go test` runner resolves them by
-            // name via reflection.
-            NodeKind::GoFunction | NodeKind::GoMethod => {
-                if is_go_entry_name(n.name.as_deref()) {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            // Swift: top-level `main()` (Swift Argument Parser / `@main`)
-            // and XCTest's `test*` instance methods are reflection-driven
-            // entries. Tag them so reachability does not flag them as dead.
-            NodeKind::SwiftFunction | NodeKind::SwiftMethod => {
-                if is_swift_entry_name(n.name.as_deref()) {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            // Python: pytest discovers `def test_*` / `class Test*` by
-            // name, and conventional entrypoints (`main`, `__main__`,
-            // `app`, `cli`) are invoked through reflection / frameworks.
-            // Tag them so reachability never flags them as dead.
-            NodeKind::PythonFunction | NodeKind::PythonMethod => {
-                if is_python_entry_name(n.name.as_deref()) {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            // Rust: `fn main` is the binary entry point. `#[test]`
-            // functions are tagged as `TestCase` by the Rust spec (so they
-            // are seeded above), and the in-process heuristic resolver emits
-            // `Calls` / `References` edges, so reachability now flows through
-            // the real call graph instead of stopping at `main`.
-            NodeKind::RustFunction => {
-                if n.name.as_deref() == Some("main") {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-            _ => {}
-        }
-        // P17: any symbol whose `metadata_json` carries a framework
-        // role classified as an "externally triggered" entry point
-        // (FastAPI route, Celery task, Click/Typer command, …) is
-        // not really dead — the framework calls it. We parse the
-        // JSON inline; failures fall back to the default rules so a
-        // malformed payload never flips a real symbol into reachable.
-        if is_code_kind(n.kind) {
-            if let Some(json) = n.metadata_json.as_deref() {
-                if is_python_framework_entrypoint_metadata(json) {
-                    entry_ids.insert(n.id.to_string());
-                }
-            }
-        }
         // public_api_roots: anything under those paths.
         if let Some(p) = n.path.as_deref() {
             if matches_set(&public_set, p) && is_code_kind(n.kind) {
@@ -288,48 +222,6 @@ pub fn analyze_dead_code_with_store(
                 .entry(edge.to_id.as_str())
                 .or_default()
                 .push(edge.from_id.as_str());
-        }
-    }
-
-    // Swift: types that derive (transitively) from a framework base are
-    // instantiated by UIKit / AppKit / SwiftUI through storyboards, XIBs,
-    // cell registration, segues and the `@UIApplicationMain` responder chain
-    // — none of which leave an in-repo edge. Seed those types *and* their
-    // members (which the framework invokes via lifecycle callbacks,
-    // target-action and data sources) so reachability does not mistake the
-    // whole UI layer for dead code. Driven by the `swift_inherits` metadata
-    // the structural scanner records on every class/struct declaration.
-    let swift_framework_types = swift_framework_instantiated_types(&nodes);
-    if !swift_framework_types.is_empty() {
-        let mut contains_children: HashMap<&str, Vec<&str>> = HashMap::new();
-        for edge in &edges {
-            if edge.kind == EdgeKind::Contains {
-                contains_children
-                    .entry(edge.from_id.as_str())
-                    .or_default()
-                    .push(edge.to_id.as_str());
-            }
-        }
-        for n in &nodes {
-            if !matches!(n.kind, NodeKind::SwiftClass | NodeKind::SwiftStruct) {
-                continue;
-            }
-            if !n
-                .name
-                .as_deref()
-                .is_some_and(|nm| swift_framework_types.contains(nm))
-            {
-                continue;
-            }
-            // Seed the type and every symbol it transitively `Contains`.
-            let mut stack = vec![n.id.as_str()];
-            while let Some(id) = stack.pop() {
-                if entry_ids.insert(id.to_string()) {
-                    if let Some(children) = contains_children.get(id) {
-                        stack.extend(children.iter().copied());
-                    }
-                }
-            }
         }
     }
 
@@ -588,6 +480,163 @@ pub fn analyze_dead_code_with_store(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Symbols a framework, runtime, or harness invokes without leaving an
+/// in-repo edge: routes, providers, tests, lifecycle callbacks, per-language
+/// entry names, Cargo implicit targets, Python framework roles, and Swift
+/// types instantiated by UIKit/AppKit/SwiftUI (plus their members).
+///
+/// This is the single source of "implicitly alive" knowledge — dead-code
+/// seeds reachability from it and questions suppresses orphan prompts with
+/// it, so the two analyses can never disagree about what a framework drives.
+pub fn implicit_entry_ids(
+    nodes: &[specslice_core::Node],
+    edges: &[specslice_core::EdgeAssertion],
+) -> BTreeSet<String> {
+    let mut entry_ids: BTreeSet<String> = BTreeSet::new();
+    for n in nodes {
+        // Auxiliary code (examples/, demos/, tools/, benchmarks/) is a set of
+        // standalone programs invoked by humans, not by in-repo callers.
+        // Treating them as entries (a) stops them being flagged dead and
+        // (b) keeps the production APIs they exercise reachable.
+        if is_code_kind(n.kind)
+            && n.path
+                .as_deref()
+                .is_some_and(crate::path_class::is_auxiliary_path)
+        {
+            entry_ids.insert(n.id.to_string());
+            continue;
+        }
+        match n.kind {
+            NodeKind::Route | NodeKind::DartProvider | NodeKind::TestCase | NodeKind::TestGroup => {
+                entry_ids.insert(n.id.to_string());
+            }
+            NodeKind::DartMethod => {
+                if is_lifecycle_method_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            NodeKind::DartFunction => {
+                if n.path.as_deref().is_some_and(is_test_path)
+                    && is_lifecycle_method_name(n.name.as_deref())
+                {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            // Go: `main` and `init` are the language's hard entry points.
+            // Treat `Test*` / `Benchmark*` / `Example*` exported functions as
+            // entry points too because the `go test` runner resolves them by
+            // name via reflection.
+            NodeKind::GoFunction | NodeKind::GoMethod => {
+                if is_go_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            // Swift: top-level `main()` (Swift Argument Parser / `@main`)
+            // and XCTest's `test*` instance methods are reflection-driven
+            // entries. Tag them so reachability does not flag them as dead.
+            NodeKind::SwiftFunction | NodeKind::SwiftMethod => {
+                if is_swift_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            // Python: pytest discovers `def test_*` / `class Test*` by
+            // name, and conventional entrypoints (`main`, `__main__`,
+            // `app`, `cli`) are invoked through reflection / frameworks.
+            // Tag them so reachability never flags them as dead.
+            NodeKind::PythonFunction | NodeKind::PythonMethod => {
+                if is_python_entry_name(n.name.as_deref()) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+            // Rust: `fn main` is the binary entry point. `#[test]`
+            // functions are tagged as `TestCase` by the Rust spec (so they
+            // are seeded above), and the in-process heuristic resolver emits
+            // `Calls` / `References` edges, so reachability now flows through
+            // the real call graph instead of stopping at `main`. Cargo also
+            // invokes `benches/`, `examples/` and `build.rs` targets directly
+            // (criterion macros / harness reflection leave no in-repo call
+            // edge), so everything in them counts as an entry.
+            NodeKind::RustFunction | NodeKind::RustMethod
+                if n.name.as_deref() == Some("main")
+                    || n.path.as_deref().is_some_and(is_rust_cargo_target_path) =>
+            {
+                entry_ids.insert(n.id.to_string());
+            }
+            // C / C++: the runtime invokes `main` (and a few libc-contracted
+            // hooks) with no in-repo caller.
+            NodeKind::CFunction | NodeKind::CppFunction
+                if matches!(n.name.as_deref(), Some("main" | "wmain" | "WinMain")) =>
+            {
+                entry_ids.insert(n.id.to_string());
+            }
+            // Java: the JVM invokes `main`; JUnit discovers `test*` methods
+            // via reflection; `java.lang.Object` contract overrides
+            // (`toString` in string concat, `equals`/`hashCode` in
+            // collections, …) are runtime-invoked with no in-repo edge.
+            NodeKind::JavaMethod if is_java_entry_name(n.name.as_deref()) => {
+                entry_ids.insert(n.id.to_string());
+            }
+            _ => {}
+        }
+        // P17: any symbol whose `metadata_json` carries a framework
+        // role classified as an "externally triggered" entry point
+        // (FastAPI route, Celery task, Click/Typer command, …) is
+        // not really dead — the framework calls it. We parse the
+        // JSON inline; failures fall back to the default rules so a
+        // malformed payload never flips a real symbol into reachable.
+        if is_code_kind(n.kind) {
+            if let Some(json) = n.metadata_json.as_deref() {
+                if is_python_framework_entrypoint_metadata(json) {
+                    entry_ids.insert(n.id.to_string());
+                }
+            }
+        }
+    }
+
+    // Swift: types that derive (transitively) from a framework base are
+    // instantiated by UIKit / AppKit / SwiftUI through storyboards, XIBs,
+    // cell registration, segues and the `@UIApplicationMain` responder chain
+    // — none of which leave an in-repo edge. Seed those types *and* their
+    // members (which the framework invokes via lifecycle callbacks,
+    // target-action and data sources) so reachability does not mistake the
+    // whole UI layer for dead code. Driven by the `swift_inherits` metadata
+    // the structural scanner records on every class/struct declaration.
+    let swift_framework_types = swift_framework_instantiated_types(nodes);
+    if !swift_framework_types.is_empty() {
+        let mut contains_children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in edges {
+            if edge.kind == EdgeKind::Contains {
+                contains_children
+                    .entry(edge.from_id.as_str())
+                    .or_default()
+                    .push(edge.to_id.as_str());
+            }
+        }
+        for n in nodes {
+            if !matches!(n.kind, NodeKind::SwiftClass | NodeKind::SwiftStruct) {
+                continue;
+            }
+            if !n
+                .name
+                .as_deref()
+                .is_some_and(|nm| swift_framework_types.contains(nm))
+            {
+                continue;
+            }
+            // Seed the type and every symbol it transitively `Contains`.
+            let mut stack = vec![n.id.as_str()];
+            while let Some(id) = stack.pop() {
+                if entry_ids.insert(id.to_string()) {
+                    if let Some(children) = contains_children.get(id) {
+                        stack.extend(children.iter().copied());
+                    }
+                }
+            }
+        }
+    }
+    entry_ids
+}
+
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
@@ -657,6 +706,15 @@ fn is_lifecycle_method_name(name: Option<&str>) -> bool {
             | "didChangeLocales"
             | "didHaveMemoryPressure"
     )
+}
+
+/// Cargo-invoked target files: nothing in-repo calls into them, cargo does.
+fn is_rust_cargo_target_path(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    p.ends_with("/build.rs")
+        || p == "build.rs"
+        || p.split('/')
+            .any(|seg| seg == "benches" || seg == "examples")
 }
 
 fn is_go_entry_name(name: Option<&str>) -> bool {
@@ -899,6 +957,25 @@ fn is_python_framework_entrypoint_metadata(json: &str) -> bool {
         Ok(role) => role.is_framework_entrypoint(),
         Err(_) => false,
     }
+}
+
+fn is_java_entry_name(name: Option<&str>) -> bool {
+    let Some(raw) = name else {
+        return false;
+    };
+    let last = raw.rsplit(['.', '#']).next().unwrap_or(raw);
+    // JVM entry point + java.lang.Object contract methods the runtime (or
+    // collections / string concatenation) invokes without an in-repo edge.
+    if matches!(
+        last,
+        "main" | "toString" | "equals" | "hashCode" | "clone" | "finalize"
+    ) {
+        return true;
+    }
+    // JUnit 3 convention (`testFoo`); JUnit 4/5 `@Test` methods are usually
+    // ALSO named `test*` in the wild. Annotation-driven discovery without
+    // the prefix is covered by the TestCase nodes the indexer emits.
+    last.starts_with("test") && last.len() > 4
 }
 
 fn is_python_entry_name(name: Option<&str>) -> bool {
@@ -1329,6 +1406,109 @@ mod tests {
     }
 
     #[test]
+    fn c_and_cpp_main_are_implicit_entry_points() {
+        // C/C++: the runtime invokes `main`; nothing in the repo calls it.
+        let (mut store, _dir) = empty_store();
+        insert_node_kind(
+            &mut store,
+            "c::src/server.c::main",
+            NodeKind::CFunction,
+            "src/server.c",
+            "main",
+        );
+        insert_node_kind(
+            &mut store,
+            "c::src/dict.c::dictCreate",
+            NodeKind::CFunction,
+            "src/dict.c",
+            "dictCreate",
+        );
+        insert_calls(
+            &mut store,
+            "c::src/server.c::main",
+            "c::src/dict.c::dictCreate",
+        );
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions::default(),
+            &DeadCodeConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .candidates
+                .iter()
+                .any(|c| c.id.contains("main") || c.id.contains("dictCreate")),
+            "main and its callees are alive: {:?}",
+            report.candidates.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn auxiliary_code_is_an_implicit_entry_not_a_dead_candidate() {
+        // gson dogfood: `extras/examples/**` classes were reported dead.
+        // Examples / demos / tools are standalone programs whose "caller" is
+        // a human reading docs — they are entries (which also keeps the core
+        // APIs they exercise reachable), never dead-code candidates.
+        let (mut store, _dir) = empty_store();
+        insert_node_kind(
+            &mut store,
+            "java::examples/rawcollections/Example.java::Example.run",
+            NodeKind::JavaMethod,
+            "examples/rawcollections/Example.java",
+            "run",
+        );
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions::default(),
+            &DeadCodeConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            report.candidates.is_empty(),
+            "examples are entries, not dead code: {:?}",
+            report.candidates.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_main_junit_and_object_contracts_are_implicit_entry_points() {
+        // Regression (gson): `public static void main` (JVM-invoked), JUnit
+        // `testXxx` methods (reflection-discovered) and `java.lang.Object`
+        // contract overrides (`toString` — invoked by the runtime / string
+        // concat, never via an in-repo edge) were all reported dead.
+        let (mut store, _dir) = empty_store();
+        insert_node_kind(
+            &mut store,
+            "java::src/Example.java::Example.main",
+            NodeKind::JavaMethod,
+            "src/Example.java",
+            "main",
+        );
+        insert_node_kind(
+            &mut store,
+            "java::src/Money.java::Money.toString",
+            NodeKind::JavaMethod,
+            "src/Money.java",
+            "toString",
+        );
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions::default(),
+            &DeadCodeConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            !report
+                .candidates
+                .iter()
+                .any(|c| c.id.contains("main") || c.id.contains("toString")),
+            "JVM/runtime-invoked methods must not be dead: {:?}",
+            report.candidates.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn swift_framework_subclasses_and_their_members_are_reachable() {
         // Regression (yunlan): UIKit instantiates `UIViewController` / `UIView`
         // / cell subclasses from storyboards, XIBs and cell registration with
@@ -1464,6 +1644,70 @@ mod tests {
         assert!(
             !dead.contains(&work_id),
             "the reachable function must not be dead, got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn rust_cargo_targets_are_entry_points_not_dead_code() {
+        // `benches/`, `examples/` and `build.rs` are cargo-invoked targets:
+        // nothing in-repo calls them, yet cargo runs them. Dogfooding the
+        // sokoban repo flagged `benches/generator_bench.rs::bench_generation`
+        // as dead — a guaranteed false positive for any crate with benches.
+        let (mut store, _dir) = empty_store();
+        insert_node_kind(
+            &mut store,
+            "rust::generator/benches/gen_bench.rs::bench_generation",
+            NodeKind::RustFunction,
+            "generator/benches/gen_bench.rs",
+            "bench_generation",
+        );
+        insert_node_kind(
+            &mut store,
+            "rust::examples/demo.rs::run_demo",
+            NodeKind::RustFunction,
+            "examples/demo.rs",
+            "run_demo",
+        );
+        insert_node_kind(
+            &mut store,
+            "rust::crates/x/build.rs::generate_tables",
+            NodeKind::RustFunction,
+            "crates/x/build.rs",
+            "generate_tables",
+        );
+        insert_node_kind(
+            &mut store,
+            "rust::crates/x/src/lib.rs::truly_dead",
+            NodeKind::RustFunction,
+            "crates/x/src/lib.rs",
+            "truly_dead",
+        );
+
+        let report = analyze_dead_code_with_store(
+            &store,
+            DeadCodeOptions {
+                repo_root: ".".into(),
+                min_confidence: DeadCodeConfidence::Low,
+                include_tests: false,
+            },
+            &config_with(vec![]),
+        )
+        .unwrap();
+
+        let dead: Vec<&str> = report.candidates.iter().map(|c| c.id.as_str()).collect();
+        for cargo_target in [
+            "rust::generator/benches/gen_bench.rs::bench_generation",
+            "rust::examples/demo.rs::run_demo",
+            "rust::crates/x/build.rs::generate_tables",
+        ] {
+            assert!(
+                !dead.contains(&cargo_target),
+                "cargo target {cargo_target} must not be dead, got {dead:?}"
+            );
+        }
+        assert!(
+            dead.contains(&"rust::crates/x/src/lib.rs::truly_dead"),
+            "the unreferenced library function must still be reported, got {dead:?}"
         );
     }
 

@@ -1,6 +1,6 @@
 //! MCP tool catalogue and dispatcher.
 //!
-//! Six tools — see module-level descriptors below. Each handler is
+//! Seven tools — see module-level descriptors below. Each handler is
 //! intentionally small: parse JSON args → call into `specslice-engine`
 //! → return the engine's response as a JSON value. The server module
 //! wraps that value as an MCP `tools/call` content block.
@@ -18,6 +18,7 @@ use specslice_store::Store;
 use crate::protocol::ToolDescriptor;
 use crate::server::Server;
 
+mod check_drift;
 mod context_pack;
 mod dead_code;
 mod explain_symbol;
@@ -37,6 +38,7 @@ pub fn descriptors() -> Vec<ToolDescriptor> {
         impact_tool::descriptor(),
         dead_code::descriptor(),
         context_pack::descriptor(),
+        check_drift::descriptor(),
     ]
 }
 
@@ -49,6 +51,7 @@ pub fn is_known(name: &str) -> bool {
             | "impact"
             | "dead_code"
             | "context_pack"
+            | "check_drift"
     )
 }
 
@@ -60,6 +63,7 @@ pub fn call(server: &Server, name: &str, args: &Value) -> Result<Value> {
         "impact" => impact_tool::call(server, args),
         "dead_code" => dead_code::call(server, args),
         "context_pack" => context_pack::call(server, args),
+        "check_drift" => check_drift::call(server, args),
         other => Err(anyhow!("unknown tool `{other}`")),
     }
 }

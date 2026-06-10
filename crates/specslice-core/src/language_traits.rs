@@ -51,6 +51,84 @@ pub enum Language {
     Generic,
 }
 
+/// How a language lexes a single quote `'`. Hand-rolled scanners (literal
+/// catalogue, noise stripping) need this to tell a Dart string `'a.b'` from a
+/// Rust char `'a'` / lifetime `'a`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleQuote {
+    /// `'...'` is a string, identical to `"..."` (Dart / Python / TS / JS).
+    String,
+    /// `'a'` is a char/rune literal; a bare `'a` (no closing quote) is a
+    /// label / lifetime to be skipped (Rust / C / C++ / Go / Java / Swift).
+    Char,
+}
+
+/// Lexical surface facts a scanner needs when it walks **raw source without a
+/// full grammar** (e.g. `constants::scan_literals`, `source_text::strip_noise`).
+///
+/// Before this existed, every such scanner re-hardcoded the same per-language
+/// `match`/`matches!(lang, Python)` arms inline, and they silently drifted out
+/// of sync (the literal scanner treated `'…'` as a string only for
+/// Dart/Python/TS while the noise stripper treated it as a string for *every*
+/// language). Centralising the facts here — next to the other per-language
+/// truths — means a new language is described in ONE place and every scanner
+/// stays consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexSyntax {
+    /// Marker that starts a line comment (`//` for the C family, `#` Python).
+    pub line_comment: &'static str,
+    /// `(open, close)` block-comment delimiters, when the language has them.
+    pub block_comment: Option<(&'static str, &'static str)>,
+    /// How `'` is lexed (string vs char/lifetime).
+    pub single_quote: SingleQuote,
+}
+
+impl LexSyntax {
+    /// True when the line comment is `#` (Python). Convenience for scanners
+    /// whose hand-rolled loop only distinguishes `//` from `#`.
+    pub fn uses_hash_comments(self) -> bool {
+        self.line_comment == "#"
+    }
+
+    /// True when `'…'` should be lexed as a string literal.
+    pub fn single_quote_is_string(self) -> bool {
+        matches!(self.single_quote, SingleQuote::String)
+    }
+}
+
+const LEX_C_FAMILY: LexSyntax = LexSyntax {
+    line_comment: "//",
+    block_comment: Some(("/*", "*/")),
+    single_quote: SingleQuote::Char,
+};
+
+/// Lexical facts for a language. `Doc`/`Synthetic`/`Generic` are never scanned
+/// for literals, so they return the C-family default harmlessly.
+pub fn lex_syntax(lang: Language) -> LexSyntax {
+    match lang {
+        // `'…'` is a string, `//` + `/* */` comments.
+        Language::Dart | Language::Typescript => LexSyntax {
+            single_quote: SingleQuote::String,
+            ..LEX_C_FAMILY
+        },
+        // `#` line comments, no block comment, `'…'`/`"…"` both strings.
+        Language::Python => LexSyntax {
+            line_comment: "#",
+            block_comment: None,
+            single_quote: SingleQuote::String,
+        },
+        // `'a'` is a char/rune (or a Rust lifetime when unbalanced).
+        Language::Swift
+        | Language::Go
+        | Language::Java
+        | Language::Rust
+        | Language::C
+        | Language::Cpp => LEX_C_FAMILY,
+        // Not host languages — never scanned; harmless default.
+        Language::Doc | Language::Synthetic | Language::Generic => LEX_C_FAMILY,
+    }
+}
+
 /// Coarse "what is this thing structurally?" family. Consumers map this
 /// to UI columns / sort order / serialization names without re-doing the
 /// per-kind `match`.
@@ -437,6 +515,52 @@ mod tests {
                 similarity_supported(*kind),
                 is_callable(*kind),
                 "similarity should be wired to is_callable for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lex_syntax_matches_per_language_surface() {
+        // String-quote languages: `'…'` is a string.
+        for lang in [Language::Dart, Language::Typescript, Language::Python] {
+            assert!(
+                lex_syntax(lang).single_quote_is_string(),
+                "{lang:?} should treat single quotes as strings"
+            );
+        }
+        // Char/lifetime languages: `'a'` is a char, never a string.
+        for lang in [
+            Language::Rust,
+            Language::C,
+            Language::Cpp,
+            Language::Go,
+            Language::Java,
+            Language::Swift,
+        ] {
+            assert!(
+                !lex_syntax(lang).single_quote_is_string(),
+                "{lang:?} should treat single quotes as char/lifetime"
+            );
+        }
+        // Only Python uses `#` line comments and has no block comment.
+        assert!(lex_syntax(Language::Python).uses_hash_comments());
+        assert_eq!(lex_syntax(Language::Python).block_comment, None);
+        for lang in [
+            Language::Rust,
+            Language::Dart,
+            Language::Typescript,
+            Language::Go,
+            Language::Java,
+            Language::Swift,
+            Language::C,
+            Language::Cpp,
+        ] {
+            let lex = lex_syntax(lang);
+            assert!(!lex.uses_hash_comments(), "{lang:?} uses // not #");
+            assert_eq!(
+                lex.block_comment,
+                Some(("/*", "*/")),
+                "{lang:?} should have C-style block comments"
             );
         }
     }

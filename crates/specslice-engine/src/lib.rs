@@ -26,6 +26,8 @@ pub mod export;
 pub mod feature_cluster;
 pub mod feature_map;
 pub mod feature_pack;
+pub mod fts_text;
+pub mod fulltext_indexer;
 pub mod git_diff;
 pub mod go_indexer;
 pub mod go_treesitter;
