@@ -101,10 +101,13 @@ sizeable projects — the local exporters above are the right tool.
 
 For AI agents, prefer the JSON-RPC MCP server over scraping CLI text.
 It exposes `search_graph`, `get_subgraph`, `explain_symbol`,
-`impact`, `dead_code`, and `context_pack`. Each returns structured
-JSON matching the CLI's `--json` schema. Candidate context is exposed
-through `context_pack` / `explain_symbol`, not separate
-candidate-prefixed MCP tools.
+`impact`, `dead_code`, `context_pack`, and `check_drift`. Each returns
+structured JSON matching the CLI's `--json` schema. Candidate context
+is exposed through `context_pack` / `explain_symbol`, not separate
+candidate-prefixed MCP tools. `check_drift` runs the consistency
+checks (broken links, orphan requirements, `doc_stale_code_ref`
+doc→code drift, requirement implementation hints) and returns the
+findings list.
 
 ```bash
 specslice-mcp --repo-root /path/to/repo

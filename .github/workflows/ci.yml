@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins the exact channel + components (rustfmt,
+      # clippy). `rustup show` installs and selects it on the runner so CI uses
+      # the same toolchain as developers — no silent lint drift.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # The project's discipline is "zero warnings". Enforce it: any fmt diff,
+      # any clippy warning, or any test failure fails the build.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # LSP / Dart-sidecar integration tests are #[ignore] by default and soft
+      # skip when their external binary is absent, so the job stays green on a
+      # clean runner. They can be exercised in a dedicated job that installs the
+      # toolchains, if/when desired.

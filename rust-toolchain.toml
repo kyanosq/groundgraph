@@ -1,0 +1,8 @@
+[toolchain]
+# Pin the exact toolchain so `cargo fmt`/`clippy`/`test` are reproducible across
+# every contributor and CI. A floating `stable` is what let a clippy version
+# bump silently introduce 23 lint warnings into a "zero-warning" workspace; pin
+# the version and bump it deliberately in one place.
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
