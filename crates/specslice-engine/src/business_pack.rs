@@ -310,6 +310,10 @@ fn build_pack(
     let mut assigned_symbols = 0usize;
     let mut total_tests = 0usize;
     let mut total_docs = 0usize;
+    // stem → owning module, for the doc↔source stem association of pass 2.
+    // Fed from every placed code path (symbols *and* File nodes — symbol-only
+    // graphs exist in unit fixtures and File-less language drivers).
+    let mut stem_owner: HashMap<String, Option<String>> = HashMap::new();
 
     for node in nodes {
         let is_symbol =
@@ -339,7 +343,27 @@ fn build_pack(
             cohesion: partition.cohesion[cidx],
             ..Default::default()
         });
-        module_of_node.insert(&node.id, slug);
+        module_of_node.insert(&node.id, slug.clone());
+
+        // Only *source* files may own a stem: the docs tree mirrors source
+        // names (`docs/blueprints.rst` ↔ `src/flask/blueprints.py`), so the
+        // doc file itself — a File node in its own path-bucket — must not
+        // claim the stem and turn every mirror pair ambiguous.
+        if (is_symbol || node.kind == NodeKind::File)
+            && !is_test_path(path)
+            && !is_doc_file_path(path)
+        {
+            if let Some(stem) = source_stem_token(path) {
+                stem_owner
+                    .entry(stem)
+                    .and_modify(|owner| {
+                        if owner.as_deref() != Some(slug.as_str()) {
+                            *owner = None; // shared stem → ambiguous
+                        }
+                    })
+                    .or_insert_with(|| Some(slug.clone()));
+            }
+        }
 
         if node.kind == NodeKind::File {
             acc.files.insert(path.to_string());
@@ -355,9 +379,27 @@ fn build_pack(
         }
     }
 
-    let known_slugs: BTreeSet<String> = modules.keys().cloned().collect();
+    // Docs may only associate with *business* module slugs. The scaffolding
+    // buckets (`docs`, `tests`, …) exist as accumulators, but letting the
+    // segment matcher resolve `docs/blueprints.rst` to the `docs` bucket
+    // captures every doc into a module that is never reported (real flask
+    // bug: all stem-matched docs vanished into the `docs` path-bucket).
+    let known_slugs: BTreeSet<String> = modules
+        .keys()
+        .filter(|slug| !NON_BUSINESS_BUCKETS.contains(&slug.as_str()))
+        .cloned()
+        .collect();
 
-    // ---- 2. associate docs by normalised segment match ------------------
+    // ---- 2. associate docs --------------------------------------------
+    // (a) path-segment match: `docs/feature-docs/customer-edit/…` →
+    //     `customer_edit`.
+    // (b) source-file-stem match: docs trees commonly mirror source files
+    //     by *name*, not by directory — flask's `docs/blueprints.rst`
+    //     documents `src/flask/blueprints.py` (same for leveldb's
+    //     `doc/table_format.md` ↔ `table/format.cc` family). A doc stem
+    //     that equals a source-file stem owned by exactly one module is
+    //     that module's documentation; ambiguous or generic stems
+    //     (`index`, `init`) attach nowhere rather than wrongly.
     for node in nodes {
         if node.kind != NodeKind::DocSection {
             continue;
@@ -365,7 +407,10 @@ fn build_pack(
         let Some(path) = node.path.as_deref() else {
             continue;
         };
-        if let Some(slug) = match_doc_to_module(path, &known_slugs) {
+        let slug = match_doc_to_module(path, &known_slugs).or_else(|| {
+            source_stem_token(path).and_then(|stem| stem_owner.get(&stem).cloned().flatten())
+        });
+        if let Some(slug) = slug {
             if let Some(acc) = modules.get_mut(&slug) {
                 acc.docs.push(node);
             }
@@ -465,8 +510,13 @@ fn build_pack(
         });
     }
 
-    // Drop trivial modules (no symbols at all) and order by signal.
-    reports.retain(|m| m.symbol_count > 0 || !m.docs.is_empty());
+    // A business module must hold code. Doc-only communities (`docs/tutorial`
+    // path-buckets in flask/tokio) are manual chapters — their slug dodges
+    // NON_BUSINESS_BUCKETS because only the repo-root "docs" segment is
+    // listed — and reporting them invites the AI to invent a "Tutorial"
+    // business candidate. Their content still reaches real modules through
+    // the doc-association passes above.
+    reports.retain(|m| m.symbol_count > 0);
     // `total_modules` counts the discovered *business* modules (after the
     // scaffolding denylist), independent of the `max_modules` cap.
     let total_modules = reports.len();
@@ -1619,6 +1669,31 @@ fn normalise_token(s: &str) -> String {
         .collect()
 }
 
+/// Whether the path is a prose document (by extension) rather than code.
+fn is_doc_file_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".md", ".mdx", ".markdown", ".rst", ".txt", ".adoc"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Normalised file stem usable as a doc↔source identity token, or `None`
+/// when the stem carries no identity: generic names (`index`, `main`),
+/// dunder plumbing (`__init__`), or too short to be distinctive.
+fn source_stem_token(path: &str) -> Option<String> {
+    let file = path.replace('\\', "/");
+    let file = file.rsplit('/').next()?;
+    let stem = file.split('.').next()?;
+    if stem.starts_with("__") && stem.ends_with("__") {
+        return None;
+    }
+    let norm = normalise_token(stem);
+    if norm.len() < 3 || GENERIC_NAMES.contains(&norm.as_str()) {
+        return None;
+    }
+    Some(norm)
+}
+
 /// Turn an arbitrary directory name into a valid business-candidate slug
 /// (`^[a-z0-9][a-z0-9_-]*$`).
 fn slugify(name: &str) -> String {
@@ -2671,6 +2746,134 @@ mod tests {
                 .iter()
                 .all(|e| !e.name.contains("CopyWith")),
             "freezed-generated copyWith classes must not be entry points"
+        );
+    }
+
+    /// flask/tokio dogfood: `docs/tutorial/`, `docs/deploying/` form isolated
+    /// path-buckets whose slug ("tutorial") dodges the NON_BUSINESS_BUCKETS
+    /// denylist (only the repo-root "docs" segment is on it). A community with
+    /// zero code symbols is a manual chapter, not a business module — its
+    /// content only matters where it attaches to a code module as evidence.
+    #[test]
+    fn doc_only_communities_are_never_business_modules() {
+        let (mut store, _dir) = empty_store();
+        // Real code module.
+        let a = "python_class::src/flask/app.py#Flask";
+        let b = "python_function::src/flask/blueprints.py#Blueprint";
+        store
+            .upsert_node(&node(a, NodeKind::PythonClass, "src/flask/app.py", "Flask"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::PythonFunction,
+                "src/flask/blueprints.py",
+                "Blueprint",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        // Doc-only tree: File + DocSection nodes, no code symbols.
+        for f in ["docs/tutorial/install.rst", "docs/tutorial/layout.rst"] {
+            store
+                .upsert_node(&node(
+                    &format!("file::{f}"),
+                    NodeKind::File,
+                    f,
+                    f.rsplit('/').next().unwrap(),
+                ))
+                .unwrap();
+            store
+                .upsert_node(&node(
+                    &format!("doc_section::{f}#Top"),
+                    NodeKind::DocSection,
+                    f,
+                    "Top",
+                ))
+                .unwrap();
+        }
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.modules.iter().all(|m| m.id != "tutorial"),
+            "a docs-only community must not be reported as a business module; got {:?}",
+            pack.modules.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert!(
+            pack.modules.iter().any(|m| m.symbol_count > 0),
+            "the real code module survives"
+        );
+    }
+
+    /// flask dogfood: the docs tree mirrors source files by *name* —
+    /// `docs/blueprints.rst` documents `src/flask/blueprints.py` — but shares
+    /// no path segment with the module slug, so segment matching alone left
+    /// every code module with `docs: []`. A doc file whose stem equals the
+    /// stem of a source file inside exactly one module is that module's
+    /// documentation. Generic stems (`index`, `init`) stay unmatched.
+    #[test]
+    fn doc_named_after_a_source_file_attaches_to_that_modules_docs() {
+        let (mut store, _dir) = empty_store();
+        let a = "python_class::src/flask/app.py#Flask";
+        let b = "python_class::src/flask/blueprints.py#Blueprint";
+        store
+            .upsert_node(&node(a, NodeKind::PythonClass, "src/flask/app.py", "Flask"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::PythonClass,
+                "src/flask/blueprints.py",
+                "Blueprint",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::docs/blueprints.rst#Modular Applications",
+                NodeKind::DocSection,
+                "docs/blueprints.rst",
+                "Modular Applications",
+            ))
+            .unwrap();
+        // The docs indexer also emits a File node per doc — these form a
+        // `docs` path-bucket whose slug must never capture the association
+        // (real flask bug: every stem-matched doc landed in the scaffolding
+        // bucket because `docs` was a known slug).
+        store
+            .upsert_node(&node(
+                "file::docs/blueprints.rst",
+                NodeKind::File,
+                "docs/blueprints.rst",
+                "blueprints.rst",
+            ))
+            .unwrap();
+        // Generic stem must NOT attach (would false-link half the docs tree).
+        store
+            .upsert_node(&node(
+                "doc_section::docs/index.rst#Welcome",
+                NodeKind::DocSection,
+                "docs/index.rst",
+                "Welcome",
+            ))
+            .unwrap();
+
+        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let module = pack
+            .modules
+            .iter()
+            .find(|m| m.symbol_count > 0)
+            .expect("code module");
+        assert!(
+            module
+                .docs
+                .iter()
+                .any(|d| d.path == "docs/blueprints.rst"),
+            "stem-matched doc must attach to the module owning blueprints.py; docs={:?}",
+            module.docs
+        );
+        assert!(
+            module.docs.iter().all(|d| d.path != "docs/index.rst"),
+            "generic-stem docs must not attach"
         );
     }
 

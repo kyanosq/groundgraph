@@ -399,11 +399,16 @@ impl Default for DocsConfig {
 }
 
 fn default_docs_paths() -> Vec<String> {
-    vec!["docs".into(), "specs".into(), "adr".into()]
+    // Both plural and singular dirs: `docs/` dominates, but `doc/` is the
+    // convention of a large slice of classic projects (leveldb, git, vim,
+    // postgres). Nonexistent roots are skipped, so listing both is free.
+    vec!["docs".into(), "doc".into(), "specs".into(), "adr".into()]
 }
 
 fn default_docs_include() -> Vec<String> {
-    vec!["**/*.md".into(), "**/*.mdx".into()]
+    // rst: the Python ecosystem's documentation format (flask, django,
+    // numpy); the docs indexer parses underlined titles natively.
+    vec!["**/*.md".into(), "**/*.mdx".into(), "**/*.rst".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
