@@ -90,6 +90,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             if !has_doc_extension(path) {
                 continue;
             }
+            if is_inside_vendored_project(path, &abs_root) {
+                continue;
+            }
             let rel = path
                 .strip_prefix(&options.repo_root)
                 .unwrap_or(path)
@@ -131,16 +134,22 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let in_doc_dir = has_doc_extension(path)
-                && rel.rsplit_once('/').is_some_and(|(dirs, _)| {
-                    dirs.split('/').any(|seg| bare_names.contains(seg))
-                });
-            let take = if in_doc_dir {
+            let in_doc_named_tree = rel
+                .rsplit_once('/')
+                .is_some_and(|(dirs, _)| dirs.split('/').any(|seg| bare_names.contains(seg)));
+            let take = if in_doc_named_tree && has_doc_extension(path) {
+                // A manifest directory between the file and its doc root is
+                // a foreign project vendored into the docs tree (reference
+                // copies of other repos) — not our documentation.
                 matches_include_globs(&options.include_globs, &rel)?
+                    && !is_vendored_under_doc_root(path, &bare_names)
             } else {
                 // Package-root doc: well-known name + manifest sibling. The
                 // extension allowlist lives in `is_well_known_root_doc`.
+                // Manifest directories *inside* a doc tree are vendored
+                // projects, not workspace members.
                 is_well_known_root_doc(name)
+                    && !in_doc_named_tree
                     && path.parent().is_some_and(has_package_manifest)
             };
             if !take {
@@ -210,6 +219,44 @@ fn has_package_manifest(dir: &Path) -> bool {
         "Gemfile",
     ];
     MANIFESTS.iter().any(|m| dir.join(m).is_file())
+}
+
+/// Whether any directory from `file`'s parent up to (but excluding) `stop`
+/// holds a package manifest — i.e. the file belongs to a foreign project
+/// vendored inside the walked tree. The doc root itself is exempt: sphinx
+/// tooling files in `docs/` are common and harmless.
+fn is_inside_vendored_project(file: &Path, stop: &Path) -> bool {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d == stop {
+            return false;
+        }
+        if has_package_manifest(d) {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Same vendored-project test for the repo-wide walk, where the boundary is
+/// the nearest ancestor whose *name* matches a bare doc root (`docs`).
+fn is_vendored_under_doc_root(
+    file: &Path,
+    bare_names: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if bare_names.contains(name) {
+            return false;
+        }
+        if has_package_manifest(d) {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Conventional top-level documents that double as a project's de-facto
@@ -816,6 +863,42 @@ mod tests {
         assert!(
             nodes.iter().all(|n| !n.id.to_string().contains("node_modules")),
             "vendored package READMEs must stay pruned"
+        );
+    }
+
+    /// A vendored project copy inside the docs tree (specslice dogfood:
+    /// `docs/sourcecode/gitnexus/` is a competitor repo kept for reference,
+    /// carrying its own `package.json` + ARCHITECTURE.md) is *not* our
+    /// documentation. Any directory between a doc file and its doc root that
+    /// holds a package manifest marks a foreign project — its docs stay out.
+    /// The same manifest in the docs root itself (sphinx tooling) is fine.
+    #[test]
+    fn vendored_projects_inside_doc_trees_stay_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let vendored = root.join("docs/sourcecode/gitnexus");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# Guide\n\nbody\n").unwrap();
+        std::fs::write(vendored.join("package.json"), "{}").unwrap();
+        std::fs::write(vendored.join("ARCHITECTURE.md"), "# Arch\n\nnoise\n").unwrap();
+        std::fs::write(vendored.join("README.md"), "# Gitnexus\n\nnoise\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes.iter().all(|n| !n.id.to_string().contains("gitnexus")),
+            "vendored project docs must stay out; got {result:?}"
+        );
+        assert!(
+            nodes.iter().any(|n| n.id.to_string() == "file::docs/guide.md"),
+            "our own docs still indexed"
         );
     }
 
