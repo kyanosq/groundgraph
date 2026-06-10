@@ -495,3 +495,111 @@ fn fulltext_match_is_unavailable_not_an_error_on_a_pre_fts_database() {
         "node_fts absent → content layer unavailable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bulk write session (single-transaction indexing)
+// ---------------------------------------------------------------------------
+
+/// Indexing upserts hundreds of thousands of rows. In autocommit mode every
+/// statement is its own WAL commit (pwrite + lock churn → the django 99s
+/// profile was dominated by pread/pwrite/fsync). A bulk session must turn the
+/// whole ingest into ONE transaction, while staying idempotent (double begin /
+/// double commit are no-ops, not errors).
+#[test]
+fn bulk_session_wraps_upserts_in_one_transaction() {
+    let (_tmp, mut store) = fresh_store();
+
+    store.begin_bulk().expect("begin bulk");
+    assert!(
+        !store.connection().is_autocommit(),
+        "begin_bulk must open a real transaction"
+    );
+    // Nested begin must be a no-op, not "cannot start a transaction".
+    store.begin_bulk().expect("nested begin is a no-op");
+
+    let node = Node::new(ArtifactId::new("sym::a.rs#alpha"), NodeKind::CFunction);
+    store.upsert_node(&node).expect("upsert inside bulk");
+
+    store.commit_bulk().expect("commit bulk");
+    assert!(
+        store.connection().is_autocommit(),
+        "commit_bulk must return to autocommit"
+    );
+    store.commit_bulk().expect("double commit is a no-op");
+
+    let found = store.find_node(&node.id).expect("query").expect("exists");
+    assert_eq!(found.id, node.id);
+}
+
+/// The repository helpers that used to open their own `BEGIN` (clear,
+/// fulltext rebuild, SCIP suppression) must compose inside a bulk session
+/// instead of failing with "cannot start a transaction within a transaction".
+#[test]
+fn internal_write_helpers_compose_inside_bulk_session() {
+    let (_tmp, mut store) = fresh_store();
+
+    let mut node = Node::new(ArtifactId::new("sym::b.rs#beta"), NodeKind::CFunction);
+    node.indexer = Some("tree_sitter".into());
+    node.source_file = Some("b.rs".into());
+    store.upsert_node(&node).expect("seed node");
+
+    store.begin_bulk().expect("begin bulk");
+    store
+        .clear_indexer_outputs("tree_sitter")
+        .expect("clear inside bulk session");
+    store
+        .rebuild_fulltext(&[FulltextRow {
+            node_id: "sym::b.rs#beta".into(),
+            body: "beta body".into(),
+        }])
+        .expect("fulltext rebuild inside bulk session");
+    store
+        .delete_precision_edges_for_files_except(&["b.rs".into()], "scip")
+        .expect("suppression inside bulk session");
+    store.commit_bulk().expect("commit");
+
+    assert!(
+        store.find_node(&node.id).expect("query").is_none(),
+        "clear_indexer_outputs must have removed the seeded node"
+    );
+}
+
+/// An error mid-session must not leave the connection stuck inside a failed
+/// transaction: rollback_bulk restores autocommit so later writes succeed.
+#[test]
+fn rollback_bulk_discards_the_session_and_restores_autocommit() {
+    let (_tmp, mut store) = fresh_store();
+
+    store.begin_bulk().expect("begin");
+    let node = Node::new(ArtifactId::new("sym::c.rs#gamma"), NodeKind::CFunction);
+    store.upsert_node(&node).expect("upsert");
+    store.rollback_bulk().expect("rollback");
+
+    assert!(store.connection().is_autocommit(), "back to autocommit");
+    assert!(
+        store.find_node(&node.id).expect("query").is_none(),
+        "rolled-back rows must be gone"
+    );
+    store.rollback_bulk().expect("rollback outside session is a no-op");
+}
+
+/// Large graphs (django: 229 MB graph.db) thrash the default 2 MB page cache:
+/// profiles showed pread + BtreeTableMoveto dominating. Opening the store
+/// must provision an indexing-grade page cache and mmap window.
+#[test]
+fn open_configures_page_cache_and_mmap_for_large_graphs() {
+    let (_tmp, store) = fresh_store();
+    let cache: i64 = store
+        .connection()
+        .query_row("PRAGMA cache_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cache, -65536, "expect 64 MiB page cache, got {cache}");
+    let mmap: i64 = store
+        .connection()
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        mmap >= 1 << 28,
+        "expect a ≥256 MiB mmap window for read paths, got {mmap}"
+    );
+}

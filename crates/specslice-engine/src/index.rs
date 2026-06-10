@@ -128,6 +128,14 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         .migrate()
         .with_context(|| format!("running migrations on {}", db_path.display()))?;
 
+    // One bulk transaction for the whole ingest. Autocommit mode turns the
+    // 10^5+ upserts of a large repo into as many WAL commits; the django
+    // profile was dominated by pread/pwrite/fsync, not CPU. A single commit
+    // amortizes that to one WAL append + one checkpoint. Early `?` returns
+    // drop the connection, which rolls the half-built generation back — the
+    // previous complete index stays untouched.
+    store.begin_bulk().context("opening bulk write session")?;
+
     let mut result = IndexResult::default();
 
     if options.include_docs {
@@ -405,6 +413,8 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     let fulltext = crate::fulltext_indexer::rebuild_fulltext_index(&mut store, &options.repo_root)
         .context("rebuilding fulltext content layer")?;
     result.fulltext = Some(fulltext);
+
+    store.commit_bulk().context("committing bulk write session")?;
 
     Ok(result)
 }

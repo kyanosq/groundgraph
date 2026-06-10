@@ -20,3 +20,12 @@ CREATE INDEX IF NOT EXISTS idx_edge_assertions_kind ON edge_assertions(kind);
 -- evidence-quality scoring and focus cards; index the foreign key so those
 -- stay O(matches) instead of O(table).
 CREATE INDEX IF NOT EXISTS idx_evidence_artifact ON evidence(artifact_id);
+
+-- Ingest-path indexes. SCIP-authoritative suppression deletes precision edges
+-- one source_file at a time (django: 3026 covered files); without an index
+-- each DELETE re-scanned all ~96k edges, and that single loop dominated the
+-- whole-repo index profile. Re-index also clears per indexer (nodes + edges),
+-- which otherwise full-scans both tables once per indexer name.
+CREATE INDEX IF NOT EXISTS idx_edge_assertions_source_file ON edge_assertions(source_file);
+CREATE INDEX IF NOT EXISTS idx_edge_assertions_indexer ON edge_assertions(indexer);
+CREATE INDEX IF NOT EXISTS idx_nodes_indexer ON nodes(indexer);

@@ -85,13 +85,24 @@ impl Store {
         // drops the per-commit fsync while staying durable across app crashes —
         // acceptable for a rebuildable index cache. busy_timeout avoids spurious
         // "database is locked" under the WAL reader/writer split.
+        // cache_size/mmap_size: graphs for large repos reach hundreds of MB
+        // (django: 229 MB). The SQLite default 2 MiB page cache thrashes —
+        // profiles showed pread + BtreeTableMoveto dominating index time. A
+        // 64 MiB cache plus a 256 MiB mmap window serves hot B-tree pages
+        // from memory; both are per-connection settings, not persisted.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;\
+             PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456;",
         )
         .map_err(|source| StoreError::OpenDb {
             path: path.clone(),
             source,
         })?;
+        // The repository layer funnels every statement through
+        // `prepare_cached`; the working set is a few dozen distinct SQL
+        // strings, so re-parsing them per call (autocommit ingest does 10^5+
+        // calls) is pure overhead.
+        conn.set_prepared_statement_cache_capacity(64);
         let store = Self { conn, path };
         // Read-only commands open the store but never run `migrate()`. After a
         // binary upgrade adds adjacency indexes, those commands would scan
@@ -128,6 +139,61 @@ impl Store {
     /// Idempotently apply all schema migrations.
     pub fn migrate(&mut self) -> StoreResult<()> {
         migrations::apply_all(&mut self.conn)
+    }
+
+    /// Open a bulk write session: one explicit transaction covering an entire
+    /// ingest. In autocommit mode every upsert is its own WAL commit; an
+    /// indexing run does 10^5+ of them, and the per-commit lock/WAL-frame
+    /// churn dominated large-repo profiles. Idempotent — calling inside an
+    /// open session is a no-op, so nested scopes compose.
+    pub fn begin_bulk(&self) -> StoreResult<()> {
+        if self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
+    }
+
+    /// Commit the bulk session opened by [`Store::begin_bulk`]. No-op when no
+    /// session is open. If the process dies before this, SQLite rolls the
+    /// open transaction back on connection close — the index is rebuildable,
+    /// so losing an unfinished ingest is the correct outcome.
+    pub fn commit_bulk(&self) -> StoreResult<()> {
+        if !self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("COMMIT")
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
+    }
+
+    /// Abort the bulk session, discarding all its writes. No-op outside a
+    /// session, so error paths can call it unconditionally.
+    pub fn rollback_bulk(&self) -> StoreResult<()> {
+        if !self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("ROLLBACK")
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
+    }
+
+    /// Run `f` inside a write transaction. When a bulk session (or any outer
+    /// transaction) is already open, joins it instead of nesting — SQLite has
+    /// no nested BEGIN. Otherwise opens its own transaction; on error the
+    /// `Transaction` guard rolls back on drop.
+    pub(crate) fn with_write_tx<T>(
+        &mut self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> StoreResult<T> {
+        if !self.conn.is_autocommit() {
+            return f(&self.conn);
+        }
+        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
+        let out = f(&tx)?;
+        tx.commit().map_err(StoreError::sqlite)?;
+        Ok(out)
     }
 
     pub fn path(&self) -> &Path {
@@ -198,6 +264,12 @@ mod tests {
             "idx_edge_assertions_to",
             "idx_edge_assertions_kind",
             "idx_evidence_artifact",
+            // Ingest-path indexes: SCIP suppression deletes per source_file
+            // (django: 3026 files × full scan of 96k edges dominated the
+            // profile) and clear_indexer_outputs deletes per indexer.
+            "idx_edge_assertions_source_file",
+            "idx_edge_assertions_indexer",
+            "idx_nodes_indexer",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

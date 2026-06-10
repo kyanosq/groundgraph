@@ -35,8 +35,9 @@ impl Store {
     pub fn upsert_node(&mut self, node: &Node) -> StoreResult<()> {
         let sql = "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
         self.conn
+            .prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
             .execute(
-                sql,
                 params![
                     node.id.as_str(),
                     node.kind.as_str(),
@@ -93,8 +94,9 @@ impl Store {
     pub fn upsert_edge(&mut self, edge: &EdgeAssertion) -> StoreResult<()> {
         let sql = "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
         self.conn
+            .prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
             .execute(
-                sql,
                 params![
                     edge.id.as_str(),
                     edge.from_id.as_str(),
@@ -149,8 +151,9 @@ impl Store {
     pub fn upsert_evidence(&mut self, ev: &Evidence) -> StoreResult<()> {
         let sql = "INSERT INTO evidence (id, artifact_id, kind, path, start_line, end_line, snippet, hash, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET artifact_id=excluded.artifact_id, kind=excluded.kind, path=excluded.path, start_line=excluded.start_line, end_line=excluded.end_line, snippet=excluded.snippet, hash=excluded.hash, metadata_json=excluded.metadata_json";
         self.conn
+            .prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
             .execute(
-                sql,
                 params![
                     ev.id.as_str(),
                     ev.artifact_id.as_str(),
@@ -182,8 +185,9 @@ impl Store {
     pub fn upsert_symbol_range(&mut self, range: &SymbolRange) -> StoreResult<()> {
         let sql = "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(file_path, symbol_id) DO UPDATE SET start_line=excluded.start_line, end_line=excluded.end_line, symbol_kind=excluded.symbol_kind, qualified_name=excluded.qualified_name, parent_symbol_id=excluded.parent_symbol_id";
         self.conn
+            .prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
             .execute(
-                sql,
                 params![
                     range.file_path,
                     range.symbol_id.as_str(),
@@ -230,8 +234,9 @@ impl Store {
     pub fn upsert_file_index(&mut self, entry: &FileIndexEntry) -> StoreResult<()> {
         let sql = "INSERT INTO file_index (path, hash, kind, indexed_at, index_generation) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, kind=excluded.kind, indexed_at=excluded.indexed_at, index_generation=excluded.index_generation";
         self.conn
+            .prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
             .execute(
-                sql,
                 params![
                     entry.path,
                     entry.hash,
@@ -260,26 +265,26 @@ impl Store {
     /// Delete every node, edge, evidence and symbol range produced by the
     /// given indexer name. Used to re-index without leaving stale rows.
     pub fn clear_indexer_outputs(&mut self, indexer: &str) -> StoreResult<()> {
-        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
-        tx.execute("DELETE FROM nodes WHERE indexer = ?1", params![indexer])
+        self.with_write_tx(|tx| {
+            tx.execute("DELETE FROM nodes WHERE indexer = ?1", params![indexer])
+                .map_err(StoreError::sqlite)?;
+            tx.execute(
+                "DELETE FROM edge_assertions WHERE indexer = ?1",
+                params![indexer],
+            )
             .map_err(StoreError::sqlite)?;
-        tx.execute(
-            "DELETE FROM edge_assertions WHERE indexer = ?1",
-            params![indexer],
-        )
-        .map_err(StoreError::sqlite)?;
-        tx.execute(
-            "DELETE FROM evidence WHERE artifact_id NOT IN (SELECT id FROM nodes)",
-            params![],
-        )
-        .map_err(StoreError::sqlite)?;
-        tx.execute(
-            "DELETE FROM symbol_ranges WHERE symbol_id NOT IN (SELECT id FROM nodes)",
-            params![],
-        )
-        .map_err(StoreError::sqlite)?;
-        tx.commit().map_err(StoreError::sqlite)?;
-        Ok(())
+            tx.execute(
+                "DELETE FROM evidence WHERE artifact_id NOT IN (SELECT id FROM nodes)",
+                params![],
+            )
+            .map_err(StoreError::sqlite)?;
+            tx.execute(
+                "DELETE FROM symbol_ranges WHERE symbol_id NOT IN (SELECT id FROM nodes)",
+                params![],
+            )
+            .map_err(StoreError::sqlite)?;
+            Ok(())
+        })
     }
 
     /// SCIP-authoritative suppression. For each `source_file` SCIP covered,
@@ -299,9 +304,8 @@ impl Store {
         }
         let calls = EdgeKind::Calls.as_str();
         let references = EdgeKind::References.as_str();
-        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
-        let mut removed = 0usize;
-        {
+        self.with_write_tx(|tx| {
+            let mut removed = 0usize;
             let mut stmt = tx
                 .prepare(
                     "DELETE FROM edge_assertions \
@@ -315,9 +319,8 @@ impl Store {
                     .execute(params![file, calls, references, keep_indexer])
                     .map_err(StoreError::sqlite)?;
             }
-        }
-        tx.commit().map_err(StoreError::sqlite)?;
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -335,11 +338,10 @@ impl Store {
     /// `specslice index` run after every structural pass, so the content layer
     /// always mirrors the current node set — no per-indexer ownership needed.
     pub fn rebuild_fulltext(&mut self, rows: &[FulltextRow]) -> StoreResult<usize> {
-        let tx = self.conn.transaction().map_err(StoreError::sqlite)?;
-        tx.execute("DELETE FROM node_fts", [])
-            .map_err(StoreError::sqlite)?;
-        let mut inserted = 0usize;
-        {
+        self.with_write_tx(|tx| {
+            tx.execute("DELETE FROM node_fts", [])
+                .map_err(StoreError::sqlite)?;
+            let mut inserted = 0usize;
             let mut stmt = tx
                 .prepare("INSERT INTO node_fts (node_id, body) VALUES (?1, ?2)")
                 .map_err(StoreError::sqlite)?;
@@ -351,9 +353,8 @@ impl Store {
                     .map_err(StoreError::sqlite)?;
                 inserted += 1;
             }
-        }
-        tx.commit().map_err(StoreError::sqlite)?;
-        Ok(inserted)
+            Ok(inserted)
+        })
     }
 
     /// BM25-ranked fulltext match. `match_expr` must be a well-formed FTS5
