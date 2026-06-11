@@ -292,8 +292,29 @@ fn language_build_excludes(lang: &str) -> Vec<String> {
 /// `android/build.gradle`, an `ios/Podfile`, …) would otherwise elect phantom
 /// languages. Platform-embedding dirs are skipped entirely. The walk is
 /// bounded (depth + file cap) and skips VCS / dependency / build directories.
+/// Manifest files that declare a first-party language project. A language
+/// backed by a manifest is elected even with a single source file; without
+/// one it needs more than a trace presence (stray gdb scripts, codegen
+/// helpers) to justify an indexing pass.
+const LANGUAGE_MANIFESTS: &[(&str, &str)] = &[
+    ("pubspec.yaml", "dart"),
+    ("go.mod", "go"),
+    ("package.swift", "swift"),
+    ("package.json", "typescript"),
+    ("cargo.toml", "rust"),
+    ("composer.json", "php"),
+    ("gemfile", "ruby"),
+    ("pom.xml", "java"),
+    ("build.gradle", "java"),
+    ("build.gradle.kts", "kotlin"),
+    ("pyproject.toml", "python"),
+    ("requirements.txt", "python"),
+    ("setup.py", "python"),
+];
+
 fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut manifest_langs: BTreeSet<&'static str> = BTreeSet::new();
     let mut topdirs: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     // Header-rich dirs (fmt's `include/`): headers never *elect* a language,
     // but once a real translation unit elects C/C++, the header dirs must
@@ -328,6 +349,16 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
                     break 'walk;
                 }
                 let path = entry.path();
+                let lower_name = name.to_ascii_lowercase();
+                if let Some((_, lang)) = LANGUAGE_MANIFESTS
+                    .iter()
+                    .find(|(manifest, _)| *manifest == lower_name)
+                {
+                    manifest_langs.insert(lang);
+                }
+                if lower_name.ends_with(".csproj") {
+                    manifest_langs.insert("csharp");
+                }
                 let Some(ext) = path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -375,10 +406,14 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
     }
 
     // One selection per language with ≥1 real source file, deterministically
-    // ordered by language id.
+    // ordered by language id. Languages without a manifest need more than a
+    // trace presence (≥3 files or ≥25% of the repo's sources).
+    let total: usize = counts.values().sum();
     counts
         .into_iter()
-        .filter(|(_, c)| *c > 0)
+        .filter(|(lang, c)| {
+            *c > 0 && (manifest_langs.contains(lang) || *c >= 3 || *c * 4 >= total)
+        })
         .map(|(lang, _)| {
             let mut roots = topdirs.get(lang).cloned().unwrap_or_default();
             // Elected C/C++ also owns its header-rich dirs (fmt's
@@ -478,6 +513,33 @@ mod tests {
             ids(&sels),
             vec!["dart", "go", "swift", "typescript"],
             "every first-party language must be selected"
+        );
+    }
+
+    /// Regression (rust-analyzer): a single gdb pretty-printer `.py` among
+    /// ~1500 `.rs` files made `init` enable a python pass over `lib/` —
+    /// which is a Rust directory. A language with no manifest and only a
+    /// trace presence is build tooling, not a first-party language.
+    /// Manifest-backed languages (pubspec, package.json…) stay elected even
+    /// with one file.
+    #[test]
+    fn stray_single_script_does_not_elect_a_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "Cargo.toml", "[workspace]\n");
+        for i in 0..6 {
+            write(
+                root,
+                &format!("crates/a/src/f{i}.rs"),
+                "pub fn x() {}\n",
+            );
+        }
+        write(root, "lib/smol_str/src/gdb_printer.py", "print('x')\n");
+        let sels = detect_language_selections(root);
+        assert_eq!(
+            ids(&sels),
+            vec!["rust"],
+            "a stray script must not elect python"
         );
     }
 

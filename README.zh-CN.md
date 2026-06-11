@@ -25,7 +25,7 @@ SpecSlice 为代码库构建一张**带证据**的图——把需求、文档、
 - **非侵入（零写回）。** SpecSlice 绝不编辑、注解或提交你的代码。所有状态都是可重建的缓存，只在 `.specslice/` 下。
 - **证据优先于断言。** 边由具体事实支撑（一个调用点、一处文档链接、一条测试引用），并带置信度——不是黑盒启发式。
 - **AI 提候选，人确认。** 业务逻辑候选由代码/文档/测试事实生成，必须经人工审阅后才成为权威。
-- **分层、多语言。** 进程内 tree-sitter 后端覆盖广度（Rust、TypeScript、Python、Go、Java、C、C++、Swift）外加 Dart 分析器 sidecar；**可选**的 SCIP/LSP 叠加层在你需要的地方补上精确的调用/引用边。
+- **分层、多语言。** 进程内 tree-sitter 后端覆盖广度（Rust、TypeScript、Python、Go、Java、C、C++、Swift、C#、Ruby、PHP、Kotlin）外加 Dart 分析器 sidecar；**可选**的 SCIP/LSP 叠加层在你需要的地方补上精确的调用/引用边。
 
 > SpecSlice **不是**更快的 grep。它是检索之上的一层：意图对齐、可追溯、文档/代码漂移。它能自举——SpecSlice 索引自己的 Rust 源码。
 
@@ -98,7 +98,7 @@ specslice dashboard                 # 单文件离线 HTML 管理面板
 
 | 层级 | 机制 | 语言 |
 | --- | --- | --- |
-| 广度（默认） | 进程内 **tree-sitter** | Rust、TypeScript、Python、Go、Java、C、C++、Swift |
+| 广度（默认） | 进程内 **tree-sitter** | Rust、TypeScript、Python、Go、Java、C、C++、Swift、C#、Ruby、PHP、Kotlin |
 | Dart | 内置**分析器 sidecar**（领域感知：Riverpod / Hive / 导航 / 内购） | Dart |
 | 文档 | Markdown / 需求 / ADR | `.md`、`.mdx` |
 

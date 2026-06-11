@@ -1997,7 +1997,10 @@ pub const ALWAYS_SKIP_DIRS: &[&str] = &[
     // Go toolchain convention (adopted industry-wide): `testdata/` holds
     // fixtures — often intentionally malformed or generated source — that
     // the compiler itself ignores. Indexing them floods dead-code/search.
+    // `test_data` is the same convention with an underscore (rust-analyzer's
+    // parser fixtures: ~470 deliberately broken `.rs` files).
     "testdata",
+    "test_data",
     // Python virtualenvs / installed packages / caches
     ".venv",
     "venv",

@@ -35,6 +35,34 @@ fn index(root: &Path) -> IndexResult {
     index_repository(IndexOptions::all(root)).expect("index must succeed")
 }
 
+/// Regression (rust-analyzer): `crates/parser/test_data/**` holds ~470
+/// fixture `.rs` files (many intentionally malformed). The Go-convention
+/// `testdata/` was already skipped, but the underscored variant slipped
+/// through and inflated the parser module to 539 "files" in `propose`.
+#[test]
+fn fixture_dirs_are_never_indexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "src/lib.rs", "pub fn real() {}\n");
+    write(root, "src/test_data/fixture_a.rs", "pub fn phantom_a() {}\n");
+    write(root, "src/testdata/fixture_b.rs", "pub fn phantom_b() {}\n");
+    enable_treesitter(root, "rust");
+    index(root);
+
+    let store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    let nodes = store.list_all_nodes().unwrap();
+    assert!(
+        nodes.iter().any(|n| n.name.as_deref() == Some("real")),
+        "production symbol must be indexed"
+    );
+    for phantom in ["phantom_a", "phantom_b"] {
+        assert!(
+            !nodes.iter().any(|n| n.name.as_deref() == Some(phantom)),
+            "fixture symbol {phantom} must not be indexed"
+        );
+    }
+}
+
 #[test]
 fn unified_pass_indexes_all_six_languages() {
     let tmp = tempfile::tempdir().unwrap();

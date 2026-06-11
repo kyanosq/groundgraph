@@ -25,7 +25,7 @@ It indexes your repository into a SQLite graph of **nodes** (symbols, files, doc
 - **Non-invasive (zero write-back).** SpecSlice never edits, annotates, or commits to your code. All state is a rebuildable cache under `.specslice/`.
 - **Evidence over assertion.** Edges are backed by concrete facts (a call site, a doc link, a test reference), each with a confidence level — not opaque heuristics.
 - **AI proposes, humans confirm.** Business-logic candidates are generated from code/doc/test facts and only become authoritative after a human review step.
-- **Tiered, multi-language.** A fast in-process tree-sitter backend covers breadth (Rust, TypeScript, Python, Go, Java, C, C++, Swift) plus a Dart analyzer sidecar; an *optional* SCIP/LSP overlay adds precise call/reference edges where you want them.
+- **Tiered, multi-language.** A fast in-process tree-sitter backend covers breadth (Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin) plus a Dart analyzer sidecar; an *optional* SCIP/LSP overlay adds precise call/reference edges where you want them.
 
 > SpecSlice is **not** a faster grep. It is the layer above retrieval: intent alignment, traceability, and doc/code drift. It self-hosts — SpecSlice indexes its own Rust source.
 
@@ -98,7 +98,7 @@ Run `specslice --help` (or `specslice <command> --help`) for the full, authorita
 
 | Tier | Mechanism | Languages |
 | --- | --- | --- |
-| Breadth (default) | In-process **tree-sitter** | Rust, TypeScript, Python, Go, Java, C, C++, Swift |
+| Breadth (default) | In-process **tree-sitter** | Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin |
 | Dart | Bundled **analyzer sidecar** (domain-aware: Riverpod / Hive / navigation / IAP) | Dart |
 | Docs | Markdown / requirements / ADR | `.md`, `.mdx` |
 

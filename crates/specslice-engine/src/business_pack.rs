@@ -1067,7 +1067,8 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
         adj.entry(a).or_default().push((b, w));
         adj.entry(b).or_default().push((a, w));
     }
-    let top_seg = |path: &str| path.split('/').next().unwrap_or_default().to_string();
+    let member_seg =
+        |path: &str| production_member(path).unwrap_or_default().to_string();
     let group_key: Vec<String> = (0..n)
         .map(|i| {
             if let Some(tok) = feature_marker_token(&files[i]) {
@@ -1077,7 +1078,7 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
                     let mut by_member: BTreeMap<String, f64> = BTreeMap::new();
                     for &(nb, w) in adj.get(&i).into_iter().flatten() {
                         if comm[nb] == comm[i] && !is_test_path(&files[nb]) {
-                            *by_member.entry(top_seg(&files[nb])).or_default() += w;
+                            *by_member.entry(member_seg(&files[nb])).or_default() += w;
                         }
                     }
                     by_member
@@ -1086,9 +1087,9 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
                         // smallest for determinism.
                         .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
                         .map(|(member, _)| member)
-                        .unwrap_or_else(|| top_seg(&files[i]))
+                        .unwrap_or_else(|| member_seg(&files[i]))
                 } else {
-                    top_seg(&files[i])
+                    member_seg(&files[i])
                 };
                 format!("comm::{}::{member}", comm[i])
             } else {
@@ -1127,11 +1128,23 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
         }
         let mi = match slug_index.get(&base) {
             Some(&existing) => {
-                // merge: keep the shorter (more general) path anchor
-                if !pfx.is_empty()
-                    && (prefix[existing].is_empty() || pfx.len() < prefix[existing].len())
-                {
-                    prefix[existing] = pfx;
+                // merge: a production anchor always outranks a test-tree
+                // anchor (laravel: isolated `tests/Database` buckets merge
+                // into the production "Database" community — anchoring the
+                // merged module at `tests/` would get it deleted by the
+                // test-tree report filter). Within the same class, keep the
+                // shorter (more general) anchor.
+                if !pfx.is_empty() {
+                    let old = &prefix[existing];
+                    let replace = old.is_empty()
+                        || match (is_test_path(old), is_test_path(&pfx)) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => pfx.len() < old.len(),
+                        };
+                    if replace {
+                        prefix[existing] = pfx;
+                    }
                 }
                 existing
             }
@@ -1190,6 +1203,26 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
         prefix,
         cohesion,
     }
+}
+
+/// Workspace containers whose *children* are publication units. A repo's
+/// top-level `crates/` (cargo workspace) or `packages/` (js / dart
+/// monorepos) is structure; `crates/<member>` is the boundary. Plain code
+/// roots (`src`, `lib`) are NOT containers — a single-rooted repo is one
+/// member.
+const MEMBER_CONTAINERS: &[&str] = &["crates", "packages", "apps", "modules"];
+
+/// The top-level *publication-unit* directory a path belongs to:
+/// `spring-core/src/…` → `spring-core`, `crates/foo/src/…` → `crates/foo`,
+/// `src/anything/…` → `src`. Returns `None` for root-level files.
+fn production_member(path: &str) -> Option<&str> {
+    let (first, rest) = path.split_once('/')?;
+    if MEMBER_CONTAINERS.contains(&first.to_ascii_lowercase().as_str()) {
+        if let Some((second, _)) = rest.split_once('/') {
+            return Some(&path[..first.len() + 1 + second.len()]);
+        }
+    }
+    Some(first)
 }
 
 /// Return the feature token for a path **only** when it sits under an
@@ -1329,9 +1362,94 @@ fn name_module(
         .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
         .map(|(d, c)| (d.clone(), *c));
     if let Some((disp, cnt)) = dominant {
-        if cnt * 2 >= file_idxs.len() || token_count.len() == 1 {
+        // Majority is judged among the files that actually *voted* — test
+        // paths carry no trusted token and must not dilute the denominator
+        // (laravel: 70 test files starved "Database" of its majority and a
+        // central exception class named the module). A clear plurality
+        // (≥2× the runner-up) also counts; near-ties (cross-component
+        // families like Bus+Queue) fall through to the central symbol.
+        // Either way the voters must cover a meaningful share of the
+        // community's production files, so a handful of stray tokens can
+        // never name a large community.
+        let voters: usize = token_count.values().sum();
+        let runner_up = token_count
+            .values()
+            .copied()
+            .filter(|&c| c < cnt)
+            .max()
+            .unwrap_or(0);
+        let eligible = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .count();
+        let covers = voters * 3 >= eligible;
+        let majority = cnt * 2 >= voters;
+        let plurality = cnt >= 3 && runner_up > 0 && cnt >= runner_up * 2;
+        if token_count.len() == 1 || (covers && (majority || plurality)) {
             let pfx = token_prefix.get(&disp).cloned().unwrap_or_default();
             return (disp, pfx);
+        }
+    }
+
+    // (a15) unique production member. When token votes tie in (a) and the
+    //     community sits entirely inside ONE top-level subproject of a
+    //     multi-member repo, that directory is the author's own boundary
+    //     and name for the code (spring-core's util/convert/codec family
+    //     is "spring-core", never a hash-map class or its busiest file).
+    //     Single-member repos skip this — the lone member carries no
+    //     information and the deeper rules differentiate communities.
+    {
+        // The member's display segment is the path's last component
+        // (`crates/specslice-core` → `specslice-core`).
+        fn leaf(m: &str) -> &str {
+            m.rsplit('/').next().unwrap_or(m)
+        }
+        let member_ok = |m: &str| {
+            let l = leaf(m).to_ascii_lowercase();
+            !SOURCE_ROOTS.contains(&l.as_str())
+                && !LAYER_DIRS.contains(&l.as_str())
+                && !NON_BUSINESS_BUCKETS.contains(&slugify(&l).as_str())
+        };
+        let community: BTreeSet<&str> = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .filter_map(|&fi| production_member(&files[fi]))
+            .collect();
+        if community.len() == 1 {
+            let member = *community.iter().next().expect("len checked");
+            if member_ok(member) {
+                let repo_members: BTreeSet<&str> = files
+                    .iter()
+                    .filter(|p| !is_test_path(p))
+                    .filter_map(|p| production_member(p))
+                    .filter(|m| member_ok(m))
+                    .collect();
+                if repo_members.len() >= 2 {
+                    // Members of a family share a brand prefix
+                    // (`spring-core` / `spring-web`, `okhttp-tls` /
+                    // `okhttp`, `crates/specslice-core` / `-engine`): the
+                    // tail is the author's module name and matches what
+                    // token-named sibling communities produce (`web`), so
+                    // the two merge instead of coexisting as "web" +
+                    // "spring_web".
+                    let name = leaf(member);
+                    let display = name
+                        .split_once('-')
+                        .filter(|(head, tail)| {
+                            !tail.is_empty()
+                                && repo_members.iter().any(|m| {
+                                    let m = leaf(m);
+                                    m != name
+                                        && (m == *head
+                                            || m.strip_prefix(head)
+                                                .is_some_and(|r| r.starts_with('-')))
+                                })
+                        })
+                        .map(|(_, tail)| tail.to_string())
+                        .unwrap_or_else(|| name.to_string());
+                    return (display, member.to_string());
+                }
+            }
         }
     }
 
@@ -2571,6 +2689,205 @@ mod tests {
         // "main" / "kotlin" are never business tokens.
         let k4 = feature_key("build-logic/src/main/kotlin/BndBuildAction.kt").expect("feature key");
         assert_eq!(k4.display, "build-logic", "got {k4:?}");
+    }
+
+    #[test]
+    fn name_module_majority_is_among_voters_not_diluted_by_tests() {
+        // Regression (laravel): a 147-file community held ~60 production
+        // files under `src/Illuminate/Database/**` plus ~70 `tests/**` files.
+        // Test paths produce no *trusted* feature token, yet they sat in the
+        // dominance denominator (`cnt*2 >= file_idxs.len()`), so "Database"
+        // never reached 50% and the module got named after the central
+        // symbol ("uniqueconstraintviolation"). Majority must be judged
+        // among the files that actually voted; clear pluralities (≥2× the
+        // runner-up) count too.
+        let mut files: Vec<String> = Vec::new();
+        for i in 0..6 {
+            files.push(format!("src/Illuminate/Database/Query/F{i}.php"));
+        }
+        files.push("src/Illuminate/Pagination/Paginator.php".to_string());
+        files.push("src/Illuminate/Support/Arr2.php".to_string());
+        for i in 0..10 {
+            files.push(format!("tests/Database/DatabaseQueryF{i}Test.php"));
+        }
+        let idxs: Vec<usize> = (0..files.len()).collect();
+        // Central symbol with huge in-degree sits in pagination — the wrong
+        // name unless directory consensus wins.
+        let n_central = node(
+            "x1",
+            NodeKind::PhpClass,
+            "src/Illuminate/Pagination/Paginator.php",
+            "Paginator",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(6, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 80);
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("database"),
+            "directory consensus among voters must outrank the central symbol: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_near_tie_communities_keep_central_symbol_naming() {
+        // Counter-case: a genuinely cross-component community (laravel's
+        // Bus+Queue+Broadcasting event family) has no dominant directory —
+        // votes split ~evenly. Forcing the slim plurality winner would be
+        // dishonest; the central-symbol rule stays in charge.
+        let files = vec![
+            "src/Illuminate/Bus/Batch.php".to_string(),
+            "src/Illuminate/Bus/PendingBatch.php".to_string(),
+            "src/Illuminate/Queue/Worker.php".to_string(),
+            "src/Illuminate/Queue/Job.php".to_string(),
+            "src/Illuminate/Broadcasting/Channel.php".to_string(),
+        ];
+        let idxs: Vec<usize> = (0..files.len()).collect();
+        let n_central = node(
+            "x2",
+            NodeKind::PhpClass,
+            "src/Illuminate/Bus/PendingBatch.php",
+            "PendingBatch",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(1, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 40);
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            !disp.eq_ignore_ascii_case("bus"),
+            "a 2-vs-2-vs-1 split must not crown 'Bus' by plurality: got {disp}"
+        );
+    }
+
+    #[test]
+    fn merged_slug_prefers_production_prefix_over_shorter_test_prefix() {
+        // Regression (laravel): the `tests/Database/**` files are isolated
+        // (no resolved edges into production) and bucket by their fallback
+        // token "Database" with prefix `tests/Database`; the production
+        // community names itself "Database" too. The slug merge kept the
+        // *shorter* anchor — `tests/Database` — and the test-tree retain
+        // then deleted the whole 548-file module from the report. A
+        // production anchor must always outrank a test anchor, regardless
+        // of length.
+        let files = [
+            "src/Illuminate/Database/Eloquent/Builder.php",
+            "src/Illuminate/Database/Eloquent/Model.php",
+            "tests/Database/DatabaseEloquentBuilderTest.php",
+            "tests/Database/DatabaseEloquentModelTest.php",
+        ];
+        let s0 = node("s0", NodeKind::PhpClass, files[0], "Builder");
+        let s1 = node("s1", NodeKind::PhpClass, files[1], "Model");
+        let t0 = node("t0", NodeKind::TestCase, files[2], "testWhere");
+        let t1 = node("t1", NodeKind::TestCase, files[3], "testSave");
+        let f: Vec<Node> = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| node(&format!("f{i}"), NodeKind::File, p, "f"))
+            .collect();
+        let mut nodes = vec![s0, s1, t0, t1];
+        nodes.extend(f);
+        // Production files couple to each other; tests stay isolated (the
+        // real failure mode: unresolved dynamic calls in the test tree).
+        let edges = vec![edge("s0", "s1", EdgeKind::Calls)];
+        let p = partition_modules(&nodes, &edges);
+        let mi = *p.by_file.get(files[0]).expect("production file placed");
+        assert_eq!(p.slug[mi], "database", "slugs: {:?}", p.slug);
+        assert!(
+            p.prefix[mi].starts_with("src/"),
+            "merged module must anchor at the production tree, got {}",
+            p.prefix[mi]
+        );
+    }
+
+    #[test]
+    fn partition_splits_workspace_member_containers() {
+        // Regression (specslice dogfood): `crates/specslice-core` symbols are
+        // referenced by every other crate, so one community spanned
+        // engine+core+store and the report showed 3 modules for a 5-crate
+        // workspace. `crates/<member>` / `packages/<member>` are publication
+        // units exactly like top-level subprojects — the member boundary is
+        // the *child* of the container, not the container itself.
+        let files = [
+            "crates/specslice-engine/src/index.rs",
+            "crates/specslice-core/src/node.rs",
+            "crates/specslice-store/src/lib.rs",
+        ];
+        let n0 = node("s0", NodeKind::RustFunction, files[0], "index_repository");
+        let n1 = node("s1", NodeKind::RustStruct, files[1], "Node");
+        let n2 = node("s2", NodeKind::RustStruct, files[2], "Store");
+        let f: Vec<Node> = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| node(&format!("f{i}"), NodeKind::File, p, "f"))
+            .collect();
+        let mut nodes = vec![n0, n1, n2];
+        nodes.extend(f);
+        // Engine references core and store heavily — one graph community.
+        let edges = vec![
+            edge("s0", "s1", EdgeKind::References),
+            edge("s0", "s2", EdgeKind::Calls),
+        ];
+        let p = partition_modules(&nodes, &edges);
+        let mi = |path: &str| *p.by_file.get(path).expect(path);
+        assert_ne!(
+            mi(files[0]),
+            mi(files[1]),
+            "engine and core are separate workspace members: {:?}",
+            p.slug
+        );
+        assert_ne!(
+            mi(files[0]),
+            mi(files[2]),
+            "engine and store are separate workspace members: {:?}",
+            p.slug
+        );
+    }
+
+    #[test]
+    fn name_module_unique_member_outranks_central_symbol_in_multimember_repos() {
+        // Regression (spring): spring-core's util/convert/codec packages form
+        // one community; package tokens tie (no majority, no 2× plurality),
+        // so the central symbol named a 285-file module
+        // "concurrentreferencehashmap". When the whole community lives in ONE
+        // top-level subproject of a multi-member repo, that directory is the
+        // author's own name for it — use it before falling back to a symbol.
+        let files = vec![
+            "spring-core/src/main/java/org/springframework/core/SpringVersion.java".to_string(),
+            "spring-core/src/main/java/org/springframework/core/convert/Converter.java"
+                .to_string(),
+            "spring-core/src/main/java/org/springframework/util/ConcurrentReferenceHashMap.java"
+                .to_string(),
+            "spring-core/src/main/java/org/springframework/util/StringUtils.java".to_string(),
+            "spring-core/src/main/java/org/springframework/codec/Codec.java".to_string(),
+            // other members exist in the repo (multi-member), but not in this
+            // community:
+            "spring-web/src/main/java/org/springframework/web/WebUtils.java".to_string(),
+        ];
+        let idxs: Vec<usize> = (0..5).collect();
+        let n_central = node(
+            "x3",
+            NodeKind::JavaClass,
+            "spring-core/src/main/java/org/springframework/util/ConcurrentReferenceHashMap.java",
+            "ConcurrentReferenceHashMap",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(2, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 90);
+        let (disp, pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("core"),
+            "unique member dir (brand prefix stripped) must outrank the central symbol: got {disp}"
+        );
+        assert_eq!(pfx, "spring-core");
     }
 
     #[test]
