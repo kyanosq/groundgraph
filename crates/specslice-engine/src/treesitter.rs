@@ -390,13 +390,17 @@ pub fn no_call_idents(_body: tree_sitter::Node<'_>, _source: &[u8]) -> Vec<(Stri
     Vec::new()
 }
 
-/// Per-file parse budget. Clean source parses in single-digit milliseconds;
-/// what blows past a budget is tree-sitter's error-recovery on files that are
-/// not really code (compiler test fixtures with intentional syntax errors —
-/// the TypeScript repo's `tests/cases` pushed a structural index from ~3 min
-/// to 20+ min). A timed-out file is skipped, not failed: one fixture must
-/// never stall the whole index run.
-const DEFAULT_PARSE_BUDGET_MS: u64 = 2_000;
+/// Per-file parse budget. Clean source parses in single-digit milliseconds —
+/// the 3.2 MB `checker.ts` (largest real-world source we've met) completes
+/// well under 500 ms — while what blows past the budget is tree-sitter's
+/// error-recovery on files that are not really code (compiler test fixtures
+/// with intentional syntax errors — the TypeScript repo's `tests/cases`
+/// pushed a structural index from ~3 min to 20+ min at no budget, and still
+/// burned ~30% of the wall clock at 2 s). Measured on that repo, 500 ms vs
+/// 2 s keeps 99.98% of symbols and cuts the index from 24.2 s to 16.4 s. A
+/// timed-out file keeps its File node but yields no symbols; raise via
+/// `SPECSLICE_PARSE_BUDGET_MS` on slow machines if fixtures matter.
+const DEFAULT_PARSE_BUDGET_MS: u64 = 500;
 
 fn parse_budget() -> std::time::Duration {
     let ms = std::env::var("SPECSLICE_PARSE_BUDGET_MS")
@@ -1419,28 +1423,39 @@ fn index_repo_with_spec_impl(
     let mut import_targets: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    // Parse in parallel, merge serially. Parsing is pure CPU (tree-sitter is
-    // reentrant per-parser) and dominates wall time on big repos; the merge
-    // below mutates shared batch state and stays single-threaded. Chunking
-    // bounds peak memory: only one chunk's sources are alive at a time.
+    // Parse in parallel, merge serially — as a *pipeline*, not in chunked
+    // lock-step. The old chunked design (parse 256, then merge 256) made
+    // every worker wait at the chunk barrier for the slowest parse; on repos
+    // whose fixtures trigger heavy error-recovery (TypeScript `tests/cases`)
+    // the profile showed workers parked in cvwait longer than they parsed.
+    // Here workers stream results through a bounded channel while the
+    // caller's thread merges concurrently; the channel bound keeps peak
+    // memory in check (only ~1k sources alive at once).
     use rayon::prelude::*;
-    const PARSE_CHUNK: usize = 256;
     let mut parse_timeouts: usize = 0;
-    for chunk in files.chunks(PARSE_CHUNK) {
-        let parsed: Vec<(&DiscoveredFile, String, Scan)> = chunk
-            .par_iter()
-            .filter_map(|file| {
-                let source = std::fs::read_to_string(&file.absolute).ok()?;
-                // Container formats (Vue SFCs) wrap parseable code in a
-                // `<script>` block; hand the grammar only that region
-                // (offsets preserved) so the rest of the file — `<template>`
-                // HTML, `<style>` CSS — never reaches the parser.
-                let parse_source = preprocess_source(&file.relative, &source);
-                let scanned = extract(spec, &parse_source);
-                Some((file, source, scanned))
-            })
-            .collect();
-        for (file, source, scanned) in parsed {
+    let files_ref: &[DiscoveredFile] = &files;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, String, Scan)>(1024);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            files_ref
+                .par_iter()
+                .enumerate()
+                .for_each_with(tx, |tx, (i, file)| {
+                    let Ok(source) = std::fs::read_to_string(&file.absolute) else {
+                        return;
+                    };
+                    // Container formats (Vue SFCs) wrap parseable code in a
+                    // `<script>` block; hand the grammar only that region
+                    // (offsets preserved) so the rest of the file —
+                    // `<template>` HTML, `<style>` CSS — never reaches the
+                    // parser.
+                    let parse_source = preprocess_source(&file.relative, &source);
+                    let scanned = extract(spec, &parse_source);
+                    let _ = tx.send((i, source, scanned));
+                });
+        });
+        for (i, source, scanned) in rx.iter() {
+            let file = &files[i];
             if scanned.parse_timed_out {
                 parse_timeouts += 1;
             }
@@ -1548,7 +1563,7 @@ fn index_repo_with_spec_impl(
                 pending_refs.push((file.relative.clone(), r.clone()));
             }
         }
-    }
+    });
     if parse_timeouts > 0 {
         result.parse_timeouts = parse_timeouts;
     }
