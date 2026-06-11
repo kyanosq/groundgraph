@@ -120,6 +120,82 @@ fn unified_pass_indexes_all_six_languages() {
     assert!(has(NodeKind::CppMethod, "tick"), "cpp method");
 }
 
+/// P26 — wave-3 breadth languages (C# / Ruby / PHP / Kotlin) flow through the
+/// same unified pass: config selects them, the generic driver indexes them,
+/// and their flagship kinds + tests land in the store.
+#[test]
+fn unified_pass_indexes_wave3_languages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    write(
+        root,
+        "src/Greeter.cs",
+        "namespace App;\npublic class Greeter\n{\n    public string Greet(string name) => \"hi\";\n}\npublic class GreeterTests\n{\n    [Fact]\n    public void Greets() { }\n}\n",
+    );
+    write(
+        root,
+        "src/billing.rb",
+        "module Billing\n  class Invoice\n    def charge!(gw)\n      gw.charge(1)\n    end\n  end\nend\n",
+    );
+    write(
+        root,
+        "src/Greeter.php",
+        "<?php\nclass Greeter {\n    public function greet(string $name): string { return \"hi\"; }\n}\nfunction top_level(): void {}\n",
+    );
+    write(
+        root,
+        "src/Greeter.kt",
+        "package app\n\nclass Greeter {\n    fun greet(name: String): String = \"hi\"\n}\n\nobject Registry { fun touch() {} }\n",
+    );
+
+    enable_treesitter(root, "csharp, ruby, php, kotlin");
+    let result = index(root);
+
+    let langs: Vec<&str> = result
+        .treesitter
+        .iter()
+        .map(|r| r.language.as_str())
+        .collect();
+    for want in ["csharp", "ruby", "php", "kotlin"] {
+        let entry = result
+            .treesitter
+            .iter()
+            .find(|r| r.language == want)
+            .unwrap_or_else(|| panic!("missing {want} in treesitter results: {langs:?}"));
+        assert!(
+            entry.files >= 1 && entry.symbols >= 2,
+            "{want} produced too little: {entry:?}"
+        );
+        assert_eq!(entry.resolver_used, format!("{want}_treesitter"));
+    }
+
+    let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    store.migrate().unwrap();
+    let nodes = store.list_all_nodes().unwrap();
+    let has = |kind: NodeKind, name: &str| {
+        nodes
+            .iter()
+            .any(|n| n.kind == kind && n.name.as_deref() == Some(name))
+    };
+
+    assert!(has(NodeKind::CSharpClass, "Greeter"), "cs class");
+    assert!(has(NodeKind::CSharpMethod, "Greet"), "cs method");
+    assert!(
+        has(NodeKind::TestCase, "Greets"),
+        "cs [Fact] becomes a test case"
+    );
+    assert!(has(NodeKind::RubyModule, "Billing"), "rb module");
+    assert!(has(NodeKind::RubyClass, "Invoice"), "rb class");
+    assert!(has(NodeKind::RubyMethod, "charge!"), "rb method");
+    assert!(has(NodeKind::PhpClass, "Greeter"), "php class");
+    assert!(has(NodeKind::PhpMethod, "greet"), "php method");
+    assert!(has(NodeKind::PhpFunction, "top_level"), "php function");
+    assert!(has(NodeKind::KotlinClass, "Greeter"), "kt class");
+    assert!(has(NodeKind::KotlinMethod, "greet"), "kt method");
+    assert!(has(NodeKind::KotlinObject, "Registry"), "kt object");
+}
+
 /// Regression: a project selected through the unified `languages:` list with
 /// `enrichment.lsp = false` (exactly what `init` writes for a JS/Vue repo) must
 /// still index the full `.tsx`/`.js`/`.jsx`/`.vue` dialect — not just `.ts`.

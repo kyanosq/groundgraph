@@ -1337,6 +1337,10 @@ pub fn spec_for_language(language_id: &str) -> Option<&'static LangSpec> {
         "swift" => Some(&crate::swift_treesitter::SWIFT_SPEC),
         "c" => Some(&crate::c_treesitter::C_SPEC),
         "cpp" | "c++" | "cxx" => Some(&crate::cpp_treesitter::CPP_SPEC),
+        "csharp" | "c#" | "cs" => Some(&crate::csharp_treesitter::CSHARP_SPEC),
+        "ruby" | "rb" => Some(&crate::ruby_treesitter::RUBY_SPEC),
+        "php" => Some(&crate::php_treesitter::PHP_SPEC),
+        "kotlin" | "kt" => Some(&crate::kotlin_treesitter::KOTLIN_SPEC),
         _ => None,
     }
 }

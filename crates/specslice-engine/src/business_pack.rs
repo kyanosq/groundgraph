@@ -610,7 +610,13 @@ fn build_pack(
     // listed — and reporting them invites the AI to invent a "Tutorial"
     // business candidate. Their content still reaches real modules through
     // the doc-association passes above.
-    reports.retain(|m| m.symbol_count > 0);
+    //
+    // Likewise a module whose path anchor lives in a test tree
+    // (`tests/Jellyfin.Api.Tests/**` buckets with no resolved edges into
+    // production code) is scaffolding: its helpers are real symbols, but
+    // reporting it would let test fixtures outrank every production module
+    // (tests dominate their own signal score).
+    reports.retain(|m| m.symbol_count > 0 && !is_test_path(&m.path_prefix));
     // `total_modules` counts the discovered *business* modules (after the
     // scaffolding denylist), independent of the `max_modules` cap.
     let total_modules = reports.len();
@@ -1043,15 +1049,48 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
 
     // ---- placement key per file ----------------------------------------
     // `feat::<slug>` for files under an explicit feature marker (trusted
-    // business boundary), else `comm::<id>` for graph-clustered files, else
-    // `path::<slug>` for isolated files with no graph signal. This single
-    // key space is what later groups files into modules.
+    // business boundary), else `comm::<id>::<member>` for graph-clustered
+    // files, else `path::<slug>` for isolated files with no graph signal.
+    // This single key space is what later groups files into modules.
+    //
+    // The `<member>` facet splits a community at top-level directory
+    // boundaries: in a monorepo those are publication units (rails gems,
+    // cargo workspace members, gradle subprojects), and a shared utility
+    // that every unit calls (rails: `Object#with` in activesupport) must
+    // make activesupport *depended on*, never fuse four gems into one
+    // module. Single-rooted repos (`src/**`) all share one member, so the
+    // facet is a no-op there. Test files are scaffolding, not members:
+    // they follow their strongest production neighbour inside the
+    // community instead of their own `tests/` top-level dir.
+    let mut adj: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+    for &(a, b, w) in &edge_list {
+        adj.entry(a).or_default().push((b, w));
+        adj.entry(b).or_default().push((a, w));
+    }
+    let top_seg = |path: &str| path.split('/').next().unwrap_or_default().to_string();
     let group_key: Vec<String> = (0..n)
         .map(|i| {
             if let Some(tok) = feature_marker_token(&files[i]) {
                 format!("feat::{}", slugify(&tok))
             } else if connected[i] {
-                format!("comm::{}", comm[i])
+                let member = if is_test_path(&files[i]) {
+                    let mut by_member: BTreeMap<String, f64> = BTreeMap::new();
+                    for &(nb, w) in adj.get(&i).into_iter().flatten() {
+                        if comm[nb] == comm[i] && !is_test_path(&files[nb]) {
+                            *by_member.entry(top_seg(&files[nb])).or_default() += w;
+                        }
+                    }
+                    by_member
+                        .into_iter()
+                        // Strongest member wins; ties go to the lexically
+                        // smallest for determinism.
+                        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+                        .map(|(member, _)| member)
+                        .unwrap_or_else(|| top_seg(&files[i]))
+                } else {
+                    top_seg(&files[i])
+                };
+                format!("comm::{}::{member}", comm[i])
             } else {
                 // Isolated file: bucket by its most specific *feature* dir.
                 let (disp, _) = fallback_feature_token(&files[i]);
@@ -1658,13 +1697,22 @@ fn skip_source_chain(dirs: &[&str], start: usize) -> usize {
 /// is not itself structural. Returns `(index, prefix_end)` where `prefix`
 /// is `dirs[..prefix_end]`.
 fn business_segment_after_source_root(dirs: &[&str], i: usize) -> Option<(usize, usize)> {
-    let j = pierce_jvm_layout(dirs, i);
-    if j < dirs.len() {
-        return Some((j, j + 1));
+    if let Some(j) = pierce_jvm_layout(dirs, i) {
+        if j < dirs.len() {
+            return Some((j, j + 1));
+        }
+        // A recognised JVM source-set chain with no package dirs at all
+        // (`build-logic/src/main/kotlin/Foo.kt`): the module directory in
+        // front of `src` is the business segment — "main" never is.
+        if i > 0 && !LAYER_DIRS.contains(&dirs[i - 1].to_ascii_lowercase().as_str()) {
+            return Some((i - 1, i));
+        }
+        return None;
     }
     let j = skip_source_chain(dirs, i + 1);
     if j < dirs.len() {
-        return Some((j, j + 1));
+        let k = pierce_pascal_namespace(dirs, j);
+        return Some((k, k + 1));
     }
     if i > 0 && !LAYER_DIRS.contains(&dirs[i - 1].to_ascii_lowercase().as_str()) {
         return Some((i - 1, i));
@@ -1672,41 +1720,101 @@ fn business_segment_after_source_root(dirs: &[&str], i: usize) -> Option<(usize,
     None
 }
 
+/// `src/<Vendor>/<Package>/…` (PSR-4 and other single-namespace-root
+/// layouts): a PascalCase vendor segment directly after the source chain is
+/// structural when a PascalCase package directory follows — `Illuminate` in
+/// laravel/framework names the *namespace* shared by every file, the
+/// component directory names the module. Pierce exactly one level. Dotted
+/// .NET project dirs (`Microsoft.Extensions.Logging`) and layer dirs
+/// (`Models`, `Controllers` in an app skeleton) are real module anchors and
+/// are never pierced into.
+fn pierce_pascal_namespace(dirs: &[&str], j: usize) -> usize {
+    let pascal = |s: &str| {
+        s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && s.chars().all(|c| c.is_ascii_alphanumeric())
+    };
+    let Some(next) = dirs.get(j + 1) else {
+        return j;
+    };
+    if pascal(dirs[j]) && pascal(next) && !LAYER_DIRS.contains(&next.to_ascii_lowercase().as_str())
+    {
+        j + 1
+    } else {
+        j
+    }
+}
+
 /// Given `dirs` and the index of a matched source root (`src`), return the
 /// index of the first *business* segment after piercing the Maven/Gradle
 /// source-set chain (`src/{main,test,commonMain,…}/{java,kotlin,…}`) and the
 /// JVM reverse-domain package prefix (`com/google/gson` → its sub-package,
-/// or the product segment for package-root files). Returns an index ==
-/// `dirs.len()` when nothing remains (caller falls back).
-fn pierce_jvm_layout(dirs: &[&str], src_idx: usize) -> usize {
+/// or the product segment for package-root files). Returns `None` when this
+/// is not a JVM source-set layout at all; `Some(dirs.len())` when the chain
+/// matched but swallowed every remaining segment (caller anchors at the
+/// module directory).
+fn pierce_jvm_layout(dirs: &[&str], src_idx: usize) -> Option<usize> {
     const JVM_LANGS: &[&str] = &["java", "kotlin", "scala", "groovy"];
     const TLDS: &[&str] = &["com", "org", "net", "io", "dev", "me", "co", "edu", "gov"];
-    let set = match dirs.get(src_idx + 1) {
-        Some(s) => s.to_ascii_lowercase(),
-        None => return dirs.len(),
-    };
-    if !(set.ends_with("main") || set.ends_with("test") || set == "androidtest") {
-        return dirs.len();
-    }
+    let set_raw = dirs.get(src_idx + 1)?;
+    let set = set_raw.to_ascii_lowercase();
     let lang_idx = src_idx + 2;
-    if !dirs
+    let lang_follows = dirs
         .get(lang_idx)
-        .is_some_and(|s| JVM_LANGS.contains(&s.to_ascii_lowercase().as_str()))
-    {
-        return dirs.len();
+        .is_some_and(|s| JVM_LANGS.contains(&s.to_ascii_lowercase().as_str()));
+    // Standard Maven/Gradle sets end in main/test; KMP repos also declare
+    // custom camelCase sets (`src/commonJvmAndroid/kotlin/...`). A camelCase
+    // segment is a set only when a JVM language dir follows — an all-lower
+    // business dir over a stray `java/` subdir is never pierced.
+    let is_source_set = set.ends_with("main")
+        || set.ends_with("test")
+        || set == "androidtest"
+        || (lang_follows && set_raw.chars().any(|c| c.is_ascii_uppercase()));
+    if !is_source_set || !lang_follows {
+        return None;
     }
-    // Package segments after the language dir.
+    // Package segments after the language dir. Letters-only comparison
+    // absorbs version suffixes (`okhttp3`) and separators (`spring-jdbc`).
+    let letters = |s: &str| -> String {
+        s.chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let module_dir = if src_idx > 0 {
+        letters(dirs[src_idx - 1])
+    } else {
+        String::new()
+    };
     let mut i = lang_idx + 1;
     // Reverse-domain prefix: TLD + organisation.
     if dirs.len() - i >= 2 && TLDS.contains(&dirs[i].to_ascii_lowercase().as_str()) {
         i += 2;
-        // Product segment: only skipped when a deeper sub-package exists
-        // (`com/google/gson/stream` → stream; `com/google/gson` → gson).
+        // Product segment: skipped when a deeper sub-package exists
+        // (`com/google/gson/stream` → stream; `com/google/gson` → gson) —
+        // unless the subproject directory is *named after* it
+        // (`spring-jdbc` ↔ `…springframework/jdbc`): a product-named
+        // subproject makes the product segment the business identity, and
+        // its sub-packages (`core`, `support`) mere structure.
         if dirs.len() - i >= 2 {
+            let pkg = letters(dirs[i]);
+            let product_named_subproject =
+                !pkg.is_empty() && module_dir != pkg && module_dir.ends_with(&pkg);
+            if !product_named_subproject {
+                i += 1;
+            }
+        }
+    } else if dirs.len() - i >= 2 {
+        // Non-reverse-domain package root that *names the product*: Kotlin
+        // repos commonly root the package at the module's own name
+        // (`okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/…` —
+        // okhttp3 ≈ okhttp). Strip it like the TLD product segment, and only
+        // when a deeper sub-package exists.
+        let pkg = letters(dirs[i]);
+        if !pkg.is_empty() && pkg == module_dir {
             i += 1;
         }
     }
-    i
+    Some(i)
 }
 
 /// Derive the business module a code/test path belongs to. Returns `None`
@@ -2356,6 +2464,195 @@ mod tests {
         assert_eq!(disp, "flutter_todos");
         let (disp2, _pfx2) = fallback_feature_token("common_github_search/lib/src/models.dart");
         assert_eq!(disp2, "common_github_search");
+    }
+
+    #[test]
+    fn feature_key_pierces_psr4_vendor_namespace() {
+        // Regression (laravel): `src/Illuminate/Auth/AuthManager.php` hit the
+        // SOURCE_ROOTS rule at `src` and took "Illuminate" — the PSR-4 vendor
+        // namespace shared by *all* 2700 files — as the business token, so
+        // every graph community named itself "illuminate" and the slug-merge
+        // collapsed the whole framework into one module. A PascalCase vendor
+        // segment directly under a source root is structural when another
+        // PascalCase package segment follows; pierce exactly one level.
+        let k = feature_key("src/Illuminate/Auth/AuthManager.php").expect("feature key");
+        assert_eq!(k.display, "Auth", "got {k:?}");
+        let k2 = feature_key("src/Illuminate/Database/Eloquent/Model.php").expect("feature key");
+        assert_eq!(k2.display, "Database", "got {k2:?}");
+        // Lowercase python/dart packages keep their package name.
+        let k3 = feature_key("src/flask/app.py").expect("feature key");
+        assert_eq!(k3.display, "flask", "got {k3:?}");
+        // A dotted .NET project dir is a real module name, never pierced.
+        let k4 = feature_key("src/Microsoft.Extensions.Logging/Logger.cs").expect("feature key");
+        assert_eq!(k4.display, "Microsoft.Extensions.Logging", "got {k4:?}");
+        // Single Pascal segment with only files below stays (it IS the module).
+        let k5 = feature_key("src/Core/engine.cs").expect("feature key");
+        assert_eq!(k5.display, "Core", "got {k5:?}");
+        // Layer dirs are never promoted to module names: an app skeleton's
+        // `src/Acme/Models/User.php` anchors at the vendor, not `Models`.
+        let k6 = feature_key("src/Acme/Models/User.php").expect("feature key");
+        assert_eq!(k6.display, "Acme", "got {k6:?}");
+    }
+
+    #[test]
+    fn partition_respects_top_level_member_boundaries() {
+        // Regression (rails): `Object#with` (activesupport core_ext) is called
+        // from actionpack/activerecord/railties alike, so one graph community
+        // spanned four gems and the dominant-file rule named the 61-file blob
+        // "with". Top-level directories of a monorepo are publication units
+        // (gems / workspace members / gradle projects): a community must never
+        // merge production files across them. Test-tree files (their own
+        // top-level dir) follow the community's dominant production member.
+        let files = [
+            "activesupport/lib/active_support/core_ext/object/with.rb",
+            "actionpack/lib/action_controller/metal.rb",
+            "activerecord/lib/active_record/base.rb",
+            "tests/object_with_test.rb",
+        ];
+        let n0 = node("s0", NodeKind::RubyMethod, files[0], "with");
+        let n1 = node("s1", NodeKind::RubyMethod, files[1], "metal_dispatch");
+        let n2 = node("s2", NodeKind::RubyMethod, files[2], "save");
+        let n3 = node("s3", NodeKind::RubyMethod, files[3], "test_with");
+        let f0 = node("f0", NodeKind::File, files[0], "with.rb");
+        let f1 = node("f1", NodeKind::File, files[1], "metal.rb");
+        let f2 = node("f2", NodeKind::File, files[2], "base.rb");
+        let f3 = node("f3", NodeKind::File, files[3], "object_with_test.rb");
+        let nodes = vec![n0, n1, n2, n3, f0, f1, f2, f3];
+        // Everyone calls `with` — one tight community in graph terms.
+        let edges = vec![
+            edge("s1", "s0", EdgeKind::Calls),
+            edge("s2", "s0", EdgeKind::Calls),
+            edge("s3", "s0", EdgeKind::Calls),
+            edge("s3", "s0", EdgeKind::References),
+        ];
+        let p = partition_modules(&nodes, &edges);
+        let mi = |path: &str| *p.by_file.get(path).expect(path);
+        assert_ne!(
+            mi(files[0]),
+            mi(files[1]),
+            "activesupport and actionpack must stay separate modules: {:?}",
+            p.slug
+        );
+        assert_ne!(
+            mi(files[1]),
+            mi(files[2]),
+            "actionpack and activerecord must stay separate modules: {:?}",
+            p.slug
+        );
+        // The test file follows the dominant production member of its
+        // community (all three call into activesupport's `with`).
+        assert_eq!(
+            mi(files[3]),
+            mi(files[0]),
+            "test file must follow the community's production member: {:?}",
+            p.slug
+        );
+    }
+
+    #[test]
+    fn feature_key_pierces_kmp_custom_source_sets() {
+        // Regression (okhttp): Kotlin Multiplatform repos declare custom
+        // source sets (`src/commonJvmAndroid/kotlin/...`) that don't end in
+        // "main"/"test", so the JVM pierce fell through and named a
+        // 140-file module "commonJvmAndroid". A camelCase set segment whose
+        // next segment is a JVM language dir is structural all the same.
+        let k = feature_key("okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/Util.kt")
+            .expect("feature key");
+        assert_eq!(k.display, "internal", "got {k:?}");
+        let k2 =
+            feature_key("okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt").expect("feature key");
+        assert_eq!(k2.display, "okhttp3", "got {k2:?}");
+        // An all-lowercase business dir that happens to sit over a `java/`
+        // subdir is NOT a source set — never pierced.
+        let k3 = feature_key("src/banking/java/Ledger.java").expect("feature key");
+        assert_eq!(k3.display, "banking", "got {k3:?}");
+        // A JVM source-set chain with no package dirs at all (Gradle
+        // build-logic conventions) anchors at the module directory —
+        // "main" / "kotlin" are never business tokens.
+        let k4 = feature_key("build-logic/src/main/kotlin/BndBuildAction.kt").expect("feature key");
+        assert_eq!(k4.display, "build-logic", "got {k4:?}");
+    }
+
+    #[test]
+    fn feature_key_keeps_product_segment_in_product_named_subprojects() {
+        // Regression (spring): `spring-jdbc/src/main/java/org/springframework/
+        // jdbc/core/JdbcTemplate.java` pierced past the product segment to
+        // the structural sub-package (`core`, `support`), so token votes
+        // scattered and 221-file modules got named after a central symbol
+        // ("jdbctemplate"). When the subproject directory is *named after*
+        // the package (`spring-jdbc` ↔ `…jdbc`), the product segment IS the
+        // business identity — keep it.
+        let k = feature_key("spring-jdbc/src/main/java/org/springframework/jdbc/core/JdbcTemplate.java")
+            .expect("feature key");
+        assert_eq!(k.display, "jdbc", "got {k:?}");
+        // Single-namespace repos still pierce to the sub-package: gson's
+        // main module documents its features by sub-package…
+        let k2 = feature_key("gson/src/main/java/com/google/gson/stream/JsonReader.java")
+            .expect("feature key");
+        assert_eq!(k2.display, "stream", "got {k2:?}");
+        // …and its `extras` module shares the `com.google.gson` namespace —
+        // the sub-package is the only distinguishing feature token.
+        let k3 = feature_key(
+            "extras/src/main/java/com/google/gson/interceptors/Intercept.java",
+        )
+        .expect("feature key");
+        assert_eq!(k3.display, "interceptors", "got {k3:?}");
+    }
+
+    #[test]
+    fn test_tree_buckets_are_never_business_modules() {
+        // Regression (jellyfin): `tests/Jellyfin.Api.Tests/**` files have no
+        // resolved edges into production code, so they bucket by path and
+        // outscored every production module in the report (tests dominate
+        // their signal). A module whose path anchor lives in a test tree is
+        // scaffolding, never a business module.
+        let nodes = vec![
+            node(
+                "p1",
+                NodeKind::CSharpClass,
+                "Jellyfin.Api/Controllers/UserController.cs",
+                "UserController",
+            ),
+            node(
+                "f1",
+                NodeKind::File,
+                "Jellyfin.Api/Controllers/UserController.cs",
+                "UserController.cs",
+            ),
+            node(
+                "h1",
+                NodeKind::CSharpClass,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpers.cs",
+                "RequestHelpers",
+            ),
+            node(
+                "t1",
+                NodeKind::TestCase,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpersTests.cs",
+                "GetOrderBy_Success",
+            ),
+            node(
+                "f2",
+                NodeKind::File,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpers.cs",
+                "RequestHelpers.cs",
+            ),
+        ];
+        let edges = Vec::new(); // no resolved coupling, exactly the failure mode
+        let pack = build_pack(&nodes, &edges, &BusinessPackOptions::default());
+        for m in &pack.modules {
+            assert!(
+                !m.path_prefix.starts_with("tests/"),
+                "test-tree bucket reported as business module: {} ({})",
+                m.id,
+                m.path_prefix
+            );
+        }
+        assert!(
+            pack.modules.iter().any(|m| m.symbol_count > 0),
+            "the production module must survive: {:?}",
+            pack.modules.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -122,6 +122,43 @@ pub enum NodeKind {
     CppEnum,
     CppFunction,
     CppMethod,
+    // ---- P26 breadth wave 3: C# / Ruby / PHP / Kotlin (tree-sitter) -------
+    // Same in-process tree-sitter convention as P21/P22: language-prefixed
+    // structural kinds, zero project configuration. C# methods include
+    // constructors (no separate kind — the grammar names them like methods);
+    // Ruby's `module` is its namespace container; PHP traits are containers
+    // in their own right; Kotlin `object` declarations are singletons but
+    // structurally classes.
+    // serde's snake_case would split the acronym ("c_sharp_class"); keep the
+    // wire form aligned with `as_str` / the language id ("csharp").
+    #[serde(rename = "csharp_class")]
+    CSharpClass,
+    #[serde(rename = "csharp_interface")]
+    CSharpInterface,
+    #[serde(rename = "csharp_struct")]
+    CSharpStruct,
+    #[serde(rename = "csharp_enum")]
+    CSharpEnum,
+    #[serde(rename = "csharp_method")]
+    CSharpMethod,
+    #[serde(rename = "csharp_function")]
+    CSharpFunction,
+    RubyModule,
+    RubyClass,
+    RubyMethod,
+    RubyFunction,
+    PhpClass,
+    PhpInterface,
+    PhpTrait,
+    PhpEnum,
+    PhpMethod,
+    PhpFunction,
+    KotlinClass,
+    KotlinInterface,
+    KotlinEnum,
+    KotlinObject,
+    KotlinMethod,
+    KotlinFunction,
     // ---- P25 data layer: DB schema as a first-class graph node ------------
     /// A database table (logical name) extracted from `CREATE TABLE` (.sql)
     /// or an ORM annotation (MyBatis-Plus `@TableName` / JPA `@Table`).
@@ -210,6 +247,28 @@ impl NodeKind {
         NodeKind::CppEnum,
         NodeKind::CppFunction,
         NodeKind::CppMethod,
+        NodeKind::CSharpClass,
+        NodeKind::CSharpInterface,
+        NodeKind::CSharpStruct,
+        NodeKind::CSharpEnum,
+        NodeKind::CSharpMethod,
+        NodeKind::CSharpFunction,
+        NodeKind::RubyModule,
+        NodeKind::RubyClass,
+        NodeKind::RubyMethod,
+        NodeKind::RubyFunction,
+        NodeKind::PhpClass,
+        NodeKind::PhpInterface,
+        NodeKind::PhpTrait,
+        NodeKind::PhpEnum,
+        NodeKind::PhpMethod,
+        NodeKind::PhpFunction,
+        NodeKind::KotlinClass,
+        NodeKind::KotlinInterface,
+        NodeKind::KotlinEnum,
+        NodeKind::KotlinObject,
+        NodeKind::KotlinMethod,
+        NodeKind::KotlinFunction,
         NodeKind::DbTable,
         NodeKind::SqlMapperStmt,
         NodeKind::HttpRoute,
@@ -240,6 +299,10 @@ impl NodeKind {
             "typescript",
             "java",
             "rust",
+            "csharp",
+            "ruby",
+            "php",
+            "kotlin",
             "cpp",
             "c",
         ]
@@ -285,6 +348,20 @@ impl NodeKind {
                 | CppClass
                 | CppStruct
                 | CppEnum
+                | CSharpClass
+                | CSharpInterface
+                | CSharpStruct
+                | CSharpEnum
+                | RubyModule
+                | RubyClass
+                | PhpClass
+                | PhpInterface
+                | PhpTrait
+                | PhpEnum
+                | KotlinClass
+                | KotlinInterface
+                | KotlinEnum
+                | KotlinObject
         )
     }
 
@@ -301,6 +378,10 @@ impl NodeKind {
                 | JavaMethod
                 | RustMethod
                 | CppMethod
+                | CSharpMethod
+                | RubyMethod
+                | PhpMethod
+                | KotlinMethod
         )
     }
 
@@ -317,6 +398,10 @@ impl NodeKind {
                 | RustFunction
                 | CFunction
                 | CppFunction
+                | CSharpFunction
+                | RubyFunction
+                | PhpFunction
+                | KotlinFunction
         )
     }
 
@@ -397,6 +482,28 @@ impl NodeKind {
             NodeKind::CppEnum => "cpp_enum",
             NodeKind::CppFunction => "cpp_function",
             NodeKind::CppMethod => "cpp_method",
+            NodeKind::CSharpClass => "csharp_class",
+            NodeKind::CSharpInterface => "csharp_interface",
+            NodeKind::CSharpStruct => "csharp_struct",
+            NodeKind::CSharpEnum => "csharp_enum",
+            NodeKind::CSharpMethod => "csharp_method",
+            NodeKind::CSharpFunction => "csharp_function",
+            NodeKind::RubyModule => "ruby_module",
+            NodeKind::RubyClass => "ruby_class",
+            NodeKind::RubyMethod => "ruby_method",
+            NodeKind::RubyFunction => "ruby_function",
+            NodeKind::PhpClass => "php_class",
+            NodeKind::PhpInterface => "php_interface",
+            NodeKind::PhpTrait => "php_trait",
+            NodeKind::PhpEnum => "php_enum",
+            NodeKind::PhpMethod => "php_method",
+            NodeKind::PhpFunction => "php_function",
+            NodeKind::KotlinClass => "kotlin_class",
+            NodeKind::KotlinInterface => "kotlin_interface",
+            NodeKind::KotlinEnum => "kotlin_enum",
+            NodeKind::KotlinObject => "kotlin_object",
+            NodeKind::KotlinMethod => "kotlin_method",
+            NodeKind::KotlinFunction => "kotlin_function",
             NodeKind::DbTable => "db_table",
             NodeKind::SqlMapperStmt => "sql_mapper_stmt",
             NodeKind::HttpRoute => "http_route",

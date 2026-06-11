@@ -40,6 +40,10 @@ pub enum Language {
     Rust,
     C,
     Cpp,
+    CSharp,
+    Ruby,
+    Php,
+    Kotlin,
     /// Markdown / Requirement / ADR / DocSection / AcceptanceCriterion.
     Doc,
     /// Synthetic graph anchors not tied to a host language (Route, Storage,
@@ -123,7 +127,20 @@ pub fn lex_syntax(lang: Language) -> LexSyntax {
         | Language::Java
         | Language::Rust
         | Language::C
-        | Language::Cpp => LEX_C_FAMILY,
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Kotlin => LEX_C_FAMILY,
+        // `#` line comments, no block comments, single-quoted strings.
+        Language::Ruby => LexSyntax {
+            line_comment: "#",
+            block_comment: None,
+            single_quote: SingleQuote::String,
+        },
+        // `//` + `/* */` like C, but `'…'` is a string.
+        Language::Php => LexSyntax {
+            single_quote: SingleQuote::String,
+            ..LEX_C_FAMILY
+        },
         // Not host languages — never scanned; harmless default.
         Language::Doc | Language::Synthetic | Language::Generic => LEX_C_FAMILY,
     }
@@ -200,6 +217,28 @@ pub fn language_of(kind: NodeKind) -> Language {
         | NodeKind::CppEnum
         | NodeKind::CppFunction
         | NodeKind::CppMethod => Language::Cpp,
+        NodeKind::CSharpClass
+        | NodeKind::CSharpInterface
+        | NodeKind::CSharpStruct
+        | NodeKind::CSharpEnum
+        | NodeKind::CSharpMethod
+        | NodeKind::CSharpFunction => Language::CSharp,
+        NodeKind::RubyModule
+        | NodeKind::RubyClass
+        | NodeKind::RubyMethod
+        | NodeKind::RubyFunction => Language::Ruby,
+        NodeKind::PhpClass
+        | NodeKind::PhpInterface
+        | NodeKind::PhpTrait
+        | NodeKind::PhpEnum
+        | NodeKind::PhpMethod
+        | NodeKind::PhpFunction => Language::Php,
+        NodeKind::KotlinClass
+        | NodeKind::KotlinInterface
+        | NodeKind::KotlinEnum
+        | NodeKind::KotlinObject
+        | NodeKind::KotlinMethod
+        | NodeKind::KotlinFunction => Language::Kotlin,
         NodeKind::Requirement
         | NodeKind::AcceptanceCriterion
         | NodeKind::Adr
@@ -249,7 +288,21 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::CEnum
         | NodeKind::CppClass
         | NodeKind::CppStruct
-        | NodeKind::CppEnum => SymbolFamily::Type,
+        | NodeKind::CppEnum
+        | NodeKind::CSharpClass
+        | NodeKind::CSharpInterface
+        | NodeKind::CSharpStruct
+        | NodeKind::CSharpEnum
+        | NodeKind::RubyModule
+        | NodeKind::RubyClass
+        | NodeKind::PhpClass
+        | NodeKind::PhpInterface
+        | NodeKind::PhpTrait
+        | NodeKind::PhpEnum
+        | NodeKind::KotlinClass
+        | NodeKind::KotlinInterface
+        | NodeKind::KotlinEnum
+        | NodeKind::KotlinObject => SymbolFamily::Type,
         // Callables.
         NodeKind::DartMethod
         | NodeKind::DartFunction
@@ -269,7 +322,15 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::RustMethod
         | NodeKind::CFunction
         | NodeKind::CppFunction
-        | NodeKind::CppMethod => SymbolFamily::Callable,
+        | NodeKind::CppMethod
+        | NodeKind::CSharpMethod
+        | NodeKind::CSharpFunction
+        | NodeKind::RubyMethod
+        | NodeKind::RubyFunction
+        | NodeKind::PhpMethod
+        | NodeKind::PhpFunction
+        | NodeKind::KotlinMethod
+        | NodeKind::KotlinFunction => SymbolFamily::Callable,
         // Tests.
         NodeKind::TestCase | NodeKind::TestGroup => SymbolFamily::Test,
         // Docs.

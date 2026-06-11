@@ -225,6 +225,10 @@ fn ext_language(ext: &str) -> Option<&'static str> {
         "py" => "python",
         "go" => "go",
         "java" => "java",
+        "cs" => "csharp",
+        "rb" | "rake" => "ruby",
+        "php" => "php",
+        "kt" | "kts" => "kotlin",
         "c" | "h" => "c",
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
         _ => return None,
@@ -265,6 +269,10 @@ fn language_build_excludes(lang: &str) -> Vec<String> {
         "python" => vec!["**/.venv/**".into(), "**/__pycache__/**".into()],
         "go" => vec!["**/vendor/**".into()],
         "java" => vec!["**/target/**".into(), "**/build/**".into()],
+        "csharp" => vec!["**/bin/**".into(), "**/obj/**".into()],
+        "ruby" => vec!["**/vendor/**".into(), "**/tmp/**".into()],
+        "php" => vec!["**/vendor/**".into(), "**/storage/**".into()],
+        "kotlin" => vec!["**/build/**".into(), "**/.gradle/**".into()],
         _ => Vec::new(),
     }
 }

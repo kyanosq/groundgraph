@@ -294,6 +294,10 @@ pub fn canonical_language_id(id: &str) -> Option<&'static str> {
         "swift" => Some("swift"),
         "c" => Some("c"),
         "cpp" | "c++" | "cxx" => Some("cpp"),
+        "csharp" | "c#" | "cs" => Some("csharp"),
+        "ruby" | "rb" => Some("ruby"),
+        "php" => Some("php"),
+        "kotlin" | "kt" => Some("kotlin"),
         _ => None,
     }
 }
