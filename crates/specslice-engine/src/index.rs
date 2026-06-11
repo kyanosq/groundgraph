@@ -119,7 +119,34 @@ pub struct TreeSitterLangResult {
     pub resolver_used: String,
 }
 
+/// Wall-clock phase reporter, enabled by `SPECSLICE_TIMING=1`. Prints each
+/// index phase's elapsed time to stderr so a slow run can be attributed to
+/// parse / ingest / scip / fulltext without a sampling profiler.
+struct PhaseTimer {
+    enabled: bool,
+    last: std::time::Instant,
+}
+
+impl PhaseTimer {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("SPECSLICE_TIMING").is_some(),
+            last: std::time::Instant::now(),
+        }
+    }
+    fn mark(&mut self, phase: &str) {
+        if self.enabled {
+            eprintln!(
+                "[timing] {phase}: {:.2}s",
+                self.last.elapsed().as_secs_f64()
+            );
+        }
+        self.last = std::time::Instant::now();
+    }
+}
+
 pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
+    let mut timer = PhaseTimer::new();
     let config = load_config(&options.repo_root)?;
     let db_path = resolve_storage_path(&options.repo_root, &config);
     let mut store = Store::open(&db_path)
@@ -149,6 +176,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         };
         let docs = index_docs(&mut store, &docs_options).context("indexing docs")?;
         result.docs = Some(docs);
+        timer.mark("docs");
     }
 
     if options.include_code {
@@ -177,6 +205,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             )
             .context("indexing Dart sources")?;
             result.code = Some(code);
+            timer.mark("dart");
         }
 
         // P11/P23.5 — opt-in Swift / Go adapters. Both are gated behind the
@@ -199,6 +228,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             let swift =
                 index_swift(&mut store, &swift_options).context("indexing Swift sources")?;
             result.swift = Some(swift);
+            timer.mark("swift");
         }
 
         // P11/P23.4 — Go adapter. The tree-sitter driver owns structure +
@@ -214,6 +244,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             };
             let go = index_go(&mut store, &go_options).context("indexing Go sources")?;
             result.go = Some(go);
+            timer.mark("go");
         }
 
         // P16/P23.1 — Python adapter. The in-process tree-sitter driver owns
@@ -231,6 +262,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             let python =
                 index_python(&mut store, &python_options).context("indexing Python sources")?;
             result.python = Some(python);
+            timer.mark("python_adapter");
         }
 
         // P20/P23.2 — TypeScript adapter. The tree-sitter driver (`.ts` +
@@ -248,6 +280,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             let ts =
                 index_typescript(&mut store, &ts_options).context("indexing TypeScript sources")?;
             result.typescript = Some(ts);
+            timer.mark("typescript_adapter");
         }
 
         // P20/P23.3 — Java adapter. The tree-sitter driver owns structure +
@@ -263,6 +296,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             };
             let java = index_java(&mut store, &java_options).context("indexing Java sources")?;
             result.java = Some(java);
+            timer.mark("java");
         }
 
         // P21 — Rust adapter. No LSP tier: the tree-sitter grammar is
@@ -280,6 +314,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             };
             let rust = index_rust(&mut store, &rust_options).context("indexing Rust sources")?;
             result.rust = Some(rust);
+            timer.mark("rust_adapter");
         }
 
         // P22 — unified tree-sitter breadth backend. One pass drives the
@@ -343,6 +378,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
                     parse_timeouts: ts.parse_timeouts,
                     resolver_used: ts.resolver_used,
                 });
+                timer.mark(&format!("treesitter:{}", spec.language_id));
             }
         }
 
@@ -370,6 +406,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
             let scip = crate::scip_overlay::ingest_scip_overlay(&mut store, &options.repo_root)
                 .context("ingesting SCIP overlay")?;
             result.scip = Some(scip);
+            timer.mark("scip");
         }
     }
 
@@ -386,6 +423,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing external links manifest")?;
         result.links = Some(links);
+            timer.mark("links");
 
         // P23.9 — Markdown requirements. Runs after the manifest so both
         // sources contribute requirement→artifact edges into the same graph;
@@ -403,6 +441,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing markdown requirements")?;
         result.requirements_md = Some(requirements_md);
+            timer.mark("requirements_md");
     }
 
     // Content layer LAST: it mirrors whatever node set the passes above just
@@ -413,8 +452,10 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     let fulltext = crate::fulltext_indexer::rebuild_fulltext_index(&mut store, &options.repo_root)
         .context("rebuilding fulltext content layer")?;
     result.fulltext = Some(fulltext);
+    timer.mark("fulltext");
 
     store.commit_bulk().context("committing bulk write session")?;
+    timer.mark("commit");
 
     Ok(result)
 }

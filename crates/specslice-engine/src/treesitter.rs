@@ -1386,6 +1386,14 @@ fn index_repo_with_spec_impl(
     options: &TsIndexOptions,
     resolve_inline: bool,
 ) -> Result<(TsIndexResult, RefResolutionInputs)> {
+    let timing = std::env::var_os("SPECSLICE_TIMING").is_some();
+    let mut t = std::time::Instant::now();
+    let mut mark = move |phase: &str, lang: &str| {
+        if timing {
+            eprintln!("[timing]   {lang}/{phase}: {:.2}s", t.elapsed().as_secs_f64());
+        }
+        t = std::time::Instant::now();
+    };
     let files = discover_files(
         &options.repo_root,
         &options.code_roots,
@@ -1394,6 +1402,7 @@ fn index_repo_with_spec_impl(
         spec.skip_dirs,
         spec.claims_path,
     )?;
+    mark("discover", spec.language_id);
     if files.is_empty() {
         return Ok((TsIndexResult::default(), RefResolutionInputs::default()));
     }
@@ -1564,6 +1573,7 @@ fn index_repo_with_spec_impl(
             }
         }
     });
+    mark("parse+merge", spec.language_id);
     if parse_timeouts > 0 {
         result.parse_timeouts = parse_timeouts;
     }
@@ -1599,12 +1609,15 @@ fn index_repo_with_spec_impl(
         inputs.pending = pending_refs;
     }
 
+    mark("resolve", spec.language_id);
+
     if result.files > 0 {
         let name = indexer_name(spec);
         ingest_language_batch_minimal(store, &batch, &name)
             .with_context(|| format!("ingesting {} tree-sitter batch", spec.language_id))?;
         result.resolver_used = name;
     }
+    mark("ingest", spec.language_id);
     Ok((result, inputs))
 }
 

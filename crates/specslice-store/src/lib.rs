@@ -148,8 +148,14 @@ impl Store {
     /// open session is a no-op, so nested scopes compose.
     pub fn begin_bulk(&self) -> StoreResult<()> {
         if self.conn.is_autocommit() {
+            // Suspend WAL auto-checkpointing for the session: a full reindex
+            // writes hundreds of MB of WAL frames, and the default 1000-page
+            // threshold checkpoints mid-transaction — copying frames into the
+            // main db while still appending more (double IO; spring profiles
+            // showed pwrite dominating). One explicit TRUNCATE checkpoint at
+            // commit writes everything exactly once and resets the WAL file.
             self.conn
-                .execute_batch("BEGIN IMMEDIATE")
+                .execute_batch("PRAGMA wal_autocheckpoint=0; BEGIN IMMEDIATE")
                 .map_err(StoreError::sqlite)?;
         }
         Ok(())
@@ -162,7 +168,9 @@ impl Store {
     pub fn commit_bulk(&self) -> StoreResult<()> {
         if !self.conn.is_autocommit() {
             self.conn
-                .execute_batch("COMMIT")
+                .execute_batch(
+                    "COMMIT; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=1000;",
+                )
                 .map_err(StoreError::sqlite)?;
         }
         Ok(())

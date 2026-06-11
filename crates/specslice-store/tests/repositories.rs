@@ -15,6 +15,68 @@ fn fresh_store() -> (TempDir, Store) {
     (tmp, store)
 }
 
+/// Multi-row VALUES upserts must behave exactly like row-at-a-time upserts:
+/// same rows land, conflicts update in place, and chunking (more rows than
+/// one statement carries) is invisible. This is the ingest hot path — 84k
+/// symbols on spring-framework went through one VDBE dispatch per row before.
+#[test]
+fn bulk_upsert_nodes_and_edges_match_row_at_a_time_semantics() {
+    let (_tmp, mut store) = fresh_store();
+
+    // 1100 nodes forces at least three 512-row chunks (two full + a tail).
+    let mut nodes: Vec<Node> = (0..1100)
+        .map(|i| {
+            let mut n = Node::new(ArtifactId::new(format!("sym::n{i:03}")), NodeKind::CFunction);
+            n.name = Some(format!("fn_{i}"));
+            n.path = Some(format!("src/f{}.rs", i % 7));
+            n.start_line = Some(1);
+            n.end_line = Some(10);
+            n.indexer = Some("bulk_test".into());
+            n
+        })
+        .collect();
+    store.upsert_nodes_bulk(&nodes).expect("bulk insert nodes");
+    assert_eq!(store.list_all_nodes().expect("list").len(), 1100);
+
+    // Re-upserting with changed names must UPDATE, never duplicate.
+    for n in &mut nodes {
+        n.name = Some(format!("{}_v2", n.name.take().unwrap()));
+    }
+    store.upsert_nodes_bulk(&nodes).expect("bulk upsert nodes");
+    let all = store.list_all_nodes().expect("list");
+    assert_eq!(all.len(), 1100);
+    assert!(all
+        .iter()
+        .all(|n| n.name.as_deref().unwrap_or("").ends_with("_v2")));
+
+    // Edges: same contract, plus mixed insert/update in one call.
+    let edges: Vec<EdgeAssertion> = (0..70)
+        .map(|i| {
+            EdgeAssertion::fact(
+                ArtifactId::new(format!("sym::n{:03}", i)),
+                ArtifactId::new(format!("sym::n{:03}", (i + 1) % 70)),
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            )
+        })
+        .collect();
+    store.upsert_edges_bulk(&edges).expect("bulk insert edges");
+    assert_eq!(
+        store.list_edges_by_kind(EdgeKind::Calls).expect("k").len(),
+        70
+    );
+    store.upsert_edges_bulk(&edges).expect("bulk re-upsert");
+    assert_eq!(
+        store.list_edges_by_kind(EdgeKind::Calls).expect("k").len(),
+        70,
+        "re-upsert must not duplicate edges"
+    );
+
+    // Empty input is a no-op, not an error.
+    store.upsert_nodes_bulk(&[]).expect("empty nodes ok");
+    store.upsert_edges_bulk(&[]).expect("empty edges ok");
+}
+
 #[test]
 fn upsert_node_is_idempotent_and_round_trips() {
     let (_tmp, mut store) = fresh_store();

@@ -31,6 +31,33 @@ const SELECT_EVIDENCE_COLS: &str =
 const SELECT_RANGE_COLS: &str =
     "file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id";
 
+/// Owned-`Value` constructors for the multi-row upsert paths, where borrowed
+/// `ToSql` references cannot outlive the per-row temporaries.
+fn val_text(s: &str) -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(s.to_owned())
+}
+
+fn val_opt_text(o: &Option<String>) -> rusqlite::types::Value {
+    match o {
+        Some(s) => rusqlite::types::Value::Text(s.clone()),
+        None => rusqlite::types::Value::Null,
+    }
+}
+
+fn val_opt_u32(o: Option<u32>) -> rusqlite::types::Value {
+    match o {
+        Some(v) => rusqlite::types::Value::Integer(i64::from(v)),
+        None => rusqlite::types::Value::Null,
+    }
+}
+
+fn val_opt_i64(o: Option<i64>) -> rusqlite::types::Value {
+    match o {
+        Some(v) => rusqlite::types::Value::Integer(v),
+        None => rusqlite::types::Value::Null,
+    }
+}
+
 impl Store {
     pub fn upsert_node(&mut self, node: &Node) -> StoreResult<()> {
         let sql = "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
@@ -89,6 +116,93 @@ impl Store {
             .map_err(StoreError::sqlite)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::sqlite)
+    }
+
+    /// Multi-row upsert: one `INSERT … VALUES (…),(…) ON CONFLICT DO UPDATE`
+    /// per chunk instead of one VDBE dispatch per row. Semantically identical
+    /// to calling [`Self::upsert_node`] per element — this is the ingest hot
+    /// path for tree-sitter batches (spring-framework: 84k symbol rows).
+    pub fn upsert_nodes_bulk(&mut self, nodes: &[Node]) -> StoreResult<()> {
+        // 13 columns × 512 rows = 6656 bound variables, far under SQLite's
+        // 32k limit while keeping statements cacheable (only two SQL shapes:
+        // full chunk and tail).
+        const CHUNK: usize = 512;
+        const COLS: usize = 13;
+        for chunk in nodes.chunks(CHUNK) {
+            let placeholders: Vec<String> = (0..chunk.len())
+                .map(|i| {
+                    let base = i * COLS;
+                    let nums: Vec<String> =
+                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
+                    format!("({})", nums.join(", "))
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                placeholders.join(", ")
+            );
+            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
+            for node in chunk {
+                values.push(val_text(node.id.as_str()));
+                values.push(val_text(node.kind.as_str()));
+                values.push(val_opt_text(&node.path));
+                values.push(val_opt_text(&node.name));
+                values.push(val_opt_u32(node.start_line));
+                values.push(val_opt_u32(node.end_line));
+                values.push(val_opt_text(&node.content_hash));
+                values.push(val_opt_text(&node.stable_key));
+                values.push(val_opt_text(&node.source_file));
+                values.push(val_opt_text(&node.source_hash));
+                values.push(val_opt_text(&node.indexer));
+                values.push(val_opt_i64(node.index_generation));
+                values.push(val_opt_text(&node.metadata_json));
+            }
+            stmt.execute(rusqlite::params_from_iter(values))
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
+    }
+
+    /// Multi-row edge upsert; see [`Self::upsert_nodes_bulk`].
+    pub fn upsert_edges_bulk(&mut self, edges: &[EdgeAssertion]) -> StoreResult<()> {
+        const CHUNK: usize = 512;
+        const COLS: usize = 14;
+        for chunk in edges.chunks(CHUNK) {
+            let placeholders: Vec<String> = (0..chunk.len())
+                .map(|i| {
+                    let base = i * COLS;
+                    let nums: Vec<String> =
+                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
+                    format!("({})", nums.join(", "))
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                placeholders.join(", ")
+            );
+            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
+            for edge in chunk {
+                values.push(val_text(edge.id.as_str()));
+                values.push(val_text(edge.from_id.as_str()));
+                values.push(val_text(edge.to_id.as_str()));
+                values.push(val_text(edge.kind.as_str()));
+                values.push(val_text(edge.source.as_str()));
+                values.push(val_text(edge.certainty.as_str()));
+                values.push(val_text(edge.status.as_str()));
+                values.push(rusqlite::types::Value::Real(f64::from(edge.confidence)));
+                values.push(val_opt_text(&edge.evidence_json));
+                values.push(val_opt_text(&edge.source_file));
+                values.push(val_opt_text(&edge.source_hash));
+                values.push(val_opt_text(&edge.indexer));
+                values.push(val_opt_i64(edge.index_generation));
+                values.push(val_opt_text(&edge.metadata_json));
+            }
+            stmt.execute(rusqlite::params_from_iter(values))
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
     }
 
     pub fn upsert_edge(&mut self, edge: &EdgeAssertion) -> StoreResult<()> {
@@ -180,6 +294,45 @@ impl Store {
             .map_err(StoreError::sqlite)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::sqlite)
+    }
+
+    /// Multi-row symbol-range upsert; see [`Self::upsert_nodes_bulk`].
+    pub fn upsert_symbol_ranges_bulk(&mut self, ranges: &[SymbolRange]) -> StoreResult<()> {
+        const CHUNK: usize = 512;
+        const COLS: usize = 7;
+        for chunk in ranges.chunks(CHUNK) {
+            let placeholders: Vec<String> = (0..chunk.len())
+                .map(|i| {
+                    let base = i * COLS;
+                    let nums: Vec<String> =
+                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
+                    format!("({})", nums.join(", "))
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id) VALUES {} ON CONFLICT(file_path, symbol_id) DO UPDATE SET start_line=excluded.start_line, end_line=excluded.end_line, symbol_kind=excluded.symbol_kind, qualified_name=excluded.qualified_name, parent_symbol_id=excluded.parent_symbol_id",
+                placeholders.join(", ")
+            );
+            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
+            for range in chunk {
+                values.push(val_text(&range.file_path));
+                values.push(val_text(range.symbol_id.as_str()));
+                values.push(rusqlite::types::Value::Integer(i64::from(
+                    range.start_line,
+                )));
+                values.push(rusqlite::types::Value::Integer(i64::from(range.end_line)));
+                values.push(val_text(range.symbol_kind.as_str()));
+                values.push(val_text(&range.qualified_name));
+                values.push(match &range.parent_symbol_id {
+                    Some(id) => val_text(id.as_str()),
+                    None => rusqlite::types::Value::Null,
+                });
+            }
+            stmt.execute(rusqlite::params_from_iter(values))
+                .map_err(StoreError::sqlite)?;
+        }
+        Ok(())
     }
 
     pub fn upsert_symbol_range(&mut self, range: &SymbolRange) -> StoreResult<()> {

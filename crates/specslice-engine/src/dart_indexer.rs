@@ -708,6 +708,17 @@ pub fn ingest_language_batch_minimal(
     batch: &LanguageIndexBatch,
     indexer_name: &str,
 ) -> Result<()> {
+    // Build every row first, write through the multi-row upsert paths once:
+    // one VDBE dispatch per 64 rows instead of per row. On spring-framework
+    // (84k symbols / 120k edges) the per-row path dominated the index wall
+    // clock after parsing was parallelised.
+    let mut nodes: Vec<Node> = Vec::with_capacity(
+        batch.files.len() + batch.symbols.len() + batch.tests.len(),
+    );
+    let mut edges: Vec<EdgeAssertion> = Vec::with_capacity(
+        batch.symbols.len() + batch.tests.len() + batch.imports.len() + batch.references.len(),
+    );
+
     for file in &batch.files {
         let mut node = Node::new(file.id.clone(), NodeKind::File);
         node.path = Some(file.path.clone());
@@ -716,7 +727,7 @@ pub fn ingest_language_batch_minimal(
             .map(|s| s.to_string_lossy().into_owned());
         node.content_hash = Some(file.content_hash.clone());
         node.indexer = Some(indexer_name.into());
-        store.upsert_node(&node)?;
+        nodes.push(node);
     }
 
     for symbol in &batch.symbols {
@@ -730,7 +741,7 @@ pub fn ingest_language_batch_minimal(
         if let Some(meta) = symbol.metadata_json.clone() {
             node.metadata_json = Some(meta);
         }
-        store.upsert_node(&node)?;
+        nodes.push(node);
 
         let mut contains = if let Some(parent) = &symbol.parent_symbol_id {
             EdgeAssertion::fact(
@@ -748,7 +759,7 @@ pub fn ingest_language_batch_minimal(
             )
         };
         contains.indexer = Some(indexer_name.into());
-        store.upsert_edge(&contains)?;
+        edges.push(contains);
     }
 
     for test in &batch.tests {
@@ -758,7 +769,7 @@ pub fn ingest_language_batch_minimal(
         node.start_line = Some(test.start_line);
         node.end_line = Some(test.end_line);
         node.indexer = Some(indexer_name.into());
-        store.upsert_node(&node)?;
+        nodes.push(node);
         let parent_id = test
             .parent_symbol_id
             .clone()
@@ -770,7 +781,7 @@ pub fn ingest_language_batch_minimal(
             EdgeSource::LanguageAdapter,
         );
         contains.indexer = Some(indexer_name.into());
-        store.upsert_edge(&contains)?;
+        edges.push(contains);
     }
 
     for import in &batch.imports {
@@ -781,7 +792,7 @@ pub fn ingest_language_batch_minimal(
             EdgeSource::LanguageAdapter,
         );
         edge.indexer = Some(indexer_name.into());
-        store.upsert_edge(&edge)?;
+        edges.push(edge);
     }
 
     for reference in &batch.references {
@@ -813,14 +824,18 @@ pub fn ingest_language_batch_minimal(
                 &reference.resolver,
             ));
         }
-        store.upsert_edge(&edge)?;
+        edges.push(edge);
     }
 
-    for range in &batch.symbol_ranges {
-        store.upsert_symbol_range(range)?;
-    }
+    store.upsert_nodes_bulk(&nodes)?;
+    store.upsert_edges_bulk(&edges)?;
+
+    let mut ranges: Vec<specslice_core::SymbolRange> = Vec::with_capacity(
+        batch.symbol_ranges.len() + batch.symbols.len() + batch.tests.len(),
+    );
+    ranges.extend(batch.symbol_ranges.iter().cloned());
     for symbol in &batch.symbols {
-        store.upsert_symbol_range(&specslice_core::SymbolRange {
+        ranges.push(specslice_core::SymbolRange {
             file_path: symbol.path.clone(),
             symbol_id: symbol.id.clone(),
             start_line: symbol.start_line,
@@ -828,10 +843,10 @@ pub fn ingest_language_batch_minimal(
             symbol_kind: symbol.kind,
             qualified_name: symbol.qualified_name.clone(),
             parent_symbol_id: symbol.parent_symbol_id.clone(),
-        })?;
+        });
     }
     for test in &batch.tests {
-        store.upsert_symbol_range(&specslice_core::SymbolRange {
+        ranges.push(specslice_core::SymbolRange {
             file_path: test.path.clone(),
             symbol_id: test.id.clone(),
             start_line: test.start_line,
@@ -839,8 +854,9 @@ pub fn ingest_language_batch_minimal(
             symbol_kind: test.kind,
             qualified_name: test.name.clone(),
             parent_symbol_id: test.parent_symbol_id.clone(),
-        })?;
+        });
     }
+    store.upsert_symbol_ranges_bulk(&ranges)?;
     Ok(())
 }
 

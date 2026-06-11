@@ -85,35 +85,49 @@ pub fn rebuild_fulltext_index(store: &mut Store, repo_root: &Path) -> Result<Ful
         ));
     }
 
+    // Read + slice + tokenise per file in parallel (pure CPU + IO, no shared
+    // state — tokenisation dominated the single-thread profile on 84k-symbol
+    // repos), then insert serially. Deterministic: per-file row order is
+    // preserved and the files keep their BTreeMap path order.
+    use rayon::prelude::*;
+    let per_file: Vec<(usize, usize, Vec<FulltextRow>)> = by_path
+        .par_iter()
+        .map(|(path, spans)| {
+            let abs = repo_root.join(path);
+            let Ok(contents) = std::fs::read_to_string(&abs) else {
+                return (0usize, spans.len(), Vec::new());
+            };
+            let lines: Vec<&str> = contents.lines().collect();
+            let mut rows: Vec<FulltextRow> = Vec::new();
+            for (node_id, start, end, extend_comments) in spans {
+                let start = if *extend_comments {
+                    extend_over_leading_comments(&lines, *start)
+                } else {
+                    *start
+                };
+                let body = slice_span(&lines, start, *end);
+                if body.is_empty() {
+                    continue;
+                }
+                let tokens = fts_tokens(&body);
+                if tokens.is_empty() {
+                    continue;
+                }
+                rows.push(FulltextRow {
+                    node_id: node_id.clone(),
+                    body: tokens.join(" "),
+                });
+            }
+            (1usize, 0usize, rows)
+        })
+        .collect();
+
     let mut result = FulltextIndexResult::default();
     let mut rows: Vec<FulltextRow> = Vec::new();
-    for (path, spans) in &by_path {
-        let abs = repo_root.join(path);
-        let Ok(contents) = std::fs::read_to_string(&abs) else {
-            result.skipped_unreadable += spans.len();
-            continue;
-        };
-        result.files_read += 1;
-        let lines: Vec<&str> = contents.lines().collect();
-        for (node_id, start, end, extend_comments) in spans {
-            let start = if *extend_comments {
-                extend_over_leading_comments(&lines, *start)
-            } else {
-                *start
-            };
-            let body = slice_span(&lines, start, *end);
-            if body.is_empty() {
-                continue;
-            }
-            let tokens = fts_tokens(&body);
-            if tokens.is_empty() {
-                continue;
-            }
-            rows.push(FulltextRow {
-                node_id: node_id.clone(),
-                body: tokens.join(" "),
-            });
-        }
+    for (read, skipped, file_rows) in per_file {
+        result.files_read += read;
+        result.skipped_unreadable += skipped;
+        rows.extend(file_rows);
     }
 
     result.nodes_indexed = store
