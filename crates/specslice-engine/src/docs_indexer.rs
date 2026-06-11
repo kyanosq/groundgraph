@@ -134,9 +134,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let in_doc_named_tree = rel
-                .rsplit_once('/')
-                .is_some_and(|(dirs, _)| dirs.split('/').any(|seg| bare_names.contains(seg)));
+            let in_doc_named_tree = rel.rsplit_once('/').is_some_and(|(dirs, _)| {
+                dirs.split('/').any(|seg| is_doc_dir_name(seg, &bare_names))
+            });
             let take = if in_doc_named_tree && has_doc_extension(path) {
                 // A manifest directory between the file and its doc root is
                 // a foreign project vendored into the docs tree (reference
@@ -196,7 +196,7 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
 fn has_doc_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),
-        Some("md") | Some("mdx") | Some("markdown") | Some("rst")
+        Some("md") | Some("mdx") | Some("markdown") | Some("rst") | Some("adoc")
     )
 }
 
@@ -239,8 +239,28 @@ fn is_inside_vendored_project(file: &Path, stop: &Path) -> bool {
     false
 }
 
+/// Whether a directory name denotes a documentation tree. Exact bare-name
+/// matches (`docs`) plus hyphen/underscore word variants: spring-framework's
+/// `framework-docs/`, a `docs-src/`. Word-split keeps `docker/` and
+/// `doctor/` out — substring matching would not. Variants never widen past
+/// the configuration: a word matches only when it is itself a configured
+/// bare root (or a doc-family synonym, when any doc-family root is
+/// configured) — a repo configured with only `requirements/` keeps its
+/// `docs/` tree unindexed, exactly as written.
+fn is_doc_dir_name(name: &str, bare_names: &std::collections::BTreeSet<String>) -> bool {
+    if bare_names.contains(name) {
+        return true;
+    }
+    const DOC_FAMILY: [&str; 3] = ["doc", "docs", "documentation"];
+    let doc_family_enabled = DOC_FAMILY.iter().any(|w| bare_names.contains(*w));
+    name.split(['-', '_']).any(|word| {
+        bare_names.contains(word)
+            || (doc_family_enabled && DOC_FAMILY.contains(&word))
+    })
+}
+
 /// Same vendored-project test for the repo-wide walk, where the boundary is
-/// the nearest ancestor whose *name* matches a bare doc root (`docs`).
+/// the nearest ancestor whose *name* matches a doc-tree directory.
 fn is_vendored_under_doc_root(
     file: &Path,
     bare_names: &std::collections::BTreeSet<String>,
@@ -248,7 +268,7 @@ fn is_vendored_under_doc_root(
     let mut dir = file.parent();
     while let Some(d) = dir {
         let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if bare_names.contains(name) {
+        if is_doc_dir_name(name, bare_names) {
             return false;
         }
         if has_package_manifest(d) {
@@ -267,7 +287,7 @@ fn is_well_known_root_doc(file_name: &str) -> bool {
     let Some((stem, ext)) = lower.rsplit_once('.') else {
         return false;
     };
-    matches!(ext, "md" | "mdx" | "markdown" | "rst")
+    matches!(ext, "md" | "mdx" | "markdown" | "rst" | "adoc")
         && ["readme", "architecture", "design", "contributing"]
             .iter()
             .any(|known| stem == *known || stem.starts_with(&format!("{known}.")))
@@ -344,13 +364,13 @@ fn index_one_file(
 ) -> Result<()> {
     let raw = std::fs::read_to_string(abs_path)
         .with_context(|| format!("reading {}", abs_path.display()))?;
-    let is_rst = rel_path
+    let ext = rel_path
         .rsplit_once('.')
-        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("rst"));
-    let parsed = if is_rst {
-        parse_rst(&raw)
-    } else {
-        parse_markdown(&raw)
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    let parsed = match ext.as_deref() {
+        Some("rst") => parse_rst(&raw),
+        Some("adoc") => parse_adoc(&raw),
+        _ => parse_markdown(&raw),
     };
 
     let mut file_node = Node::new(file_id(rel_path), NodeKind::File);
@@ -453,6 +473,59 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
         headings,
         total_lines,
         content_hash,
+    }
+}
+
+/// Parse AsciiDoc section titles: lines opening with 1–6 `=` markers plus a
+/// space (`= Title`, `== Section`). The JVM ecosystem's documentation format
+/// (spring-framework alone ships 470 `.adoc` pages). Comment lines (`//`)
+/// and the contents of literal/listing blocks (`....` / `----` fences) are
+/// skipped; AsciiDoc's rarely-used setext underline style is not.
+fn parse_adoc(raw: &str) -> ParsedDoc {
+    let mut total_lines = 0u32;
+    let mut headings = Vec::new();
+    let mut content_hasher = Sha256::new();
+    let mut fence: Option<&str> = None;
+    for (idx, line) in raw.lines().enumerate() {
+        total_lines += 1;
+        content_hasher.update(line.as_bytes());
+        content_hasher.update(b"\n");
+        let trimmed = line.trim_end();
+        // Literal (`....`) and listing (`----`) block delimiters toggle a
+        // verbatim region whose lines are never headings.
+        if matches!(trimmed, "...." | "----") {
+            fence = match fence {
+                Some(open) if open == trimmed => None,
+                Some(open) => Some(open),
+                None => Some(trimmed),
+            };
+            continue;
+        }
+        if fence.is_some() || trimmed.starts_with("//") {
+            continue;
+        }
+        let marker_len = trimmed.chars().take_while(|&c| c == '=').count();
+        if marker_len == 0 || marker_len > 6 {
+            continue;
+        }
+        let rest = &trimmed[marker_len..];
+        let title = rest.trim();
+        if !rest.starts_with(' ') || title.is_empty() {
+            continue;
+        }
+        headings.push(Heading {
+            level: u8::try_from(marker_len).unwrap_or(6),
+            text: title.to_string(),
+            line: u32::try_from(idx + 1).unwrap_or(u32::MAX),
+        });
+    }
+    if total_lines == 0 {
+        total_lines = 1;
+    }
+    ParsedDoc {
+        headings,
+        total_lines,
+        content_hash: format!("{:x}", content_hasher.finalize()),
     }
 }
 
@@ -899,6 +972,107 @@ mod tests {
         assert!(
             nodes.iter().any(|n| n.id.to_string() == "file::docs/guide.md"),
             "our own docs still indexed"
+        );
+    }
+
+    /// AsciiDoc is the documentation lingua franca of the JVM ecosystem
+    /// (spring-framework ships 470 `.adoc` pages, hibernate/quarkus the
+    /// same). `=` heading markers must become DocSections with their marker
+    /// count as the level, and the document keeps its line/hash facts.
+    #[test]
+    fn asciidoc_headings_become_doc_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/core.adoc"),
+            "= Core Technologies\n\nIntro body.\n\n== The IoC Container\n\nBody text.\n\n=== Bean Overview\n\nMore.\n\n// = a comment, not a heading\n\n....\n= inside literal block\n....\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into(), "**/*.adoc".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        assert_eq!(result.files, 1, "core.adoc indexed; got {result:?}");
+        let nodes = store.list_all_nodes().unwrap();
+        let titles: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == specslice_core::NodeKind::DocSection)
+            .filter_map(|n| n.name.as_deref())
+            .collect();
+        assert!(
+            titles.contains(&"Core Technologies")
+                && titles.contains(&"The IoC Container")
+                && titles.contains(&"Bean Overview"),
+            "adoc `=` headings become DocSections; got {titles:?}"
+        );
+        assert!(
+            !titles.iter().any(|t| t.contains("comment") || t.contains("literal")),
+            "comments and literal blocks are not headings; got {titles:?}"
+        );
+    }
+
+    /// Documentation directories come in name variants: spring-framework
+    /// keeps its 470 adoc pages under `framework-docs/`, others use
+    /// `docs-src/` or `documentation/`. A directory whose hyphen/underscore
+    /// word split contains `doc`/`docs`/`documentation` is a doc dir; mere
+    /// substrings (`docker/`, `doctor/`) are NOT.
+    #[test]
+    fn hyphenated_doc_dir_variants_are_discovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("framework-docs/modules/ROOT/pages")).unwrap();
+        std::fs::create_dir_all(root.join("docker")).unwrap();
+        std::fs::write(
+            root.join("framework-docs/modules/ROOT/pages/core.adoc"),
+            "= Core Technologies\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("docker/notes.md"), "# Docker notes\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into(), "**/*.adoc".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        let nodes = store.list_all_nodes().unwrap();
+        assert!(
+            nodes.iter().any(|n| n
+                .id
+                .to_string()
+                .contains("framework-docs/modules/ROOT/pages/core.adoc")),
+            "framework-docs variant must be discovered; got {result:?}"
+        );
+        assert!(
+            nodes.iter().all(|n| !n.id.to_string().contains("docker/")),
+            "docker/ is not a docs dir"
+        );
+
+        // Variants must never widen past the configuration: with only
+        // `requirements` configured, neither `docs/` nor `framework-docs/`
+        // may be discovered.
+        let mut store2 = Store::open(root.join("graph2.db")).unwrap();
+        store2.migrate().unwrap();
+        let opts2 = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("requirements")],
+            include_globs: vec!["**/*.md".into(), "**/*.adoc".into()],
+        };
+        index_docs(&mut store2, &opts2).unwrap();
+        let nodes2 = store2.list_all_nodes().unwrap();
+        assert!(
+            nodes2
+                .iter()
+                .all(|n| !n.id.to_string().contains("framework-docs/")),
+            "doc-dir variants must not fire when no doc-family root is configured"
         );
     }
 

@@ -275,18 +275,48 @@ fn swift_import_of(node: tree_sitter::Node<'_>, src: &[u8]) -> Vec<String> {
     }
 }
 
-/// Swift `import`s name *modules* (build targets), not files: one module
-/// maps to many files with no source-level path. There is therefore no
-/// sound file-to-file edge to draw, so every import resolves to `None`
-/// (recorded for the count, never a dangling node). A future SCIP / module
-/// map could refine this; until then resolution is intentionally deferred.
+/// Swift `import`s name *modules* (build targets), not files. SwiftPM's
+/// convention pins a module to a directory — `Sources/<Module>/**` at the
+/// package root — so an imported module whose target directory exists in
+/// the repo resolves to that directory's representative file: the
+/// module-named file (`Sources/NIOCore/NIOCore.swift`) when present, else
+/// the lexicographically first. Platform modules (Foundation, UIKit) match
+/// no directory and resolve to nothing — never a dangling edge. Same-module
+/// imports (re-exports) resolve to nothing rather than a self-loop.
 fn swift_resolve_import(
-    _raw: &str,
-    _from_file: &str,
-    _all_files: &[String],
+    raw: &str,
+    from_file: &str,
+    all_files: &[String],
     _src_roots: &[String],
 ) -> Option<String> {
-    None
+    // `import struct NIOCore.ByteBuffer` arrives as `NIOCore.ByteBuffer`;
+    // the module is the head segment.
+    let module = raw.split('.').next()?.trim();
+    if module.is_empty() {
+        return None;
+    }
+    let root_prefix = format!("Sources/{module}/");
+    let nested_marker = format!("/Sources/{module}/");
+    if from_file.starts_with(&root_prefix) || from_file.contains(&nested_marker) {
+        return None;
+    }
+    let mut representative: Option<&String> = None;
+    let module_named_suffix = format!("/{module}.swift");
+    for file in all_files {
+        if !file.ends_with(".swift") {
+            continue;
+        }
+        if !(file.starts_with(&root_prefix) || file.contains(&nested_marker)) {
+            continue;
+        }
+        if file.ends_with(&module_named_suffix) {
+            return Some(file.clone());
+        }
+        if representative.is_none_or(|best| file < best) {
+            representative = Some(file);
+        }
+    }
+    representative.cloned()
 }
 
 /// Heuristic outbound call identifiers from a Swift callable body (see
@@ -824,9 +854,56 @@ class FooTests: XCTestCase {
             "import-kind keyword stripped: {imports:?}"
         );
         assert!(imports.contains(&"Mod.helper"), "{imports:?}");
-        // Module imports never resolve to repo files (no dangling edges).
+        // Platform-module imports never resolve to repo files (no dangling
+        // edges).
         assert_eq!(
             swift_resolve_import("Foundation", "Sources/App/main.swift", &[], &[]),
+            None
+        );
+    }
+
+    /// SwiftPM lays targets out as `Sources/<Module>/**`; `import NIOCore`
+    /// from another target is an in-repo dependency (swift-nio: 554 files,
+    /// 0 import edges before this). Resolve a module import to its target
+    /// directory's representative file — the module-named file when present,
+    /// else the lexicographically first — and only when the convention
+    /// holds; platform modules (Foundation, UIKit) resolve to nothing.
+    #[test]
+    fn swiftpm_module_imports_resolve_to_target_representative_file() {
+        let all = vec![
+            "Sources/NIOCore/ByteBuffer.swift".to_string(),
+            "Sources/NIOCore/NIOCore.swift".to_string(),
+            "Sources/NIOPosix/Bootstrap.swift".to_string(),
+            "Packages/Inner/Sources/Util/Helpers.swift".to_string(),
+        ];
+        // Module-named file wins.
+        assert_eq!(
+            swift_resolve_import("NIOCore", "Sources/NIOPosix/Bootstrap.swift", &all, &[]),
+            Some("Sources/NIOCore/NIOCore.swift".to_string())
+        );
+        // `import struct NIOCore.ByteBuffer` → module head resolves the same.
+        assert_eq!(
+            swift_resolve_import(
+                "NIOCore.ByteBuffer",
+                "Sources/NIOPosix/Bootstrap.swift",
+                &all,
+                &[]
+            ),
+            Some("Sources/NIOCore/NIOCore.swift".to_string())
+        );
+        // Nested-package layout (`*/Sources/<Module>/`) resolves too.
+        assert_eq!(
+            swift_resolve_import("Util", "Sources/NIOCore/ByteBuffer.swift", &all, &[]),
+            Some("Packages/Inner/Sources/Util/Helpers.swift".to_string())
+        );
+        // No matching target directory → no edge.
+        assert_eq!(
+            swift_resolve_import("Foundation", "Sources/NIOCore/ByteBuffer.swift", &all, &[]),
+            None
+        );
+        // A file must never import its own module (self-loop guard).
+        assert_eq!(
+            swift_resolve_import("NIOCore", "Sources/NIOCore/ByteBuffer.swift", &all, &[]),
             None
         );
     }

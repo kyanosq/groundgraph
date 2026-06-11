@@ -407,8 +407,14 @@ fn default_docs_paths() -> Vec<String> {
 
 fn default_docs_include() -> Vec<String> {
     // rst: the Python ecosystem's documentation format (flask, django,
-    // numpy); the docs indexer parses underlined titles natively.
-    vec!["**/*.md".into(), "**/*.mdx".into(), "**/*.rst".into()]
+    // numpy); adoc: the JVM ecosystem's (spring, hibernate, quarkus). The
+    // docs indexer parses both natively.
+    vec![
+        "**/*.md".into(),
+        "**/*.mdx".into(),
+        "**/*.rst".into(),
+        "**/*.adoc".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

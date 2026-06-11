@@ -1621,16 +1621,12 @@ fn fallback_feature_token(path: &str) -> (String, String) {
     // Drop the repo-root segment, then take the first non-layer segment.
     for (i, seg) in dirs.iter().enumerate().skip(1) {
         if !LAYER_DIRS.contains(&seg.to_ascii_lowercase().as_str()) {
-            // A source root inside a multi-module repo (`extras/src/...`):
-            // pierce the Maven/Gradle chain so the bucket is named by the
-            // first business package, never "src" / "main".
+            // A source root inside a multi-module repo (`extras/src/...`,
+            // `pkg/lib/src/...`): pierce the structural chain so the bucket
+            // is named by the business package, never "src" / "main".
             if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) {
-                let j = pierce_jvm_layout(dirs, i);
-                if j < dirs.len() {
-                    return (dirs[j].to_string(), dirs[..=j].join("/"));
-                }
-                if i + 1 < dirs.len() {
-                    return (dirs[i + 1].to_string(), dirs[..=i + 1].join("/"));
+                if let Some((k, end)) = business_segment_after_source_root(dirs, i) {
+                    return (dirs[k].to_string(), dirs[..end].join("/"));
                 }
             }
             return (seg.to_string(), dirs[..=i].join("/"));
@@ -1641,6 +1637,39 @@ fn fallback_feature_token(path: &str) -> (String, String) {
     // the app/source root rather than leaking a layer name (`UI`, `ViewModel`)
     // as if it were a feature.
     (dirs[0].to_string(), dirs[0].to_string())
+}
+
+/// First index at or after `start` that is not itself a source root.
+/// Pierces consecutive structural chains like Dart/Flutter's `lib/src`
+/// (`packages/foo/lib/src/x.dart`) so `src` is never a business token.
+fn skip_source_chain(dirs: &[&str], start: usize) -> usize {
+    let mut j = start;
+    while j < dirs.len() && SOURCE_ROOTS.contains(&dirs[j].to_ascii_lowercase().as_str()) {
+        j += 1;
+    }
+    j
+}
+
+/// Resolve the business segment for a path whose segment `i` is a source
+/// root: pierce the JVM source-set chain first, then any consecutive
+/// source-root chain (`lib/src`). When the chain swallows the whole tail —
+/// the file sits directly inside `lib/src/` — the business segment is the
+/// one *before* the root (the Dart/SwiftPM package directory), provided it
+/// is not itself structural. Returns `(index, prefix_end)` where `prefix`
+/// is `dirs[..prefix_end]`.
+fn business_segment_after_source_root(dirs: &[&str], i: usize) -> Option<(usize, usize)> {
+    let j = pierce_jvm_layout(dirs, i);
+    if j < dirs.len() {
+        return Some((j, j + 1));
+    }
+    let j = skip_source_chain(dirs, i + 1);
+    if j < dirs.len() {
+        return Some((j, j + 1));
+    }
+    if i > 0 && !LAYER_DIRS.contains(&dirs[i - 1].to_ascii_lowercase().as_str()) {
+        return Some((i - 1, i));
+    }
+    None
 }
 
 /// Given `dirs` and the index of a matched source root (`src`), return the
@@ -1710,9 +1739,8 @@ fn feature_key(path: &str) -> Option<FeatureKey> {
     //    pierced first — "main" / "com" are never business tokens.
     for (i, seg) in dirs.iter().enumerate() {
         if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
-            let j = pierce_jvm_layout(&dirs, i);
-            if j < dirs.len() {
-                return Some(make_key(dirs[j], &dirs[..=j], true));
+            if let Some((k, end)) = business_segment_after_source_root(&dirs, i) {
+                return Some(make_key(dirs[k], &dirs[..end], true));
             }
             return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
         }
@@ -2302,6 +2330,32 @@ mod tests {
             "extras/src/main/java/com/google/gson/interceptors/Intercept.java",
         );
         assert_eq!(disp, "interceptors");
+    }
+
+    #[test]
+    fn feature_key_pierces_dart_lib_src_chain_to_the_package_segment() {
+        // Regression (bloc): `examples/github_search/common_github_search/
+        // lib/src/*.dart` hit the SOURCE_ROOTS rule at `lib` and took the
+        // next segment — `src`, itself a source root — as a trusted business
+        // token, naming a 61-symbol module "Src". Consecutive structural
+        // segments must be pierced; when nothing remains after the chain the
+        // business segment is the one *before* it (Dart package layout).
+        let k = feature_key("examples/github_search/common_github_search/lib/src/models.dart")
+            .expect("feature key");
+        assert_eq!(k.display, "common_github_search", "got {k:?}");
+        // A feature dir after the chain still wins (src-layout Python).
+        let k2 = feature_key("src/flask/app.py").expect("feature key");
+        assert_eq!(k2.display, "flask", "got {k2:?}");
+        // Monorepo package roots keep their package name.
+        let k3 = feature_key("packages/bloc/lib/src/bloc.dart").expect("feature key");
+        assert_eq!(k3.display, "bloc", "got {k3:?}");
+        // Isolated-file fallback: the first non-layer segment after the
+        // repo root is the app dir itself — never "src".
+        let (disp, _pfx) =
+            fallback_feature_token("examples/flutter_todos/lib/src/widgets/card.dart");
+        assert_eq!(disp, "flutter_todos");
+        let (disp2, _pfx2) = fallback_feature_token("common_github_search/lib/src/models.dart");
+        assert_eq!(disp2, "common_github_search");
     }
 
     #[test]
