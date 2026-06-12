@@ -90,14 +90,22 @@ impl Store {
         // profiles showed pread + BtreeTableMoveto dominating index time. A
         // 64 MiB cache plus a 256 MiB mmap window serves hot B-tree pages
         // from memory; both are per-connection settings, not persisted.
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;\
-             PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456;",
-        )
-        .map_err(|source| StoreError::OpenDb {
-            path: path.clone(),
-            source,
-        })?;
+        //
+        // Every pragma is a *performance* knob, not a correctness requirement:
+        // SQLite stays fully functional under its defaults. Applied one by one,
+        // best-effort, so an environment that rejects a single pragma (e.g.
+        // mmap-restricted containers) degrades to a slower-but-correct store
+        // instead of failing — and a failed pragma cannot skip the later ones
+        // the way a single aborted batch did.
+        for pragma in [
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA synchronous=NORMAL;",
+            "PRAGMA busy_timeout=5000;",
+            "PRAGMA cache_size=-65536;",
+            "PRAGMA mmap_size=268435456;",
+        ] {
+            let _ = conn.execute_batch(pragma);
+        }
         // The repository layer funnels every statement through
         // `prepare_cached`; the working set is a few dozen distinct SQL
         // strings, so re-parsing them per call (autocommit ingest does 10^5+
@@ -167,11 +175,18 @@ impl Store {
     /// so losing an unfinished ingest is the correct outcome.
     pub fn commit_bulk(&self) -> StoreResult<()> {
         if !self.conn.is_autocommit() {
+            // COMMIT alone decides success. The two PRAGMAs after it are
+            // housekeeping: if the checkpoint fails (disk pressure, a
+            // concurrent reader pinning the WAL) the data is still safely
+            // committed — reporting that as an error would make callers
+            // re-run a whole ingest for nothing, and bailing between the
+            // statements used to leave `wal_autocheckpoint=0` behind so
+            // the WAL grew without bound (issues2.md #55).
             self.conn
-                .execute_batch(
-                    "COMMIT; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=1000;",
-                )
+                .execute_batch("COMMIT")
                 .map_err(StoreError::sqlite)?;
+            let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            let _ = self.conn.execute_batch("PRAGMA wal_autocheckpoint=1000;");
         }
         Ok(())
     }
@@ -343,5 +358,26 @@ mod tests {
     fn open_on_tableless_db_is_a_noop_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Store::open(dir.path().join("fresh.db")).is_ok());
+    }
+
+    /// `commit_bulk` must always restore `wal_autocheckpoint` and leave
+    /// the connection in autocommit, whatever happens to the optional
+    /// checkpoint housekeeping (issues2.md #55).
+    #[test]
+    fn commit_bulk_restores_autocheckpoint_and_autocommit() {
+        let (store, _dir) = migrated_store();
+        store.begin_bulk().unwrap();
+        let mid: i64 = store
+            .connection()
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mid, 0, "bulk session suspends autocheckpoint");
+        store.commit_bulk().unwrap();
+        assert!(store.connection().is_autocommit());
+        let after: i64 = store
+            .connection()
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 1000, "autocheckpoint must come back after commit");
     }
 }

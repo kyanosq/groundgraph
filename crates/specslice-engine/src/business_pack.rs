@@ -1067,8 +1067,7 @@ fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition
         adj.entry(a).or_default().push((b, w));
         adj.entry(b).or_default().push((a, w));
     }
-    let member_seg =
-        |path: &str| production_member(path).unwrap_or_default().to_string();
+    let member_seg = |path: &str| production_member(path).unwrap_or_default().to_string();
     let group_key: Vec<String> = (0..n)
         .map(|i| {
             if let Some(tok) = feature_marker_token(&files[i]) {
@@ -2859,8 +2858,7 @@ mod tests {
         // author's own name for it — use it before falling back to a symbol.
         let files = vec![
             "spring-core/src/main/java/org/springframework/core/SpringVersion.java".to_string(),
-            "spring-core/src/main/java/org/springframework/core/convert/Converter.java"
-                .to_string(),
+            "spring-core/src/main/java/org/springframework/core/convert/Converter.java".to_string(),
             "spring-core/src/main/java/org/springframework/util/ConcurrentReferenceHashMap.java"
                 .to_string(),
             "spring-core/src/main/java/org/springframework/util/StringUtils.java".to_string(),
@@ -2899,8 +2897,10 @@ mod tests {
         // ("jdbctemplate"). When the subproject directory is *named after*
         // the package (`spring-jdbc` ↔ `…jdbc`), the product segment IS the
         // business identity — keep it.
-        let k = feature_key("spring-jdbc/src/main/java/org/springframework/jdbc/core/JdbcTemplate.java")
-            .expect("feature key");
+        let k = feature_key(
+            "spring-jdbc/src/main/java/org/springframework/jdbc/core/JdbcTemplate.java",
+        )
+        .expect("feature key");
         assert_eq!(k.display, "jdbc", "got {k:?}");
         // Single-namespace repos still pierce to the sub-package: gson's
         // main module documents its features by sub-package…
@@ -2909,10 +2909,8 @@ mod tests {
         assert_eq!(k2.display, "stream", "got {k2:?}");
         // …and its `extras` module shares the `com.google.gson` namespace —
         // the sub-package is the only distinguishing feature token.
-        let k3 = feature_key(
-            "extras/src/main/java/com/google/gson/interceptors/Intercept.java",
-        )
-        .expect("feature key");
+        let k3 = feature_key("extras/src/main/java/com/google/gson/interceptors/Intercept.java")
+            .expect("feature key");
         assert_eq!(k3.display, "interceptors", "got {k3:?}");
     }
 
@@ -3639,7 +3637,8 @@ mod tests {
                 .unwrap();
         }
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         assert!(
             pack.modules.iter().all(|m| m.id != "tutorial"),
             "a docs-only community must not be reported as a business module; got {:?}",
@@ -3704,17 +3703,15 @@ mod tests {
             ))
             .unwrap();
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         let module = pack
             .modules
             .iter()
             .find(|m| m.symbol_count > 0)
             .expect("code module");
         assert!(
-            module
-                .docs
-                .iter()
-                .any(|d| d.path == "docs/blueprints.rst"),
+            module.docs.iter().any(|d| d.path == "docs/blueprints.rst"),
             "stem-matched doc must attach to the module owning blueprints.py; docs={:?}",
             module.docs
         );
@@ -3771,7 +3768,9 @@ mod tests {
                 "UdpSocket",
             ))
             .unwrap();
-        store.upsert_edge(&edge(reg, sched, EdgeKind::Calls)).unwrap();
+        store
+            .upsert_edge(&edge(reg, sched, EdgeKind::Calls))
+            .unwrap();
         store.upsert_edge(&edge(tcp, udp, EdgeKind::Calls)).unwrap();
 
         // Two votes for the io module via backtick-quoted identifiers.
@@ -3804,12 +3803,15 @@ mod tests {
             ))
             .unwrap();
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         let io_module = pack
             .modules
             .iter()
             .find(|m| {
-                m.entry_points.iter().any(|e| e.name.contains("Registration"))
+                m.entry_points
+                    .iter()
+                    .any(|e| e.name.contains("Registration"))
                     || m.path_prefix.contains("io")
             })
             .expect("io module exists");
@@ -3855,15 +3857,22 @@ mod tests {
         store.upsert_edge(&edge(r1, r2, EdgeKind::Calls)).unwrap();
         store.upsert_edge(&edge(i1, i2, EdgeKind::Calls)).unwrap();
         for (id, name) in [
-            ("doc_section::docs/refactor.md#`Registration` and `ScheduledIo`", "`Registration` and `ScheduledIo`"),
-            ("doc_section::docs/refactor.md#`AsyncRead` / `AsyncWrite`", "`AsyncRead` / `AsyncWrite`"),
+            (
+                "doc_section::docs/refactor.md#`Registration` and `ScheduledIo`",
+                "`Registration` and `ScheduledIo`",
+            ),
+            (
+                "doc_section::docs/refactor.md#`AsyncRead` / `AsyncWrite`",
+                "`AsyncRead` / `AsyncWrite`",
+            ),
         ] {
             store
                 .upsert_node(&node(id, NodeKind::DocSection, "docs/refactor.md", name))
                 .unwrap();
         }
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         let holders: Vec<&str> = pack
             .modules
             .iter()
@@ -3888,7 +3897,12 @@ mod tests {
         let a = "rust_fn::core/src/engine.rs#start_engine";
         let b = "rust_fn::core/src/engine_util.rs#stop_engine";
         store
-            .upsert_node(&node(a, NodeKind::RustFunction, "core/src/engine.rs", "start_engine"))
+            .upsert_node(&node(
+                a,
+                NodeKind::RustFunction,
+                "core/src/engine.rs",
+                "start_engine",
+            ))
             .unwrap();
         store
             .upsert_node(&node(
@@ -3917,7 +3931,8 @@ mod tests {
             ))
             .unwrap();
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         assert!(
             pack.key_docs.iter().any(|d| d.path == "web/README.md"),
             "README matching a symbol-less bucket must fall through to key_docs; got {:?}",
@@ -3975,7 +3990,8 @@ mod tests {
             ))
             .unwrap();
 
-        let pack = propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
         assert!(
             pack.key_docs.iter().any(|d| d.path == "README.md"),
             "unattached README must appear in pack-level key_docs; got {:?}",
@@ -3987,7 +4003,9 @@ mod tests {
             pack.key_docs
         );
         assert!(
-            pack.key_docs.iter().all(|d| d.path != "docs/contributing/style.md"),
+            pack.key_docs
+                .iter()
+                .all(|d| d.path != "docs/contributing/style.md"),
             "nested non-well-known docs must stay out of key_docs"
         );
     }

@@ -45,6 +45,10 @@ pub const ENV_ENABLE: &str = "SPECSLICE_DART_ANALYZER";
 /// relative to the repo root.
 pub const ENV_BIN: &str = "SPECSLICE_DART_ANALYZER_BIN";
 
+/// Override the sidecar wall-clock budget (seconds, default 600). A hung
+/// analyzer otherwise blocked `specslice index` forever (issues2.md #48).
+pub const ENV_TIMEOUT_SECS: &str = "SPECSLICE_DART_ANALYZER_TIMEOUT_SECS";
+
 /// Default workspace location of the sidecar entry point. Kept in sync
 /// with the file we ship at `tool/specslice_dart_analyzer/`.
 pub const DEFAULT_SIDECAR_REL: &str =
@@ -163,27 +167,85 @@ pub fn try_run(
     }
     drop(child.stdin.take());
 
-    let output = match child.wait_with_output() {
-        Ok(out) => out,
-        Err(e) => {
-            return SidecarOutcome::Skipped {
-                reason: format!("wait sidecar: {e}"),
-            };
+    // Reader threads keep both pipes drained (a full pipe would deadlock
+    // the child) while the main thread enforces a wall-clock budget — a
+    // hung analyzer must not hang `specslice index` forever
+    // (issues2.md #48).
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let budget = sidecar_timeout();
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() > budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return SidecarOutcome::Skipped {
+                        reason: format!(
+                            "sidecar exceeded the {}s budget and was killed \
+                             (override with {ENV_TIMEOUT_SECS})",
+                            budget.as_secs()
+                        ),
+                    };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return SidecarOutcome::Skipped {
+                    reason: format!("wait sidecar: {e}"),
+                };
+            }
         }
     };
-    if !output.status.success() {
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
         return SidecarOutcome::Skipped {
             reason: format!(
                 "sidecar exited with {:?} stderr={}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+                status.code(),
+                String::from_utf8_lossy(&stderr)
                     .chars()
                     .take(200)
                     .collect::<String>()
             ),
         };
     }
-    parse_response(&output.stdout)
+    parse_response(&stdout)
+}
+
+/// Wall-clock budget for one sidecar run. Large Flutter repos legitimately
+/// take minutes (cold analyzer); the default only has to stop *hangs*.
+fn sidecar_timeout() -> std::time::Duration {
+    let secs = std::env::var(ENV_TIMEOUT_SECS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
 }
 
 fn is_enabled() -> bool {
@@ -324,78 +386,57 @@ fn parse_response(stdout: &[u8]) -> SidecarOutcome {
         language: "dart".into(),
         ..Default::default()
     };
-    for v in response.files {
-        match serde_json::from_value(v) {
-            Ok(f) => batch.files.push(f),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid file row: {e}"),
-                };
+    // Partial recovery (issues2.md #48): one malformed record (sidecar /
+    // engine version skew) must drop *that record*, not the whole batch —
+    // "9 999 of 10 000 symbols" beats "Dart index missing entirely".
+    // Dropped rows surface as an [`AdapterDiagnostic`] per record family.
+    let mut dropped: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    fn collect<T: serde::de::DeserializeOwned>(
+        rows: Vec<serde_json::Value>,
+        family: &'static str,
+        out: &mut Vec<T>,
+        dropped: &mut std::collections::BTreeMap<&'static str, usize>,
+    ) {
+        for v in rows {
+            match serde_json::from_value(v) {
+                Ok(parsed) => out.push(parsed),
+                Err(_) => *dropped.entry(family).or_insert(0) += 1,
             }
         }
     }
-    for v in response.symbols {
-        match serde_json::from_value(v) {
-            Ok(s) => batch.symbols.push(s),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid symbol row: {e}"),
-                };
-            }
-        }
+    collect(response.files, "file", &mut batch.files, &mut dropped);
+    collect(response.symbols, "symbol", &mut batch.symbols, &mut dropped);
+    collect(response.tests, "test", &mut batch.tests, &mut dropped);
+    collect(
+        response.symbol_ranges,
+        "symbol_range",
+        &mut batch.symbol_ranges,
+        &mut dropped,
+    );
+    collect(response.imports, "import", &mut batch.imports, &mut dropped);
+    collect(
+        response.references,
+        "reference",
+        &mut batch.references,
+        &mut dropped,
+    );
+    collect(
+        response.synthetic_nodes,
+        "synthetic_node",
+        &mut batch.synthetic_nodes,
+        &mut dropped,
+    );
+    for (family, count) in dropped {
+        batch
+            .diagnostics
+            .push(specslice_core::language_batch::AdapterDiagnostic {
+                path: String::new(),
+                message: format!("sidecar response: dropped {count} invalid {family} row(s)"),
+            });
     }
-    for v in response.tests {
-        match serde_json::from_value(v) {
-            Ok(t) => batch.tests.push(t),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid test row: {e}"),
-                };
-            }
-        }
-    }
-    for v in response.symbol_ranges {
-        match serde_json::from_value(v) {
-            Ok(r) => batch.symbol_ranges.push(r),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid symbol_range row: {e}"),
-                };
-            }
-        }
-    }
-    for v in response.imports {
-        match serde_json::from_value(v) {
-            Ok(i) => batch.imports.push(i),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid import row: {e}"),
-                };
-            }
-        }
-    }
-    for v in response.references {
-        match serde_json::from_value(v) {
-            Ok(r) => batch.references.push(r),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid reference row: {e}"),
-                };
-            }
-        }
-    }
-    for v in response.synthetic_nodes {
-        match serde_json::from_value(v) {
-            Ok(s) => batch.synthetic_nodes.push(s),
-            Err(e) => {
-                return SidecarOutcome::Skipped {
-                    reason: format!("invalid synthetic_node row: {e}"),
-                };
-            }
-        }
-    }
-    // Diagnostics are informational only — we surface them via the
-    // outcome's caller, not the batch.
+    // Sidecar-side diagnostics are informational only — we surface them via
+    // the outcome's caller, not the batch.
     let _ = response.diagnostics;
 
     SidecarOutcome::Used(batch)
@@ -621,6 +662,45 @@ mod tests {
                 assert_eq!(batch.tests[0].name, "exposes monthly/yearly/lifetime ids");
             }
             other => panic!("expected Used, got {other:?}"),
+        }
+    }
+
+    /// issues2.md #48: one malformed record must not throw away the whole
+    /// batch. 9 999 good symbols + 1 incompatible row = a 9 999-symbol
+    /// batch with a diagnostic, not a sidecar skip.
+    #[test]
+    fn parse_response_recovers_partially_from_invalid_rows() {
+        let raw = br#"{
+          "ok": true,
+          "symbols": [
+            {
+              "id": "dart_class::lib/a.dart#Good",
+              "kind": "dart_class",
+              "path": "lib/a.dart",
+              "name": "Good",
+              "qualified_name": "Good",
+              "start_line": 1,
+              "end_line": 3,
+              "parent_symbol_id": null,
+              "metadata_json": null
+            },
+            { "id": "dart_class::lib/b.dart#Bad", "kind": 42 }
+          ]
+        }"#;
+        match parse_response(raw) {
+            SidecarOutcome::Used(batch) => {
+                assert_eq!(batch.symbols.len(), 1, "good row survives");
+                assert_eq!(batch.symbols[0].name, "Good");
+                assert!(
+                    batch
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.message.contains("invalid") || d.message.contains("symbol")),
+                    "dropped rows must surface as a diagnostic: {:?}",
+                    batch.diagnostics
+                );
+            }
+            other => panic!("expected partial Used, got {other:?}"),
         }
     }
 

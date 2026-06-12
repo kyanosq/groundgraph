@@ -184,6 +184,17 @@ fn export_jsonl_writes_real_rows_for_indexed_fixture() {
     let edges = std::fs::read_to_string(&edges_path).unwrap();
     assert!(nodes.lines().any(|l| l.contains("REQ-WATERMARK-001")));
     assert!(edges.lines().any(|l| l.contains("declares_implementation")));
+    // The atomic-write path must clean up after itself: only the three
+    // exported tables may exist in the bundle directory, no temp residue.
+    let stray: Vec<String> = std::fs::read_dir(&outcome.bundle_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.ends_with(".jsonl"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "unexpected files in bundle dir: {stray:?}"
+    );
 }
 
 #[test]

@@ -407,6 +407,11 @@ impl LspClient {
     /// dance. Failures are surfaced via the returned `Result` but the
     /// child is always waited on via [`Drop`] to avoid zombies.
     pub fn shutdown(&mut self) -> Result<()> {
+        if self.child.is_none() {
+            // Already force-killed (e.g. after a response timeout) —
+            // writing shutdown/exit into a dead pipe is pointless.
+            return Ok(());
+        }
         let shutdown_result = self.request("shutdown", json!(null));
         let exit_notify = self.notify("exit", json!(null));
         let wait_result = self
@@ -865,6 +870,13 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Value> {
     }
     let length =
         content_length.ok_or_else(|| anyhow!("LSP frame missing Content-Length header"))?;
+    // A hostile or broken server must not drive a multi-GB allocation from
+    // one header line (issues2.md #32). Real responses (large
+    // documentSymbol trees) stay well under this.
+    const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+    if length > MAX_FRAME_BYTES {
+        bail!("LSP frame of {length} bytes exceeds the {MAX_FRAME_BYTES}-byte cap");
+    }
     let mut buf = vec![0u8; length];
     reader
         .read_exact(&mut buf)
@@ -1042,6 +1054,21 @@ mod tests {
         assert!(msg.contains("4 bytes"), "expected length error, got: {msg}");
     }
 
+    /// issues2.md #32: a hostile/broken server header like
+    /// `Content-Length: 99999999999` must be rejected up front, not turned
+    /// into a giant buffer allocation.
+    #[test]
+    fn read_message_rejects_absurd_content_length_without_allocating() {
+        let data = b"Content-Length: 99999999999\r\n\r\n";
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let err = read_message(&mut reader).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("exceeds") || msg.contains("too large"),
+            "expected a size-cap error, got: {msg}"
+        );
+    }
+
     #[test]
     fn from_raw_covers_known_lsp_symbol_kinds() {
         assert_eq!(LspSymbolKind::from_raw(5), LspSymbolKind::Class);
@@ -1145,6 +1172,21 @@ mod tests {
             msg.contains("timed out") || msg.contains("超时"),
             "expected a timeout error, got: {msg}"
         );
+    }
+
+    /// After a timeout the child has already been force-killed and
+    /// reaped — `shutdown()` must be a no-op success, not a doomed
+    /// shutdown/exit write into a closed pipe (issues.md #25).
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_after_forced_kill_is_a_clean_noop() {
+        let mut client = LspClient::spawn("sleep", &["30"], Path::new("/"))
+            .expect("sleep should be spawnable on Unix");
+        client.set_response_timeout(Duration::from_millis(100));
+        let _ = client.initialize("file:///tmp").unwrap_err();
+        client
+            .shutdown()
+            .expect("shutdown after force_kill must succeed as a no-op");
     }
 
     /// P15 — `callHierarchy/outgoingCalls` returns

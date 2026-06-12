@@ -38,14 +38,7 @@ pub fn run(
             let mermaid = render_impact_mermaid(&report);
             match output {
                 Some(path) => {
-                    if let Some(parent) = path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!("creating output directory {}", parent.display())
-                            })?;
-                        }
-                    }
-                    std::fs::write(&path, &mermaid)
+                    super::output::write_atomic(&path, &mermaid)
                         .with_context(|| format!("writing impact mermaid to {}", path.display()))?;
                     println!("已写入: {}", path.display());
                 }

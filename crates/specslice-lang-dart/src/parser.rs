@@ -68,6 +68,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
     let mut pending_symbol: Option<PendingSymbol> = None;
     let mut depth = 0usize;
     let mut total_lines = 0u32;
+    let mut scan = ScanState::default();
 
     for (idx, raw_line) in source.lines().enumerate() {
         let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
@@ -75,9 +76,28 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         let line = strip_inline_string_braces(raw_line);
         let trimmed = line.trim_start();
 
+        // Lines that *start* inside a multi-line `'''`/`"""` literal are
+        // string content, not code: only depth bookkeeping may see them,
+        // or template text like `class Fake {` would register as real
+        // symbols (issues2.md #37).
+        if scan.in_multiline_string() {
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
         if let Some(pending) = pending_symbol.take() {
             let depth_before = depth;
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             if depth > depth_before {
                 open_symbol_starts.push((pending.id, pending.start_line, depth));
             } else if declaration_finished_without_open_body(&line) {
@@ -115,7 +135,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         // Skip blank lines without clearing doc buffer.
         if trimmed.is_empty() {
             // Update depth and continue.
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             close_symbols(
                 &mut open_symbol_starts,
                 &mut class_stack,
@@ -135,7 +155,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 from_file: file_artifact.id.clone(),
                 to_path: target,
             });
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             close_symbols(
                 &mut open_symbol_starts,
                 &mut class_stack,
@@ -169,7 +189,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
             };
             symbols.push(sym);
             let opens_brace = line.contains('{');
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             if opens_brace {
                 class_stack.push(ClassFrame {
                     id: class_id.clone(),
@@ -204,7 +224,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 end_line: line_no,
                 parent_symbol_id: current_class.as_ref().map(|c| c.0.clone()),
             });
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             close_symbols(
                 &mut open_symbol_starts,
                 &mut class_stack,
@@ -229,7 +249,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                 end_line: line_no,
                 parent_symbol_id: current_class.as_ref().map(|c| c.0.clone()),
             });
-            update_depth(&line, &mut depth);
+            update_depth(&line, &mut depth, &mut scan);
             close_symbols(
                 &mut open_symbol_starts,
                 &mut class_stack,
@@ -272,7 +292,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     metadata_json: None,
                 });
                 let depth_before = depth;
-                update_depth(&line, &mut depth);
+                update_depth(&line, &mut depth, &mut scan);
                 if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
                 } else if declaration_finished_without_open_body(&line) {
@@ -309,7 +329,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     .entry(class.0.clone())
                     .or_default()
                     .insert(field_name, type_name);
-                update_depth(&line, &mut depth);
+                update_depth(&line, &mut depth, &mut scan);
                 close_symbols(
                     &mut open_symbol_starts,
                     &mut class_stack,
@@ -336,7 +356,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     metadata_json: None,
                 });
                 let depth_before = depth;
-                update_depth(&line, &mut depth);
+                update_depth(&line, &mut depth, &mut scan);
                 if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
                 } else if declaration_finished_without_open_body(&line) {
@@ -383,7 +403,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
                     metadata_json: None,
                 });
                 let depth_before = depth;
-                update_depth(&line, &mut depth);
+                update_depth(&line, &mut depth, &mut scan);
                 if depth > depth_before {
                     open_symbol_starts.push((id, line_no, depth));
                 } else if declaration_finished_without_open_body(&line) {
@@ -418,7 +438,7 @@ pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
         }
 
         // Default: just update brace depth.
-        update_depth(&line, &mut depth);
+        update_depth(&line, &mut depth, &mut scan);
         close_symbols(
             &mut open_symbol_starts,
             &mut class_stack,
@@ -570,20 +590,22 @@ fn declaration_finished_without_open_body(line: &str) -> bool {
 }
 
 fn disambiguate_duplicate_test_ids(tests: &mut [TestArtifact]) {
-    for idx in 0..tests.len() {
-        let slug = slugify(&tests[idx].name);
-        let duplicate_count = tests
-            .iter()
-            .filter(|candidate| {
-                candidate.kind == tests[idx].kind
-                    && candidate.path == tests[idx].path
-                    && slugify(&candidate.name) == slug
-            })
-            .count();
-        if duplicate_count <= 1 {
+    // Single counting pass instead of the old O(N²) re-slugify-everything
+    // inner loop — generated golden-test files easily hold thousands of
+    // cases (issues2.md #60).
+    let slugs: Vec<String> = tests.iter().map(|t| slugify(&t.name)).collect();
+    let mut counts: std::collections::HashMap<(NodeKind, String, String), usize> =
+        std::collections::HashMap::new();
+    for (t, slug) in tests.iter().zip(&slugs) {
+        *counts
+            .entry((t.kind, t.path.clone(), slug.clone()))
+            .or_insert(0) += 1;
+    }
+    for (idx, slug) in slugs.iter().enumerate() {
+        let key = (tests[idx].kind, tests[idx].path.clone(), slug.clone());
+        if counts.get(&key).copied().unwrap_or(0) <= 1 {
             continue;
         }
-
         let unique_slug = format!("{slug}-line-{}", tests[idx].start_line);
         tests[idx].id = match tests[idx].kind {
             NodeKind::TestCase => dart_test_id(&tests[idx].path, &unique_slug),
@@ -672,25 +694,80 @@ fn finalize_symbol(
     });
 }
 
-fn update_depth(line: &str, depth: &mut usize) {
+/// Cross-line scanner state for [`update_depth`]. `triple` is `Some((quote,
+/// raw))` while the scanner is inside a multi-line `'''`/`"""` literal —
+/// per-line resets used to treat template content as code and drift the
+/// brace depth (issues2.md #37).
+#[derive(Default)]
+struct ScanState {
+    triple: Option<(char, bool)>,
+}
+
+impl ScanState {
+    fn in_multiline_string(&self) -> bool {
+        self.triple.is_some()
+    }
+}
+
+fn update_depth(line: &str, depth: &mut usize, state: &mut ScanState) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
     let mut in_string = false;
+    let mut raw_string = false;
     let mut quote_char = '"';
+    // Escape state instead of a one-char look-back: `prev != '\\'` misread
+    // `"\\"` (escaped backslash, string *closed*) as still-open, which then
+    // mis-counted every following brace (issues.md #5).
+    let mut escaped = false;
     let mut prev = ' ';
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
+    while i < chars.len() {
+        let ch = chars[i];
+        // Inside a multi-line literal: consume until the closing run.
+        // `escaped` legitimately resets at line start — a trailing `\`
+        // escapes the newline itself, not the next line's first char.
+        if let Some((q, raw)) = state.triple {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' && !raw {
+                escaped = true;
+            } else if ch == q && chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                state.triple = None;
+                prev = ' ';
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         if in_string {
-            if ch == quote_char && prev != '\\' {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' && !raw_string {
+                escaped = true;
+            } else if ch == quote_char {
                 in_string = false;
             }
             prev = ch;
+            i += 1;
             continue;
         }
         match ch {
             '\'' | '"' => {
+                // Dart raw strings (`r'...'`) have no escapes at all.
+                let raw = prev == 'r';
+                if chars.get(i + 1) == Some(&ch) && chars.get(i + 2) == Some(&ch) {
+                    state.triple = Some((ch, raw));
+                    escaped = false;
+                    prev = ' ';
+                    i += 3;
+                    continue;
+                }
                 in_string = true;
                 quote_char = ch;
+                raw_string = raw;
+                escaped = false;
             }
-            '/' if chars.peek() == Some(&'/') => break, // line comment
+            '/' if chars.get(i + 1) == Some(&'/') => break, // line comment
             '{' => *depth += 1,
             '}' if *depth > 0 => {
                 *depth -= 1;
@@ -698,7 +775,27 @@ fn update_depth(line: &str, depth: &mut usize) {
             _ => {}
         }
         prev = ch;
+        i += 1;
     }
+}
+
+/// Byte index of the first unescaped `quote` in `s`, honouring `\\` pairs.
+fn find_unescaped(s: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == quote {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn strip_inline_string_braces(line: &str) -> String {
@@ -741,7 +838,7 @@ fn parse_import(line: &str) -> Option<String> {
     if quote != '\'' && quote != '"' {
         return None;
     }
-    let end = rest[1..].find(quote)?;
+    let end = find_unescaped(&rest[1..], quote)?;
     Some(rest[1..1 + end].to_string())
 }
 
@@ -769,7 +866,7 @@ fn extract_call_arg(line: &str, prefix: &str) -> Option<String> {
         return None;
     }
     let inside = &after[1..];
-    let end = inside.find(quote)?;
+    let end = find_unescaped(inside, quote)?;
     Some(inside[..end].to_string())
 }
 
@@ -781,6 +878,10 @@ fn parse_method(line: &str) -> Option<String> {
     }
     for kw in [
         "if(", "if ", "for(", "for ", "while(", "while ", "switch", "return ", "return;",
+        // A `factory` is always a constructor; when the class name does
+        // not match (so `parse_constructor` passed), modelling it as a
+        // method would collapse names at the `.` (issues2.md #36).
+        "factory ",
     ] {
         if line.starts_with(kw) {
             return None;
@@ -816,7 +917,16 @@ fn parse_top_level_function(line: &str) -> Option<String> {
 }
 
 fn parse_constructor(line: &str, class_name: &str) -> Option<String> {
-    let trimmed = line.trim_start_matches("const ").trim_start();
+    // `factory` (and `const factory`) constructors must keep their own
+    // names: falling through to `parse_method` collapsed every factory in
+    // a class onto one method id (issues2.md #36).
+    let trimmed = line
+        .trim_start_matches("const ")
+        .trim_start()
+        .trim_start_matches("factory ")
+        .trim_start()
+        .trim_start_matches("const ")
+        .trim_start();
     if !trimmed.starts_with(class_name) {
         return None;
     }
@@ -1147,18 +1257,163 @@ mod tests {
         assert_eq!(methods, vec!["open".to_string()]);
     }
 
+    fn depth_of(lines: &[&str]) -> usize {
+        let mut d = 0usize;
+        let mut scan = ScanState::default();
+        for line in lines {
+            update_depth(line, &mut d, &mut scan);
+        }
+        d
+    }
+
     #[test]
     fn update_depth_skips_braces_inside_strings_and_line_comments() {
-        let mut d = 0usize;
-        update_depth("var x = '{{{'; // }", &mut d);
-        assert_eq!(d, 0);
-        update_depth("class X {", &mut d);
-        assert_eq!(d, 1);
-        update_depth("}", &mut d);
-        assert_eq!(d, 0);
+        assert_eq!(depth_of(&["var x = '{{{'; // }"]), 0);
+        assert_eq!(depth_of(&["class X {"]), 1);
+        assert_eq!(depth_of(&["class X {", "}"]), 0);
         // Underflow safety.
-        update_depth("}", &mut d);
-        assert_eq!(d, 0);
+        assert_eq!(depth_of(&["}"]), 0);
+    }
+
+    #[test]
+    fn update_depth_handles_escaped_backslash_before_closing_quote() {
+        // `"\\"` is a complete string literal (escaped backslash). The old
+        // `prev != '\\'` check saw the backslash and kept the scanner "inside
+        // a string", so the following `{` was swallowed (issues.md #5).
+        assert_eq!(
+            depth_of(&[r#"var s = "\\"; if (x) {"#]),
+            1,
+            "the trailing `{{` must be counted"
+        );
+
+        // An escaped quote really does stay inside the string.
+        assert_eq!(
+            depth_of(&[r#"var s = "a\"b{"; "#]),
+            0,
+            "braces inside the string must not count"
+        );
+
+        // Even-length backslash runs end the escape: `"a\\\\"` closes too.
+        assert_eq!(depth_of(&[r#"var s = "a\\\\"; {"#]), 1);
+    }
+
+    #[test]
+    fn update_depth_tracks_triple_quotes_across_lines() {
+        // Braces inside a multi-line literal must not count…
+        assert_eq!(depth_of(&["var s = '''", "{ {", "''';", "{"]), 1);
+        // …and a triple-quoted literal that opens and closes on one line
+        // leaves no dangling state.
+        assert_eq!(depth_of(&["var s = '''{ x }''';", "{"]), 1);
+        // Quotes inside the literal don't close it.
+        assert_eq!(
+            depth_of(&["var s = \"\"\"", "it's 'quoted' {", "\"\"\";"]),
+            0
+        );
+    }
+
+    /// issues2.md #36: `factory Foo.x(...)` used to fall through
+    /// `parse_constructor` (the `factory ` prefix broke the class-name
+    /// match) into `parse_method`, where `take_while` stopped at `.` —
+    /// every factory in a class collapsed onto one method named like the
+    /// class, colliding on a single symbol id.
+    #[test]
+    fn factory_constructors_register_as_distinct_constructors() {
+        let src = "class Foo {\n  factory Foo.fromJson(Map j) { return Foo._(); }\n  factory Foo.fromYaml(String y) { return Foo._(); }\n  Foo._();\n}\n";
+        let r = parse(src);
+        let ctors: Vec<&str> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartConstructor)
+            .map(|s| s.qualified_name.as_str())
+            .collect();
+        assert!(
+            ctors.contains(&"Foo.fromJson") && ctors.contains(&"Foo.fromYaml"),
+            "factories must become distinct constructors, got {ctors:?}"
+        );
+        assert!(
+            !r.symbols
+                .iter()
+                .any(|s| s.kind == NodeKind::DartMethod && s.name == "Foo"),
+            "no collapsed method named after the class may appear"
+        );
+    }
+
+    /// issues2.md #37: `update_depth` reset its string state on every
+    /// line, so a multi-line `'''...'''` template containing `{` drifted
+    /// the depth counter and dragged enclosing symbol ranges to EOF.
+    #[test]
+    fn triple_quoted_strings_do_not_corrupt_brace_depth() {
+        let src = "class C {\n  void f() {\n    var s = '''\n{ \"json\": \"template\",\n''';\n  }\n  void g() {}\n}\n";
+        let r = parse(src);
+        let f = r
+            .ranges
+            .iter()
+            .find(|x| x.qualified_name == "C.f")
+            .expect("f range");
+        assert_eq!(f.end_line, 6, "f must close right after the literal");
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "C.g"),
+            "g must still be discovered after the template"
+        );
+    }
+
+    /// Declaration-looking text inside a multi-line string must not be
+    /// parsed as real symbols (issues2.md #37).
+    #[test]
+    fn declarations_inside_triple_quoted_strings_are_ignored() {
+        let src = "void real() {\n  var tpl = '''\nclass Fake {\n  void phantom() {}\n}\n''';\n}\n";
+        let r = parse(src);
+        assert!(
+            !r.symbols.iter().any(|s| s.name == "Fake"),
+            "class text inside a string literal must not register"
+        );
+        assert!(
+            !r.symbols.iter().any(|s| s.name == "phantom"),
+            "method text inside a string literal must not register"
+        );
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "real"),
+            "the real function must survive"
+        );
+    }
+
+    /// Raw triple-quoted strings (`r'''`) have no escapes at all.
+    #[test]
+    fn raw_triple_quoted_strings_close_without_escape_handling() {
+        let src = "void f() {\n  var s = r'''\n{ \\\n''';\n}\nvoid g() {}\n";
+        let r = parse(src);
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "g"),
+            "g must be discovered after the raw template"
+        );
+        let f = r
+            .ranges
+            .iter()
+            .find(|x| x.qualified_name == "f")
+            .expect("f range");
+        assert_eq!(f.end_line, 5);
+    }
+
+    #[test]
+    fn parse_import_and_call_args_handle_escaped_quotes() {
+        // Escaped quote inside the literal must not terminate it (#6).
+        assert_eq!(
+            parse_import(r"import 'it\'s.dart';").as_deref(),
+            Some(r"it\'s.dart")
+        );
+        assert_eq!(
+            parse_test_call(r"test('it\'s working', () {});").as_deref(),
+            Some(r"it\'s working")
+        );
+        assert_eq!(
+            parse_group_call(r#"group("say \"hi\"", () {});"#).as_deref(),
+            Some(r#"say \"hi\""#)
+        );
+        // A literal ending in an escaped backslash still terminates.
+        assert_eq!(
+            parse_test_call(r#"test("ends with backslash\\", () {});"#).as_deref(),
+            Some(r#"ends with backslash\\"#)
+        );
     }
 
     #[test]

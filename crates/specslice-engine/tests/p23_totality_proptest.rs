@@ -108,6 +108,70 @@ proptest! {
     }
 }
 
+/// Index the schema/route pipeline over one adversarial file per language;
+/// returns a count fingerprint. Exercises the hand-rolled scanners hardened
+/// in issues2.md (#31/#44/#45/#49: route normalization, Python prefixes,
+/// Go string literals; plus brace/paren tracking from the first batch).
+fn index_schema_fingerprint(src: &str) -> (usize, usize, usize, usize) {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    for name in [
+        "A.java",
+        "app.py",
+        "main.go",
+        "client.dart",
+        "schema.sql",
+        "Mapper.xml",
+    ] {
+        fs::write(root.join("src").join(name), src).unwrap();
+    }
+    let mut store = fresh_store(root);
+    let stats = specslice_engine::schema_indexer::index_schema_into(&mut store, root)
+        .expect("schema indexing must not error");
+    (
+        stats.files_scanned,
+        stats.http_routes,
+        stats.sql_tables + stats.orm_tables,
+        stats.inline_sql_table_edges + stats.stmt_table_edges,
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// The schema/route pipeline is total and deterministic on adversarial
+    /// valid-UTF-8 input across Java, Python, Go, Dart, SQL, and XML.
+    #[test]
+    fn schema_pipeline_is_total_and_deterministic(seed in ".{0,48}", shape in 0u8..4) {
+        let src = adversarial(&seed, shape);
+        let a = index_schema_fingerprint(&src);
+        let b = index_schema_fingerprint(&src);
+        prop_assert_eq!(a, b, "schema pipeline not deterministic");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Pure scanners hardened for Unicode in issues2.md (#47 normalize,
+    /// #52 tokenise_keywords) must be total and deterministic on any string.
+    #[test]
+    fn pure_scanners_are_total_and_deterministic(s in ".{0,200}") {
+        use specslice_engine::similarity::{normalize, Language};
+        for lang in [
+            Language::Python, Language::Dart, Language::Rust, Language::Go,
+            Language::Swift, Language::TypeScript, Language::Java,
+            Language::C, Language::Cpp,
+        ] {
+            prop_assert_eq!(normalize(lang, &s), normalize(lang, &s));
+        }
+        let a = specslice_engine::search::tokenise_keywords(&s);
+        let b = specslice_engine::search::tokenise_keywords(&s);
+        prop_assert_eq!(a, b);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 

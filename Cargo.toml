@@ -12,7 +12,8 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.87"
+# 1.89 for `File::lock` (concurrent stats append, issues2.md #35).
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/specslice/specslice"
 

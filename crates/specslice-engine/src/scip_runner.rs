@@ -480,8 +480,11 @@ fn language_source_exts(language: &str) -> &'static [&'static str] {
 /// Digest of every relevant source file under `cwd` for `language`:
 /// `(relative path, length, mtime)` tuples hashed in sorted order — the same
 /// staleness contract `make`/`ninja` use. Content is NOT read: a digest of a
-/// 3 000-file tree costs milliseconds. Collisions (touch without change)
-/// only cause a redundant re-run, never a stale overlay.
+/// 3 000-file tree costs milliseconds. Touch-without-change only causes a
+/// redundant re-run. The converse (same length AND same mtime after a real
+/// edit — needs a deliberate `touch -r` or a 1-second-resolution FS) can
+/// keep a stale overlay, like every mtime-based build system; `--force`
+/// re-runs unconditionally (issues2.md #33: accepted trade-off).
 fn inputs_digest(cwd: &Path, language: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let exts = language_source_exts(language);
@@ -550,8 +553,8 @@ fn execute(
 ) -> ScipRunOutcome {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
-    match cmd.output() {
-        Ok(o) if o.status.success() => {
+    match run_with_capped_stderr(&mut cmd) {
+        Ok((status, _)) if status.success() => {
             if writes_cwd_index {
                 let produced = cwd.join("index.scip");
                 if produced.exists() {
@@ -578,9 +581,9 @@ fn execute(
                 }
             }
         }
-        Ok(o) => {
-            let summary = summarize_stderr(&o.stderr);
-            let mut msg = format!("退出码 {}: {summary}", o.status);
+        Ok((status, stderr)) => {
+            let summary = summarize_stderr(&stderr);
+            let mut msg = format!("退出码 {status}: {summary}");
             if let Some(hint) = scip_failure_hint(program, &summary) {
                 msg.push_str(&format!("（{hint}）"));
             }
@@ -596,6 +599,47 @@ fn execute(
             output: None,
         },
     }
+}
+
+/// Keep at most this much of an indexer's stderr in memory. We only need the
+/// leading error line for the summary; verbose indexers on big monorepos can
+/// emit hundreds of MB (issues.md #14).
+const STDERR_CAP_BYTES: usize = 64 * 1024;
+
+/// Run `cmd`, discarding stdout entirely (the index artefact goes to a file,
+/// never to stdout) and retaining only a capped prefix of stderr. The pipe is
+/// drained to EOF past the cap so the child can never block on a full pipe.
+fn run_with_capped_stderr(
+    cmd: &mut Command,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stderr = child.stderr.take().expect("stderr was requested as piped");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < STDERR_CAP_BYTES {
+                    let take = n.min(STDERR_CAP_BYTES - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+    }
+    let status = child.wait()?;
+    Ok((status, buf))
 }
 
 /// Distil an indexer's stderr into one actionable line. Indexers print the real
@@ -650,6 +694,27 @@ mod tests {
 
     /// Stub binary resolver used by the planner tests.
     type BinFinder = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_capped_stderr_drains_oversized_output_without_buffering_it_all() {
+        // ~2 MiB of stderr — far beyond the cap. The runner must
+        // (a) not deadlock on a full pipe, (b) bound the buffer, and
+        // (c) still report the exit status (issues.md #14).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "i=0; while [ $i -lt 2048 ]; do printf '%01024d' 0 >&2; i=$((i+1)); done",
+        ]);
+        let (status, stderr) = run_with_capped_stderr(&mut cmd).expect("spawn sh");
+        assert!(status.success());
+        assert!(
+            stderr.len() <= STDERR_CAP_BYTES,
+            "stderr buffer must be capped: got {} bytes",
+            stderr.len()
+        );
+        assert!(!stderr.is_empty(), "capped prefix must still be kept");
+    }
 
     #[test]
     fn summarize_stderr_prefers_the_error_line_over_a_backtrace_tail() {

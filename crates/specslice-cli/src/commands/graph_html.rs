@@ -41,20 +41,10 @@ pub fn render_html(view: &GraphViewModel) -> String {
 /// Escape any `</...>` sequence that could prematurely close the script tag
 /// when the JSON payload contains markup-like strings.
 fn sanitize_json_for_script(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            out.push_str("<\\/");
-            i += 2;
-            continue;
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    out
+    // `</` is pure ASCII and UTF-8 is self-synchronising, so a plain
+    // string replace can never split a multi-byte character — unlike the
+    // old byte-by-byte loop, which mangled CJK text (issues.md #1).
+    raw.replace("</", "<\\/")
 }
 
 const DOCTYPE: &str = "<!doctype html>\n";
@@ -525,7 +515,7 @@ const RENDERER_JS: &str = r#"(function () {
       // without ever spelling out an XML namespace URI (the offline policy
       // forbids any URL literal inside the generated HTML).
       const tmp = document.createElement('div');
-      tmp.innerHTML = '<svg><g class="edge layer-' + e.layer + (aggregated ? ' aggregated' : '') + '">' +
+      tmp.innerHTML = '<svg><g class="edge layer-' + escapeAttr(e.layer) + (aggregated ? ' aggregated' : '') + '">' +
         '<path d="' + d + '" data-from="' + escapeAttr(from.id) + '" data-to="' + escapeAttr(to.id) + '"></path>' +
         '<title>' + escapeAttr(e.kind) + '</title>' +
         '</g></svg>';
@@ -550,7 +540,7 @@ const RENDERER_JS: &str = r#"(function () {
             : n.kind);
       const classes = ['node-card', 'kind-' + n.kind, 'layer-' + n.layer];
       if (selected && selected.id === n.id) classes.push('selected');
-      tmp.innerHTML = '<svg><g class="' + classes.join(' ') + '" data-id="' + escapeAttr(n.id) + '">' +
+      tmp.innerHTML = '<svg><g class="' + escapeAttr(classes.join(' ')) + '" data-id="' + escapeAttr(n.id) + '">' +
         '<rect class="node-bg" x="' + p.x + '" y="' + p.y + '" width="' + p.w + '" height="' + p.h + '"></rect>' +
         '<text class="node-label" x="' + (p.x + 10) + '" y="' + (p.y + 18) + '">' + escapeText(n.label || n.id) + '</text>' +
         '<text class="node-sub" x="' + (p.x + 10) + '" y="' + (p.y + 34) + '">' + escapeText(subText) + '</text>' +
@@ -725,7 +715,10 @@ const RENDERER_JS: &str = r#"(function () {
     ];
     for (const [label, value] of pairs) {
       const span = document.createElement('span');
-      span.innerHTML = label + ' <b>' + (value || 0) + '</b>';
+      span.appendChild(document.createTextNode(label + ' '));
+      const b = document.createElement('b');
+      b.textContent = String(value || 0);
+      span.appendChild(b);
       statsEl.appendChild(span);
     }
   }
@@ -819,6 +812,20 @@ mod tests {
     fn sanitize_leaves_normal_text_untouched() {
         let raw = r#"{"a":"hello","b":42}"#;
         assert_eq!(sanitize_json_for_script(raw), raw);
+    }
+
+    #[test]
+    fn sanitize_preserves_multibyte_utf8_payloads() {
+        // Reports of Chinese repos carry CJK labels and emoji; the old
+        // byte-by-byte `push(b as char)` mangled every multi-byte
+        // character into mojibake (issues.md #1).
+        let raw = r#"{"label":"登录鉴权 🚀 中文","html":"</script>"}"#;
+        let out = sanitize_json_for_script(raw);
+        assert!(
+            out.contains("登录鉴权 🚀 中文"),
+            "multi-byte text must survive sanitising: {out}"
+        );
+        assert!(out.contains("<\\/script>"));
     }
 
     #[test]

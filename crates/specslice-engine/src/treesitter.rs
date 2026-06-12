@@ -1394,7 +1394,10 @@ fn index_repo_with_spec_impl(
     let mut t = std::time::Instant::now();
     let mut mark = move |phase: &str, lang: &str| {
         if timing {
-            eprintln!("[timing]   {lang}/{phase}: {:.2}s", t.elapsed().as_secs_f64());
+            eprintln!(
+                "[timing]   {lang}/{phase}: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
         }
         t = std::time::Instant::now();
     };

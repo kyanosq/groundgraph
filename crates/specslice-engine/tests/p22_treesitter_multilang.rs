@@ -44,7 +44,11 @@ fn fixture_dirs_are_never_indexed() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(root, "src/lib.rs", "pub fn real() {}\n");
-    write(root, "src/test_data/fixture_a.rs", "pub fn phantom_a() {}\n");
+    write(
+        root,
+        "src/test_data/fixture_a.rs",
+        "pub fn phantom_a() {}\n",
+    );
     write(root, "src/testdata/fixture_b.rs", "pub fn phantom_b() {}\n");
     enable_treesitter(root, "rust");
     index(root);

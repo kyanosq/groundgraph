@@ -107,6 +107,11 @@ pub fn append_stat(specslice_dir: &Path, stat: &CommandStat) -> std::io::Result<
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    // Exclusive lock for the append: `write_all` may split into several
+    // `write` syscalls (large metrics maps), and concurrent specslice
+    // processes (CI: index + search + impact on one repo) would interleave
+    // bytes mid-line (issues2.md #35). Released when `f` drops.
+    f.lock()?;
     f.write_all(line.as_bytes())
 }
 
@@ -243,6 +248,41 @@ mod tests {
         assert_eq!(loaded[0].command, "search");
         assert_eq!(loaded[0].metrics.get("hits"), Some(&7));
         assert_eq!(loaded[1].command, "index");
+    }
+
+    /// issues2.md #35: concurrent appends from several processes (CI
+    /// running index + search + impact at once) must never interleave
+    /// bytes mid-line. Large metrics maps force multi-syscall writes;
+    /// the file lock keeps each line whole.
+    #[test]
+    fn concurrent_appends_never_corrupt_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ss = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let ss = ss.clone();
+                std::thread::spawn(move || {
+                    // ~64 KB of metrics per line to defeat single-write atomicity.
+                    let mut metrics = BTreeMap::new();
+                    for k in 0..1500 {
+                        metrics.insert(format!("metric_thread{t}_key{k:05}"), k);
+                    }
+                    for i in 0..20u64 {
+                        let stat = make_stat(&format!("cmd{t}_{i}"), i, true, metrics.clone());
+                        append_stat(&ss, &stat).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let loaded = load_stats(&ss.join(STATS_REL_PATH)).unwrap();
+        assert_eq!(
+            loaded.len(),
+            8 * 20,
+            "every appended line must parse back — corruption loses lines"
+        );
     }
 
     #[test]

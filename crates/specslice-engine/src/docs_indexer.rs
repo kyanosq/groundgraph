@@ -54,7 +54,7 @@ pub struct DocsIndexOptions {
 /// Walk all configured doc roots and merge results into the given store.
 pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsIndexResult> {
     let mut result = DocsIndexResult::default();
-    let mut visited = Vec::new();
+    let mut visited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Configured roots split in two: a *bare directory name* (`docs`, `doc`)
     // matches that directory anywhere in the tree — monorepo members keep
@@ -101,10 +101,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             if !matches_include_globs(&options.include_globs, &rel)? {
                 continue;
             }
-            if visited.iter().any(|v| v == &rel) {
+            if !visited.insert(rel.clone()) {
                 continue;
             }
-            visited.push(rel.clone());
             index_one_file(store, &rel, path, &mut result)
                 .with_context(|| format!("indexing markdown file {rel}"))?;
         }
@@ -155,10 +154,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             if !take {
                 continue;
             }
-            if visited.iter().any(|v| v == &rel) {
+            if !visited.insert(rel.clone()) {
                 continue;
             }
-            visited.push(rel.clone());
             index_one_file(store, &rel, path, &mut result)
                 .with_context(|| format!("indexing document {rel}"))?;
         }
@@ -182,10 +180,9 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             continue;
         }
         let rel = name.to_string();
-        if visited.iter().any(|v| v == &rel) {
+        if !visited.insert(rel.clone()) {
             continue;
         }
-        visited.push(rel.clone());
         index_one_file(store, &rel, &path, &mut result)
             .with_context(|| format!("indexing root document {rel}"))?;
     }
@@ -253,10 +250,8 @@ fn is_doc_dir_name(name: &str, bare_names: &std::collections::BTreeSet<String>) 
     }
     const DOC_FAMILY: [&str; 3] = ["doc", "docs", "documentation"];
     let doc_family_enabled = DOC_FAMILY.iter().any(|w| bare_names.contains(*w));
-    name.split(['-', '_']).any(|word| {
-        bare_names.contains(word)
-            || (doc_family_enabled && DOC_FAMILY.contains(&word))
-    })
+    name.split(['-', '_'])
+        .any(|word| bare_names.contains(word) || (doc_family_enabled && DOC_FAMILY.contains(&word)))
 }
 
 /// Same vendored-project test for the repo-wide walk, where the boundary is
@@ -836,9 +831,7 @@ mod tests {
             "root README must be indexed without configuration"
         );
         assert!(
-            nodes
-                .iter()
-                .all(|n| n.id.to_string() != "file::notes.md"),
+            nodes.iter().all(|n| n.id.to_string() != "file::notes.md"),
             "arbitrary root markdown must stay out"
         );
     }
@@ -934,7 +927,9 @@ mod tests {
             "README in a manifest-less directory must stay out"
         );
         assert!(
-            nodes.iter().all(|n| !n.id.to_string().contains("node_modules")),
+            nodes
+                .iter()
+                .all(|n| !n.id.to_string().contains("node_modules")),
             "vendored package READMEs must stay pruned"
         );
     }
@@ -970,7 +965,9 @@ mod tests {
             "vendored project docs must stay out; got {result:?}"
         );
         assert!(
-            nodes.iter().any(|n| n.id.to_string() == "file::docs/guide.md"),
+            nodes
+                .iter()
+                .any(|n| n.id.to_string() == "file::docs/guide.md"),
             "our own docs still indexed"
         );
     }
@@ -1012,7 +1009,9 @@ mod tests {
             "adoc `=` headings become DocSections; got {titles:?}"
         );
         assert!(
-            !titles.iter().any(|t| t.contains("comment") || t.contains("literal")),
+            !titles
+                .iter()
+                .any(|t| t.contains("comment") || t.contains("literal")),
             "comments and literal blocks are not headings; got {titles:?}"
         );
     }

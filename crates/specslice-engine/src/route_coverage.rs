@@ -311,12 +311,15 @@ fn route_path(n: &Node) -> Option<String> {
 }
 
 /// Whether a path segment is a placeholder (path parameter / wildcard) that
-/// must not participate in matching: `{id}`, `:id`, `*`, `<id>`.
+/// must not participate in matching: `{id}`, `:id`, `*`, `<id>` / `<int:id>`,
+/// and raw template interpolation (`${id}`, `$id`) that escaped upstream
+/// normalization (issues2.md #31/#44).
 fn is_param_segment(seg: &str) -> bool {
     (seg.starts_with('{') && seg.ends_with('}'))
         || (seg.starts_with('<') && seg.ends_with('>'))
         || seg.starts_with(':')
         || seg.starts_with('*')
+        || seg.starts_with('$')
 }
 
 /// Concrete (non-placeholder) path segments, lowercased.
@@ -406,6 +409,12 @@ mod tests {
         );
         // :param and <param> forms too.
         assert_eq!(route_key("/orders/:id/items", 2), "orders/items");
+        // Template-literal interpolation that escaped normalization
+        // (`${id}`, `$id`) must also drop out (issues2.md #31/#44).
+        assert_eq!(route_key("/orders/${id}/items", 2), "orders/items");
+        assert_eq!(route_key("/orders/$id/items", 2), "orders/items");
+        // Flask/FastAPI typed converters: `<int:id>`.
+        assert_eq!(route_key("/orders/<int:id>/items", 2), "orders/items");
         // suffix=0 keeps the whole concrete path.
         assert_eq!(route_key("/a/b/c", 0), "a/b/c", "suffix 0 => whole path");
         // Short path: fewer segments than the suffix → keep all.
@@ -459,6 +468,62 @@ mod tests {
         // server-only route surfaces as extra.
         let extra: Vec<&str> = report.extra.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(extra, vec!["internal/health"]);
+    }
+
+    /// issues2.md #31/#44 epic, end to end: a Spring server declaring
+    /// `{id}` params and a Dart client consuming with `${id}` interpolation
+    /// are indexed into two separate stores by the real schema indexer and
+    /// must align under route-coverage — the exact cross-graph link the
+    /// route pipeline exists for.
+    #[test]
+    fn spring_server_and_dart_client_align_end_to_end() {
+        let server_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            server_dir.path().join("OrderController.java"),
+            r#"
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+    @GetMapping("/{id}/items")
+    public List<Item> items(@PathVariable Long id) { return null; }
+}
+"#,
+        )
+        .unwrap();
+        let mut server = Store::open(server_dir.path().join("graph.db")).unwrap();
+        server.migrate().unwrap();
+        let s_stats =
+            crate::schema_indexer::index_schema_into(&mut server, server_dir.path()).unwrap();
+        assert_eq!(s_stats.http_routes, 1, "server route indexed");
+
+        let client_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            client_dir.path().join("api.dart"),
+            r#"
+class OrderApi {
+  Future<void> items(int id) async {
+    final r = await _dio.get<Map<String, dynamic>>('/orders/${id}/items');
+  }
+}
+"#,
+        )
+        .unwrap();
+        let mut client = Store::open(client_dir.path().join("graph.db")).unwrap();
+        client.migrate().unwrap();
+        let c_stats =
+            crate::schema_indexer::index_schema_into(&mut client, client_dir.path()).unwrap();
+        assert_eq!(c_stats.consumed_routes, 1, "consumed route indexed");
+
+        let report =
+            analyze_route_coverage_with_stores(&client, &server, &RouteCoverageOptions::default())
+                .unwrap();
+        assert_eq!(report.stats.source_routes, 1);
+        assert_eq!(
+            report.stats.ported_keys, 1,
+            "client `${{id}}` and server `{{id}}` must meet at one key; missing: {:?}",
+            report.missing
+        );
+        assert!(report.missing.is_empty());
     }
 
     #[test]

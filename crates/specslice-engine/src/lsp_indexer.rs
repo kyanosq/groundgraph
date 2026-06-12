@@ -617,9 +617,10 @@ fn probe_call_hierarchy_and_references(
 /// Best-effort wait for the LSP server's call-hierarchy index to come
 /// online. We pick a callable symbol from each opened file (so that
 /// per-file readiness is exercised) and retry `prepareCallHierarchy`
-/// up to `WARMUP_MAX_ATTEMPTS` times, sleeping `WARMUP_SLEEP` between.
-/// The whole pass is capped at `WARMUP_TOTAL_BUDGET` so a wedged
-/// server never slows down `specslice index` more than ~5s.
+/// until it answers, sleeping `WARMUP_SLEEP` between attempts.
+/// The whole pass is capped at `WARMUP_TOTAL_BUDGET` (15s, sized for
+/// sourcekit-lsp's IndexStoreDB cold start — see the constant below)
+/// so a wedged server can never stall `specslice index` beyond that.
 ///
 /// We never propagate errors here: warmup is a best-effort signal,
 /// and the subsequent probing pass will still respect graceful
@@ -915,11 +916,30 @@ fn visit_symbols(
 pub(crate) fn simple_glob_match(pattern: &str, path: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = path.chars().collect();
-    glob_match_rec(&pat, 0, &txt, 0)
+    // Failure memo: patterns with several `*`/`**` segments otherwise
+    // backtrack exponentially (`**/**/**/x` vs a long path froze whole
+    // index runs — issues2.md #50). State space is (pi, ti), so caching
+    // failed states bounds the walk at O(P×T) cached entries.
+    let mut failed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    glob_match_rec(&pat, 0, &txt, 0, &mut failed)
 }
 
-fn glob_match_rec(pat: &[char], mut pi: usize, txt: &[char], mut ti: usize) -> bool {
-    while pi < pat.len() {
+fn glob_match_rec(
+    pat: &[char],
+    start_pi: usize,
+    txt: &[char],
+    start_ti: usize,
+    failed: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    if failed.contains(&(start_pi, start_ti)) {
+        return false;
+    }
+    let mut pi = start_pi;
+    let mut ti = start_ti;
+    let matched = loop {
+        if pi >= pat.len() {
+            break ti == txt.len();
+        }
         if pat[pi] == '*' {
             let double = pi + 1 < pat.len() && pat[pi + 1] == '*';
             if double {
@@ -931,43 +951,42 @@ fn glob_match_rec(pat: &[char], mut pi: usize, txt: &[char], mut ti: usize) -> b
                 }
                 // Try matching the remainder against every suffix of
                 // `txt[ti..]` (including the empty suffix).
-                for j in ti..=txt.len() {
-                    if glob_match_rec(pat, next, txt, j) {
-                        return true;
-                    }
-                }
-                return false;
-            } else {
-                // `*` — match within a single segment.
-                let next = pi + 1;
-                for j in ti..=txt.len() {
-                    // Stop expanding once we hit a `/`.
-                    if j > ti && txt[j - 1] == '/' {
-                        break;
-                    }
-                    if glob_match_rec(pat, next, txt, j) {
-                        return true;
-                    }
-                }
-                return false;
+                break (ti..=txt.len()).any(|j| glob_match_rec(pat, next, txt, j, failed));
             }
+            // `*` — match within a single segment.
+            let next = pi + 1;
+            let mut hit = false;
+            for j in ti..=txt.len() {
+                // Stop expanding once we hit a `/`.
+                if j > ti && txt[j - 1] == '/' {
+                    break;
+                }
+                if glob_match_rec(pat, next, txt, j, failed) {
+                    hit = true;
+                    break;
+                }
+            }
+            break hit;
         }
         if ti >= txt.len() {
-            return false;
+            break false;
         }
         match pat[pi] {
             '?' => {
                 if txt[ti] == '/' {
-                    return false;
+                    break false;
                 }
             }
             c if c == txt[ti] => {}
-            _ => return false,
+            _ => break false,
         }
         pi += 1;
         ti += 1;
+    };
+    if !matched {
+        failed.insert((start_pi, start_ti));
     }
-    ti == txt.len()
+    matched
 }
 
 /// Return `true` when `command` resolves to a binary on the system
@@ -1163,6 +1182,35 @@ mod tests {
         assert!(!simple_glob_match("**/.build/**", "Foo/Sources/lib.swift"));
         assert!(simple_glob_match("*.swift", "Hello.swift"));
         assert!(!simple_glob_match("*.swift", "Sources/Hello.swift"));
+    }
+
+    /// issues2.md #50: a user glob with several `**` segments used to
+    /// backtrack exponentially (O(L^N)) against long non-matching paths —
+    /// one bad exclude line froze `specslice index`. Must finish instantly.
+    #[test]
+    fn simple_glob_match_survives_pathological_double_star_patterns() {
+        let pattern = "**/**/**/**/**/**/**/**/needle.swift";
+        let path = (0..50)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/leaf.swift";
+        let started = std::time::Instant::now();
+        assert!(!simple_glob_match(pattern, &path));
+        // generous bound: memoized matching is microseconds; the old
+        // backtracker would burn effectively forever.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "pathological glob took {:?}",
+            started.elapsed()
+        );
+        // And the same pattern still matches when it should.
+        let good = (0..10)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/needle.swift";
+        assert!(simple_glob_match(pattern, &good));
     }
 
     #[test]

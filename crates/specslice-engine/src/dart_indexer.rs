@@ -236,13 +236,23 @@ fn backfill_referenced_symbols(
         .chain(batch.tests.iter().map(|t| t.id.to_string()))
         .collect();
 
+    // id → first overlay symbol with that id, so the lookup inside the
+    // reference loop is O(1) instead of a linear scan (issues.md #26).
+    let mut overlay_by_id: std::collections::HashMap<
+        String,
+        &specslice_core::language_batch::SymbolArtifact,
+    > = std::collections::HashMap::with_capacity(overlay_symbols.len());
+    for sym in overlay_symbols {
+        overlay_by_id.entry(sym.id.to_string()).or_insert(sym);
+    }
+
     for reference in &batch.references {
         for endpoint in [&reference.from_symbol_id, &reference.to_symbol_id] {
             let id = endpoint.to_string();
             if present.contains(&id) || !is_structural_dart_id(&id) {
                 continue;
             }
-            if let Some(sym) = overlay_symbols.iter().find(|s| s.id == *endpoint) {
+            if let Some(sym) = overlay_by_id.get(&id).copied() {
                 // Attach to the file (not a possibly-missing parent) so the
                 // gap-fill never introduces a dangling `contains` edge.
                 let mut sym = sym.clone();
@@ -712,9 +722,8 @@ pub fn ingest_language_batch_minimal(
     // one VDBE dispatch per 64 rows instead of per row. On spring-framework
     // (84k symbols / 120k edges) the per-row path dominated the index wall
     // clock after parsing was parallelised.
-    let mut nodes: Vec<Node> = Vec::with_capacity(
-        batch.files.len() + batch.symbols.len() + batch.tests.len(),
-    );
+    let mut nodes: Vec<Node> =
+        Vec::with_capacity(batch.files.len() + batch.symbols.len() + batch.tests.len());
     let mut edges: Vec<EdgeAssertion> = Vec::with_capacity(
         batch.symbols.len() + batch.tests.len() + batch.imports.len() + batch.references.len(),
     );
@@ -830,9 +839,8 @@ pub fn ingest_language_batch_minimal(
     store.upsert_nodes_bulk(&nodes)?;
     store.upsert_edges_bulk(&edges)?;
 
-    let mut ranges: Vec<specslice_core::SymbolRange> = Vec::with_capacity(
-        batch.symbol_ranges.len() + batch.symbols.len() + batch.tests.len(),
-    );
+    let mut ranges: Vec<specslice_core::SymbolRange> =
+        Vec::with_capacity(batch.symbol_ranges.len() + batch.symbols.len() + batch.tests.len());
     ranges.extend(batch.symbol_ranges.iter().cloned());
     for symbol in &batch.symbols {
         ranges.push(specslice_core::SymbolRange {

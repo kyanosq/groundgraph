@@ -230,9 +230,7 @@ fn collect_ruby_calls(
                 .and_then(|m| node_text(m, src));
             let receiver = child.child_by_field_name("receiver");
             match (method, receiver) {
-                (Some("new"), Some(r))
-                    if matches!(r.kind(), "constant" | "scope_resolution") =>
-                {
+                (Some("new"), Some(r)) if matches!(r.kind(), "constant" | "scope_resolution") => {
                     if let Some(t) = node_text(r, src) {
                         let bare = t.rsplit("::").next().unwrap_or(t);
                         out.push((bare.to_string(), RefKind::Reference));
@@ -419,8 +417,9 @@ end
             "nested describe: {groups:?}"
         );
         // helper stays structural.
-        assert!(qnames(&s, NodeKind::RubyMethod)
-            .contains(&"InvoiceTest::helper_method".to_string()));
+        assert!(
+            qnames(&s, NodeKind::RubyMethod).contains(&"InvoiceTest::helper_method".to_string())
+        );
     }
 
     #[test]

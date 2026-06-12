@@ -348,23 +348,13 @@ pub fn analyze_similarity_with_store(
             };
             let n = candidates.len();
             let mut uf = UnionFind::new(n);
-            // Bucket by top-16-bit prefix to skip obvious non-pairs
-            // — pairs differing in their top 16 bits cannot have
-            // hamming ≤ max_hamming when max_hamming < 16 (which is
-            // the only useful range for similarity ≥ 0.75). This
-            // is a cheap pre-filter, NOT correctness-critical; we
-            // still run an exact pass over the full O(N²) when the
-            // threshold allows large hamming.
-            let mut pair_scores: BTreeMap<(usize, usize), f32> = BTreeMap::new();
             for i in 0..n {
                 for j in (i + 1)..n {
                     let a = scanned[candidates[i]].simhash;
                     let b = scanned[candidates[j]].simhash;
                     let h = (a ^ b).count_ones();
                     if h <= max_hamming {
-                        let sim = 1.0 - (h as f32 / 64.0);
                         uf.union(i, j);
-                        pair_scores.insert((i.min(j), i.max(j)), sim);
                     }
                 }
             }
@@ -378,18 +368,20 @@ pub fn analyze_similarity_with_store(
                 if indices.len() < options.min_cluster_size {
                     continue;
                 }
-                // Worst-case lower bound on similarity inside the
-                // cluster — find the smallest pair_scores entry
-                // whose endpoints lie in this group.
+                // Worst-case similarity inside the cluster. Union-find
+                // merges transitively (A~B, B~C ⇒ {A,B,C}), so the worst
+                // pair may never have passed the hamming gate — recompute
+                // every pair instead of trusting discovered links
+                // (issues.md #12).
                 let mut min_sim: f32 = 1.0;
                 for a in 0..indices.len() {
                     for b in (a + 1)..indices.len() {
-                        let lo = indices[a].min(indices[b]);
-                        let hi = indices[a].max(indices[b]);
-                        if let Some(s) = pair_scores.get(&(lo, hi)) {
-                            if *s < min_sim {
-                                min_sim = *s;
-                            }
+                        let ha = scanned[candidates[indices[a]]].simhash;
+                        let hb = scanned[candidates[indices[b]]].simhash;
+                        let h = (ha ^ hb).count_ones();
+                        let sim = 1.0 - (h as f32 / 64.0);
+                        if sim < min_sim {
+                            min_sim = sim;
                         }
                     }
                 }
@@ -648,7 +640,10 @@ pub fn normalize(language: Language, source: &str) -> Vec<String> {
             out.push("NUM".into());
             continue;
         }
-        if c.is_ascii_alphabetic() || c == '_' {
+        // Unicode-aware: CJK / Greek / etc. identifiers must fold to `ID`
+        // exactly like ASCII names, or renaming a Chinese identifier
+        // changes the structural fingerprint (issues2.md #47).
+        if c.is_alphabetic() || c == '_' {
             let ident = consume_identifier(&mut chars);
             if is_structural_keyword(language, &ident) {
                 out.push(ident);
@@ -720,7 +715,7 @@ fn consume_number_literal(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) 
 fn consume_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     let mut s = String::new();
     while let Some(&c) = chars.peek() {
-        if c.is_ascii_alphanumeric() || c == '_' {
+        if c.is_alphanumeric() || c == '_' {
             s.push(c);
             chars.next();
         } else {
@@ -1219,6 +1214,27 @@ def salute(person):
         );
     }
 
+    /// issues2.md #47: Unicode identifiers (`用户_count`, `α`) must fold to
+    /// the same `ID` placeholder as ASCII names. The old ASCII-only
+    /// scanner exploded each CJK char into its own punctuation token, so
+    /// renaming a Chinese identifier changed the structural fingerprint.
+    #[test]
+    fn normalize_folds_unicode_identifiers_like_ascii_ones() {
+        let cjk = "def 用户统计(数据):\n    return 数据\n";
+        let ascii = "def stats(data):\n    return data\n";
+        assert_eq!(
+            normalize(Language::Python, cjk),
+            normalize(Language::Python, ascii),
+            "CJK and ASCII identifiers must normalize identically"
+        );
+        let mixed = "int 计数 = other;\n";
+        let plain = "int counter = other;\n";
+        assert_eq!(
+            normalize(Language::Dart, mixed),
+            normalize(Language::Dart, plain)
+        );
+    }
+
     #[test]
     fn normalize_drops_python_docstrings() {
         let with_doc = r#"
@@ -1595,6 +1611,62 @@ function process(text: string): number {
         assert!(
             h_unrelated > 8,
             "unrelated body should drift far from original: got h={h_unrelated}",
+        );
+    }
+
+    #[test]
+    fn chained_near_cluster_reports_true_worst_case_similarity() {
+        // A~B and B~C are within the hamming threshold but A~C is NOT.
+        // Union-find still merges all three into one cluster (transitive
+        // closure) — the reported score must then be the TRUE worst pair
+        // (A,C), not just the worst *discovered* pair (issues.md #12).
+        let body_a = "def fa(x):\n    a = x + 1\n    b = a * 2\n    c = b - 3\n    d = c + 4\n    e = d * 5\n    return e\n";
+        let body_b = "def fb(x):\n    a = x + 1\n    b = a * 2\n    c = b - 3\n    d = c + 4\n    e = d * 5\n    f = e % 6\n    g = f + 7\n    return g\n";
+        let body_c = "def fc(x):\n    a = x + 1\n    b = a * 2\n    c = b - 3\n    d = c + 4\n    e = d * 5\n    f = e % 6\n    g = f + 7\n    while g > 0:\n        g = g - 1\n    h = g * 9\n    return h\n";
+
+        let ta = normalize(Language::Python, body_a);
+        let tb = normalize(Language::Python, body_b);
+        let tc = normalize(Language::Python, body_c);
+        let h_ab = (simhash_tokens(&ta, 5) ^ simhash_tokens(&tb, 5)).count_ones();
+        let h_bc = (simhash_tokens(&tb, 5) ^ simhash_tokens(&tc, 5)).count_ones();
+        let h_ac = (simhash_tokens(&ta, 5) ^ simhash_tokens(&tc, 5)).count_ones();
+        // Pick the threshold between the chain links and the far pair.
+        let link_max = h_ab.max(h_bc);
+        assert!(
+            link_max + 2 <= h_ac,
+            "test premise: need a chain, got h_ab={h_ab} h_bc={h_bc} h_ac={h_ac}"
+        );
+        let threshold = link_max + 1;
+        let min_similarity = 1.0 - (threshold as f32 / 64.0);
+
+        let (mut store, dir) = empty_store();
+        write_python(dir.path(), "app/a.py", body_a);
+        write_python(dir.path(), "app/b.py", body_b);
+        write_python(dir.path(), "app/c.py", body_c);
+        insert_py_fn(&mut store, "app/a.py", "fa", (1, 7));
+        insert_py_fn(&mut store, "app/b.py", "fb", (1, 9));
+        insert_py_fn(&mut store, "app/c.py", "fc", (1, 12));
+        let report = analyze_similarity_with_store(
+            &store,
+            SimilarityOptions {
+                repo_root: dir.path().into(),
+                min_tokens: 8,
+                mode: SimilarityMode::Near,
+                min_similarity,
+                ..SimilarityOptions::default()
+            },
+        )
+        .unwrap();
+        let cluster = report
+            .clusters
+            .iter()
+            .find(|c| c.members.len() == 3)
+            .expect("transitive closure must merge all three");
+        let score = cluster.similarity_score.expect("score");
+        let true_worst = 1.0 - (h_ac as f32 / 64.0);
+        assert!(
+            (score - true_worst).abs() < 1e-6,
+            "score must reflect the true worst pair: got {score}, want {true_worst}"
         );
     }
 

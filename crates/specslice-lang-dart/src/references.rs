@@ -205,12 +205,13 @@ pub fn compute_references_with_options(
             continue;
         }
 
+        let mut strip_state = StripState::default();
         for (offset, raw_line) in lines[body_start..body_end].iter().enumerate() {
             // 1-based. Saturate when a file is absurdly long (>4 G lines)
             // rather than truncating silently — we'd already have stopped
             // scanning meaningfully by then.
             let line_no = u32::try_from(body_start + offset + 1).unwrap_or(u32::MAX);
-            let cleaned = strip_strings_and_comments(raw_line);
+            let cleaned = strip_strings_and_comments(raw_line, &mut strip_state);
             scan_identifiers(&cleaned, |ident, before, after| {
                 if !opts.include_noise && is_framework_noise(ident) {
                     return;
@@ -320,29 +321,30 @@ fn classify(before: Option<char>, after: Option<char>) -> Hint {
 }
 
 fn scan_identifiers<F: FnMut(&str, Option<char>, Option<char>)>(line: &str, mut visit: F) {
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if is_ident_start(c) {
-            let start = i;
-            while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-                i += 1;
-            }
-            let ident = &line[start..i];
-            let before = if start == 0 {
-                None
-            } else {
-                line[..start].chars().last()
-            };
-            let after = line[i..].chars().next();
-            // Skip pure keyword-ish tokens fast: Dart keywords cannot collide
-            // with user symbol names that the adapter records, so this is
-            // purely an optimisation. We still let the lookup decide.
-            visit(ident, before, after);
-        } else {
-            i += 1;
+    // Char-boundary-safe walk: the old `bytes[i] as char` zero-extended
+    // UTF-8 continuation bytes into bogus U+0080.. code points. Harmless
+    // while the predicates were ASCII-only, but slicing on a byte offset
+    // is one refactor away from a panic (issues.md #7).
+    let mut iter = line.char_indices().peekable();
+    while let Some((start, c)) = iter.next() {
+        if !is_ident_start(c) {
+            continue;
         }
+        let mut end = start + c.len_utf8();
+        while let Some(&(i, next)) = iter.peek() {
+            if !is_ident_continue(next) {
+                break;
+            }
+            iter.next();
+            end = i + next.len_utf8();
+        }
+        let ident = &line[start..end];
+        let before = line[..start].chars().last();
+        let after = line[end..].chars().next();
+        // Skip pure keyword-ish tokens fast: Dart keywords cannot collide
+        // with user symbol names that the adapter records, so this is
+        // purely an optimisation. We still let the lookup decide.
+        visit(ident, before, after);
     }
 }
 
@@ -354,40 +356,111 @@ fn is_ident_continue(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
 }
 
+/// Cross-line state for [`strip_strings_and_comments`]. Block comments
+/// (which nest in Dart) and `'''`/`"""` literals span lines; per-line
+/// resets let commented-out code produce phantom reference edges
+/// (issues2.md #56).
+#[derive(Default)]
+struct StripState {
+    block_comment_depth: usize,
+    triple: Option<(char, bool)>,
+}
+
 /// Erase comment payloads and string literal bodies so identifier scanning
 /// does not match against documentation or quoted text. The output keeps
 /// punctuation in place (so `before` / `after` heuristics stay correct) and
 /// only replaces the inner characters with spaces.
-fn strip_strings_and_comments(line: &str) -> String {
+fn strip_strings_and_comments(line: &str, state: &mut StripState) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
     let mut i = 0usize;
     let mut in_string = false;
-    let mut quote = b'"';
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if c == quote && (i == 0 || bytes[i - 1] != b'\\') {
-                in_string = false;
-                out.push(c as char);
+    let mut quote = '"';
+    // Escape *state*, not a one-byte look-back: `"\\"` ends the string
+    // (escaped backslash), `"\""` does not (escaped quote) — issues.md #5.
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if state.block_comment_depth > 0 {
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                state.block_comment_depth += 1;
+                out.push_str("  ");
+                i += 2;
+            } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                state.block_comment_depth -= 1;
+                out.push_str("  ");
+                i += 2;
+            } else {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if let Some((q, raw)) = state.triple {
+            if escaped {
+                escaped = false;
+                out.push(' ');
+            } else if c == '\\' && !raw {
+                escaped = true;
+                out.push(' ');
+            } else if c == q && chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                state.triple = None;
+                out.push(q);
+                out.push(q);
+                out.push(q);
+                i += 3;
+                continue;
             } else {
                 out.push(' ');
             }
             i += 1;
             continue;
         }
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            // Line comment — stop processing.
-            break;
-        }
-        if c == b'\'' || c == b'"' {
-            in_string = true;
-            quote = c;
-            out.push(c as char);
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(' ');
+            } else if c == '\\' {
+                escaped = true;
+                out.push(' ');
+            } else if c == quote {
+                in_string = false;
+                out.push(c);
+            } else {
+                out.push(' ');
+            }
             i += 1;
             continue;
         }
-        out.push(c as char);
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            // Line comment — stop processing.
+            break;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            state.block_comment_depth = 1;
+            out.push_str("  ");
+            i += 2;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            // Dart raw strings (`r'...'`) have no escape sequences.
+            let raw = i > 0 && chars[i - 1] == 'r';
+            if chars.get(i + 1) == Some(&c) && chars.get(i + 2) == Some(&c) {
+                state.triple = Some((c, raw));
+                out.push(c);
+                out.push(c);
+                out.push(c);
+                i += 3;
+                continue;
+            }
+            in_string = true;
+            escaped = false;
+            quote = c;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
         i += 1;
     }
     out
@@ -714,14 +787,88 @@ mod tests {
         assert!(matches!(classify(None, Some('.')), Hint::ClassReference));
     }
 
+    fn strip_one(line: &str) -> String {
+        strip_strings_and_comments(line, &mut StripState::default())
+    }
+
     #[test]
     fn strip_strings_and_comments_handles_escapes_and_mixed_quotes() {
-        let cleaned = strip_strings_and_comments(r#"x = "a \"b\" c"; // y = "z""#);
+        let cleaned = strip_one(r#"x = "a \"b\" c"; // y = "z""#);
         assert!(cleaned.contains("x ="));
         assert!(!cleaned.contains('y'), "comment payload must be erased");
         // Single quotes work too.
-        let cleaned2 = strip_strings_and_comments("x = 'pro_monthly'; // ignored");
+        let cleaned2 = strip_one("x = 'pro_monthly'; // ignored");
         assert!(!cleaned2.contains("pro_monthly"));
+    }
+
+    #[test]
+    fn strip_strings_and_comments_closes_string_after_escaped_backslash() {
+        // `"\\"` is a finished literal; the identifier after it must survive
+        // (the old single-char look-back kept the scanner "in string" and
+        // erased everything that followed — issues.md #5 sibling).
+        let cleaned = strip_one(r#"var s = "\\"; doThing();"#);
+        assert!(
+            cleaned.contains("doThing"),
+            "code after the closed literal must be kept: {cleaned}"
+        );
+    }
+
+    /// issues2.md #56: block comments were not stripped at all — every
+    /// identifier inside `/* ... */` (single-line, multi-line, nested)
+    /// produced phantom reference edges.
+    #[test]
+    fn strip_strings_and_comments_erases_block_comments() {
+        // Single-line block comment.
+        let mut st = StripState::default();
+        let c1 = strip_strings_and_comments("a(); /* OldService() */ b();", &mut st);
+        assert!(c1.contains("a()") && c1.contains("b()"), "{c1}");
+        assert!(!c1.contains("OldService"), "{c1}");
+        assert_eq!(st.block_comment_depth, 0);
+
+        // Multi-line: state carries across lines.
+        let mut st = StripState::default();
+        let c2 = strip_strings_and_comments("a(); /* start", &mut st);
+        assert!(!c2.contains("start"));
+        let c3 = strip_strings_and_comments("OldService.call();", &mut st);
+        assert!(!c3.contains("OldService"), "{c3}");
+        let c4 = strip_strings_and_comments("end */ b();", &mut st);
+        assert!(c4.contains("b()") && !c4.contains("end"), "{c4}");
+
+        // Dart block comments nest.
+        let mut st = StripState::default();
+        let c5 = strip_strings_and_comments("/* outer /* inner */ stillComment */ ok();", &mut st);
+        assert!(c5.contains("ok()") && !c5.contains("stillComment"), "{c5}");
+    }
+
+    /// Multi-line `'''` strings must also be erased across lines.
+    #[test]
+    fn strip_strings_and_comments_erases_triple_quoted_strings() {
+        let mut st = StripState::default();
+        let c1 = strip_strings_and_comments("var tpl = '''", &mut st);
+        assert!(c1.contains("var tpl"), "{c1}");
+        let c2 = strip_strings_and_comments("OldService() 'quote' \"quote\"", &mut st);
+        assert!(!c2.contains("OldService"), "{c2}");
+        let c3 = strip_strings_and_comments("'''; done();", &mut st);
+        assert!(c3.contains("done()"), "{c3}");
+    }
+
+    /// End-to-end: identifiers inside block comments must not create
+    /// reference edges (issues2.md #56).
+    #[test]
+    fn block_comment_mentions_do_not_create_edges() {
+        let target = method("lib/old.dart", "OldService", "call", 1, 3);
+        let user = method("lib/user.dart", "User", "go", 1, 5);
+        let symbols = vec![target.clone(), user.clone()];
+        let ranges = vec![range_for(&user)];
+        let sources = vec![FileSource {
+            path: "lib/user.dart".into(),
+            source: "void go() {\n  /*\n  call();\n  */\n}\n".into(),
+        }];
+        let edges = compute_references(&sources, &symbols, &ranges, &BTreeMap::new());
+        assert!(
+            edges.is_empty(),
+            "commented-out call must not produce edges: {edges:?}"
+        );
     }
 
     #[test]
@@ -731,6 +878,18 @@ mod tests {
             seen.push(ident.to_string());
         });
         assert_eq!(seen, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn scan_identifiers_is_utf8_safe_around_multibyte_text() {
+        // Multi-byte characters (CJK comments / strings survive stripping
+        // when unterminated) must neither split identifiers nor panic on
+        // char boundaries (issues.md #7).
+        let mut seen: Vec<String> = Vec::new();
+        scan_identifiers("中文 doThing(参数) 结束", |ident, _, _| {
+            seen.push(ident.to_string());
+        });
+        assert_eq!(seen, vec!["doThing"]);
     }
 
     #[test]

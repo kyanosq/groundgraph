@@ -7,7 +7,7 @@
 //! graph). It replaces the manual graph trawling that `connect propose`
 //! could not do at scale.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use specslice_engine::business_pack::{
@@ -59,22 +59,11 @@ pub fn run(args: ProposeRunArgs) -> Result<()> {
 
     match args.out.as_deref() {
         Some(path) => {
-            write_to(path, &rendered)?;
+            super::output::write_atomic(path, &rendered)?;
             eprintln!("已写入业务证据包: {}", path.display());
         }
         None => println!("{rendered}"),
     }
-    Ok(())
-}
-
-fn write_to(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent of {}", path.display()))?;
-        }
-    }
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -175,9 +164,12 @@ fn render_markdown(pack: &BusinessPack) -> String {
     // the AI prompt
     s.push_str("## 喂给 AI 的提示词\n\n");
     s.push_str("把本文件（或 `--format json` 的证据包）连同下面的提示词交给你信任的模型，让它产出 `.specslice/candidates/business_logic.yaml`：\n\n");
-    s.push_str("```text\n");
+    // Four-backtick fence: the prompt template may legitimately contain
+    // ``` blocks (yaml examples), which would otherwise close the outer
+    // fence early (issues2.md #59).
+    s.push_str("````text\n");
     s.push_str(pack.prompt.trim_end());
-    s.push_str("\n```\n");
+    s.push_str("\n````\n");
 
     s
 }
@@ -335,9 +327,33 @@ fn cohesion_hint(cohesion: f64) -> &'static str {
 }
 
 fn mermaid_id(slug: &str) -> String {
-    // mermaid node ids must be identifier-ish; slugs are already
-    // `[a-z0-9_-]` but `-` is safest replaced with `_`.
-    slug.replace('-', "_")
+    // Mermaid node ids must be identifier-ish (`[A-Za-z0-9_]`). Slugs are
+    // normally `[a-z0-9_-]`, but module ids derived from directory paths
+    // can carry `/` or `.` (issues2.md #59). Replace everything else with
+    // `_`, and when that lossy fold actually fired, append a short content
+    // hash so `lib/auth` and `lib.auth` stay distinct nodes.
+    let mut out = String::with_capacity(slug.len());
+    let mut lossy = false;
+    for ch in slug.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            if ch != '-' {
+                lossy = true;
+            }
+            out.push('_');
+        }
+    }
+    if lossy || out.is_empty() {
+        // FNV-1a 32-bit: tiny, deterministic, no dependencies.
+        let mut h: u32 = 0x811c_9dc5;
+        for b in slug.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        out.push_str(&format!("_{h:08x}"));
+    }
+    out
 }
 
 fn escape_mermaid(s: &str) -> String {
@@ -455,6 +471,45 @@ mod tests {
         assert!(
             md.contains("dart_class::lib/features/auth/auth_bloc.dart#AuthBloc"),
             "evidence id surfaced for copy-paste"
+        );
+    }
+
+    /// issues2.md #59: module ids that come from directory paths
+    /// (`lib_v2/auth`, `pkg.core`) must not leak `/` or `.` into mermaid
+    /// node ids, and distinct raw ids must not collapse into one node.
+    #[test]
+    fn mermaid_id_sanitizes_path_like_ids_without_collisions() {
+        let a = mermaid_id("lib_v2/auth");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "sanitized id must be identifier-ish: {a}"
+        );
+        let b = mermaid_id("lib_v2.auth");
+        assert_ne!(a, b, "different raw ids must stay distinct nodes");
+        // Clean slugs pass through untouched (stable diffs).
+        assert_eq!(mermaid_id("auth"), "auth");
+        assert_eq!(mermaid_id("user-profile"), "user_profile");
+    }
+
+    /// issues2.md #59: a prompt containing a ``` fence must not break out
+    /// of the surrounding markdown code block.
+    #[test]
+    fn prompt_with_triple_backticks_stays_inside_the_fence() {
+        let mut pack = sample_pack();
+        pack.prompt = "before\n```yaml\nkey: value\n```\nafter".into();
+        let md = render_markdown(&pack);
+        let tail = md
+            .split("## 喂给 AI 的提示词")
+            .nth(1)
+            .expect("prompt section");
+        let fence_open = tail
+            .find("````text")
+            .expect("outer fence must be 4 backticks");
+        let fence_close = tail.rfind("\n````").expect("closing 4-backtick fence");
+        assert!(fence_close > fence_open);
+        assert!(
+            tail[fence_open..fence_close].contains("```yaml"),
+            "inner triple fence preserved verbatim"
         );
     }
 

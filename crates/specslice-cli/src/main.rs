@@ -640,8 +640,8 @@ struct CandidateListArgs {
 struct CandidateShowArgs {
     /// 候选 id。
     id: String,
-    /// 输出 JSON。等价于 `--format json`。
-    #[arg(long)]
+    /// 输出 JSON。等价于 `--format json`，与显式 `--format` 互斥。
+    #[arg(long, conflicts_with = "format")]
     json: bool,
     /// P14 — 输出格式。`mermaid` 会渲染“业务描述 → evidence files/
     /// symbols/tests”的局部 flowchart，状态会映射为已接受 (Confirmed)
@@ -812,12 +812,14 @@ struct SearchArgs {
     /// - `mermaid` 输出 `flowchart LR` 子图，适合 PR / 设计文档。
     #[arg(long, value_enum, default_value_t = SearchFormatArg::Text)]
     format: SearchFormatArg,
-    /// 兼容别名 — 等价于 `--format json`。
-    #[arg(long)]
+    /// 兼容别名 — 等价于 `--format json`，与显式 `--format` 互斥。
+    #[arg(long, conflicts_with = "format")]
     json: bool,
     /// `--format html` 的默认写入路径为
     /// `<repo_root>/.specslice/export/search-<slug>.html`；当
     /// `--format mermaid` 时直接写入指定路径（默认打印到 stdout）。
+    /// 显式传入的路径不受 `.specslice/` 非侵入约束——这是用户主动
+    /// 指定的输出位置；省略该参数时 SpecSlice 永远只写 `.specslice/`。
     #[arg(long)]
     output: Option<PathBuf>,
     /// 保留 framework 噪声 calls（toString / build / dispose / …）。
@@ -923,8 +925,9 @@ struct ImpactArgs {
     #[arg(long)]
     worktree: bool,
     /// Output a machine-readable JSON document. Equivalent to
-    /// `--format json` and kept for back-compat.
-    #[arg(long)]
+    /// `--format json` and kept for back-compat; conflicts with an
+    /// explicit `--format`.
+    #[arg(long, conflicts_with = "format")]
     json: bool,
     /// 输出格式：`text`（默认）/ `json` / `mermaid`。`mermaid`
     /// 渲染 "changed files → impacted business → suggested tests" 的
@@ -1454,5 +1457,44 @@ fn dispatch(cli: Cli) -> Result<u8> {
             json: args.json,
         })
         .map(|()| 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// issues2.md #58: `--json` is a legacy alias for `--format json`.
+    /// Passing both an explicit `--format` and `--json` used to silently
+    /// pick JSON; it must be a hard parse error instead.
+    #[test]
+    fn json_flag_conflicts_with_explicit_format() {
+        for argv in [
+            vec!["specslice", "search", "foo", "--format", "html", "--json"],
+            vec!["specslice", "impact", "--format", "mermaid", "--json"],
+            vec![
+                "specslice",
+                "candidate",
+                "show",
+                "x",
+                "--format",
+                "text",
+                "--json",
+            ],
+        ] {
+            let err = Cli::try_parse_from(&argv)
+                .expect_err(&format!("{argv:?} must be rejected as conflicting"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    /// Each flag alone keeps working — back-compat for existing scripts.
+    #[test]
+    fn json_flag_alone_and_format_alone_still_parse() {
+        assert!(Cli::try_parse_from(["specslice", "search", "foo", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["specslice", "search", "foo", "--format", "html"]).is_ok());
+        assert!(Cli::try_parse_from(["specslice", "impact", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["specslice", "candidate", "show", "x", "--json"]).is_ok());
     }
 }

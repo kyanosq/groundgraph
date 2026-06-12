@@ -32,13 +32,7 @@ pub fn run(args: DashboardRunArgs) -> Result<()> {
         Some(p) => p.clone(),
         None => repo_root.join(".specslice/export/dashboard.html"),
     };
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent of {}", target.display()))?;
-        }
-    }
-    std::fs::write(&target, html)
+    super::output::write_atomic(&target, &html)
         .with_context(|| format!("writing dashboard to {}", target.display()))?;
     println!("wrote {}", target.display());
     println!("open it in any browser — fully offline, no server required.");
@@ -46,17 +40,27 @@ pub fn run(args: DashboardRunArgs) -> Result<()> {
 }
 
 /// Run one analysis section, folding errors into a JSON payload instead of
-/// aborting the panel.
-fn section<T: serde::Serialize>(result: Result<T>) -> Value {
+/// aborting the panel. Error chains may carry absolute host paths (store
+/// open contexts, IO errors); redact them so a shared dashboard never
+/// leaks the host directory layout (issues2.md #40).
+fn section<T: serde::Serialize>(repo_root: &Path, result: Result<T>) -> Value {
     match result {
         Ok(v) => serde_json::to_value(v).unwrap_or_else(|e| json!({ "error": e.to_string() })),
-        Err(e) => json!({ "error": format!("{e:#}") }),
+        Err(e) => {
+            let mut msg = format!("{e:#}");
+            let root = repo_root.to_string_lossy();
+            if !root.is_empty() {
+                msg = msg.replace(root.as_ref(), "<repo>");
+            }
+            json!({ "error": msg })
+        }
     }
 }
 
 fn collect(repo_root: &Path) -> Value {
-    let overview = section(overview(repo_root));
+    let overview = section(repo_root, overview(repo_root));
     let modules = section(
+        repo_root,
         propose_business_pack(BusinessPackOptions {
             repo_root: repo_root.to_path_buf(),
             ..BusinessPackOptions::default()
@@ -64,6 +68,7 @@ fn collect(repo_root: &Path) -> Value {
         .context("propose"),
     );
     let features = section(
+        repo_root,
         analyze_feature_map(FeatureMapOptions {
             repo_root: repo_root.to_path_buf(),
             ..FeatureMapOptions::default()
@@ -71,6 +76,7 @@ fn collect(repo_root: &Path) -> Value {
         .context("features"),
     );
     let checks = section(
+        repo_root,
         run_checks(CheckOptions {
             repo_root: repo_root.to_path_buf(),
             impact: None,
@@ -78,6 +84,7 @@ fn collect(repo_root: &Path) -> Value {
         .context("check"),
     );
     let dead_code = section(
+        repo_root,
         analyze_dead_code(DeadCodeOptions {
             repo_root: repo_root.to_path_buf(),
             ..DeadCodeOptions::default()
@@ -85,17 +92,25 @@ fn collect(repo_root: &Path) -> Value {
         .context("dead-code"),
     );
     let questions = section(
+        repo_root,
         analyze_questions(QuestionsOptions {
             repo_root: repo_root.to_path_buf(),
             ..QuestionsOptions::default()
         })
         .context("questions"),
     );
-    let purity = section(purity_summary(repo_root));
+    let purity = section(repo_root, purity_summary(repo_root));
 
+    // Repo *name* only — dashboards travel (CI artifacts, pasted into
+    // issues), and the absolute path would leak usernames and host
+    // directory layout (issues2.md #40).
+    let repo_name = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repository".to_string());
     json!({
         "meta": {
-            "repo_root": repo_root.display().to_string(),
+            "repo": repo_name,
             "generated_at": chrono_lite_now(),
             "tool": format!("specslice {}", env!("CARGO_PKG_VERSION")),
         },
@@ -275,7 +290,7 @@ function searchable(containerId,inputPh,renderRows){
 
 // ---- meta ----
 var meta=D.meta||{};
-el('meta').innerHTML='repo: '+esc(meta.repo_root||'?')+'<br>'+esc(meta.tool||'')+'<br>'+esc(meta.generated_at||'');
+el('meta').innerHTML='repo: '+esc(meta.repo||'?')+'<br>'+esc(meta.tool||'')+'<br>'+esc(meta.generated_at||'');
 
 // ---- overview ----
 (function(){
@@ -429,5 +444,23 @@ mod tests {
         assert!(DASHBOARD_TEMPLATE.contains("/*SS_DASHBOARD_DATA*/"));
         assert!(!DASHBOARD_TEMPLATE.contains("src=\"http"));
         assert!(!DASHBOARD_TEMPLATE.contains("href=\"http"));
+    }
+
+    /// issues2.md #40: dashboards get shared (CI artifacts, issues). The
+    /// payload must identify the repo by name only — never by the host's
+    /// absolute path, which leaks usernames and directory layout.
+    #[test]
+    fn collect_embeds_repo_name_not_host_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("acme-app");
+        std::fs::create_dir_all(repo.join(".specslice")).unwrap();
+        let data = collect(&repo);
+        let payload = serde_json::to_string(&data).unwrap();
+        assert_eq!(data["meta"]["repo"], "acme-app");
+        let host_prefix = dir.path().to_string_lossy().to_string();
+        assert!(
+            !payload.contains(&host_prefix),
+            "absolute host path must not appear in the dashboard payload"
+        );
     }
 }

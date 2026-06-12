@@ -16,6 +16,18 @@ pub enum EvidenceKind {
 }
 
 impl EvidenceKind {
+    /// Every variant, in declaration order — the single source of truth
+    /// `from_str` iterates, mirroring [`crate::NodeKind::ALL`] so decoders
+    /// can never drift from `as_str`.
+    pub const ALL: &'static [EvidenceKind] = &[
+        EvidenceKind::DocSection,
+        EvidenceKind::DartDocComment,
+        EvidenceKind::DartTestCall,
+        EvidenceKind::DartGroupCall,
+        EvidenceKind::Import,
+        EvidenceKind::GitDiff,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EvidenceKind::DocSection => "doc_section",
@@ -25,6 +37,13 @@ impl EvidenceKind {
             EvidenceKind::Import => "import",
             EvidenceKind::GitDiff => "git_diff",
         }
+    }
+
+    /// Inverse of [`EvidenceKind::as_str`]; `None` for unknown strings.
+    /// Centralised here so the store decoder never re-implements the map.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<EvidenceKind> {
+        EvidenceKind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 }
 
@@ -53,6 +72,14 @@ mod tests {
         assert_eq!(EvidenceKind::DartGroupCall.as_str(), "dart_group_call");
         assert_eq!(EvidenceKind::Import.as_str(), "import");
         assert_eq!(EvidenceKind::GitDiff.as_str(), "git_diff");
+    }
+
+    #[test]
+    fn evidence_kind_from_str_round_trips_all_variants() {
+        for kind in EvidenceKind::ALL {
+            assert_eq!(EvidenceKind::from_str(kind.as_str()), Some(*kind));
+        }
+        assert_eq!(EvidenceKind::from_str("nope"), None);
     }
 
     #[test]

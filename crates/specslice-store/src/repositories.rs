@@ -58,36 +58,74 @@ fn val_opt_i64(o: Option<i64>) -> rusqlite::types::Value {
     }
 }
 
+/// `(?1, ?2, …), (?8, ?9, …), …` placeholder text for a multi-row VALUES.
+fn values_placeholders(rows: usize, cols: usize) -> String {
+    let groups: Vec<String> = (0..rows)
+        .map(|i| {
+            let base = i * cols;
+            let nums: Vec<String> = (1..=cols).map(|c| format!("?{}", base + c)).collect();
+            format!("({})", nums.join(", "))
+        })
+        .collect();
+    groups.join(", ")
+}
+
+/// Execute one multi-row VALUES chunk. Full-size chunks share a single SQL
+/// shape per table and go through the statement cache; tail chunks (up to
+/// 511 distinct shapes) are prepared uncached so they cannot evict the hot
+/// cached statements (the cache only holds 64 entries).
+fn execute_chunk(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    values: Vec<rusqlite::types::Value>,
+    cacheable: bool,
+) -> Result<(), StoreError> {
+    if cacheable {
+        conn.prepare_cached(sql)
+            .map_err(StoreError::sqlite)?
+            .execute(rusqlite::params_from_iter(values))
+            .map(|_| ())
+            .map_err(StoreError::sqlite)
+    } else {
+        conn.prepare(sql)
+            .map_err(StoreError::sqlite)?
+            .execute(rusqlite::params_from_iter(values))
+            .map(|_| ())
+            .map_err(StoreError::sqlite)
+    }
+}
+
 impl Store {
     pub fn upsert_node(&mut self, node: &Node) -> StoreResult<()> {
         let sql = "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
-            .execute(
-                params![
-                    node.id.as_str(),
-                    node.kind.as_str(),
-                    node.path,
-                    node.name,
-                    node.start_line,
-                    node.end_line,
-                    node.content_hash,
-                    node.stable_key,
-                    node.source_file,
-                    node.source_hash,
-                    node.indexer,
-                    node.index_generation,
-                    node.metadata_json,
-                ],
-            )
+            .execute(params![
+                node.id.as_str(),
+                node.kind.as_str(),
+                node.path,
+                node.name,
+                node.start_line,
+                node.end_line,
+                node.content_hash,
+                node.stable_key,
+                node.source_file,
+                node.source_hash,
+                node.indexer,
+                node.index_generation,
+                node.metadata_json,
+            ])
             .map(|_| ())
             .map_err(StoreError::sqlite)
     }
 
     pub fn find_node(&self, id: &ArtifactId) -> StoreResult<Option<Node>> {
+        // Read paths use `prepare_cached` too: `search` fan-out calls
+        // `find_node` / `list_edges_from/to` thousands of times per query,
+        // and re-parsing the SQL each call is pure overhead.
         let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes WHERE id = ?1");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let mut rows = stmt
             .query(params![id.as_str()])
             .map_err(StoreError::sqlite)?;
@@ -100,7 +138,7 @@ impl Store {
 
     pub fn list_nodes_by_kind(&self, kind: NodeKind) -> StoreResult<Vec<Node>> {
         let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes WHERE kind = ?1 ORDER BY id");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params![kind.as_str()], node_from_row)
             .map_err(StoreError::sqlite)?;
@@ -110,7 +148,7 @@ impl Store {
 
     pub fn list_all_nodes(&self) -> StoreResult<Vec<Node>> {
         let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes ORDER BY id");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map([], node_from_row)
             .map_err(StoreError::sqlite)?;
@@ -122,87 +160,76 @@ impl Store {
     /// per chunk instead of one VDBE dispatch per row. Semantically identical
     /// to calling [`Self::upsert_node`] per element — this is the ingest hot
     /// path for tree-sitter batches (spring-framework: 84k symbol rows).
+    ///
+    /// Runs inside a write transaction: joins the caller's bulk session when
+    /// one is open, otherwise opens its own — so a mid-batch failure can
+    /// never leave a partially-committed batch behind.
     pub fn upsert_nodes_bulk(&mut self, nodes: &[Node]) -> StoreResult<()> {
         // 13 columns × 512 rows = 6656 bound variables, far under SQLite's
-        // 32k limit while keeping statements cacheable (only two SQL shapes:
-        // full chunk and tail).
+        // 32k limit while keeping the hot (full-chunk) statement cacheable.
         const CHUNK: usize = 512;
         const COLS: usize = 13;
-        for chunk in nodes.chunks(CHUNK) {
-            let placeholders: Vec<String> = (0..chunk.len())
-                .map(|i| {
-                    let base = i * COLS;
-                    let nums: Vec<String> =
-                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
-                    format!("({})", nums.join(", "))
-                })
-                .collect();
-            let sql = format!(
-                "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
-                placeholders.join(", ")
-            );
-            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
-            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
-            for node in chunk {
-                values.push(val_text(node.id.as_str()));
-                values.push(val_text(node.kind.as_str()));
-                values.push(val_opt_text(&node.path));
-                values.push(val_opt_text(&node.name));
-                values.push(val_opt_u32(node.start_line));
-                values.push(val_opt_u32(node.end_line));
-                values.push(val_opt_text(&node.content_hash));
-                values.push(val_opt_text(&node.stable_key));
-                values.push(val_opt_text(&node.source_file));
-                values.push(val_opt_text(&node.source_hash));
-                values.push(val_opt_text(&node.indexer));
-                values.push(val_opt_i64(node.index_generation));
-                values.push(val_opt_text(&node.metadata_json));
+        self.with_write_tx(|conn| {
+            for chunk in nodes.chunks(CHUNK) {
+                let sql = format!(
+                    "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                    values_placeholders(chunk.len(), COLS)
+                );
+                let mut values: Vec<rusqlite::types::Value> =
+                    Vec::with_capacity(chunk.len() * COLS);
+                for node in chunk {
+                    values.push(val_text(node.id.as_str()));
+                    values.push(val_text(node.kind.as_str()));
+                    values.push(val_opt_text(&node.path));
+                    values.push(val_opt_text(&node.name));
+                    values.push(val_opt_u32(node.start_line));
+                    values.push(val_opt_u32(node.end_line));
+                    values.push(val_opt_text(&node.content_hash));
+                    values.push(val_opt_text(&node.stable_key));
+                    values.push(val_opt_text(&node.source_file));
+                    values.push(val_opt_text(&node.source_hash));
+                    values.push(val_opt_text(&node.indexer));
+                    values.push(val_opt_i64(node.index_generation));
+                    values.push(val_opt_text(&node.metadata_json));
+                }
+                execute_chunk(conn, &sql, values, chunk.len() == CHUNK)?;
             }
-            stmt.execute(rusqlite::params_from_iter(values))
-                .map_err(StoreError::sqlite)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Multi-row edge upsert; see [`Self::upsert_nodes_bulk`].
     pub fn upsert_edges_bulk(&mut self, edges: &[EdgeAssertion]) -> StoreResult<()> {
         const CHUNK: usize = 512;
         const COLS: usize = 14;
-        for chunk in edges.chunks(CHUNK) {
-            let placeholders: Vec<String> = (0..chunk.len())
-                .map(|i| {
-                    let base = i * COLS;
-                    let nums: Vec<String> =
-                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
-                    format!("({})", nums.join(", "))
-                })
-                .collect();
-            let sql = format!(
-                "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
-                placeholders.join(", ")
-            );
-            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
-            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
-            for edge in chunk {
-                values.push(val_text(edge.id.as_str()));
-                values.push(val_text(edge.from_id.as_str()));
-                values.push(val_text(edge.to_id.as_str()));
-                values.push(val_text(edge.kind.as_str()));
-                values.push(val_text(edge.source.as_str()));
-                values.push(val_text(edge.certainty.as_str()));
-                values.push(val_text(edge.status.as_str()));
-                values.push(rusqlite::types::Value::Real(f64::from(edge.confidence)));
-                values.push(val_opt_text(&edge.evidence_json));
-                values.push(val_opt_text(&edge.source_file));
-                values.push(val_opt_text(&edge.source_hash));
-                values.push(val_opt_text(&edge.indexer));
-                values.push(val_opt_i64(edge.index_generation));
-                values.push(val_opt_text(&edge.metadata_json));
+        self.with_write_tx(|conn| {
+            for chunk in edges.chunks(CHUNK) {
+                let sql = format!(
+                    "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                    values_placeholders(chunk.len(), COLS)
+                );
+                let mut values: Vec<rusqlite::types::Value> =
+                    Vec::with_capacity(chunk.len() * COLS);
+                for edge in chunk {
+                    values.push(val_text(edge.id.as_str()));
+                    values.push(val_text(edge.from_id.as_str()));
+                    values.push(val_text(edge.to_id.as_str()));
+                    values.push(val_text(edge.kind.as_str()));
+                    values.push(val_text(edge.source.as_str()));
+                    values.push(val_text(edge.certainty.as_str()));
+                    values.push(val_text(edge.status.as_str()));
+                    values.push(rusqlite::types::Value::Real(f64::from(edge.confidence)));
+                    values.push(val_opt_text(&edge.evidence_json));
+                    values.push(val_opt_text(&edge.source_file));
+                    values.push(val_opt_text(&edge.source_hash));
+                    values.push(val_opt_text(&edge.indexer));
+                    values.push(val_opt_i64(edge.index_generation));
+                    values.push(val_opt_text(&edge.metadata_json));
+                }
+                execute_chunk(conn, &sql, values, chunk.len() == CHUNK)?;
             }
-            stmt.execute(rusqlite::params_from_iter(values))
-                .map_err(StoreError::sqlite)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn upsert_edge(&mut self, edge: &EdgeAssertion) -> StoreResult<()> {
@@ -210,24 +237,22 @@ impl Store {
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
-            .execute(
-                params![
-                    edge.id.as_str(),
-                    edge.from_id.as_str(),
-                    edge.to_id.as_str(),
-                    edge.kind.as_str(),
-                    edge.source.as_str(),
-                    edge.certainty.as_str(),
-                    edge.status.as_str(),
-                    edge.confidence as f64,
-                    edge.evidence_json,
-                    edge.source_file,
-                    edge.source_hash,
-                    edge.indexer,
-                    edge.index_generation,
-                    edge.metadata_json,
-                ],
-            )
+            .execute(params![
+                edge.id.as_str(),
+                edge.from_id.as_str(),
+                edge.to_id.as_str(),
+                edge.kind.as_str(),
+                edge.source.as_str(),
+                edge.certainty.as_str(),
+                edge.status.as_str(),
+                edge.confidence as f64,
+                edge.evidence_json,
+                edge.source_file,
+                edge.source_hash,
+                edge.indexer,
+                edge.index_generation,
+                edge.metadata_json,
+            ])
             .map(|_| ())
             .map_err(StoreError::sqlite)
     }
@@ -253,8 +278,10 @@ impl Store {
         suffix: &str,
         params: impl rusqlite::Params,
     ) -> StoreResult<Vec<EdgeAssertion>> {
+        // Only four fixed suffixes exist (`from`/`to`/`kind`/all), so the
+        // cache holds at most four shapes — safe to cache.
         let sql = format!("SELECT {SELECT_EDGE_COLS} FROM edge_assertions {suffix}");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params, edge_from_row)
             .map_err(StoreError::sqlite)?;
@@ -267,19 +294,17 @@ impl Store {
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
-            .execute(
-                params![
-                    ev.id.as_str(),
-                    ev.artifact_id.as_str(),
-                    ev.kind.as_str(),
-                    ev.path,
-                    ev.start_line,
-                    ev.end_line,
-                    ev.snippet,
-                    ev.hash,
-                    ev.metadata_json,
-                ],
-            )
+            .execute(params![
+                ev.id.as_str(),
+                ev.artifact_id.as_str(),
+                ev.kind.as_str(),
+                ev.path,
+                ev.start_line,
+                ev.end_line,
+                ev.snippet,
+                ev.hash,
+                ev.metadata_json,
+            ])
             .map(|_| ())
             .map_err(StoreError::sqlite)
     }
@@ -288,7 +313,7 @@ impl Store {
         let sql = format!(
             "SELECT {SELECT_EVIDENCE_COLS} FROM evidence WHERE artifact_id = ?1 ORDER BY id"
         );
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params![artifact.as_str()], evidence_from_row)
             .map_err(StoreError::sqlite)?;
@@ -300,39 +325,32 @@ impl Store {
     pub fn upsert_symbol_ranges_bulk(&mut self, ranges: &[SymbolRange]) -> StoreResult<()> {
         const CHUNK: usize = 512;
         const COLS: usize = 7;
-        for chunk in ranges.chunks(CHUNK) {
-            let placeholders: Vec<String> = (0..chunk.len())
-                .map(|i| {
-                    let base = i * COLS;
-                    let nums: Vec<String> =
-                        (1..=COLS).map(|c| format!("?{}", base + c)).collect();
-                    format!("({})", nums.join(", "))
-                })
-                .collect();
-            let sql = format!(
-                "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id) VALUES {} ON CONFLICT(file_path, symbol_id) DO UPDATE SET start_line=excluded.start_line, end_line=excluded.end_line, symbol_kind=excluded.symbol_kind, qualified_name=excluded.qualified_name, parent_symbol_id=excluded.parent_symbol_id",
-                placeholders.join(", ")
-            );
-            let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
-            let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * COLS);
-            for range in chunk {
-                values.push(val_text(&range.file_path));
-                values.push(val_text(range.symbol_id.as_str()));
-                values.push(rusqlite::types::Value::Integer(i64::from(
-                    range.start_line,
-                )));
-                values.push(rusqlite::types::Value::Integer(i64::from(range.end_line)));
-                values.push(val_text(range.symbol_kind.as_str()));
-                values.push(val_text(&range.qualified_name));
-                values.push(match &range.parent_symbol_id {
-                    Some(id) => val_text(id.as_str()),
-                    None => rusqlite::types::Value::Null,
-                });
+        self.with_write_tx(|conn| {
+            for chunk in ranges.chunks(CHUNK) {
+                let sql = format!(
+                    "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id) VALUES {} ON CONFLICT(file_path, symbol_id) DO UPDATE SET start_line=excluded.start_line, end_line=excluded.end_line, symbol_kind=excluded.symbol_kind, qualified_name=excluded.qualified_name, parent_symbol_id=excluded.parent_symbol_id",
+                    values_placeholders(chunk.len(), COLS)
+                );
+                let mut values: Vec<rusqlite::types::Value> =
+                    Vec::with_capacity(chunk.len() * COLS);
+                for range in chunk {
+                    values.push(val_text(&range.file_path));
+                    values.push(val_text(range.symbol_id.as_str()));
+                    values.push(rusqlite::types::Value::Integer(i64::from(
+                        range.start_line,
+                    )));
+                    values.push(rusqlite::types::Value::Integer(i64::from(range.end_line)));
+                    values.push(val_text(range.symbol_kind.as_str()));
+                    values.push(val_text(&range.qualified_name));
+                    values.push(match &range.parent_symbol_id {
+                        Some(id) => val_text(id.as_str()),
+                        None => rusqlite::types::Value::Null,
+                    });
+                }
+                execute_chunk(conn, &sql, values, chunk.len() == CHUNK)?;
             }
-            stmt.execute(rusqlite::params_from_iter(values))
-                .map_err(StoreError::sqlite)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn upsert_symbol_range(&mut self, range: &SymbolRange) -> StoreResult<()> {
@@ -340,27 +358,25 @@ impl Store {
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
-            .execute(
-                params![
-                    range.file_path,
-                    range.symbol_id.as_str(),
-                    range.start_line,
-                    range.end_line,
-                    range.symbol_kind.as_str(),
-                    range.qualified_name,
-                    range
-                        .parent_symbol_id
-                        .as_ref()
-                        .map(|id| id.as_str().to_string()),
-                ],
-            )
+            .execute(params![
+                range.file_path,
+                range.symbol_id.as_str(),
+                range.start_line,
+                range.end_line,
+                range.symbol_kind.as_str(),
+                range.qualified_name,
+                range
+                    .parent_symbol_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_string()),
+            ])
             .map(|_| ())
             .map_err(StoreError::sqlite)
     }
 
     pub fn list_symbol_ranges_for_file(&self, file_path: &str) -> StoreResult<Vec<SymbolRange>> {
         let sql = format!("SELECT {SELECT_RANGE_COLS} FROM symbol_ranges WHERE file_path = ?1 ORDER BY start_line, symbol_id");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params![file_path], symbol_range_from_row)
             .map_err(StoreError::sqlite)?;
@@ -376,7 +392,7 @@ impl Store {
         end: u32,
     ) -> StoreResult<Vec<SymbolRange>> {
         let sql = format!("SELECT {SELECT_RANGE_COLS} FROM symbol_ranges WHERE file_path = ?1 AND start_line <= ?3 AND end_line >= ?2 ORDER BY start_line, end_line, symbol_id");
-        let mut stmt = self.conn.prepare(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params![file_path, start, end], symbol_range_from_row)
             .map_err(StoreError::sqlite)?;
@@ -389,15 +405,13 @@ impl Store {
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
-            .execute(
-                params![
-                    entry.path,
-                    entry.hash,
-                    entry.kind,
-                    entry.indexed_at,
-                    entry.index_generation,
-                ],
-            )
+            .execute(params![
+                entry.path,
+                entry.hash,
+                entry.kind,
+                entry.indexed_at,
+                entry.index_generation,
+            ])
             .map(|_| ())
             .map_err(StoreError::sqlite)
     }
@@ -405,7 +419,7 @@ impl Store {
     pub fn get_file_hash(&self, path: &str) -> StoreResult<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT hash FROM file_index WHERE path = ?1")
+            .prepare_cached("SELECT hash FROM file_index WHERE path = ?1")
             .map_err(StoreError::sqlite)?;
         let mut rows = stmt.query(params![path]).map_err(StoreError::sqlite)?;
         if let Some(row) = rows.next().map_err(StoreError::sqlite)? {
@@ -417,7 +431,16 @@ impl Store {
 
     /// Delete every node, edge, evidence and symbol range produced by the
     /// given indexer name. Used to re-index without leaving stale rows.
+    ///
+    /// Rows with `indexer IS NULL` are deliberately untouched: NULL marks
+    /// unmanaged data (operator-confirmed links, external imports) that no
+    /// indexer owns, so no indexer's re-run may delete it. Every built-in
+    /// indexer tags its own writes — see e.g. `make_indexed_edge` in the
+    /// docs indexer.
     pub fn clear_indexer_outputs(&mut self, indexer: &str) -> StoreResult<()> {
+        // `node_fts` only exists after migration 003; older databases skip
+        // the orphan sweep (they have no content layer to go stale).
+        let has_fts = self.fulltext_available()?;
         self.with_write_tx(|tx| {
             tx.execute("DELETE FROM nodes WHERE indexer = ?1", params![indexer])
                 .map_err(StoreError::sqlite)?;
@@ -436,6 +459,16 @@ impl Store {
                 params![],
             )
             .map_err(StoreError::sqlite)?;
+            // Fulltext rows referencing deleted nodes would otherwise survive
+            // (`node_id` is UNINDEXED, no FK) and `fulltext_match` would keep
+            // returning ghost ids that `find_node` cannot resolve.
+            if has_fts {
+                tx.execute(
+                    "DELETE FROM node_fts WHERE node_id NOT IN (SELECT id FROM nodes)",
+                    params![],
+                )
+                .map_err(StoreError::sqlite)?;
+            }
             Ok(())
         })
     }
@@ -496,7 +529,7 @@ impl Store {
                 .map_err(StoreError::sqlite)?;
             let mut inserted = 0usize;
             let mut stmt = tx
-                .prepare("INSERT INTO node_fts (node_id, body) VALUES (?1, ?2)")
+                .prepare_cached("INSERT INTO node_fts (node_id, body) VALUES (?1, ?2)")
                 .map_err(StoreError::sqlite)?;
             for row in rows {
                 if row.body.trim().is_empty() {
@@ -630,15 +663,11 @@ fn edge_from_row(row: &Row<'_>) -> Result<EdgeAssertion, rusqlite::Error> {
 
 fn evidence_from_row(row: &Row<'_>) -> Result<Evidence, rusqlite::Error> {
     let kind_str: String = row.get(2)?;
-    let kind = match kind_str.as_str() {
-        "doc_section" => EvidenceKind::DocSection,
-        "dart_doc_comment" => EvidenceKind::DartDocComment,
-        "dart_test_call" => EvidenceKind::DartTestCall,
-        "dart_group_call" => EvidenceKind::DartGroupCall,
-        "import" => EvidenceKind::Import,
-        "git_diff" => EvidenceKind::GitDiff,
-        other => return Err(decode_error(2, format!("unknown evidence kind {other}"))),
-    };
+    // Single source of truth lives in `specslice-core` (same pattern as
+    // `node_from_row`); a new EvidenceKind variant can no longer be written
+    // but fail to decode.
+    let kind = EvidenceKind::from_str(&kind_str)
+        .ok_or_else(|| decode_error(2, format!("unknown evidence kind {kind_str}")))?;
     Ok(Evidence {
         id: ArtifactId::new(row.get::<_, String>(0)?),
         artifact_id: ArtifactId::new(row.get::<_, String>(1)?),
@@ -673,48 +702,20 @@ fn symbol_range_from_row(row: &Row<'_>) -> Result<SymbolRange, rusqlite::Error> 
 }
 
 fn parse_edge_kind(raw: &str) -> Result<EdgeKind, rusqlite::Error> {
-    Ok(match raw {
-        "contains" => EdgeKind::Contains,
-        "imports" => EdgeKind::Imports,
-        "documents" => EdgeKind::Documents,
-        "declares_implementation" => EdgeKind::DeclaresImplementation,
-        "declares_verification" => EdgeKind::DeclaresVerification,
-        "references" => EdgeKind::References,
-        "calls" => EdgeKind::Calls,
-        "reads_provider" => EdgeKind::ReadsProvider,
-        "navigates_to" => EdgeKind::NavigatesTo,
-        "persists_to" => EdgeKind::PersistsTo,
-        "subscribes_stream" => EdgeKind::SubscribesStream,
-        "derives_from" => EdgeKind::DerivesFrom,
-        other => return Err(decode_error(3, format!("unknown edge kind {other}"))),
-    })
+    EdgeKind::from_str(raw).ok_or_else(|| decode_error(3, format!("unknown edge kind {raw}")))
 }
 
 fn parse_edge_source(raw: &str) -> Result<EdgeSource, rusqlite::Error> {
-    Ok(match raw {
-        "filesystem" => EdgeSource::Filesystem,
-        "language_adapter" => EdgeSource::LanguageAdapter,
-        "markdown" => EdgeSource::Markdown,
-        "external_manifest" => EdgeSource::ExternalManifest,
-        "git_diff" => EdgeSource::GitDiff,
-        other => return Err(decode_error(4, format!("unknown edge source {other}"))),
-    })
+    EdgeSource::from_str(raw).ok_or_else(|| decode_error(4, format!("unknown edge source {raw}")))
 }
 
 fn parse_edge_certainty(raw: &str) -> Result<EdgeCertainty, rusqlite::Error> {
-    Ok(match raw {
-        "fact" => EdgeCertainty::Fact,
-        "declared" => EdgeCertainty::Declared,
-        other => return Err(decode_error(5, format!("unknown edge certainty {other}"))),
-    })
+    EdgeCertainty::from_str(raw)
+        .ok_or_else(|| decode_error(5, format!("unknown edge certainty {raw}")))
 }
 
 fn parse_edge_status(raw: &str) -> Result<EdgeStatus, rusqlite::Error> {
-    Ok(match raw {
-        "confirmed" => EdgeStatus::Confirmed,
-        "deprecated" => EdgeStatus::Deprecated,
-        other => return Err(decode_error(6, format!("unknown edge status {other}"))),
-    })
+    EdgeStatus::from_str(raw).ok_or_else(|| decode_error(6, format!("unknown edge status {raw}")))
 }
 
 fn decode_error(col: usize, message: String) -> rusqlite::Error {

@@ -35,7 +35,6 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// notifications (no response expected) carry no id.
 #[derive(Debug, Deserialize)]
 pub struct Request {
-    #[allow(dead_code)]
     pub jsonrpc: String,
     #[serde(default)]
     pub id: Option<Value>,

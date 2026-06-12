@@ -178,7 +178,9 @@ fn php_resolve_import(
     };
     find_by_tail(&parts).or_else(|| {
         // Member / function import: drop the trailing segment.
-        (parts.len() >= 2).then(|| find_by_tail(&parts[..parts.len() - 1])).flatten()
+        (parts.len() >= 2)
+            .then(|| find_by_tail(&parts[..parts.len() - 1]))
+            .flatten()
     })
 }
 
@@ -225,7 +227,9 @@ fn collect_php_calls(
             }
             "object_creation_expression" => {
                 for i in 0..child.named_child_count() {
-                    let Some(c) = child.named_child(u32::try_from(i).unwrap_or(u32::MAX)) else { break };
+                    let Some(c) = child.named_child(u32::try_from(i).unwrap_or(u32::MAX)) else {
+                        break;
+                    };
                     if matches!(c.kind(), "name" | "qualified_name") {
                         if let Some(t) = node_text(c, src) {
                             let bare = t.rsplit('\\').next().unwrap_or(t);
@@ -326,7 +330,10 @@ function top_level(int $x): int { return $x * 2; }
         assert!(qnames(&s, NodeKind::PhpTrait).contains(&"Loggable".to_string()));
         assert!(qnames(&s, NodeKind::PhpEnum).contains(&"Status".to_string()));
         let methods = qnames(&s, NodeKind::PhpMethod);
-        assert!(methods.contains(&"Greeter::greet".to_string()), "{methods:?}");
+        assert!(
+            methods.contains(&"Greeter::greet".to_string()),
+            "{methods:?}"
+        );
         assert!(
             methods.contains(&"Greeter::__construct".to_string()),
             "{methods:?}"

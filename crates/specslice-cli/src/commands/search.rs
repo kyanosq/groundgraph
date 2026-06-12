@@ -86,11 +86,7 @@ pub fn run(args: SearchRunArgs) -> Result<()> {
                 compute_search_html_payload(&result, &args.repo_root, HTML_DEFAULT_FOCUS_BUDGET);
             let html = search_html::render_html(&payload).context("rendering search HTML")?;
             let out_path = resolve_html_output(&args.repo_root, &args.output, &result)?;
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating output directory {}", parent.display()))?;
-            }
-            std::fs::write(&out_path, html)
+            super::output::write_atomic(&out_path, &html)
                 .with_context(|| format!("writing HTML to {}", out_path.display()))?;
             println!("HTML 已生成: {}", out_path.display());
         }
@@ -166,14 +162,7 @@ fn write_or_stdout(
 ) -> Result<()> {
     match output {
         Some(path) => {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("creating output directory {}", parent.display())
-                    })?;
-                }
-            }
-            std::fs::write(path, contents)
+            super::output::write_atomic(path, contents)
                 .with_context(|| format!("writing output to {}", path.display()))?;
             println!("已写入: {}", path.display());
         }
@@ -542,6 +531,7 @@ mod tests {
                     line_range: None,
                     snippet: None,
                 }],
+                truncated: false,
             },
             graph_commands: vec![],
             warnings: Vec::new(),

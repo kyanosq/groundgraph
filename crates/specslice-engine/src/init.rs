@@ -411,9 +411,7 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
     let total: usize = counts.values().sum();
     counts
         .into_iter()
-        .filter(|(lang, c)| {
-            *c > 0 && (manifest_langs.contains(lang) || *c >= 3 || *c * 4 >= total)
-        })
+        .filter(|(lang, c)| *c > 0 && (manifest_langs.contains(lang) || *c >= 3 || *c * 4 >= total))
         .map(|(lang, _)| {
             let mut roots = topdirs.get(lang).cloned().unwrap_or_default();
             // Elected C/C++ also owns its header-rich dirs (fmt's
@@ -528,11 +526,7 @@ mod tests {
         let root = dir.path();
         write(root, "Cargo.toml", "[workspace]\n");
         for i in 0..6 {
-            write(
-                root,
-                &format!("crates/a/src/f{i}.rs"),
-                "pub fn x() {}\n",
-            );
+            write(root, &format!("crates/a/src/f{i}.rs"), "pub fn x() {}\n");
         }
         write(root, "lib/smol_str/src/gdb_printer.py", "print('x')\n");
         let sels = detect_language_selections(root);

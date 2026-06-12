@@ -5,7 +5,6 @@
 //! single JSON object on its own line. An empty graph still produces empty
 //! `<table>.jsonl` files so downstream tools can rely on the layout.
 
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -61,9 +60,13 @@ pub fn export(options: ExportOptions) -> Result<ExportOutcome> {
 }
 
 fn export_table(conn: &Connection, table: &str, dest: &Path) -> Result<()> {
-    let file =
-        File::create(dest).with_context(|| format!("creating export file {}", dest.display()))?;
-    let mut writer = BufWriter::new(file);
+    // Stream into a sibling temp file and rename at the end, so an
+    // interrupted export can never leave a truncated `.jsonl` where a
+    // previous good bundle stood (same policy as the CLI's write_atomic).
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file beside {}", dest.display()))?;
+    let mut writer = BufWriter::new(tmp);
 
     let mut stmt = conn
         .prepare(&format!("SELECT * FROM {table}"))
@@ -90,6 +93,11 @@ fn export_table(conn: &Connection, table: &str, dest: &Path) -> Result<()> {
     }
 
     writer.flush().context("flushing JSONL writer")?;
+    let tmp = writer
+        .into_inner()
+        .context("finalising buffered JSONL writer")?;
+    tmp.persist(dest)
+        .with_context(|| format!("moving export into place at {}", dest.display()))?;
     Ok(())
 }
 

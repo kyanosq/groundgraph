@@ -213,6 +213,10 @@ pub struct SearchMatch {
 pub struct SearchSubgraph {
     pub nodes: Vec<SearchNode>,
     pub edges: Vec<SearchEdge>,
+    /// `true` when expansion hit [`SUBGRAPH_NODE_BUDGET`] and stopped
+    /// early — the subgraph is a prefix, not the full closure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,6 +573,37 @@ pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Resul
 /// flood CLI / JSON output.
 const SNIPPET_MAX_CHARS: usize = 200;
 
+/// Cap on the size of a file read for snippets. Snippets are a convenience;
+/// slurping a 50 MB generated `.g.dart` for one line is not worth the
+/// allocation (issues2.md #51).
+const SNIPPET_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read a file for snippet extraction, defensively:
+/// - node paths must stay inside the repo (`..` / absolute paths come from
+///   a hand-edited or corrupted index, never from our indexers);
+/// - oversized files are skipped, not slurped;
+/// - non-UTF-8 bytes (GBK comments in legacy sources) degrade lossily
+///   instead of losing the whole snippet.
+fn read_snippet_lines(repo_root: &Path, rel: &str) -> Option<Vec<String>> {
+    use std::path::Component;
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let full = repo_root.join(rel_path);
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > SNIPPET_MAX_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&full).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    Some(text.lines().map(String::from).collect())
+}
+
 /// Attach one grounding source line to each final match (see
 /// [`SearchMatch::snippet`]). Files are read once per distinct path; missing
 /// or shifted files degrade to "no snippet", never an error — the snippet is
@@ -587,11 +622,9 @@ fn attach_snippets(repo_root: &Path, matches: &mut [SearchMatch], tokens: &[Stri
         let Some((start, end)) = m.line_range else {
             continue;
         };
-        let lines = cache.entry(path.clone()).or_insert_with(|| {
-            std::fs::read_to_string(repo_root.join(&path))
-                .ok()
-                .map(|c| c.lines().map(String::from).collect())
-        });
+        let lines = cache
+            .entry(path.clone())
+            .or_insert_with(|| read_snippet_lines(repo_root, &path));
         let Some(lines) = lines else { continue };
         let decl_idx = (start.max(1) as usize - 1).min(lines.len().saturating_sub(1));
         let ext_start =
@@ -1143,6 +1176,7 @@ fn build_focus_card(
         focused: SearchSubgraph {
             nodes: focused_nodes,
             edges: focused_edges,
+            truncated,
         },
         edge_groups,
         focus_truncated: truncated,
@@ -1257,18 +1291,63 @@ fn build_tokens(query: &SearchQuery) -> Result<(String, Vec<String>)> {
 }
 
 /// Split free-form keywords on whitespace + punctuation, lower-case
-/// and dedupe.
+/// and dedupe. CJK runs additionally split into overlapping bigrams
+/// (mirroring the FTS layer) so a Chinese phrase matches node names by
+/// fragment, not only as one exact substring (issues2.md #52).
 pub fn tokenise_keywords(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let push = |t: String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        // Byte length: single ASCII letters are noise, while one CJK char
+        // (3 bytes) carries meaning and stays.
+        if t.len() < 2 {
+            return;
+        }
+        if seen.insert(t.clone()) {
+            out.push(t);
+        }
+    };
     for piece in raw.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let p = piece.trim().to_ascii_lowercase();
-        if p.len() < 2 {
+        if p.is_empty() {
             continue;
         }
-        if seen.insert(p.clone()) {
-            out.push(p);
+        if p.is_ascii() {
+            push(p, &mut out, &mut seen);
+            continue;
         }
+        // Mixed run: ASCII sub-runs stay whole, non-ASCII (CJK) sub-runs
+        // become overlapping bigrams.
+        let mut ascii = String::new();
+        let mut wide: Vec<char> = Vec::new();
+        let flush_wide =
+            |wide: &mut Vec<char>, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+                match wide.len() {
+                    0 => {}
+                    1 => push(wide[0].to_string(), out, seen),
+                    _ => {
+                        for pair in wide.windows(2) {
+                            push(pair.iter().collect(), out, seen);
+                        }
+                    }
+                }
+                wide.clear();
+            };
+        for ch in p.chars() {
+            if ch.is_ascii() {
+                flush_wide(&mut wide, &mut out, &mut seen);
+                ascii.push(ch);
+            } else {
+                if !ascii.is_empty() {
+                    push(std::mem::take(&mut ascii), &mut out, &mut seen);
+                }
+                wide.push(ch);
+            }
+        }
+        if !ascii.is_empty() {
+            push(ascii, &mut out, &mut seen);
+        }
+        flush_wide(&mut wide, &mut out, &mut seen);
     }
     out
 }
@@ -1735,6 +1814,11 @@ fn position_matches(store: &Store, path: &str, line: u32) -> Result<Vec<SearchMa
 // Subgraph expansion
 // ---------------------------------------------------------------------------
 
+/// Hard cap on how many nodes one search subgraph may materialise. The
+/// subgraph is shipped to reports / JSON wholesale, so an unbounded
+/// closure on a dense graph would buffer arbitrarily much memory.
+pub const SUBGRAPH_NODE_BUDGET: usize = 5_000;
+
 fn expand_subgraph(
     store: &Store,
     matches: &[SearchMatch],
@@ -1744,10 +1828,11 @@ fn expand_subgraph(
     let mut node_ids: BTreeSet<String> = matches.iter().map(|m| m.id.clone()).collect();
     let mut frontier: Vec<String> = node_ids.iter().cloned().collect();
     let mut kept_edges: Vec<EdgeAssertion> = Vec::new();
+    let mut truncated = false;
 
     let allow_kind: HashSet<&str> = EXPANSION_EDGE_KINDS.iter().copied().collect();
 
-    for _ in 0..depth {
+    'hops: for _ in 0..depth {
         let mut next: BTreeSet<String> = BTreeSet::new();
         for id in &frontier {
             let aid = ArtifactId::new(id.clone());
@@ -1759,6 +1844,10 @@ fn expand_subgraph(
                     continue;
                 }
                 if !node_ids.contains(edge.to_id.as_str()) {
+                    if node_ids.len() + next.len() >= SUBGRAPH_NODE_BUDGET {
+                        truncated = true;
+                        break 'hops;
+                    }
                     next.insert(edge.to_id.to_string());
                 }
                 kept_edges.push(edge);
@@ -1771,6 +1860,10 @@ fn expand_subgraph(
                     continue;
                 }
                 if !node_ids.contains(edge.from_id.as_str()) {
+                    if node_ids.len() + next.len() >= SUBGRAPH_NODE_BUDGET {
+                        truncated = true;
+                        break 'hops;
+                    }
                     next.insert(edge.from_id.to_string());
                 }
                 kept_edges.push(edge);
@@ -1811,6 +1904,12 @@ fn expand_subgraph(
     let mut subgraph_edges: Vec<SearchEdge> = Vec::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
     for e in kept_edges {
+        // After a budget cut some collected edges point at nodes that
+        // never made it into the subgraph — drop them so consumers never
+        // see dangling endpoints.
+        if !node_ids.contains(e.from_id.as_str()) || !node_ids.contains(e.to_id.as_str()) {
+            continue;
+        }
         if !seen_edges.insert(e.id.to_string()) {
             continue;
         }
@@ -1830,6 +1929,7 @@ fn expand_subgraph(
     Ok(SearchSubgraph {
         nodes: subgraph_nodes,
         edges: subgraph_edges,
+        truncated,
     })
 }
 
@@ -2002,6 +2102,44 @@ mod tests {
         store.upsert_edge(&edge).unwrap();
     }
 
+    /// A dense hub (one anchor, thousands of neighbours) must not be
+    /// materialised wholesale: expansion stops at the node budget and
+    /// the subgraph says so, instead of buffering an arbitrarily large
+    /// JSON payload.
+    #[test]
+    fn expand_subgraph_stops_at_node_budget_and_reports_truncation() {
+        let (mut store, _dir) = empty_store();
+        let hub = insert_method(&mut store, "lib/hub.dart", "Hub.run", (1, 2));
+        for i in 0..(SUBGRAPH_NODE_BUDGET + 100) {
+            let callee = insert_method(
+                &mut store,
+                &format!("lib/n{i}.dart"),
+                &format!("C{i}.leaf"),
+                (1, 2),
+            );
+            insert_calls_edge(&mut store, &hub, &callee);
+        }
+        let matches = vec![SearchMatch {
+            id: hub.clone(),
+            kind: "dart_method".into(),
+            label: "Hub.run".into(),
+            path: Some("lib/hub.dart".into()),
+            line_range: Some((1, 2)),
+            score: 10,
+            source: None,
+            match_reasons: vec![],
+            framework_role: None,
+            snippet: None,
+        }];
+        let sub = expand_subgraph(&store, &matches, 3, false).unwrap();
+        assert!(
+            sub.nodes.len() <= SUBGRAPH_NODE_BUDGET,
+            "node budget must hold: got {}",
+            sub.nodes.len()
+        );
+        assert!(sub.truncated, "caller must learn the subgraph was cut");
+    }
+
     #[test]
     fn tokenise_keywords_splits_on_whitespace_and_punctuation_lowercase() {
         let toks = tokenise_keywords("Login Auth, session/token");
@@ -2012,6 +2150,87 @@ mod tests {
     fn tokenise_keywords_drops_single_char_noise() {
         let toks = tokenise_keywords("a IAP b iap");
         assert_eq!(toks, vec!["iap"]);
+    }
+
+    fn match_at(path: &str, range: (u32, u32)) -> SearchMatch {
+        SearchMatch {
+            id: format!("test::{path}"),
+            kind: "dart_fn".into(),
+            label: "f".into(),
+            path: Some(path.to_string()),
+            line_range: Some(range),
+            score: 1,
+            source: None,
+            match_reasons: Vec::new(),
+            framework_role: None,
+            snippet: None,
+        }
+    }
+
+    /// issues2.md #51: snippets must survive non-UTF-8 source bytes
+    /// (GBK comments), must not follow `..`/absolute paths out of the
+    /// repo, and must skip huge generated files instead of slurping them.
+    #[test]
+    fn attach_snippets_is_lossy_safe_and_stays_inside_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // (1) Non-UTF-8 bytes: GBK-encoded comment line + valid code line.
+        let mut gbk = Vec::new();
+        gbk.extend_from_slice(b"// ");
+        gbk.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]); // GBK garbage
+        gbk.extend_from_slice(b"\nvoid doLogin() {}\n");
+        std::fs::write(root.join("a.dart"), gbk).unwrap();
+
+        // (2) A secret file *outside* the repo root.
+        std::fs::write(dir.path().join("secret.txt"), "TOP-SECRET\n").unwrap();
+
+        // (3) A huge generated file.
+        let big = "x".repeat(3 * 1024 * 1024);
+        std::fs::write(root.join("big.g.dart"), &big).unwrap();
+
+        let mut matches = vec![
+            match_at("a.dart", (2, 2)),
+            match_at("../secret.txt", (1, 1)),
+            match_at("big.g.dart", (1, 1)),
+        ];
+        let tokens = vec!["dologin".to_string(), "top".to_string()];
+        attach_snippets(&root, &mut matches, &tokens, "doLogin top");
+
+        assert!(
+            matches[0]
+                .snippet
+                .as_deref()
+                .is_some_and(|s| s.contains("doLogin")),
+            "non-UTF-8 file must still yield a snippet: {:?}",
+            matches[0].snippet
+        );
+        assert!(
+            matches[1].snippet.is_none(),
+            "`..` path must not escape the repo: {:?}",
+            matches[1].snippet
+        );
+        assert!(
+            matches[2].snippet.is_none(),
+            "oversized file must be skipped: {:?}",
+            matches[2].snippet
+        );
+    }
+
+    /// issues2.md #52: a CJK phrase used to stay one opaque token, so
+    /// `登录 服务` could not hit a node named `用户登录服务`. CJK runs now
+    /// split into overlapping bigrams like the FTS layer.
+    #[test]
+    fn tokenise_keywords_bigrams_cjk_runs() {
+        let toks = tokenise_keywords("用户登录");
+        assert_eq!(toks, vec!["用户", "户登", "登录"]);
+        // Mixed ASCII + CJK runs keep both families.
+        let mixed = tokenise_keywords("auth用户");
+        assert!(mixed.contains(&"auth".to_string()), "{mixed:?}");
+        assert!(mixed.contains(&"用户".to_string()), "{mixed:?}");
+        // A single CJK char is meaningful (unlike single ASCII letters).
+        assert_eq!(tokenise_keywords("图"), vec!["图"]);
     }
 
     #[test]

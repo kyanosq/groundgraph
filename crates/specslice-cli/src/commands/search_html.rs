@@ -37,20 +37,10 @@ pub fn render_html(payload: &SearchHtmlPayload) -> Result<String> {
 }
 
 fn sanitize_for_script(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            out.push_str("<\\/");
-            i += 2;
-            continue;
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    out
+    // `</` is pure ASCII and UTF-8 is self-synchronising, so a plain
+    // string replace can never split a multi-byte character — unlike the
+    // old byte-by-byte loop, which mangled CJK text (issues.md #1).
+    raw.replace("</", "<\\/")
 }
 
 const DOCTYPE: &str = "<!doctype html>\n";
@@ -309,7 +299,10 @@ const RENDERER_JS: &str = r#"
   if (!dataEl) return;
   let payload;
   try { payload = JSON.parse(dataEl.textContent); } catch (e) {
-    document.body.innerHTML = '<pre>无法解析 search payload: ' + e.message + '</pre>';
+    // textContent, never innerHTML: parse errors can echo payload fragments.
+    const pre = document.createElement('pre');
+    pre.textContent = '无法解析 search payload: ' + e.message;
+    document.body.replaceChildren(pre);
     return;
   }
   const cards = payload.focus_cards || [];
@@ -334,8 +327,18 @@ const RENDERER_JS: &str = r#"
     span.textContent = t;
     tokensEl.appendChild(span);
   });
-  document.getElementById('hdr-stats').innerHTML =
-    '命中 <b>' + (payload.matches_total || 0) + '</b> · 焦点卡片 <b>' + cards.length + '</b>';
+  (function () {
+    const stats = document.getElementById('hdr-stats');
+    stats.textContent = '';
+    stats.appendChild(document.createTextNode('命中 '));
+    const b1 = document.createElement('b');
+    b1.textContent = String(payload.matches_total || 0);
+    stats.appendChild(b1);
+    stats.appendChild(document.createTextNode(' · 焦点卡片 '));
+    const b2 = document.createElement('b');
+    b2.textContent = String(cards.length);
+    stats.appendChild(b2);
+  })();
 
   // ---------- Edge-kind filter chips (toolbar)
   const hiddenEdgeKinds = new Set();
@@ -983,7 +986,10 @@ const RENDERER_JS: &str = r#"
     const wrap = document.createElement('div');
     wrap.className = 'edge-detail';
     const t = document.createElement('div');
-    t.innerHTML = '<b>' + row.edge_kind + '</b> · ' + row.neighbor_kind;
+    const kindEl = document.createElement('b');
+    kindEl.textContent = row.edge_kind;
+    t.appendChild(kindEl);
+    t.appendChild(document.createTextNode(' · ' + (row.neighbor_kind || '')));
     wrap.appendChild(t);
     const m = document.createElement('div');
     m.className = 'meta mono';
@@ -1009,3 +1015,40 @@ const RENDERER_JS: &str = r#"
   if (cards.length) selectCard(0);
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_for_script, RENDERER_JS};
+
+    /// No dynamic string may be concatenated into an `innerHTML` sink —
+    /// build DOM nodes and use `textContent` instead (issues.md #2).
+    /// `e.message` can echo attacker-shaped payload fragments; enum-ish
+    /// fields are defended in depth.
+    #[test]
+    fn renderer_js_never_concatenates_dynamic_strings_into_inner_html() {
+        for line in RENDERER_JS.lines() {
+            if !line.contains("innerHTML") {
+                continue;
+            }
+            assert!(
+                !line.contains('+'),
+                "innerHTML assignment must not concatenate dynamic content: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_multibyte_utf8_payloads() {
+        // The search reader is zh-CN first; the old byte-by-byte
+        // `push(b as char)` turned every CJK char into mojibake
+        // (issues.md #1).
+        let raw = r#"{"query":"登录鉴权 🚀","snippet":"</script>"}"#;
+        let out = sanitize_for_script(raw);
+        assert!(
+            out.contains("登录鉴权 🚀"),
+            "multi-byte text must survive sanitising: {out}"
+        );
+        assert!(out.contains("<\\/script>"));
+        assert!(!out.contains("</script>"));
+    }
+}

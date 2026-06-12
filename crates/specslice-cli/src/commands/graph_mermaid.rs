@@ -141,8 +141,17 @@ fn format_label(label: &str, path: Option<&str>) -> String {
     }
 }
 
+/// Mermaid's quoted strings use HTML entities (`#quot;`), not backslash
+/// escapes. `#` must go first or it would re-escape the entities we emit;
+/// `<`/`>` are interpreted as HTML when `htmlLabels` is on (the default);
+/// `|` would close an edge label (issues.md #16).
 fn escape_label(text: &str) -> String {
-    text.replace('"', "\\\"").replace('\n', " ")
+    text.replace('#', "#35;")
+        .replace('"', "#quot;")
+        .replace('<', "#lt;")
+        .replace('>', "#gt;")
+        .replace('|', "#124;")
+        .replace('\n', " ")
 }
 
 fn escape_comment(text: &str) -> String {
@@ -226,10 +235,27 @@ mod tests {
         assert!(out.contains("n1("));
         assert!(out.contains("n0 -->|documents| n1"));
         assert!(
-            out.contains("\\\""),
-            "label quotes should be escaped: {out}"
+            out.contains("#quot;"),
+            "label quotes should be escaped as Mermaid entities: {out}"
         );
         assert!(!out.contains("docsec::"), "raw ids leaked: {out}");
+    }
+
+    /// Mermaid quoted labels escape via HTML entities (`#quot;`), NOT
+    /// backslashes; `<`/`>` are parsed as HTML when htmlLabels is on,
+    /// a raw `#` starts an entity, and `|` would close an edge label
+    /// (issues.md #16). Generics + quotes + pipes must all survive.
+    #[test]
+    fn escape_label_neutralises_mermaid_metacharacters() {
+        let escaped = escape_label("Vec<T> \"quoted\" #5 a|b\nnext");
+        assert_eq!(
+            escaped,
+            "Vec#lt;T#gt; #quot;quoted#quot; #35;5 a#124;b next"
+        );
+        assert!(
+            !escaped.contains('\\'),
+            "backslash escapes are not Mermaid syntax: {escaped}"
+        );
     }
 
     #[test]

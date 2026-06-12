@@ -157,6 +157,7 @@ mod tests {
             subgraph: SearchSubgraph {
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                truncated: false,
             },
             graph_commands: Vec::new(),
             warnings: vec!["warn: 节点 abc 的出边质量查询失败：disk i/o error".to_string()],
@@ -185,6 +186,7 @@ mod tests {
             subgraph: SearchSubgraph {
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                truncated: false,
             },
             graph_commands: Vec::new(),
             warnings: Vec::new(),

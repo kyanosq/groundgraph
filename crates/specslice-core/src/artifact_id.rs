@@ -90,6 +90,11 @@ pub fn dart_group_id(path: &str, slug: &str) -> ArtifactId {
 /// Convert any user-visible string into a stable, ascii-only slug used inside
 /// node IDs. Whitespace and non-alphanumerics collapse to `-`, leading and
 /// trailing dashes are stripped, and the result is lowercased.
+///
+/// Inputs with no ASCII alphanumerics at all (pure-CJK headings — the
+/// dominant case for Chinese docs) fall back to a content hash instead of a
+/// fixed word, so two different headings can never collide on one id
+/// (issues2.md #53).
 pub fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_dash = true;
@@ -106,10 +111,21 @@ pub fn slugify(text: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
-        "section".to_string()
+        format!("s{:016x}", fnv1a64(text.as_bytes()))
     } else {
         out
     }
+}
+
+/// FNV-1a 64-bit — tiny, dependency-free, deterministic. Only used for the
+/// slug fallback above; not a cryptographic hash and does not need to be.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -179,10 +195,25 @@ mod tests {
             slugify("Auto watermark placement"),
             "auto-watermark-placement"
         );
-        assert_eq!(slugify("自动水印放置"), "section");
         assert_eq!(slugify("Hello, World!"), "hello-world");
-        assert_eq!(slugify(""), "section");
-        assert_eq!(slugify("---"), "section");
+    }
+
+    /// Two different all-CJK headings must NOT collapse onto one slug —
+    /// the old fixed `"section"` fallback merged every Chinese doc
+    /// section in a file into a single node id (issues2.md #53).
+    #[test]
+    fn slugify_keeps_distinct_cjk_headings_distinct_and_deterministic() {
+        let a = slugify("自动水印放置");
+        let b = slugify("用户登录鉴权");
+        assert_ne!(a, b, "distinct CJK headings must produce distinct slugs");
+        assert_eq!(a, slugify("自动水印放置"), "slug must be deterministic");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "slug must stay ascii-safe: {a}"
+        );
+        // Truly empty inputs still need *some* stable non-empty slug.
+        assert!(!slugify("").is_empty());
+        assert_ne!(slugify("---"), slugify("自动水印放置"));
     }
 
     #[test]

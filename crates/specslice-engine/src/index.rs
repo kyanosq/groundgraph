@@ -161,6 +161,14 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     // amortizes that to one WAL append + one checkpoint. Early `?` returns
     // drop the connection, which rolls the half-built generation back — the
     // previous complete index stays untouched.
+    //
+    // Deliberately all-or-nothing (issues2.md #34): per-indexer commits
+    // would leave a *mixed-generation* graph on failure (new dart rows,
+    // old java rows), and the cross-indexer linking passes that run later
+    // (schema routes → callables, docs → symbols) would build edges
+    // against nodes from different generations. A failed run costing a
+    // re-index beats a silently inconsistent graph — the index is a
+    // rebuildable cache, never the source of truth.
     store.begin_bulk().context("opening bulk write session")?;
 
     let mut result = IndexResult::default();
@@ -423,7 +431,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing external links manifest")?;
         result.links = Some(links);
-            timer.mark("links");
+        timer.mark("links");
 
         // P23.9 — Markdown requirements. Runs after the manifest so both
         // sources contribute requirement→artifact edges into the same graph;
@@ -441,7 +449,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
         )
         .context("indexing markdown requirements")?;
         result.requirements_md = Some(requirements_md);
-            timer.mark("requirements_md");
+        timer.mark("requirements_md");
     }
 
     // Content layer LAST: it mirrors whatever node set the passes above just
@@ -454,7 +462,9 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     result.fulltext = Some(fulltext);
     timer.mark("fulltext");
 
-    store.commit_bulk().context("committing bulk write session")?;
+    store
+        .commit_bulk()
+        .context("committing bulk write session")?;
     timer.mark("commit");
 
     Ok(result)

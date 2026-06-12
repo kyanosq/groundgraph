@@ -413,29 +413,24 @@ pub fn default_dead_code_reason(kind: NodeKind) -> &'static str {
 /// Search aliases — extra strings the search engine should match a node
 /// kind on, beyond its raw `as_str()` form. Kept tiny to avoid
 /// surprising fuzzy matches.
+///
+/// Method / free-function aliases are derived from the categorisation
+/// predicates (not a hand-listed arm) so every language — present and
+/// future — gets them automatically; the old explicit list silently
+/// omitted C# / Ruby / PHP / Kotlin.
 pub fn search_aliases(kind: NodeKind) -> &'static [&'static str] {
+    if kind.is_method() {
+        return &["method", "fn"];
+    }
+    if kind.is_free_function() {
+        return &["function", "fn"];
+    }
     match kind {
         NodeKind::DartProvider => &["provider", "riverpod"],
         NodeKind::Route => &["route", "navigation"],
         NodeKind::Storage => &["storage", "persistence"],
         NodeKind::BusinessCandidate => &["candidate", "business"],
         NodeKind::TestCase | NodeKind::TestGroup => &["test"],
-        NodeKind::DartMethod
-        | NodeKind::SwiftMethod
-        | NodeKind::GoMethod
-        | NodeKind::PythonMethod
-        | NodeKind::TypescriptMethod
-        | NodeKind::JavaMethod
-        | NodeKind::RustMethod
-        | NodeKind::CppMethod => &["method", "fn"],
-        NodeKind::DartFunction
-        | NodeKind::SwiftFunction
-        | NodeKind::GoFunction
-        | NodeKind::PythonFunction
-        | NodeKind::TypescriptFunction
-        | NodeKind::RustFunction
-        | NodeKind::CFunction
-        | NodeKind::CppFunction => &["function", "fn"],
         NodeKind::RustTrait => &["trait", "interface"],
         NodeKind::CppNamespace => &["namespace", "module"],
         _ => &[],
@@ -446,67 +441,11 @@ pub fn search_aliases(kind: NodeKind) -> &'static [&'static str] {
 mod tests {
     use super::*;
 
-    /// Enumerate every NodeKind so the matrix tests below scream the
-    /// moment a new kind is added without updating `language_traits`.
-    const ALL_KINDS: &[NodeKind] = &[
-        NodeKind::File,
-        NodeKind::Requirement,
-        NodeKind::AcceptanceCriterion,
-        NodeKind::Adr,
-        NodeKind::DocSection,
-        NodeKind::DartClass,
-        NodeKind::DartMethod,
-        NodeKind::DartFunction,
-        NodeKind::DartConstructor,
-        NodeKind::TestCase,
-        NodeKind::TestGroup,
-        NodeKind::DartProvider,
-        NodeKind::Route,
-        NodeKind::Storage,
-        NodeKind::BusinessCandidate,
-        NodeKind::SwiftClass,
-        NodeKind::SwiftStruct,
-        NodeKind::SwiftEnum,
-        NodeKind::SwiftProtocol,
-        NodeKind::SwiftMethod,
-        NodeKind::SwiftFunction,
-        NodeKind::SwiftInitializer,
-        NodeKind::GoStruct,
-        NodeKind::GoInterface,
-        NodeKind::GoMethod,
-        NodeKind::GoFunction,
-        NodeKind::PythonModule,
-        NodeKind::PythonClass,
-        NodeKind::PythonFunction,
-        NodeKind::PythonMethod,
-        NodeKind::TypescriptModule,
-        NodeKind::TypescriptClass,
-        NodeKind::TypescriptInterface,
-        NodeKind::TypescriptEnum,
-        NodeKind::TypescriptFunction,
-        NodeKind::TypescriptMethod,
-        NodeKind::JavaPackage,
-        NodeKind::JavaClass,
-        NodeKind::JavaInterface,
-        NodeKind::JavaEnum,
-        NodeKind::JavaMethod,
-        NodeKind::JavaConstructor,
-        NodeKind::RustModule,
-        NodeKind::RustStruct,
-        NodeKind::RustEnum,
-        NodeKind::RustTrait,
-        NodeKind::RustFunction,
-        NodeKind::RustMethod,
-        NodeKind::CFunction,
-        NodeKind::CStruct,
-        NodeKind::CEnum,
-        NodeKind::CppNamespace,
-        NodeKind::CppClass,
-        NodeKind::CppStruct,
-        NodeKind::CppEnum,
-        NodeKind::CppFunction,
-        NodeKind::CppMethod,
-    ];
+    /// The matrix tests iterate `NodeKind::ALL` — the single source of
+    /// truth maintained next to the enum itself — so a new kind can never
+    /// silently bypass these tests the way the old hand-copied slice let
+    /// the 25 P25/P26 kinds slip through (regression issues.md #18).
+    const ALL_KINDS: &[NodeKind] = NodeKind::ALL;
 
     #[test]
     fn every_kind_has_a_language_and_family() {
@@ -521,12 +460,33 @@ mod tests {
     #[test]
     fn matrix_total_count_matches_known_kinds() {
         // Hard-code the expected total so a kind addition that forgets
-        // to update ALL_KINDS fails this test loudly.
+        // to append to `NodeKind::ALL` fails this test loudly.
         assert_eq!(
             ALL_KINDS.len(),
-            57,
-            "ALL_KINDS missing a NodeKind variant. Add it to the slice and to every predicate arm."
+            82,
+            "NodeKind::ALL missing a variant. Append it there and update this count."
         );
+    }
+
+    #[test]
+    fn method_and_function_aliases_cover_every_language() {
+        // Searching "method" / "function" must hit the callable kinds of
+        // *every* language — the hand-listed arms used to omit C# / Ruby /
+        // PHP / Kotlin (issues.md #22).
+        for kind in ALL_KINDS {
+            if kind.is_method() {
+                assert!(
+                    search_aliases(*kind).contains(&"method"),
+                    "{kind:?} must alias \"method\""
+                );
+            }
+            if kind.is_free_function() {
+                assert!(
+                    search_aliases(*kind).contains(&"function"),
+                    "{kind:?} must alias \"function\""
+                );
+            }
+        }
     }
 
     #[test]

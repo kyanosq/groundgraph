@@ -20,6 +20,7 @@ pub mod impact;
 pub mod index;
 pub mod init;
 pub mod logic;
+pub mod output;
 pub mod port_coverage;
 pub mod propose;
 pub mod questions;

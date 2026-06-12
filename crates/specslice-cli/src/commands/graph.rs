@@ -97,7 +97,7 @@ fn emit_json(view: &GraphViewModel, out: Option<&Path>, pretty: bool) -> Result<
     .context("serialising graph view to JSON")?;
     match out {
         Some(path) => {
-            write_to(path, &json)?;
+            super::output::write_atomic(path, &json)?;
             println!("wrote {}", path.display());
             Ok(())
         }
@@ -112,7 +112,7 @@ fn emit_mermaid(view: &GraphViewModel, out: Option<&Path>) -> Result<()> {
     let body = render_mermaid(view);
     match out {
         Some(path) => {
-            write_to(path, &body)?;
+            super::output::write_atomic(path, &body)?;
             println!("wrote {}", path.display());
             Ok(())
         }
@@ -129,7 +129,7 @@ fn emit_html(view: &GraphViewModel, repo_root: &Path, out: Option<&Path>) -> Res
         None => repo_root.join(DEFAULT_HTML_OUT),
     };
     let body = render_html(view);
-    write_to(&target, &body)?;
+    super::output::write_atomic(&target, &body)?;
     println!("wrote {}", target.display());
     Ok(())
 }
@@ -146,7 +146,7 @@ fn emit_web(repo_root: &Path, out: Option<&Path>) -> Result<()> {
         Some(p) => p.to_path_buf(),
         None => repo_root.join(DEFAULT_WEB_OUT),
     };
-    write_to(&target, &html)?;
+    super::output::write_atomic(&target, &html)?;
     println!(
         "wrote {} ({} nodes, {} links)",
         target.display(),
@@ -194,18 +194,6 @@ fn inline_vendor_bundle(html: &str) -> String {
     // while guaranteeing the inlined bundle cannot close the host tag early.
     let safe_bundle = VIEWER_BUNDLE.replace("</script", "<\\/script");
     html.replacen(VENDOR_TAG, &format!("<script>{safe_bundle}</script>"), 1)
-}
-
-fn write_to(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent of {}", path.display()))?;
-        }
-    }
-    std::fs::write(path, body)
-        .with_context(|| format!("writing graph output to {}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]

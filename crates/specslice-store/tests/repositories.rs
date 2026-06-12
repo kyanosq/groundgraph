@@ -26,7 +26,10 @@ fn bulk_upsert_nodes_and_edges_match_row_at_a_time_semantics() {
     // 1100 nodes forces at least three 512-row chunks (two full + a tail).
     let mut nodes: Vec<Node> = (0..1100)
         .map(|i| {
-            let mut n = Node::new(ArtifactId::new(format!("sym::n{i:03}")), NodeKind::CFunction);
+            let mut n = Node::new(
+                ArtifactId::new(format!("sym::n{i:03}")),
+                NodeKind::CFunction,
+            );
             n.name = Some(format!("fn_{i}"));
             n.path = Some(format!("src/f{}.rs", i % 7));
             n.start_line = Some(1);
@@ -447,6 +450,53 @@ fn clear_indexer_outputs_removes_relevant_rows() {
         .is_empty());
 }
 
+/// Re-indexing clears an indexer's nodes; the fulltext layer must not keep
+/// referencing the deleted ids, or `fulltext_match` returns ghost node ids
+/// that `find_node` can no longer resolve (issues.md #4).
+#[test]
+fn clear_indexer_outputs_also_drops_orphaned_fulltext_rows() {
+    let (_tmp, mut store) = fresh_store();
+
+    let mut kept = Node::new(
+        ArtifactId::new("rust::keep.rs#kept"),
+        NodeKind::RustFunction,
+    );
+    kept.indexer = Some("other_indexer".into());
+    store.upsert_node(&kept).unwrap();
+
+    let mut doomed = Node::new(
+        ArtifactId::new("dart_class::a.dart#Ghost"),
+        NodeKind::DartClass,
+    );
+    doomed.indexer = Some("dart_lightweight".into());
+    store.upsert_node(&doomed).unwrap();
+
+    store
+        .rebuild_fulltext(&[
+            FulltextRow {
+                node_id: "rust::keep.rs#kept".into(),
+                body: "kept body words".into(),
+            },
+            FulltextRow {
+                node_id: "dart_class::a.dart#Ghost".into(),
+                body: "ghost body words".into(),
+            },
+        ])
+        .unwrap();
+
+    store.clear_indexer_outputs("dart_lightweight").unwrap();
+
+    let hits = store.fulltext_match("\"ghost\"", 10).unwrap();
+    assert!(
+        hits.is_empty(),
+        "fulltext must not return ids of deleted nodes: {hits:?}"
+    );
+    // The surviving indexer's content row must be untouched.
+    let hits = store.fulltext_match("\"kept\"", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].node_id, "rust::keep.rs#kept");
+}
+
 #[test]
 fn decoding_a_corrupted_line_number_returns_an_error_not_silent_wrap() {
     let tmp = TempDir::new().expect("tempdir");
@@ -642,7 +692,9 @@ fn rollback_bulk_discards_the_session_and_restores_autocommit() {
         store.find_node(&node.id).expect("query").is_none(),
         "rolled-back rows must be gone"
     );
-    store.rollback_bulk().expect("rollback outside session is a no-op");
+    store
+        .rollback_bulk()
+        .expect("rollback outside session is a no-op");
 }
 
 /// Large graphs (django: 229 MB graph.db) thrash the default 2 MB page cache:

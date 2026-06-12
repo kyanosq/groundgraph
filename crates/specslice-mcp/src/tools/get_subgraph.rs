@@ -15,6 +15,14 @@ use crate::server::Server;
 
 use super::{object_schema, open_store, parse_edge_kinds, resolve_repo_root};
 
+/// Budgets for the BFS expansion. The whole subgraph is shipped back as a
+/// single JSON-RPC line, so an unbounded walk on a dense graph would buffer
+/// arbitrarily much memory and produce an unusable reply (issues.md #9).
+/// When a budget trips, the response carries `"truncated": true`.
+const MAX_SUBGRAPH_DEPTH: usize = 16;
+const MAX_SUBGRAPH_NODES: usize = 2_000;
+const MAX_SUBGRAPH_EDGES: usize = 8_000;
+
 pub fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: "get_subgraph",
@@ -75,7 +83,8 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .get("depth")
         .and_then(|v| v.as_u64())
         .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(SEARCH_DEFAULT_DEPTH);
+        .unwrap_or(SEARCH_DEFAULT_DEPTH)
+        .min(MAX_SUBGRAPH_DEPTH);
     let edge_kinds_filter = parse_edge_kinds(args.get("edge_kinds").unwrap_or(&Value::Null))?;
     let resolvers_filter = parse_resolvers(args.get("resolvers").unwrap_or(&Value::Null))?;
     let include_noise = args
@@ -105,13 +114,26 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
     let mut nodes_out: Vec<Value> = vec![node_to_json(&anchor)];
     let mut edges_out: Vec<Value> = Vec::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
+    let mut truncated = false;
 
-    while let Some((id, hop)) = queue.pop_front() {
+    'walk: while let Some((id, hop)) = queue.pop_front() {
         if hop >= depth {
             continue;
         }
         let aid = ArtifactId::new(id.clone());
-        for edge in store.list_edges_from(&aid)? {
+        let outgoing = store.list_edges_from(&aid)?.into_iter().map(|e| {
+            let other = e.to_id.clone();
+            (e, other)
+        });
+        let incoming = store.list_edges_to(&aid)?.into_iter().map(|e| {
+            let other = e.from_id.clone();
+            (e, other)
+        });
+        for (edge, other_id) in outgoing.chain(incoming) {
+            if nodes_out.len() >= MAX_SUBGRAPH_NODES || edges_out.len() >= MAX_SUBGRAPH_EDGES {
+                truncated = true;
+                break 'walk;
+            }
             let kind_str = edge.kind.as_str();
             if !allow_edge_kind.contains(kind_str) {
                 continue;
@@ -126,32 +148,9 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
             if seen_edges.insert(edge_id.clone()) {
                 edges_out.push(edge_to_json(&edge));
             }
-            let other = edge.to_id.to_string();
+            let other = other_id.to_string();
             if visited.insert(other.clone()) {
-                if let Some(n) = store.find_node(&edge.to_id)? {
-                    nodes_out.push(node_to_json(&n));
-                }
-                queue.push_back((other, hop + 1));
-            }
-        }
-        for edge in store.list_edges_to(&aid)? {
-            let kind_str = edge.kind.as_str();
-            if !allow_edge_kind.contains(kind_str) {
-                continue;
-            }
-            if !resolver_allowed(&edge, &resolvers_filter) {
-                continue;
-            }
-            if !include_noise && is_noise_calls(kind_str, edge.to_id.as_str()) {
-                continue;
-            }
-            let edge_id = edge.id.to_string();
-            if seen_edges.insert(edge_id.clone()) {
-                edges_out.push(edge_to_json(&edge));
-            }
-            let other = edge.from_id.to_string();
-            if visited.insert(other.clone()) {
-                if let Some(n) = store.find_node(&edge.from_id)? {
+                if let Some(n) = store.find_node(&other_id)? {
                     nodes_out.push(node_to_json(&n));
                 }
                 queue.push_back((other, hop + 1));
@@ -182,6 +181,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
     Ok(json!({
         "anchor_id": anchor.id.to_string(),
         "depth": depth,
+        "truncated": truncated,
         "nodes": nodes_out,
         "edges": edges_out,
     }))
@@ -280,10 +280,11 @@ fn is_noise_calls(kind: &str, to_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_resolvers, resolver_allowed};
+    use super::{call, parse_resolvers, resolver_allowed, MAX_SUBGRAPH_NODES};
+    use crate::server::Server;
     use serde_json::json;
     use specslice_core::{
-        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus, Node, NodeKind,
     };
 
     fn make_edge(indexer: Option<&str>) -> EdgeAssertion {
@@ -303,6 +304,57 @@ mod tests {
             index_generation: None,
             metadata_json: None,
         }
+    }
+
+    /// A dense graph must not be buffered wholesale into one JSON-RPC
+    /// line: the walk stops at the node budget and says so via
+    /// `truncated` (issues.md #9).
+    #[test]
+    fn bfs_stops_at_the_node_budget_and_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".specslice")).unwrap();
+        std::fs::write(dir.path().join(".specslice.yaml"), "{}\n").unwrap();
+        let mut store =
+            specslice_store::Store::open(dir.path().join(".specslice/graph.db")).unwrap();
+        store.migrate().unwrap();
+
+        let anchor = ArtifactId::new("dart_fn::lib/hub.dart#hub".to_string());
+        store
+            .upsert_node(&Node::new(anchor.clone(), NodeKind::DartFunction))
+            .unwrap();
+        let fan_out = MAX_SUBGRAPH_NODES + 500;
+        for i in 0..fan_out {
+            let to = ArtifactId::new(format!("dart_fn::lib/n{i}.dart#leaf{i}"));
+            store
+                .upsert_node(&Node::new(to.clone(), NodeKind::DartFunction))
+                .unwrap();
+            let mut edge = EdgeAssertion::fact(
+                anchor.clone(),
+                to,
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            );
+            edge.id = ArtifactId::new(format!("edge::{i}"));
+            store.upsert_edge(&edge).unwrap();
+        }
+
+        let server = Server::new(dir.path().to_path_buf());
+        let out = call(
+            &server,
+            &json!({ "node_id": anchor.to_string(), "depth": 3 }),
+        )
+        .unwrap();
+        let nodes = out["nodes"].as_array().unwrap();
+        assert!(
+            nodes.len() <= MAX_SUBGRAPH_NODES,
+            "node budget must hold: got {}",
+            nodes.len()
+        );
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "caller must learn the subgraph was cut short"
+        );
     }
 
     #[test]

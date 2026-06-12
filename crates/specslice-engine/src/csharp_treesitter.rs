@@ -332,7 +332,10 @@ namespace MyApp.Services
             "record collapses to class"
         );
         let methods = qnames(&s, NodeKind::CSharpMethod);
-        assert!(methods.contains(&"Greeter.Greet".to_string()), "{methods:?}");
+        assert!(
+            methods.contains(&"Greeter.Greet".to_string()),
+            "{methods:?}"
+        );
         assert!(
             methods.contains(&"Greeter.Greeter".to_string()),
             "constructor is a method named after the type: {methods:?}"

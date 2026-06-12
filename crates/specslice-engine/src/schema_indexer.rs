@@ -1614,8 +1614,10 @@ pub fn parse_java_entity_tables(text: &str) -> Vec<ParsedTable> {
 
     for (idx, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        let opens = i32::try_from(line.matches('{').count()).unwrap_or(i32::MAX);
-        let closes = i32::try_from(line.matches('}').count()).unwrap_or(i32::MAX);
+        // Braces inside string/char literals (`String p = "{";`) must not
+        // shift the depth, or every later field is misread as method-body
+        // noise (issues.md #10).
+        let (opens, closes) = brace_counts_outside_strings(line);
         if line.is_empty() || line.starts_with("//") || line.starts_with('*') {
             depth += opens - closes;
             continue;
@@ -2158,6 +2160,7 @@ pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
     // Only treat `@` that sit at *code* level as decorators — a `@router.post`
     // printed inside a docstring usage example or a `#` comment is documentation,
     // not a route (atagent regression: phantom `POST /` with no real handler).
+    let prefixes = collect_python_router_prefixes(text);
     for i in python_decorator_offsets(b) {
         let (dotted, after) = read_dotted_ident(b, i + 1);
         let Some(verb_kind) = python_decorator_verb(&dotted) else {
@@ -2178,10 +2181,15 @@ pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
             PyVerb::Websocket => "WS".to_string(),
             PyVerb::Route => python_methods_verb(body).unwrap_or_else(|| "GET".to_string()),
         };
+        // `@router.get(...)` serves under the router's `prefix=` (FastAPI) /
+        // `url_prefix=` (Flask Blueprint), like Java class-level
+        // `@RequestMapping` (issues2.md #45).
+        let recv = dotted.rsplit_once('.').map(|(r, _)| r).unwrap_or("");
+        let base = prefixes.get(recv).map(String::as_str).unwrap_or("");
         if let Some(method) = python_handler_after(b, end) {
             routes.push(ParsedRoute {
                 verb,
-                path: normalize_route("", &path),
+                path: normalize_route(base, &path),
                 class: String::new(),
                 method,
                 line: line_of(text, i),
@@ -2189,6 +2197,106 @@ pub fn parse_python_routes(text: &str) -> Vec<ParsedRoute> {
         }
     }
     routes
+}
+
+/// Map of router variable → route prefix, recovered from
+/// `name = APIRouter(prefix="/api/v1")` and
+/// `name = Blueprint("x", __name__, url_prefix="/admin")` assignments
+/// (issues2.md #45).
+fn collect_python_router_prefixes(text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let b = text.as_bytes();
+    for (ctor, kwarg) in [("APIRouter", "prefix"), ("Blueprint", "url_prefix")] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(ctor) {
+            let at = from + rel;
+            from = at + ctor.len();
+            // Whole-identifier match only (`MyAPIRouterFactory` must not hit).
+            if at > 0 && is_ident_byte(b[at - 1]) {
+                continue;
+            }
+            let after = at + ctor.len();
+            if after < b.len() && is_ident_byte(b[after]) {
+                continue;
+            }
+            let j = skip_ws(b, after);
+            if j >= b.len() || b[j] != b'(' {
+                continue;
+            }
+            let Some((body, _)) = balanced_parens(b, j) else {
+                continue;
+            };
+            let Some(target) = python_assign_target(b, at) else {
+                continue;
+            };
+            let Some(prefix) = python_kwarg_string(body, kwarg) else {
+                continue;
+            };
+            out.insert(target, prefix);
+        }
+    }
+    out
+}
+
+/// The identifier being assigned when `call_at` points at the callee of
+/// `name = Callee(...)`; `None` when the call is not a simple assignment.
+fn python_assign_target(b: &[u8], call_at: usize) -> Option<String> {
+    let mut i = call_at;
+    while i > 0 && (b[i - 1] == b' ' || b[i - 1] == b'\t') {
+        i -= 1;
+    }
+    if i == 0 || b[i - 1] != b'=' {
+        return None;
+    }
+    i -= 1;
+    // `==` is a comparison, not an assignment.
+    if i > 0 && b[i - 1] == b'=' {
+        return None;
+    }
+    while i > 0 && (b[i - 1] == b' ' || b[i - 1] == b'\t') {
+        i -= 1;
+    }
+    let end = i;
+    while i > 0 && is_ident_byte(b[i - 1]) {
+        i -= 1;
+    }
+    if i == end {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&b[i..end]).into_owned())
+}
+
+/// The string value of keyword argument `name` inside a call body
+/// (`prefix="/api/v1"`), or `None` when absent / non-literal.
+fn python_kwarg_string(body: &str, name: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
+        let after = at + name.len();
+        if !before_ok || (after < bytes.len() && is_ident_byte(bytes[after])) {
+            continue;
+        }
+        let j = skip_ws(bytes, after);
+        if j >= bytes.len() || bytes[j] != b'=' {
+            continue;
+        }
+        // `==` comparison guard.
+        if bytes.get(j + 1) == Some(&b'=') {
+            continue;
+        }
+        let k = skip_ws(bytes, j + 1);
+        let q = *bytes.get(k)?;
+        if q != b'"' && q != b'\'' {
+            continue;
+        }
+        let rest = &body[k + 1..];
+        let close = rest.find(q as char)?;
+        return Some(rest[..close].to_string());
+    }
+    None
 }
 
 /// Byte offsets of every `@` that sits at Python *code* level — i.e. not inside
@@ -2417,28 +2525,40 @@ fn parse_go_route_pattern(arg: &str) -> Option<(String, String)> {
 /// Concatenate the contents of every double-quoted or backtick-raw string
 /// literal in an expression, ignoring `+` operators and variable identifiers.
 fn concat_string_literals(expr: &str) -> String {
-    let b = expr.as_bytes();
+    // Char-wise, not byte-wise: bytes zero-extended UTF-8 continuation
+    // bytes into mojibake, and `\n` was "decoded" to the letter `n`,
+    // silently rewriting route paths (issues2.md #49). Only `\"` and `\\`
+    // decode; other escapes stay legible as written so the indexed path
+    // still greps against the source.
+    let chars: Vec<char> = expr.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'"' => {
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
                 let mut j = i + 1;
-                while j < b.len() && b[j] != b'"' {
-                    if b[j] == b'\\' && j + 1 < b.len() {
-                        out.push(b[j + 1] as char);
+                while j < chars.len() && chars[j] != '"' {
+                    if chars[j] == '\\' && j + 1 < chars.len() {
+                        match chars[j + 1] {
+                            '"' => out.push('"'),
+                            '\\' => out.push('\\'),
+                            other => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                        }
                         j += 2;
                         continue;
                     }
-                    out.push(b[j] as char);
+                    out.push(chars[j]);
                     j += 1;
                 }
                 i = j + 1;
             }
-            b'`' => {
+            '`' => {
                 let mut j = i + 1;
-                while j < b.len() && b[j] != b'`' {
-                    out.push(b[j] as char);
+                while j < chars.len() && chars[j] != '`' {
+                    out.push(chars[j]);
                     j += 1;
                 }
                 i = j + 1;
@@ -2915,20 +3035,23 @@ pub fn parse_dart_route_constants(text: &str) -> Vec<DartRouteConst> {
         if !is_ident(&name) {
             continue;
         }
-        let Some(path) = first_dart_string_literal(&text[eq + 1..]) else {
+        let Some(raw_path) = first_dart_string_literal(&text[eq + 1..]) else {
             continue;
         };
-        if !path.starts_with('/') || path.len() < 2 {
+        if !raw_path.starts_with('/') || raw_path.len() < 2 {
             continue;
         }
         let class_name = enclosing_dart_class(&classes, idx);
         if !is_route_table_class(&class_name) {
             continue;
         }
+        // Same placeholder normalization as the inline-call pipeline, so
+        // `/users/$id` and `/users/${id}` collapse onto one consumed node
+        // (issues2.md #31/#44).
         out.push(DartRouteConst {
             class_name,
             name,
-            path,
+            path: normalize_consumed_route_path(&raw_path),
         });
     }
     out
@@ -3433,11 +3556,29 @@ fn read_ident(b: &[u8], start: usize) -> (String, usize) {
 
 /// Given `bytes[open] == '('`, return the inner body (excluding the parens)
 /// and the index just past the matching `)`.
+///
+/// Parens inside string literals — `@GetMapping("/smile(")`, SQL
+/// `DEFAULT '('` — are content, not nesting (issues.md #11).
 fn balanced_parens(b: &[u8], open: usize) -> Option<(&str, usize)> {
     let mut depth = 0i32;
     let mut i = open;
+    let mut in_string = 0u8;
+    let mut escaped = false;
     while i < b.len() {
-        match b[i] {
+        let c = b[i];
+        if in_string != 0 {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == in_string {
+                in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => in_string = c,
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
@@ -3451,6 +3592,36 @@ fn balanced_parens(b: &[u8], open: usize) -> Option<(&str, usize)> {
         i += 1;
     }
     None
+}
+
+/// Count `{` / `}` on a Java source line, ignoring any inside string or
+/// char literals and anything behind a `//` comment.
+fn brace_counts_outside_strings(line: &str) -> (i32, i32) {
+    let mut opens = 0i32;
+    let mut closes = 0i32;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                in_string = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => in_string = Some(c),
+            '/' if chars.peek() == Some(&'/') => break,
+            '{' => opens += 1,
+            '}' => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
 }
 
 fn split_top_level_commas(body: &str) -> Vec<String> {
@@ -4193,6 +4364,86 @@ def dynamic():
         assert_eq!(legacy.path, "/legacy");
     }
 
+    /// issues2.md #49: the old byte-wise literal concat zero-extended UTF-8
+    /// continuation bytes into mojibake and "decoded" `\n` to `n` / `\x2f`
+    /// to `x`, silently corrupting route paths.
+    #[test]
+    fn concat_string_literals_is_utf8_safe_and_keeps_escapes_legible() {
+        // CJK path survives intact.
+        assert_eq!(concat_string_literals(r#""/api/用户""#), "/api/用户");
+        // Adjacent literals still concatenate.
+        assert_eq!(
+            concat_string_literals(r#""/api/" + "v1/users""#),
+            "/api/v1/users"
+        );
+        // Escaped quote and backslash decode…
+        assert_eq!(concat_string_literals(r#""a\"b""#), "a\"b");
+        assert_eq!(concat_string_literals(r#""a\\b""#), "a\\b");
+        // …while unknown escapes stay legible as written instead of being
+        // mangled into a different path (`\n` is NOT the letter n).
+        assert_eq!(concat_string_literals(r#""a\nb""#), "a\\nb");
+        assert_eq!(concat_string_literals(r#""v\x2f1""#), "v\\x2f1");
+        // Backtick raw literal keeps everything verbatim.
+        assert_eq!(concat_string_literals("`/raw/路径`"), "/raw/路径");
+    }
+
+    /// issues2.md #45: `APIRouter(prefix=...)` / `Blueprint(url_prefix=...)`
+    /// must propagate onto the decorated paths, the same way Java class-level
+    /// `@RequestMapping` and Go `Gin.Group()` prefixes already do.
+    #[test]
+    fn parse_python_routes_propagates_router_prefixes() {
+        let py = r#"
+from fastapi import APIRouter
+from flask import Blueprint
+
+router = APIRouter(prefix="/api/v1", tags=["users"])
+bp = Blueprint("admin", __name__, url_prefix="/admin")
+plain = APIRouter()
+
+@router.get("/users")
+def list_users():
+    return []
+
+@bp.route("/dashboard", methods=["GET"])
+def dashboard():
+    return "ok"
+
+@plain.get("/health")
+def health():
+    return "up"
+"#;
+        let routes = parse_python_routes(py);
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/users"),
+            "APIRouter prefix must apply, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/admin/dashboard"),
+            "Blueprint url_prefix must apply, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/health"),
+            "prefix-less router stays bare, got {paths:?}"
+        );
+    }
+
+    /// issues2.md #46 claimed `skip_python_string` misses a closing `"""`
+    /// at end-of-file; the bound is actually correct. Pin it.
+    #[test]
+    fn python_decorators_after_eof_adjacent_docstring_are_found() {
+        // The module docstring closes at the very last byte before the
+        // decorator block — and in the second sample the file *ends* with
+        // the closing quotes.
+        let py = "\"\"\"module doc\"\"\"\n@app.get(\"/x\")\ndef x():\n    return 1\n";
+        let routes = parse_python_routes(py);
+        assert_eq!(routes.len(), 1, "decorator after docstring: {routes:?}");
+
+        let trailing = "@app.get(\"/y\")\ndef y():\n    \"\"\"doc ends file\"\"\"";
+        let routes2 = parse_python_routes(trailing);
+        assert_eq!(routes2.len(), 1, "docstring at EOF: {routes2:?}");
+    }
+
     #[test]
     fn parse_python_routes_ignores_non_web_python() {
         let py = r#"
@@ -4424,6 +4675,30 @@ class ApiEndpoints {
             .unwrap();
         assert_eq!(sd.class_name, "ApiEndpoints");
         assert_eq!(sd.name, "styleDetail");
+    }
+
+    /// Interpolated path params in endpoint-table constants must normalize
+    /// to `:param` like the inline-call pipeline does, so `/users/$id` and
+    /// `/users/${id}` collapse onto one consumed node and the placeholder
+    /// drops out of cross-graph match keys (issues2.md #31/#44).
+    #[test]
+    fn parse_dart_route_constants_normalizes_interpolated_params() {
+        let dart = r#"
+class ApiEndpoints {
+  static const String userDetail = '/member/users/$userId';
+  static const String orderItem = '/order/orders/${orderId}';
+}
+"#;
+        let routes = parse_dart_route_constants(dart);
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/member/users/:param"),
+            "dollar-identifier must placeholder, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/order/orders/:param"),
+            "braced interpolation must placeholder, got {paths:?}"
+        );
     }
 
     #[test]
@@ -4963,6 +5238,56 @@ public class CraftConflict implements Serializable {
     fn non_entity_java_yields_no_tables() {
         let java = "public class CraftConflictController { public void foo() {} }";
         assert!(parse_java_entity_tables(java).is_empty());
+    }
+
+    #[test]
+    fn entity_fields_after_a_braced_string_literal_are_still_columns() {
+        // `"{"` inside a field initialiser used to be counted as a real
+        // brace, so the depth drifted to 2 and every later field was
+        // misread as method-body noise (issues.md #10).
+        let java = r#"
+import com.baomidou.mybatisplus.annotation.TableId;
+
+@TableName("demo")
+public class Demo implements Serializable {
+
+    @TableId
+    private Integer id;
+
+    private String jsonPrefix = "{";
+
+    private Integer afterBrace;
+}
+"#;
+        let tables = parse_java_entity_tables(java);
+        assert_eq!(tables.len(), 1);
+        let names: Vec<&str> = tables[0].columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"after_brace"),
+            "field after the braced literal must still be a column: {names:?}"
+        );
+    }
+
+    #[test]
+    fn balanced_parens_skips_parens_inside_string_literals() {
+        // Route annotations regularly carry parens in their path strings —
+        // `@GetMapping("/smile(")` — the old counter treated them as real
+        // nesting and never found the close (issues.md #11).
+        let b = br#"("/smile(" , handler)"#;
+        let (body, end) = balanced_parens(b, 0).expect("must close at the real `)`");
+        assert_eq!(body, r#""/smile(" , handler"#);
+        assert_eq!(end, b.len());
+
+        // Single-quoted SQL strings too: `DEFAULT '('` inside a column body.
+        let b = b"(x INT DEFAULT '(', y INT)";
+        let (body, _) = balanced_parens(b, 0).expect("close");
+        assert_eq!(body, "x INT DEFAULT '(', y INT");
+
+        // Balanced input without strings keeps working.
+        let b = b"(a, (b, c), d)";
+        let (body, end) = balanced_parens(b, 0).expect("close");
+        assert_eq!(body, "a, (b, c), d");
+        assert_eq!(end, b.len());
     }
 
     #[test]

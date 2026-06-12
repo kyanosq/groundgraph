@@ -9,7 +9,7 @@ pub fn run_propose(repo_root: &Path, out: Option<&Path>, pretty: bool) -> Result
     let pack = propose_evidence(repo_root)?;
     let serialised = serialise_evidence(&pack, pretty)?;
     match out {
-        Some(path) => write_to(path, &serialised)?,
+        Some(path) => super::output::write_atomic(path, &serialised)?,
         None => println!("{}", serialised),
     }
     Ok(())
@@ -49,18 +49,6 @@ fn serialise_evidence(pack: &EvidencePack, pretty: bool) -> Result<String> {
         serde_json::to_string(pack)
     };
     json.context("serialising evidence pack to JSON")
-}
-
-fn write_to(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent of {}", path.display()))?;
-        }
-    }
-    std::fs::write(path, body)
-        .with_context(|| format!("writing evidence pack to {}", path.display()))?;
-    Ok(())
 }
 
 fn print_human(outcome: &ApplyOutcome) {

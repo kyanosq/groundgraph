@@ -42,6 +42,23 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    /// Every variant, in declaration order. Single source of truth for
+    /// `from_str` — decoders never re-implement the text→kind map.
+    pub const ALL: &'static [EdgeKind] = &[
+        EdgeKind::Contains,
+        EdgeKind::Imports,
+        EdgeKind::Documents,
+        EdgeKind::DeclaresImplementation,
+        EdgeKind::DeclaresVerification,
+        EdgeKind::References,
+        EdgeKind::Calls,
+        EdgeKind::ReadsProvider,
+        EdgeKind::NavigatesTo,
+        EdgeKind::PersistsTo,
+        EdgeKind::SubscribesStream,
+        EdgeKind::DerivesFrom,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeKind::Contains => "contains",
@@ -58,6 +75,12 @@ impl EdgeKind {
             EdgeKind::DerivesFrom => "derives_from",
         }
     }
+
+    /// Inverse of [`EdgeKind::as_str`]; `None` for unknown strings.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<EdgeKind> {
+        EdgeKind::ALL.iter().copied().find(|k| k.as_str() == s)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,6 +94,14 @@ pub enum EdgeSource {
 }
 
 impl EdgeSource {
+    pub const ALL: &'static [EdgeSource] = &[
+        EdgeSource::Filesystem,
+        EdgeSource::LanguageAdapter,
+        EdgeSource::Markdown,
+        EdgeSource::ExternalManifest,
+        EdgeSource::GitDiff,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeSource::Filesystem => "filesystem",
@@ -79,6 +110,12 @@ impl EdgeSource {
             EdgeSource::ExternalManifest => "external_manifest",
             EdgeSource::GitDiff => "git_diff",
         }
+    }
+
+    /// Inverse of [`EdgeSource::as_str`]; `None` for unknown strings.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<EdgeSource> {
+        EdgeSource::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 }
 
@@ -90,11 +127,19 @@ pub enum EdgeCertainty {
 }
 
 impl EdgeCertainty {
+    pub const ALL: &'static [EdgeCertainty] = &[EdgeCertainty::Fact, EdgeCertainty::Declared];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeCertainty::Fact => "fact",
             EdgeCertainty::Declared => "declared",
         }
+    }
+
+    /// Inverse of [`EdgeCertainty::as_str`]; `None` for unknown strings.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<EdgeCertainty> {
+        EdgeCertainty::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 }
 
@@ -106,11 +151,19 @@ pub enum EdgeStatus {
 }
 
 impl EdgeStatus {
+    pub const ALL: &'static [EdgeStatus] = &[EdgeStatus::Confirmed, EdgeStatus::Deprecated];
+
     pub fn as_str(self) -> &'static str {
         match self {
             EdgeStatus::Confirmed => "confirmed",
             EdgeStatus::Deprecated => "deprecated",
         }
+    }
+
+    /// Inverse of [`EdgeStatus::as_str`]; `None` for unknown strings.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<EdgeStatus> {
+        EdgeStatus::ALL.iter().copied().find(|k| k.as_str() == s)
     }
 }
 
@@ -200,6 +253,27 @@ mod tests {
 
         assert_eq!(EdgeStatus::Confirmed.as_str(), "confirmed");
         assert_eq!(EdgeStatus::Deprecated.as_str(), "deprecated");
+    }
+
+    #[test]
+    fn edge_enums_from_str_round_trip_all_variants() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(EdgeKind::from_str(kind.as_str()), Some(*kind));
+        }
+        for source in EdgeSource::ALL {
+            assert_eq!(EdgeSource::from_str(source.as_str()), Some(*source));
+        }
+        for certainty in EdgeCertainty::ALL {
+            assert_eq!(
+                EdgeCertainty::from_str(certainty.as_str()),
+                Some(*certainty)
+            );
+        }
+        for status in EdgeStatus::ALL {
+            assert_eq!(EdgeStatus::from_str(status.as_str()), Some(*status));
+        }
+        assert_eq!(EdgeKind::from_str("nope"), None);
+        assert_eq!(EdgeSource::from_str(""), None);
     }
 
     #[test]

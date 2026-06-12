@@ -7,7 +7,7 @@
 //! command renders those accepted claims — with their real code/doc/test
 //! evidence resolved from the graph — into Markdown (or JSON / text).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use specslice_engine::business_doc::{
@@ -57,22 +57,11 @@ pub fn run(args: BusinessDocRunArgs) -> Result<()> {
 
     match args.out.as_deref() {
         Some(path) => {
-            write_to(path, &rendered)?;
+            super::output::write_atomic(path, &rendered)?;
             eprintln!("已写入业务文档: {}", path.display());
         }
         None => println!("{rendered}"),
     }
-    Ok(())
-}
-
-fn write_to(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent of {}", path.display()))?;
-        }
-    }
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
