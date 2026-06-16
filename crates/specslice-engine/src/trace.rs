@@ -20,7 +20,7 @@ use specslice_core::{ArtifactId, NodeKind};
 use specslice_store::Store;
 
 use crate::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
-use crate::search::{run_search_with_store, SearchOptions};
+use crate::search::{run_search_with_store, SearchMatch, SearchOptions};
 
 /// Edge kinds the forward closure follows. A curated subset of
 /// [`crate::search::EXPANSION_EDGE_KINDS`] that excludes the purely structural
@@ -154,14 +154,38 @@ pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> Result<Trac
     search_opts.limit = options.max_seeds.max(1);
     let search = run_search_with_store(store, search_opts)
         .with_context(|| format!("resolving trace seeds for `{}`", options.query))?;
-    let seeds: Vec<ArtifactId> = search
-        .matches
-        .iter()
-        .take(options.max_seeds.max(1))
-        .map(|m| ArtifactId::new(m.id.clone()))
-        .collect();
+    let seeds = select_seeds(&search.matches, &options.query, options.max_seeds);
 
     trace_forward(store, &options, seeds)
+}
+
+/// Choose trace seeds from ranked search matches.
+///
+/// When the query *exactly* names one or more symbols (case-insensitive match
+/// on the symbol label), trace ONLY those — that is the overwhelmingly common
+/// "trace THIS symbol" intent. Otherwise fall back to the top `max_seeds` fuzzy
+/// matches (genuinely ambiguous keyword queries still fan out).
+///
+/// Without the exact-name pin, a precise single-symbol closure (e.g.
+/// `evaluate_research_guardrails`) is polluted by unrelated symbols that merely
+/// share a token (every `_write_artifacts` in the repo gets seeded), forcing the
+/// caller/agent to re-filter the closure by hand — which negates `trace`'s
+/// whole one-command advantage over chaining greps.
+fn select_seeds(matches: &[SearchMatch], query: &str, max_seeds: usize) -> Vec<ArtifactId> {
+    let q = query.trim();
+    let exact: Vec<&SearchMatch> = matches
+        .iter()
+        .filter(|m| m.label.eq_ignore_ascii_case(q))
+        .collect();
+    let chosen: Vec<&SearchMatch> = if exact.is_empty() {
+        matches.iter().take(max_seeds.max(1)).collect()
+    } else {
+        exact
+    };
+    chosen
+        .into_iter()
+        .map(|m| ArtifactId::new(m.id.clone()))
+        .collect()
 }
 
 /// The pure BFS — separated so tests can drive it against a hand-built store.
@@ -301,6 +325,76 @@ mod tests {
         let mut n = Node::new(ArtifactId::new(id), NodeKind::JavaMethod);
         n.path = Some(path.to_string());
         n
+    }
+
+    fn search_match(id: &str, label: &str, score: i32) -> SearchMatch {
+        SearchMatch {
+            id: id.to_string(),
+            kind: "python_function".to_string(),
+            label: label.to_string(),
+            path: None,
+            line_range: None,
+            score,
+            source: None,
+            match_reasons: Vec::new(),
+            framework_role: None,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn exact_name_query_pins_seeds_dropping_fuzzy_siblings() {
+        // A precise "trace THIS symbol" query must seed ONLY the exact-name
+        // hit; same-token siblings (which `search` also returns) would drag in
+        // unrelated downstream closures.
+        let matches = vec![
+            search_match(
+                "python::a.py::evaluate_research_guardrails",
+                "evaluate_research_guardrails",
+                155,
+            ),
+            search_match("python::b.py::_write_artifacts", "_write_artifacts", 40),
+            search_match(
+                "python::c.py::evaluate_research_guardrails_helper",
+                "evaluate_research_guardrails_helper",
+                30,
+            ),
+        ];
+        let seeds = select_seeds(&matches, "evaluate_research_guardrails", 6);
+        assert_eq!(
+            seeds.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec!["python::a.py::evaluate_research_guardrails"],
+            "exact-name query must pin to the single exact symbol"
+        );
+    }
+
+    #[test]
+    fn fuzzy_query_without_exact_match_keeps_top_n() {
+        let matches = vec![
+            search_match("python::a.py::alpha", "alpha", 50),
+            search_match("python::b.py::beta", "beta", 40),
+            search_match("python::c.py::gamma", "gamma", 30),
+        ];
+        // No label equals the keyword phrase → keep the top `max_seeds` fan-out.
+        let seeds = select_seeds(&matches, "greek letters", 2);
+        assert_eq!(seeds.len(), 2, "fuzzy query keeps top max_seeds seeds");
+    }
+
+    #[test]
+    fn exact_name_match_is_case_insensitive_and_traces_all_definitions() {
+        // Two real definitions of the same name (e.g. overloaded across files)
+        // are both legitimate seeds; casing must not matter.
+        let matches = vec![
+            search_match("rust::a.rs::Build", "Build", 10),
+            search_match("rust::b.rs::build", "build", 10),
+            search_match("rust::c.rs::build_all", "build_all", 9),
+        ];
+        let seeds = select_seeds(&matches, "build", 6);
+        assert_eq!(
+            seeds.len(),
+            2,
+            "all exact-name (case-insensitive) defs seed"
+        );
     }
 
     #[test]

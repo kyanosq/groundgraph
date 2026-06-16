@@ -64,6 +64,36 @@
         "key": "DEAD",
         "truth": ["bench_dead_alpha", "bench_dead_beta"]
       }
+    },
+    {
+      "id": "t6_biz_guardrail_closure",
+      "bucket": "business-logic assembly / cross-symbol closure (real domain repo)",
+      "workspace": "/Users/qjs/Code/Projects/specslice-bench/mq",
+      "_oracle": "INDEPENDENT: hand-traced by reading src/metaquant/packages/research_guardrails.py (530 lines). The 17-fn downstream closure of evaluate_research_guardrails; the ONLY module fn excluded is guardrail_evaluation_to_dict (called by the CLI, NOT by the entry point). Domain term in docs is '防回测欺骗门禁 / anti-deception gate' but the code is named 'research_guardrails' — a real vocabulary gap. NB: `specslice trace` must use `--seeds 1` or its default 6-seed fuzzy match pollutes the closure (38 nodes).",
+      "prompt": "In this Python repo (MetaQuant, an A-share quant system), the research pipeline runs an automated anti-overfit / anti-backtest-deception guardrail that decides each candidate strategy's risk tier (strict_pass / watchlist / research_only / reject). Its entry point is the function `evaluate_research_guardrails` in `src/metaquant/packages/`. Identify the COMPLETE set of first-party (defined-in-this-repo) Python functions in its downstream call closure — every function it calls, directly or transitively, including the entry point itself. EXCLUDE dataclasses, the `*_to_dict` serializer (the entry point does NOT call it), standard-library / third-party calls, and test code. Reply on a single line in EXACTLY this format using bare function names: `FUNCS=<name1>,<name2>,...`",
+      "grade": {
+        "type": "set",
+        "key": "FUNCS",
+        "truth": [
+          "evaluate_research_guardrails",
+          "_evaluate_per_family",
+          "_family_for",
+          "family_key",
+          "_group_succeeded_rows",
+          "_strategy_report",
+          "_warnings",
+          "_with_bh_fdr",
+          "_risk_tags",
+          "_risk_tier",
+          "_one_sided_sign_test_p_value",
+          "_metric_values",
+          "_is_out_of_sample_period",
+          "_ratio_passed",
+          "_ratio",
+          "_coerce_float",
+          "_coerce_int"
+        ]
+      }
     }
   ]
 }

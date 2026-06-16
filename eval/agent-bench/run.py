@@ -157,9 +157,19 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
+    # Per-task overrides let one tasks.json target several repos (e.g. a Python
+    # business-logic repo alongside the Rust self-host). A task without its own
+    # `workspace` falls back to the global one.
+    for task in tasks:
+        tw = task.get("workspace")
+        if tw and not Path(tw).is_dir():
+            ap.error(f"task {task['id']} workspace not a directory: {tw!r}")
+
     summary: list[dict] = []
     n = 0
     for task in tasks:
+        task_ws = task.get("workspace") or workspace
+        task_to = int(task.get("timeout_secs", timeout_secs))
         for arm in arms:
             for seed in range(1, args.seeds + 1):
                 n += 1
@@ -169,9 +179,9 @@ def main(argv: list[str] | None = None) -> int:
                     arm=arm,
                     arm_nudge=arms_cfg[arm],
                     seed=seed,
-                    workspace=workspace,
+                    workspace=task_ws,
                     model=model,
-                    timeout_secs=timeout_secs,
+                    timeout_secs=task_to,
                     out_dir=args.out,
                 )
                 summary.append(res)

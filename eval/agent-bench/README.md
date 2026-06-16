@@ -32,6 +32,7 @@ auditable.
 | `t3_callers_detach` | relational callers | "which files call X" across the repo; set-graded P/R/F1 |
 | `t4_trace_kill_and_reap` | transitive call closure | downstream closure of `kill_and_reap` ({kill_tree, reap_within}); a deeper closure forces multi-hop reasoning |
 | `t5_deadcode_island` | whole-graph reachability / dead island | injected fixture: `bench_dead_beta` calls `bench_dead_alpha`, nothing calls `beta` → BOTH dead. Oracle = Rust compiler `never used` (flags both). grep's trap: `alpha` *is* textually referenced (by the equally-dead `beta`) |
+| `t6_biz_guardrail_closure` | business-logic assembly (real domain repo) | **runs against MetaQuant** (A-share quant, Python). The 17-fn downstream closure of the anti-backtest-deception guardrail (`evaluate_research_guardrails`). Oracle = hand-traced from the 530-line source; the only excluded module fn is the `*_to_dict` serializer the entry point never calls. Vocabulary gap: docs say "防回测欺骗门禁 / anti-deception gate", code says "guardrails" |
 
 ## Findings (composer-2.5, N≤3 seeds — anecdote, not proof)
 
@@ -63,13 +64,30 @@ auditable.
   Fix: take the *last* `KEY=` and capture only the leading comma-run of bare
   identifiers (regression-locked in `score.py --selftest`). Lesson: a buggy
   grader silently maligns whichever arm phrases its answer chattily.
+- **t6 (business logic, MetaQuant) also ties at 1.00 — and exposed a specslice
+  default bug.** Both arms perfectly enumerated the 17-fn guardrail closure
+  (grep reads the 530-line file and traces; specslice runs `trace`). But the
+  specslice arm was *not* cheaper: `specslice trace <symbol>` defaulted to 6
+  fuzzy seeds, so a bare trace of `evaluate_research_guardrails` pulled in
+  unrelated same-token symbols (`_write_artifacts` in three other scripts) and
+  blew the closure up to 38 nodes — forcing the agent to re-filter with grep +
+  `--json | python` + file reads. **Fix shipped** (`trace.rs::select_seeds`): an
+  exact-name query now pins to the exact symbol(s) only; a bare trace of the
+  guardrail entry dropped from *6 seeds / 38 nodes* to *1 seed / 20 nodes*
+  (unit-test-locked). This is the literal answer to "make business-logic lookup
+  more effective": the one-command closure is now trustworthy without manual
+  cleanup. (Agent-level tool counts still vary — composer-2.5 cross-checks
+  regardless — so the win is at the tool-output level, not yet a decisive
+  accuracy/effort gap at this scale.)
 - **Implication for the next iteration:** trivial fixtures don't separate the
   arms — a strong model reasons through small graphs with grep. To show a real
   *accuracy* gap you need **scale**: deep/wide call closures (10+ hops, fan-out),
   large dead clusters, or whole-repo reachability where reading every grep hit is
   infeasible. The honest thesis so far is narrow: *specslice wins when the answer
   requires separating real structure from textual noise at a scale that defeats
-  read-every-hit* (t2), and otherwise mostly ties on accuracy.
+  read-every-hit* (t2), and otherwise mostly ties on accuracy — though it has
+  twice now surfaced its own tool/usability bugs (t5 dead-island default, t6
+  trace-seed pollution), which is itself a payoff of running the benchmark.
 
 ## Setup (pinned, isolated workspace)
 
@@ -89,6 +107,17 @@ git -C "$SS" worktree add --detach /Users/qjs/Code/Projects/specslice-bench/wt H
 The `t5` fixture (`fixtures/_bench_deadcode_fixture.rs` + `setup_fixture.sh`)
 lives in this dir and is injected only into the disposable worktree — never the
 real crate. Its ground truth is whatever `cargo check` reports as `never used`.
+
+A task may override `workspace` (and `timeout_secs`) in `tasks.json` to target a
+*different* repo — `t6` runs against **MetaQuant** (a Python quant repo) to test
+real business-logic lookup, not just the Rust self-host. Set it up as a pinned,
+read-only worktree, reusing the already-built index so no re-index is needed:
+
+```bash
+MQ=/path/to/MetaQuant
+git -C "$MQ" worktree add --detach /Users/qjs/Code/Projects/specslice-bench/mq "$(git -C "$MQ" rev-parse HEAD)"
+cp -R "$MQ/.specslice" "$MQ/.specslice.yaml" /Users/qjs/Code/Projects/specslice-bench/mq/   # graph.db stores RELATIVE paths → portable
+```
 
 ## Run
 
