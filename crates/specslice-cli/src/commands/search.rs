@@ -88,7 +88,7 @@ pub fn run(args: SearchRunArgs) -> Result<()> {
             let out_path = resolve_html_output(&args.repo_root, &args.output, &result)?;
             super::output::write_atomic(&out_path, &html)
                 .with_context(|| format!("writing HTML to {}", out_path.display()))?;
-            println!("HTML 已生成: {}", out_path.display());
+            eprintln!("HTML 已生成: {}", out_path.display());
         }
         SearchFormat::Mermaid => {
             let mermaid = render_search_mermaid(&result);
@@ -164,7 +164,7 @@ fn write_or_stdout(
         Some(path) => {
             super::output::write_atomic(path, contents)
                 .with_context(|| format!("writing output to {}", path.display()))?;
-            println!("已写入: {}", path.display());
+            eprintln!("已写入: {}", path.display());
         }
         None => {
             print!("{contents}");
@@ -327,11 +327,36 @@ fn match_kind(name: &str) -> Result<NodeKind> {
     })
 }
 
+/// The content layer (FTS5) splits camelCase / snake_case identifiers into
+/// sub-tokens (and CJK runs into overlapping bigrams) before matching, so a
+/// query like `totalCents` actually searches comments/bodies for `total` +
+/// `cents`. The structural "分词" line shows the whole-identifier tokens, which
+/// hides that split — surfacing the sub-tokens makes the otherwise-invisible
+/// content matching explainable. Returns `None` when the sub-tokens add nothing
+/// over what is already shown (simple single-word queries), to avoid a
+/// redundant line.
+fn content_token_line(query: &str, structural: &[String]) -> Option<String> {
+    let content = specslice_engine::fts_text::fts_query_tokens(query);
+    if content.is_empty() {
+        return None;
+    }
+    let known: std::collections::HashSet<String> =
+        structural.iter().map(|t| t.to_lowercase()).collect();
+    let adds_new = content.iter().any(|t| !known.contains(t));
+    if !adds_new {
+        return None;
+    }
+    Some(format!("内容层分词: {}", content.join(", ")))
+}
+
 fn print_human(r: &SearchResult) {
     println!("SpecSlice search");
     println!("查询: {}", r.query);
     if !r.tokens.is_empty() {
         println!("分词: {}", r.tokens.join(", "));
+        if let Some(line) = content_token_line(&r.query, &r.tokens) {
+            println!("{line}");
+        }
     }
     println!();
     if r.matches.is_empty() {
@@ -572,6 +597,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // v0.3.0-A Phase 4 — CLI human renderer surfaces engine warnings.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_token_line_reveals_camelcase_subtokens() {
+        // `totalCents` is one structural token but the content layer searches
+        // for `total` + `cents`; the extra line must make that explicit.
+        let line = content_token_line("totalCents", &["totalcents".to_string()]);
+        assert_eq!(line, Some("内容层分词: total, cents".to_string()));
+    }
+
+    #[test]
+    fn content_token_line_silent_when_no_new_subtokens() {
+        // A single plain word tokenises to itself → nothing new to surface, so
+        // no redundant line.
+        assert_eq!(content_token_line("login", &["login".to_string()]), None);
+    }
 
     #[test]
     fn render_warnings_block_empty_returns_empty_string() {

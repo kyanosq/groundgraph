@@ -60,7 +60,8 @@ Future<int> main(List<String> argv) async {
     stdout.writeln(jsonEncode(SidecarErrorResponse(
       code: 'bad_request',
       message: 'failed to read or parse request JSON',
-      detail: '$e',
+      // #103: a PathNotFoundException embeds the absolute request path.
+      detail: sanitizeDiagnosticText('$e'),
     ).toJson()));
     return 2;
   }
@@ -72,7 +73,7 @@ Future<int> main(List<String> argv) async {
     stdout.writeln(jsonEncode(SidecarErrorResponse(
       code: 'bad_request_shape',
       message: 'request JSON does not match SidecarRequest contract',
-      detail: '$e',
+      detail: sanitizeDiagnosticText('$e'),
     ).toJson()));
     return 2;
   }
@@ -82,10 +83,15 @@ Future<int> main(List<String> argv) async {
     stdout.writeln(jsonEncode(batch.toJson()));
     return 0;
   } catch (e, st) {
+    // #103: the stack trace embeds absolute paths (…/Users/<name>/…) that would
+    // otherwise land in the graph's diagnostics + HTML reports. Keep the full
+    // trace on stderr (local debug channel) and serialise only the sanitised
+    // exception message.
+    stderr.writeln('walker_failed: $e\n$st');
     stdout.writeln(jsonEncode(SidecarErrorResponse(
       code: 'walker_failed',
       message: 'analyzer walker threw an exception',
-      detail: '$e\n$st',
+      detail: sanitizeDiagnosticText('$e'),
     ).toJson()));
     return 0; // Let the engine fall back gracefully.
   }

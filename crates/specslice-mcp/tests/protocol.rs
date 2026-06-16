@@ -117,14 +117,17 @@ fn dispatcher_tools_list_advertises_seven_tools_with_input_schemas() {
 
 #[test]
 fn packaged_skill_matches_mcp_launch_and_tool_contract() {
+    // #99: the shipped skill is now the single source `skills/specslice/SKILL.md`
+    // (the release script copies it; the drift-prone `packaging/skills` duplicate
+    // was removed). This contract test still guards that whatever we ship matches
+    // the live MCP launch command + tool list.
     let skill = std::fs::read_to_string(
         workspace_root()
-            .join("packaging")
             .join("skills")
             .join("specslice")
             .join("SKILL.md"),
     )
-    .expect("read packaged SpecSlice skill");
+    .expect("read SpecSlice skill (skills/specslice/SKILL.md)");
 
     assert!(
         skill.contains("specslice-mcp --repo-root /path/to/repo"),
@@ -182,6 +185,43 @@ fn dispatcher_unknown_tool_returns_invalid_params() {
     let value: Value = serde_json::from_str(&response_line).unwrap();
     assert_eq!(value["id"], 11);
     assert_eq!(value["error"]["code"], -32602);
+}
+
+#[test]
+fn dispatcher_validates_tool_arguments_against_input_schema() {
+    // #89: the dispatcher must enforce each tool's advertised `inputSchema`
+    // before invoking the handler, returning -32602 for a contract violation
+    // instead of silently dropping the offending field.
+    let server = Server::new(PathBuf::from("."));
+
+    // Wrong type: `depth` is declared `integer`, a string must be rejected.
+    let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_graph","arguments":{"query":"x","depth":"deep"}}}"#;
+    let v: Value = serde_json::from_str(&server.dispatch(raw).unwrap()).unwrap();
+    assert_eq!(
+        v["error"]["code"], -32602,
+        "wrong type → invalid params: {v}"
+    );
+
+    // Undeclared field with additionalProperties:false.
+    let raw = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"query":"x","bogus":1}}}"#;
+    let v: Value = serde_json::from_str(&server.dispatch(raw).unwrap()).unwrap();
+    assert_eq!(
+        v["error"]["code"], -32602,
+        "unknown field → invalid params: {v}"
+    );
+
+    // Missing required field (`node_id` for get_subgraph).
+    let raw = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_subgraph","arguments":{"depth":1}}}"#;
+    let v: Value = serde_json::from_str(&server.dispatch(raw).unwrap()).unwrap();
+    assert_eq!(
+        v["error"]["code"], -32602,
+        "missing required → invalid params: {v}"
+    );
+
+    // Enum violation for dead_code.min_confidence.
+    let raw = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"dead_code","arguments":{"min_confidence":"extreme"}}}"#;
+    let v: Value = serde_json::from_str(&server.dispatch(raw).unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], -32602, "bad enum → invalid params: {v}");
 }
 
 #[test]
@@ -290,4 +330,95 @@ fn end_to_end_initialize_list_search_against_watermark_fixture() {
         serde_json::from_str(dead_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert!(dead_payload["stats"].is_object());
     assert!(dead_payload["candidates"].is_array());
+}
+
+#[test]
+fn tools_call_round_trips_explain_context_drift_and_impact() {
+    // #222: explain_symbol / context_pack / check_drift / impact were never
+    // exercised through `tools/call`. Their schema validation, error wrapping
+    // and JSON serialization only ran in production, so a serde rename could
+    // silently return `{}` while CI stayed green. Drive each through the real
+    // dispatcher against the bootstrapped fixture.
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_fixture(tmp.path());
+    let server = Server::new(tmp.path().to_path_buf());
+
+    // Obtain a real node id from the indexed graph to anchor the symbol tools.
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_graph","arguments":{"query":"watermark","limit":5}}}"#;
+    let sv: Value = serde_json::from_str(&server.dispatch(search).expect("response")).unwrap();
+    let search_payload: Value =
+        serde_json::from_str(sv["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let node_id = search_payload["matches"][0]["id"]
+        .as_str()
+        .expect("at least one search match with an id")
+        .to_string();
+
+    let call_tool = |id: i64, name: &str, arguments: Value| -> Value {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        serde_json::from_str(&server.dispatch(&req.to_string()).expect("response")).unwrap()
+    };
+
+    // explain_symbol: must round-trip a structured node block for the id.
+    let ex = call_tool(2, "explain_symbol", json!({ "symbol_id": node_id }));
+    assert_eq!(ex["id"], 2);
+    assert_eq!(
+        ex["result"]["isError"].as_bool(),
+        Some(false),
+        "explain_symbol must succeed for an indexed node: {ex}"
+    );
+    let ex_payload: Value =
+        serde_json::from_str(ex["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        ex_payload["node"]["id"], node_id,
+        "explain_symbol echoes the node id"
+    );
+    assert!(
+        ex_payload["stats"].is_object(),
+        "explain_symbol emits stats"
+    );
+
+    // context_pack (symbol mode): must round-trip a non-empty pack.
+    let cp = call_tool(
+        3,
+        "context_pack",
+        json!({ "symbol_id": node_id, "include_snippets": false }),
+    );
+    assert_eq!(
+        cp["result"]["isError"].as_bool(),
+        Some(false),
+        "context_pack must succeed for an indexed symbol: {cp}"
+    );
+    let cp_payload: Value =
+        serde_json::from_str(cp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(cp_payload.is_object(), "context_pack returns a JSON object");
+
+    // check_drift: no args; runs consistency checks against the indexed store.
+    let cd = call_tool(4, "check_drift", json!({}));
+    assert_eq!(
+        cd["result"]["isError"].as_bool(),
+        Some(false),
+        "check_drift must succeed against a bootstrapped fixture: {cd}"
+    );
+    let cd_payload: Value =
+        serde_json::from_str(cd["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        cd_payload.is_object(),
+        "check_drift returns a findings report object"
+    );
+
+    // impact: the fixture tmp is not a git repo, so this primarily proves the
+    // dispatch → schema → error-wrapping → serialization path is intact. It
+    // must come back as a well-formed tool result (text content), never a
+    // transport-level crash, regardless of the git outcome.
+    let im = call_tool(5, "impact", json!({ "reindex": false }));
+    assert_eq!(im["id"], 5);
+    assert_eq!(
+        im["result"]["content"][0]["type"], "text",
+        "impact must return a well-formed text tool result: {im}"
+    );
 }

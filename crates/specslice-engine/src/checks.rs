@@ -829,7 +829,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }

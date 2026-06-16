@@ -167,6 +167,27 @@ impl EdgeStatus {
     }
 }
 
+/// Clamp a raw `confidence` into the `[0.0, 1.0]` invariant the rest of the
+/// system assumes (#63).
+///
+/// `confidence` is a `pub f32` on [`EdgeAssertion`], so an adapter (or a row
+/// written by an older build / external tool) can carry `NaN`, `±∞`, a negative
+/// value, or something `> 1.0`. A `NaN` is especially dangerous: it makes
+/// `partial_cmp` return `None`, so any future ranking that sorts edges by
+/// confidence would panic or produce a non-total order. `clamp` already folds
+/// `±∞` and out-of-range finites to the bounds; the only value it cannot fix is
+/// `NaN` (clamping `NaN` yields `NaN`), which we map to `1.0` — the same full
+/// confidence the [`EdgeAssertion::declared`] / [`EdgeAssertion::fact`]
+/// factories emit, since an edge only exists because some indexer asserted it.
+#[inline]
+pub fn sanitize_confidence(confidence: f32) -> f32 {
+    if confidence.is_nan() {
+        1.0
+    } else {
+        confidence.clamp(0.0, 1.0)
+    }
+}
+
 /// Row in the `edge_assertions` table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeAssertion {
@@ -177,6 +198,10 @@ pub struct EdgeAssertion {
     pub source: EdgeSource,
     pub certainty: EdgeCertainty,
     pub status: EdgeStatus,
+    /// Confidence in `[0.0, 1.0]`. Callers that compute a value should route it
+    /// through [`sanitize_confidence`] (or [`EdgeAssertion::with_confidence`]);
+    /// the store also sanitises on write and read so a stray `NaN`/out-of-range
+    /// value can never poison the graph (#63).
     pub confidence: f32,
     pub evidence_json: Option<String>,
     pub source_file: Option<String>,
@@ -189,7 +214,20 @@ pub struct EdgeAssertion {
 impl EdgeAssertion {
     /// Build a `Declared / Confirmed` edge with confidence 1.0.
     pub fn declared(from: ArtifactId, to: ArtifactId, kind: EdgeKind, source: EdgeSource) -> Self {
-        let id = ArtifactId::new(format!("edge::{}::{}::{}", kind.as_str(), from, to));
+        // Length-prefix `from` so the `from`/`to` boundary is unambiguous: node
+        // ids contain `::` (the `lang::file::qual` scheme; Rust/C++ qualified
+        // names), and a plain `from::to` join collides for distinct edges like
+        // (`a::b`→`c`) vs (`a`→`b::c`) — UPSERT would then drop one (#251). The
+        // length prefix makes the encoding injective while staying deterministic
+        // and debuggable.
+        let from_str = from.as_str();
+        let id = ArtifactId::new(format!(
+            "edge::{}::{}:{}::{}",
+            kind.as_str(),
+            from_str.len(),
+            from_str,
+            to
+        ));
         Self {
             id,
             from_id: from,
@@ -213,6 +251,20 @@ impl EdgeAssertion {
     pub fn fact(from: ArtifactId, to: ArtifactId, kind: EdgeKind, source: EdgeSource) -> Self {
         let mut edge = Self::declared(from, to, kind, source);
         edge.certainty = EdgeCertainty::Fact;
+        edge
+    }
+
+    /// Build a `Fact / Confirmed` edge with an explicit, [`sanitize_confidence`]d
+    /// confidence — for heuristic/derived edges that carry a sub-1.0 score.
+    pub fn with_confidence(
+        from: ArtifactId,
+        to: ArtifactId,
+        kind: EdgeKind,
+        source: EdgeSource,
+        confidence: f32,
+    ) -> Self {
+        let mut edge = Self::fact(from, to, kind, source);
+        edge.confidence = sanitize_confidence(confidence);
         edge
     }
 }
@@ -299,6 +351,36 @@ mod tests {
     }
 
     #[test]
+    fn declared_edge_id_has_no_from_to_boundary_collision() {
+        // #251: node ids legitimately contain `::` (the `lang::file::qual`
+        // scheme; Rust/C++ qualified names use `::`). A naive
+        // `edge::{kind}::{from}::{to}` join lets two *distinct* edges
+        // ((`a::b`→`c`) vs (`a`→`b::c`)) serialise to one id and UPSERT over
+        // each other, silently dropping an edge.
+        let mk = |from: &str, to: &str| {
+            EdgeAssertion::declared(
+                ArtifactId::new(from),
+                ArtifactId::new(to),
+                EdgeKind::Contains,
+                EdgeSource::Filesystem,
+            )
+            .id
+        };
+        assert_ne!(
+            mk("a::b", "c"),
+            mk("a", "b::c"),
+            "distinct (from,to) splits must not collide on one edge id"
+        );
+        // Determinism is preserved (same inputs → same id).
+        assert_eq!(mk("a::b", "c"), mk("a::b", "c"));
+        // A realistic Rust-style collision pair.
+        assert_ne!(
+            mk("rust::a.rs::Foo", "rust::a.rs::Bar"),
+            mk("rust::a.rs::Foo::rust::a.rs::Bar", ""),
+        );
+    }
+
+    #[test]
     fn fact_edge_changes_certainty_only() {
         let from = ArtifactId::new("a");
         let to = ArtifactId::new("b");
@@ -311,6 +393,48 @@ mod tests {
         assert_eq!(edge.certainty, EdgeCertainty::Fact);
         assert_eq!(edge.status, EdgeStatus::Confirmed);
         assert_eq!(edge.kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn sanitize_confidence_clamps_out_of_range_and_neutralises_nan() {
+        // In-range values pass through untouched.
+        assert_eq!(sanitize_confidence(0.0), 0.0);
+        assert_eq!(sanitize_confidence(0.78), 0.78);
+        assert_eq!(sanitize_confidence(1.0), 1.0);
+        // Out-of-range finites clamp to the bounds.
+        assert_eq!(sanitize_confidence(-0.5), 0.0);
+        assert_eq!(sanitize_confidence(1.5), 1.0);
+        assert_eq!(sanitize_confidence(1e30), 1.0);
+        // Infinities clamp; NaN folds to the declared-edge default 1.0 — and the
+        // result is always a total-order-safe, finite number in [0, 1].
+        assert_eq!(sanitize_confidence(f32::INFINITY), 1.0);
+        assert_eq!(sanitize_confidence(f32::NEG_INFINITY), 0.0);
+        assert_eq!(sanitize_confidence(f32::NAN), 1.0);
+        for raw in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0, 9.0, 0.4] {
+            let v = sanitize_confidence(raw);
+            assert!(v.is_finite() && (0.0..=1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn with_confidence_sanitises_and_is_a_fact_edge() {
+        let edge = EdgeAssertion::with_confidence(
+            ArtifactId::new("a"),
+            ArtifactId::new("b"),
+            EdgeKind::Calls,
+            EdgeSource::LanguageAdapter,
+            f32::NAN,
+        );
+        assert_eq!(edge.certainty, EdgeCertainty::Fact);
+        assert_eq!(edge.confidence, 1.0);
+        let edge = EdgeAssertion::with_confidence(
+            ArtifactId::new("a"),
+            ArtifactId::new("b"),
+            EdgeKind::Calls,
+            EdgeSource::LanguageAdapter,
+            2.5,
+        );
+        assert_eq!(edge.confidence, 1.0);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 use rusqlite::{params, Row};
 use serde::{Deserialize, Serialize};
 use specslice_core::{
-    ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus, Evidence,
-    EvidenceKind, Node, NodeKind, SymbolRange,
+    sanitize_confidence, ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource,
+    EdgeStatus, Evidence, EvidenceKind, Node, NodeKind, SymbolRange,
 };
 
 use crate::{Store, StoreError, StoreResult};
@@ -21,7 +21,22 @@ pub struct FileIndexEntry {
     pub index_generation: i64,
 }
 
-const SELECT_NODE_COLS: &str = "id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json";
+// Macro (not `const`) so `concat!` can fold the column list into the full
+// read SQL at compile time — `find_node` runs thousands of times per BFS, and
+// `format!`-building the same string each call is pure allocation (issues3.md
+// #157).
+macro_rules! select_node_cols {
+    () => {
+        "id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json"
+    };
+}
+const FIND_NODE_SQL: &str = concat!("SELECT ", select_node_cols!(), " FROM nodes WHERE id = ?1");
+const LIST_NODES_BY_KIND_SQL: &str = concat!(
+    "SELECT ",
+    select_node_cols!(),
+    " FROM nodes WHERE kind = ?1 ORDER BY id"
+);
+const LIST_ALL_NODES_SQL: &str = concat!("SELECT ", select_node_cols!(), " FROM nodes ORDER BY id");
 
 const SELECT_EDGE_COLS: &str = "id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json";
 
@@ -124,8 +139,10 @@ impl Store {
         // Read paths use `prepare_cached` too: `search` fan-out calls
         // `find_node` / `list_edges_from/to` thousands of times per query,
         // and re-parsing the SQL each call is pure overhead.
-        let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes WHERE id = ?1");
-        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(FIND_NODE_SQL)
+            .map_err(StoreError::sqlite)?;
         let mut rows = stmt
             .query(params![id.as_str()])
             .map_err(StoreError::sqlite)?;
@@ -137,8 +154,10 @@ impl Store {
     }
 
     pub fn list_nodes_by_kind(&self, kind: NodeKind) -> StoreResult<Vec<Node>> {
-        let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes WHERE kind = ?1 ORDER BY id");
-        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(LIST_NODES_BY_KIND_SQL)
+            .map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map(params![kind.as_str()], node_from_row)
             .map_err(StoreError::sqlite)?;
@@ -147,8 +166,10 @@ impl Store {
     }
 
     pub fn list_all_nodes(&self) -> StoreResult<Vec<Node>> {
-        let sql = format!("SELECT {SELECT_NODE_COLS} FROM nodes ORDER BY id");
-        let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(LIST_ALL_NODES_SQL)
+            .map_err(StoreError::sqlite)?;
         let rows = stmt
             .query_map([], node_from_row)
             .map_err(StoreError::sqlite)?;
@@ -218,7 +239,9 @@ impl Store {
                     values.push(val_text(edge.source.as_str()));
                     values.push(val_text(edge.certainty.as_str()));
                     values.push(val_text(edge.status.as_str()));
-                    values.push(rusqlite::types::Value::Real(f64::from(edge.confidence)));
+                    values.push(rusqlite::types::Value::Real(f64::from(sanitize_confidence(
+                        edge.confidence,
+                    ))));
                     values.push(val_opt_text(&edge.evidence_json));
                     values.push(val_opt_text(&edge.source_file));
                     values.push(val_opt_text(&edge.source_hash));
@@ -245,7 +268,7 @@ impl Store {
                 edge.source.as_str(),
                 edge.certainty.as_str(),
                 edge.status.as_str(),
-                edge.confidence as f64,
+                f64::from(sanitize_confidence(edge.confidence)),
                 edge.evidence_json,
                 edge.source_file,
                 edge.source_hash,
@@ -391,10 +414,20 @@ impl Store {
         start: u32,
         end: u32,
     ) -> StoreResult<Vec<SymbolRange>> {
-        let sql = format!("SELECT {SELECT_RANGE_COLS} FROM symbol_ranges WHERE file_path = ?1 AND start_line <= ?3 AND end_line >= ?2 ORDER BY start_line, end_line, symbol_id");
+        // Named params: the intersection mixes `start`/`end` across the two
+        // columns (`start_line <= :end AND end_line >= :start`), so positional
+        // `?2`/`?3` were easy to transpose by accident (#178).
+        let sql = format!(
+            "SELECT {SELECT_RANGE_COLS} FROM symbol_ranges \
+             WHERE file_path = :file AND start_line <= :end AND end_line >= :start \
+             ORDER BY start_line, end_line, symbol_id"
+        );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(StoreError::sqlite)?;
         let rows = stmt
-            .query_map(params![file_path, start, end], symbol_range_from_row)
+            .query_map(
+                rusqlite::named_params! { ":file": file_path, ":start": start, ":end": end },
+                symbol_range_from_row,
+            )
             .map_err(StoreError::sqlite)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::sqlite)
@@ -492,8 +525,12 @@ impl Store {
         let references = EdgeKind::References.as_str();
         self.with_write_tx(|tx| {
             let mut removed = 0usize;
+            // `prepare_cached`: SCIP suppression calls this once per source file
+            // (django: 3026), and the SQL is a single literal — re-parsing it
+            // each call bypasses the 64-entry statement cache the rest of the
+            // ingest path relies on (issues3.md #136).
             let mut stmt = tx
-                .prepare(
+                .prepare_cached(
                     "DELETE FROM edge_assertions \
                      WHERE source_file = ?1 \
                        AND kind IN (?2, ?3) \
@@ -539,6 +576,14 @@ impl Store {
                     .map_err(StoreError::sqlite)?;
                 inserted += 1;
             }
+            drop(stmt);
+            // Each `DELETE`+`INSERT` batch leaves FTS5 b-tree segments behind;
+            // without merging them, repeated `specslice index` runs (CI / nightly)
+            // let segment count grow unbounded and `MATCH` / `bm25()` slow down.
+            // FTS5's `'optimize'` command merges all segments into one — run it
+            // once per rebuild, after every row is in (issues3.md #138).
+            tx.execute("INSERT INTO node_fts(node_fts) VALUES('optimize')", [])
+                .map_err(StoreError::sqlite)?;
             Ok(inserted)
         })
     }
@@ -550,9 +595,12 @@ impl Store {
         if match_expr.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        // `prepare_cached`: every `search` runs two passes (all-tokens +
+        // any-token) and `checks` adds more — the SQL is a single literal, so
+        // re-parsing it each call is pure overhead (issues3.md #155).
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT node_id, bm25(node_fts) AS rank FROM node_fts \
                  WHERE node_fts MATCH ?1 ORDER BY rank, node_id LIMIT ?2",
             )
@@ -649,9 +697,11 @@ fn edge_from_row(row: &Row<'_>) -> Result<EdgeAssertion, rusqlite::Error> {
         certainty: parse_edge_certainty(&row.get::<_, String>(5)?)?,
         status: parse_edge_status(&row.get::<_, String>(6)?)?,
         // SQLite stores REAL as f64; our domain type is f32. Closest-value
-        // rounding is the desired behaviour for confidences in [0,1].
+        // rounding is the desired behaviour for confidences in [0,1]. Sanitise
+        // on read too (#63) so a row written by an older build / external tool
+        // with NaN/±∞/out-of-range can never reach a downstream comparator.
         #[allow(clippy::cast_possible_truncation)]
-        confidence: row.get::<_, f64>(7)? as f32,
+        confidence: sanitize_confidence(row.get::<_, f64>(7)? as f32),
         evidence_json: row.get(8)?,
         source_file: row.get(9)?,
         source_hash: row.get(10)?,
@@ -789,6 +839,54 @@ mod decode_tests {
     }
 
     #[test]
+    fn upsert_edge_sanitises_out_of_range_and_nan_confidence() {
+        // #63: `EdgeAssertion.confidence` is a `pub f32`, so a caller can hand
+        // the store NaN / ±∞ / negative / >1 values. The store must persist a
+        // finite value in [0, 1] (read back via the normal decode path) so no
+        // downstream comparator ever sees a non-total-ordered confidence.
+        let mut store = fresh_store();
+        let cases = [
+            (f32::NAN, 1.0_f32),
+            (f32::INFINITY, 1.0),
+            (f32::NEG_INFINITY, 0.0),
+            (-0.25, 0.0),
+            (2.5, 1.0),
+            (0.42, 0.42),
+        ];
+        for (i, (raw, _want)) in cases.iter().enumerate() {
+            let mut edge = EdgeAssertion::declared(
+                ArtifactId::new(format!("n{i}")),
+                ArtifactId::new("b"),
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            );
+            edge.id = ArtifactId::new(format!("conf-{i}"));
+            edge.confidence = *raw;
+            // Exercise both write paths: single + bulk.
+            if i % 2 == 0 {
+                store.upsert_edge(&edge).unwrap();
+            } else {
+                store
+                    .upsert_edges_bulk(std::slice::from_ref(&edge))
+                    .unwrap();
+            }
+        }
+        let edges = store.list_all_edges().expect("edges decode");
+        for (i, (_, want)) in cases.iter().enumerate() {
+            let got = edges
+                .iter()
+                .find(|e| e.id.as_str() == format!("conf-{i}"))
+                .unwrap_or_else(|| panic!("conf-{i} missing"));
+            assert!(
+                got.confidence.is_finite() && (0.0..=1.0).contains(&got.confidence),
+                "conf-{i}: {} out of invariant",
+                got.confidence
+            );
+            assert_eq!(got.confidence, *want, "conf-{i} sanitised value");
+        }
+    }
+
+    #[test]
     fn parse_edge_source_rejects_unknown_value() {
         let store = fresh_store();
         store
@@ -871,60 +969,32 @@ mod decode_tests {
     #[test]
     fn node_from_row_recognises_all_kinds_and_rejects_unknown() {
         let store = fresh_store();
-        let kinds = [
-            "file",
-            "requirement",
-            "acceptance_criterion",
-            "adr",
-            "doc_section",
-            "dart_class",
-            "dart_method",
-            "dart_function",
-            "dart_constructor",
-            "test_case",
-            "test_group",
-            "dart_provider",
-            "route",
-            "storage",
-            "business_candidate",
-            "swift_class",
-            "swift_struct",
-            "swift_enum",
-            "swift_protocol",
-            "swift_method",
-            "swift_function",
-            "swift_initializer",
-            "go_struct",
-            "go_interface",
-            "go_method",
-            "go_function",
-            "rust_module",
-            "rust_struct",
-            "rust_enum",
-            "rust_trait",
-            "rust_function",
-            "rust_method",
-            "c_function",
-            "c_struct",
-            "c_enum",
-            "cpp_namespace",
-            "cpp_class",
-            "cpp_struct",
-            "cpp_enum",
-            "cpp_function",
-            "cpp_method",
-        ];
+        // Iterate the single source of truth instead of a hand-maintained
+        // list — a new `NodeKind` variant is then automatically exercised
+        // here, so a missing decode branch can never slip through silently.
+        let kinds = specslice_core::NodeKind::ALL;
+        assert!(kinds.len() >= 80, "NodeKind::ALL unexpectedly small");
         for (i, k) in kinds.iter().enumerate() {
             store
                 .conn
                 .execute(
                     "INSERT INTO nodes (id, kind) VALUES (?1, ?2)",
-                    params![format!("nk-{i}"), k],
+                    params![format!("nk-{i}"), k.as_str()],
                 )
                 .unwrap();
         }
         let nodes = store.list_all_nodes().unwrap();
         assert_eq!(nodes.len(), kinds.len());
+        // Every variant round-trips back to a recognised kind.
+        let seen: std::collections::BTreeSet<&str> =
+            nodes.iter().map(|n| n.kind.as_str()).collect();
+        for k in kinds {
+            assert!(
+                seen.contains(k.as_str()),
+                "{} did not round-trip",
+                k.as_str()
+            );
+        }
 
         store
             .conn

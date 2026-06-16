@@ -174,11 +174,14 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
     let root_uri = path_to_file_uri(&options.repo_root);
     if let Err(err) = client.initialize(&root_uri) {
         return Ok(LspIndexOutcome::Skipped {
-            reason: format!(
-                "{} LSP `{}` initialize 失败：{}",
-                profile.language,
-                command,
-                flatten_error_message(&err)
+            reason: with_server_stderr(
+                format!(
+                    "{} LSP `{}` initialize 失败：{}",
+                    profile.language,
+                    command,
+                    flatten_error_message(&err)
+                ),
+                &client.captured_stderr(),
             ),
             language: profile.language,
         });
@@ -210,6 +213,17 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
         batch.files.push(file_artifact.clone());
         stats.files += 1;
 
+        // Cap single-file reads: a giant vendored/generated file would be
+        // loaded whole into a String (and shipped to the LSP) and can OOM
+        // `specslice index` (#186). Skip past the index budget, like the
+        // tree-sitter/docs paths already do.
+        if crate::source_text::is_oversized_source(&file.absolute) {
+            push_partial_warning(
+                &mut stats,
+                &format!("跳过超大文件 {}（超过索引大小上限）", file.relative),
+            );
+            continue;
+        }
         let text = match std::fs::read_to_string(&file.absolute) {
             Ok(t) => t,
             Err(err) => {
@@ -324,6 +338,28 @@ fn flatten_error_message(err: &anyhow::Error) -> String {
         out.push_str(&cause.to_string());
     }
     out
+}
+
+/// Fold a server's captured stderr tail (#214) into a skip reason so the
+/// operator sees the server's *own* error (e.g. "sourcekitd crashed") rather
+/// than just our generic "initialize 失败". Blank tails are omitted; long
+/// tails are truncated on a UTF-8 boundary, keeping the most recent bytes.
+fn with_server_stderr(reason: String, server_stderr: &str) -> String {
+    let tail = server_stderr.trim();
+    if tail.is_empty() {
+        return reason;
+    }
+    const MAX: usize = 600;
+    let shown = if tail.len() > MAX {
+        let mut start = tail.len() - MAX;
+        while start < tail.len() && !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("…{}", &tail[start..])
+    } else {
+        tail.to_string()
+    };
+    format!("{reason}（server stderr: {shown}）")
 }
 
 /// Maximum number of detailed partial-warning segments kept in
@@ -712,6 +748,9 @@ fn discover_files(
 ) -> Result<Vec<DiscoveredFile>> {
     let mut out: Vec<DiscoveredFile> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
+    // Compile the (constant) exclude globs once instead of re-collecting each
+    // pattern's chars for every candidate file (#142).
+    let exclude = ExcludeGlobs::compile(exclude_globs);
     for code_root in code_roots {
         let abs_root = repo_root.join(code_root);
         if !abs_root.exists() {
@@ -747,7 +786,7 @@ fn discover_files(
             if profile.skip_suffixes.iter().any(|s| rel.ends_with(s)) {
                 continue;
             }
-            if exclude_globs.iter().any(|g| simple_glob_match(g, &rel)) {
+            if exclude.matches(&rel) {
                 continue;
             }
             // Also skip when any path segment is in skip_dirs (handles
@@ -757,6 +796,11 @@ fn discover_files(
                 continue;
             }
             if seen.insert(rel.clone(), ()).is_some() {
+                continue;
+            }
+            // Skip oversized files: read whole into a String + hashed + fed to
+            // the LSP; an accidental giant blob can OOM the indexer (#186).
+            if crate::source_text::is_oversized_source(path) {
                 continue;
             }
             let source = std::fs::read_to_string(path)
@@ -913,15 +957,52 @@ fn visit_symbols(
 /// `*` vs `**` distinction is explicit. Backtracking is fine for the
 /// patterns operators put in `.specslice.yaml` (a handful of segments
 /// at most).
+/// Single-pattern convenience over [`glob_match_chars`]. Production discovery
+/// uses the compiled [`ExcludeGlobs`] (#142); this remains as the readable
+/// reference the glob tests assert the compiled matcher against.
+#[cfg(test)]
 pub(crate) fn simple_glob_match(pattern: &str, path: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = path.chars().collect();
+    glob_match_chars(&pat, &txt)
+}
+
+/// Core matcher over pre-collected char slices. `simple_glob_match` and the
+/// compiled [`ExcludeGlobs`] both funnel here so they share identical semantics.
+fn glob_match_chars(pat: &[char], txt: &[char]) -> bool {
     // Failure memo: patterns with several `*`/`**` segments otherwise
     // backtrack exponentially (`**/**/**/x` vs a long path froze whole
     // index runs — issues2.md #50). State space is (pi, ti), so caching
     // failed states bounds the walk at O(P×T) cached entries.
     let mut failed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    glob_match_rec(&pat, 0, &txt, 0, &mut failed)
+    glob_match_rec(pat, 0, txt, 0, &mut failed)
+}
+
+/// Pre-compiled `exclude_globs`. `discover_files` checks every candidate file
+/// against the operator's globs; collecting each (constant) pattern into a
+/// `Vec<char>` on *every* call meant a 100k-file × 5-glob walk did millions of
+/// throwaway allocations (#142). Compiling the patterns once, and collecting
+/// each path's chars once per call (not once per glob), removes that churn while
+/// reusing the exact `simple_glob_match` semantics.
+pub(crate) struct ExcludeGlobs {
+    pats: Vec<Vec<char>>,
+}
+
+impl ExcludeGlobs {
+    pub(crate) fn compile(globs: &[String]) -> Self {
+        Self {
+            pats: globs.iter().map(|g| g.chars().collect()).collect(),
+        }
+    }
+
+    /// `true` if any glob matches `path`. An empty set matches nothing.
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        if self.pats.is_empty() {
+            return false;
+        }
+        let txt: Vec<char> = path.chars().collect();
+        self.pats.iter().any(|pat| glob_match_chars(pat, &txt))
+    }
 }
 
 fn glob_match_rec(
@@ -1018,6 +1099,44 @@ pub fn binary_on_path(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #214: when an LSP server fails to come up, its own stderr (captured by
+    /// the drainer) is the real cause — fold it into the skip reason instead of
+    /// just reporting "initialize failed". Empty tails are omitted.
+    #[test]
+    fn with_server_stderr_appends_captured_tail_when_present() {
+        let reason = "swift LSP `sourcekit-lsp` initialize 失败：timeout".to_string();
+        assert_eq!(
+            with_server_stderr(reason.clone(), "   \n  "),
+            reason,
+            "blank stderr must not append a noisy empty segment"
+        );
+
+        let enriched = with_server_stderr(reason.clone(), "fatal error: sourcekitd crashed\n");
+        assert!(enriched.starts_with(&reason));
+        assert!(
+            enriched.contains("server stderr:") && enriched.contains("sourcekitd crashed"),
+            "captured stderr must be surfaced, got: {enriched}"
+        );
+    }
+
+    /// A pathologically chatty server must not blow up the skip reason: the
+    /// tail is truncated, and truncation never splits a UTF-8 char.
+    #[test]
+    fn with_server_stderr_truncates_long_tail_on_char_boundary() {
+        let reason = "go LSP `gopls` 失败".to_string();
+        let tail = "日志".repeat(1000); // 6 KiB of multi-byte chars
+        let enriched = with_server_stderr(reason, &tail);
+        assert!(
+            enriched.len() < 1200,
+            "tail must be truncated, got {} bytes",
+            enriched.len()
+        );
+        assert!(enriched.contains('…'), "truncation marker expected");
+        // The fact that this owns a valid String already proves boundary-safety,
+        // but assert the tail content is intact Unicode.
+        assert!(enriched.contains('日'));
+    }
 
     fn dummy_qualify(file_rel: &str, parent: Option<&str>, name: &str) -> String {
         match parent {
@@ -1182,6 +1301,47 @@ mod tests {
         assert!(!simple_glob_match("**/.build/**", "Foo/Sources/lib.swift"));
         assert!(simple_glob_match("*.swift", "Hello.swift"));
         assert!(!simple_glob_match("*.swift", "Sources/Hello.swift"));
+    }
+
+    /// #142: the compiled `ExcludeGlobs` matcher must be byte-for-byte
+    /// equivalent to calling `simple_glob_match` per pattern — it only hoists
+    /// the (constant) pattern `Vec<char>` collection out of the per-file loop,
+    /// never changes the match semantics. Multi-pattern `matches` is the OR of
+    /// the individual patterns (a file is excluded if *any* glob matches).
+    #[test]
+    fn exclude_globs_compiled_matches_simple_glob_match() {
+        let cases = [
+            ("**/*.gen.go", "internal/api/users.gen.go"),
+            ("**/.build/**", "Foo/.build/release/lib.swift"),
+            ("**/.build/**", "Foo/Sources/lib.swift"),
+            ("*.swift", "Hello.swift"),
+            ("*.swift", "Sources/Hello.swift"),
+            ("src/?.rs", "src/a.rs"),
+            ("src/?.rs", "src/ab.rs"),
+            ("a/**/z.rs", "a/b/c/z.rs"),
+            ("literal.txt", "literal.txt"),
+            ("literal.txt", "other.txt"),
+        ];
+        for (pat, path) in cases {
+            let compiled = ExcludeGlobs::compile(&[pat.to_string()]);
+            assert_eq!(
+                compiled.matches(path),
+                simple_glob_match(pat, path),
+                "compiled vs per-call mismatch for ({pat:?}, {path:?})",
+            );
+        }
+
+        // Multi-pattern: OR semantics, and an empty set never excludes.
+        let globs = vec!["**/*.gen.go".to_string(), "*.swift".to_string()];
+        let compiled = ExcludeGlobs::compile(&globs);
+        for path in ["x/y.gen.go", "Hello.swift", "src/keep.rs"] {
+            let expected = globs.iter().any(|g| simple_glob_match(g, path));
+            assert_eq!(compiled.matches(path), expected, "OR mismatch for {path:?}");
+        }
+        assert!(
+            !ExcludeGlobs::compile(&[]).matches("anything/at/all.rs"),
+            "an empty exclude set excludes nothing",
+        );
     }
 
     /// issues2.md #50: a user glob with several `**` segments used to

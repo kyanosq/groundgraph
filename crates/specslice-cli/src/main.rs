@@ -139,6 +139,7 @@ enum Commands {
 #[derive(Debug, clap::Args)]
 struct TraceArgs {
     /// 端点 / 符号名（与 `search` 同款匹配），如 `selectCraftTree`。
+    #[arg(value_parser = non_empty_value)]
     query: String,
     /// 最大遍历深度（跳数），默认 12。
     #[arg(long, value_name = "N", default_value_t = 12)]
@@ -447,12 +448,19 @@ struct FeaturesArgs {
 
 #[derive(Debug, clap::Args)]
 struct SelectTestsArgs {
-    /// 基准分支 / commit (默认 main)。
-    #[arg(long, default_value = "main")]
+    /// 基准分支 / commit (默认 `origin/main`，与 `impact` 统一)。
+    // Unified with `impact` so switching between the two git-diff analyses is
+    // not a trap on a fresh clone (#112).
+    #[arg(long, default_value = "origin/main")]
     base: String,
     /// 目标分支 / commit (默认 HEAD)。
     #[arg(long, default_value = "HEAD")]
     head: String,
+    /// 用 `--base` 与当前工作树比较，而非已提交的 head，这样
+    /// `select-tests` 也能在未提交改动上运行（与 `impact --worktree`
+    /// 对齐，避免在两个 git-diff 分析之间切换时踩坑）。设置后忽略 `--head`。
+    #[arg(long)]
+    worktree: bool,
     /// 让算法沿反向 `Calls` / `References` 边再走几步，
     /// 把间接依赖的测试也纳入候选。默认关闭，因为
     /// 信号完整度依赖代码图本身的质量。
@@ -639,6 +647,7 @@ struct CandidateListArgs {
 #[derive(Debug, clap::Args)]
 struct CandidateShowArgs {
     /// 候选 id。
+    #[arg(value_parser = non_empty_value)]
     id: String,
     /// 输出 JSON。等价于 `--format json`，与显式 `--format` 互斥。
     #[arg(long, conflicts_with = "format")]
@@ -670,6 +679,7 @@ impl CandidateShowFormatArg {
 #[derive(Debug, clap::Args)]
 struct CandidateReviewArgs {
     /// 候选 id。
+    #[arg(value_parser = non_empty_value)]
     id: String,
     /// 接受 (accepted)。
     #[arg(long, group = "verdict")]
@@ -820,7 +830,9 @@ struct SearchArgs {
     /// `--format mermaid` 时直接写入指定路径（默认打印到 stdout）。
     /// 显式传入的路径不受 `.specslice/` 非侵入约束——这是用户主动
     /// 指定的输出位置；省略该参数时 SpecSlice 永远只写 `.specslice/`。
-    #[arg(long)]
+    // `--out` is the canonical name across all commands (#91); `--output`
+    // stays a hidden back-compat alias for existing scripts.
+    #[arg(long = "out", alias = "output", value_name = "FILE")]
     output: Option<PathBuf>,
     /// 保留 framework 噪声 calls（toString / build / dispose / …）。
     /// 默认过滤。
@@ -901,6 +913,7 @@ struct CheckArgs {
 #[derive(Debug, clap::Args)]
 struct ContextArgs {
     /// The requirement ID (e.g. `REQ-WATERMARK-001`).
+    #[arg(value_parser = non_empty_value)]
     requirement: String,
     /// Skip inlining doc/code/test source snippets.
     #[arg(long)]
@@ -936,7 +949,9 @@ struct ImpactArgs {
     #[arg(long, value_enum, default_value_t = ImpactFormatArg::Text)]
     format: ImpactFormatArg,
     /// `--format mermaid` 的输出文件路径；省略时打印到 stdout。
-    #[arg(long)]
+    // `--out` is the canonical name across all commands (#91); `--output`
+    // stays a hidden back-compat alias for existing scripts.
+    #[arg(long = "out", alias = "output", value_name = "FILE")]
     output: Option<std::path::PathBuf>,
 }
 
@@ -960,6 +975,7 @@ impl ImpactFormatArg {
 #[derive(Debug, clap::Args)]
 struct SliceArgs {
     /// The requirement ID (e.g. `REQ-WATERMARK-001`).
+    #[arg(value_parser = non_empty_value)]
     requirement: String,
     /// Output a machine-readable JSON document instead of human text.
     #[arg(long)]
@@ -995,6 +1011,18 @@ impl From<ExportFormatArg> for specslice_engine::ExportFormat {
         match value {
             ExportFormatArg::Jsonl => specslice_engine::ExportFormat::Jsonl,
         }
+    }
+}
+
+/// clap `value_parser` that rejects an empty / whitespace-only positional
+/// argument (#114). An empty id or query is never meaningful and otherwise
+/// reaches the engine as a silent zero-hit query (or a downstream unwrap); a
+/// usage error at parse time is the honest, scriptable response.
+fn non_empty_value(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("value must not be empty".to_string())
+    } else {
+        Ok(s.to_string())
     }
 }
 
@@ -1271,10 +1299,17 @@ fn dispatch(cli: Cli) -> Result<u8> {
         })
         .map(|()| 0),
         Commands::SelectTests(args) => {
+            // Empty head ref diffs `--base` against the working tree, mirroring
+            // `impact --worktree` so the two git-diff analyses behave the same.
+            let head = if args.worktree {
+                String::new()
+            } else {
+                args.head
+            };
             commands::select_tests::run(commands::select_tests::SelectTestsRunArgs {
                 repo_root: cli.repo_root.clone(),
                 base_ref: args.base,
-                head_ref: args.head,
+                head_ref: head,
                 include_dependent: args.include_deps,
                 max_propagation_depth: args.max_depth,
                 format: args.format,
@@ -1496,5 +1531,89 @@ mod tests {
         assert!(Cli::try_parse_from(["specslice", "search", "foo", "--format", "html"]).is_ok());
         assert!(Cli::try_parse_from(["specslice", "impact", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["specslice", "candidate", "show", "x", "--json"]).is_ok());
+    }
+
+    /// #114: an empty / whitespace-only positional id or query must be a parse
+    /// error (clap usage, exit 2), not forwarded to the engine as a zero-hit
+    /// query or a downstream unwrap.
+    #[test]
+    fn empty_positional_arguments_are_rejected() {
+        for argv in [
+            vec!["specslice", "trace", ""],
+            vec!["specslice", "slice", ""],
+            vec!["specslice", "context", ""],
+            vec!["specslice", "candidate", "show", ""],
+            vec!["specslice", "candidate", "review", "", "--accept"],
+            vec!["specslice", "trace", "   "],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?}: empty positional must be rejected"
+            );
+        }
+        // Non-empty values still parse.
+        assert!(Cli::try_parse_from(["specslice", "trace", "selectFoo"]).is_ok());
+        assert!(Cli::try_parse_from(["specslice", "slice", "REQ-1"]).is_ok());
+        assert!(Cli::try_parse_from(["specslice", "candidate", "show", "c1"]).is_ok());
+    }
+
+    /// #91: the file-output flag is `--out` on every command; `--output`
+    /// remains a back-compat alias on the two commands that historically used
+    /// it (`search`, `impact`).
+    #[test]
+    fn out_flag_is_unified_with_output_alias() {
+        assert!(Cli::try_parse_from(["specslice", "graph", "--out", "g.json"]).is_ok());
+        for flag in ["--out", "--output"] {
+            assert!(
+                Cli::try_parse_from(["specslice", "search", "q", flag, "s.html"]).is_ok(),
+                "search must accept {flag}"
+            );
+            assert!(
+                Cli::try_parse_from(["specslice", "impact", flag, "i.json"]).is_ok(),
+                "impact must accept {flag}"
+            );
+        }
+    }
+
+    /// #112: `select-tests` and `impact` are both git-diff analyses; their
+    /// default base ref must be unified so switching commands is not a trap.
+    #[test]
+    fn select_tests_and_impact_share_default_base_ref() {
+        let select_base = match Cli::try_parse_from(["specslice", "select-tests"])
+            .unwrap()
+            .command
+        {
+            Commands::SelectTests(a) => a.base,
+            other => panic!("expected select-tests, got {other:?}"),
+        };
+        let impact_base = match Cli::try_parse_from(["specslice", "impact"])
+            .unwrap()
+            .command
+        {
+            Commands::Impact(a) => a.base,
+            other => panic!("expected impact, got {other:?}"),
+        };
+        assert_eq!(select_base, "origin/main");
+        assert_eq!(select_base, impact_base, "default base ref must be unified");
+    }
+
+    /// `impact` and `select-tests` are both git-diff analyses; `impact` grew a
+    /// `--worktree` flag to run on uncommitted edits, so `select-tests` must
+    /// accept it too — otherwise switching between the two is a trap (#112).
+    #[test]
+    fn select_tests_accepts_worktree_like_impact() {
+        assert!(
+            Cli::try_parse_from(["specslice", "select-tests", "--base", "HEAD", "--worktree"])
+                .is_ok(),
+            "select-tests must accept --worktree for parity with impact"
+        );
+        let worktree = match Cli::try_parse_from(["specslice", "select-tests", "--worktree"])
+            .unwrap()
+            .command
+        {
+            Commands::SelectTests(a) => a.worktree,
+            other => panic!("expected select-tests, got {other:?}"),
+        };
+        assert!(worktree, "--worktree must set the worktree flag");
     }
 }

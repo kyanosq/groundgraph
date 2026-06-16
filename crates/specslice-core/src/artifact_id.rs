@@ -98,13 +98,20 @@ pub fn dart_group_id(path: &str, slug: &str) -> ArtifactId {
 pub fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_dash = true;
+    let mut has_non_ascii = false;
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
+        } else {
+            // Non-ASCII chars (emoji, CJK) are dropped from the slug entirely.
+            if !ch.is_ascii() {
+                has_non_ascii = true;
+            }
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
         }
     }
     while out.ends_with('-') {
@@ -112,6 +119,13 @@ pub fn slugify(text: &str) -> String {
     }
     if out.is_empty() {
         format!("s{:016x}", fnv1a64(text.as_bytes()))
+    } else if has_non_ascii {
+        // The slug dropped one or more non-ASCII chars, so two headings that
+        // differ only in those chars (`Rocket 🚀` vs `Rocket 🚀🚀`) would
+        // collide and UPSERT over each other. Append a content hash to keep
+        // them distinct — generalises issues2.md #53 (pure-CJK) to mixed
+        // ASCII+non-ASCII (#203).
+        format!("{out}-{:016x}", fnv1a64(text.as_bytes()))
     } else {
         out
     }
@@ -214,6 +228,23 @@ mod tests {
         // Truly empty inputs still need *some* stable non-empty slug.
         assert!(!slugify("").is_empty());
         assert_ne!(slugify("---"), slugify("自动水印放置"));
+    }
+
+    /// Headings that share an ASCII prefix but differ only in dropped
+    /// non-ASCII chars (emoji/CJK) must NOT collide — otherwise two doc
+    /// sections claim one id and UPSERT over each other (#203).
+    #[test]
+    fn slugify_disambiguates_mixed_ascii_and_non_ascii_collisions() {
+        let a = slugify("Rocket 🚀");
+        let b = slugify("Rocket 🚀🚀");
+        assert_ne!(a, b, "emoji-count difference must not collapse to one id");
+        assert!(a.starts_with("rocket-"), "keeps readable ascii stem: {a}");
+        assert!(b.starts_with("rocket-"), "keeps readable ascii stem: {b}");
+        assert_eq!(a, slugify("Rocket 🚀"), "must stay deterministic");
+        // A mixed CJK+ASCII heading is also disambiguated, not bare.
+        assert_ne!(slugify("登录 login"), slugify("登出 login"));
+        // Pure-ASCII slugs are unchanged (no hash suffix).
+        assert_eq!(slugify("Hello World"), "hello-world");
     }
 
     #[test]

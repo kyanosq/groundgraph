@@ -14,6 +14,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use specslice_engine::business_candidates::{apply_review, ReviewStatus, ReviewVerdict};
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::init::{init_repository, InitOptions};
@@ -71,46 +73,16 @@ fn sidecar_source_present() -> bool {
         .exists()
 }
 
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
-}
-
-fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
-    if !sidecar_source_present() || !dart_available() {
-        eprintln!("skipping: dart sidecar unavailable");
+fn setup_indexed_repo() -> Option<tempfile::TempDir> {
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p5_search_golden",
+    ) {
         return None;
     }
-    let on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -135,12 +107,12 @@ fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
         result.resolver_used, RESOLVER_DART_ANALYZER,
         "P5 search golden requires sidecar resolver"
     );
-    Some((tmp, on, bin))
+    Some(tmp)
 }
 
 #[test]
 fn p5_keyword_search_purchase_surfaces_paywall_and_pro_with_reasons() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -229,7 +201,7 @@ fn p5_keyword_search_purchase_surfaces_paywall_and_pro_with_reasons() {
 
 #[test]
 fn p5_code_snippet_input_finds_targets_via_deterministic_token_extraction() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -280,7 +252,7 @@ fn p5_code_snippet_input_finds_targets_via_deterministic_token_extraction() {
 
 #[test]
 fn p5_file_line_input_resolves_to_enclosing_symbol() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -346,7 +318,7 @@ fn p5_path_segment_match_scores_above_weak_substring() {
     // Sanity for the scoring contract: a path-segment hit must
     // out-rank a weak substring hit so operators searching for a
     // module name go to the module first.
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
     let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
@@ -381,7 +353,7 @@ fn p6_html_payload_for_purchase_keeps_canvas_readable_and_carries_business_signa
     //   2. 焦点画布 ≤25 节点（与设计约束一致），可读性能在 30 秒内被人理解
     //   3. 焦点卡里能看到 calls / persists_to / declares_verification 等业务边
     //   4. 已 accepted 的 complete_purchase_unlocks_pro 候选作为卡片直接渲染
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 

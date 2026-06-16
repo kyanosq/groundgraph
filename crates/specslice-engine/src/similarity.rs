@@ -255,6 +255,12 @@ pub fn analyze_similarity_with_store(
         }
 
         let abs = repo_root.join(path_rel);
+        // Skip a file that has grown past the index byte budget rather than
+        // slurp it whole just to fingerprint one span (#245).
+        if crate::source_text::is_oversized_source(&abs) {
+            skipped += 1;
+            continue;
+        }
         let Ok(source) = std::fs::read_to_string(&abs) else {
             skipped += 1;
             continue;

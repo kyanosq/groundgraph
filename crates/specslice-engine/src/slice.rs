@@ -55,7 +55,10 @@ pub struct SliceOptions {
 impl Default for SliceOptions {
     fn default() -> Self {
         Self {
-            repo_root: PathBuf::new(),
+            // #167: "." (not empty `PathBuf::new()`) so a Default-constructed
+            // option set resolves against the current directory rather than
+            // bailing "no SpecSlice workspace". Matches `QuestionsOptions`.
+            repo_root: PathBuf::from("."),
             requirement: String::new(),
             fanout: SliceFanoutOptions::default(),
         }
@@ -244,8 +247,12 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
+    // #72 — forward-compat warning for a newer-than-supported config schema.
+    if let Some(notice) = cfg.schema_version_notice() {
+        eprintln!("specslice: {notice}");
+    }
     Ok(cfg)
 }
 
@@ -295,6 +302,15 @@ mod helper_tests {
         assert!(!is_implementation_kind(NodeKind::Requirement));
         assert!(!is_implementation_kind(NodeKind::DocSection));
         assert!(!is_implementation_kind(NodeKind::File));
+    }
+
+    #[test]
+    fn slice_options_default_repo_root_is_current_dir_like_questions() {
+        // #167: an empty `PathBuf::new()` default makes `slice_requirement`
+        // bail "no SpecSlice workspace" — a guaranteed-unusable Default. Align
+        // with the sibling `QuestionsOptions::default()` which uses "." so a
+        // `Default`-constructed option set resolves against the current dir.
+        assert_eq!(SliceOptions::default().repo_root, PathBuf::from("."));
     }
 
     #[test]

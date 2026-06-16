@@ -60,7 +60,7 @@ pub struct BusinessCandidatesDocument {
     /// candidates does not silently drop them. Note: YAML *comments*
     /// are still lost on rewrite — serde-yaml is structure-only.
     #[serde(flatten)]
-    pub extra: serde_yaml::Mapping,
+    pub extra: serde_yml::Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -118,7 +118,7 @@ pub struct BusinessCandidate {
     /// authors are advised to embed any human-narrative explanations
     /// inside `description` / `risks` rather than as `#` comments.
     #[serde(flatten)]
-    pub extra: serde_yaml::Mapping,
+    pub extra: serde_yml::Mapping,
 }
 
 fn default_status() -> String {
@@ -272,7 +272,7 @@ pub fn load_business_candidates(repo_root: &Path) -> Result<LoadOutcome> {
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading business candidates from {}", path.display()))?;
-    let mut document: BusinessCandidatesDocument = serde_yaml::from_str(&raw)
+    let mut document: BusinessCandidatesDocument = serde_yml::from_str(&raw)
         .with_context(|| format!("parsing business candidates YAML at {}", path.display()))?;
     let mut warnings = Vec::new();
     // Validate + clean candidates.
@@ -382,10 +382,35 @@ pub fn apply_review(
             path.display()
         );
     }
+    // #198: serialize the whole read → mutate → write. `write_atomic` only
+    // makes the *replace* atomic; the lost-update window spans the read and
+    // the write, so two concurrent `specslice candidate review` processes (CI)
+    // could each read the same base document and the second write clobber the
+    // first reviewer's verdict. Take an OS advisory lock (std `File::lock`, the
+    // Rust 1.89 API already used by stats.rs) on a *stable* sidecar file — it is
+    // never renamed, so every reviewer contends on the same inode — held until
+    // `_lock` drops at the end of this function.
+    let lock_path = {
+        let mut p = path.clone().into_os_string();
+        p.push(".lock");
+        PathBuf::from(p)
+    };
+    let _lock = {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening review lock {}", lock_path.display()))?;
+        f.lock()
+            .with_context(|| format!("acquiring review lock {}", lock_path.display()))?;
+        f
+    };
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut document: BusinessCandidatesDocument =
-        serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        serde_yml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let Some(target) = document
         .candidates
         .iter_mut()
@@ -426,9 +451,10 @@ pub fn apply_review(
     });
     target.status = verdict.status.as_str().to_string();
     let final_status = target.status.clone();
-    let serialised = serde_yaml::to_string(&document)
+    let serialised = serde_yml::to_string(&document)
         .with_context(|| format!("re-serialising {}", path.display()))?;
-    std::fs::write(&path, serialised).with_context(|| format!("writing {}", path.display()))?;
+    crate::atomic_write::write_atomic(&path, &serialised)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(ReviewApplyOutcome {
         candidate_id: candidate_id.into(),
         status: final_status,
@@ -832,6 +858,70 @@ candidates:
             .unwrap();
         assert_eq!(b.status, "proposed", "other candidates untouched");
         assert!(b.review.is_none());
+    }
+
+    #[test]
+    fn apply_review_is_serialized_across_concurrent_reviewers() {
+        // #198: `apply_review` is read → mutate → write_atomic. `write_atomic`
+        // only makes the *replace* atomic, not the whole read-modify-write, so
+        // two concurrent `specslice candidate review` processes (CI) could each
+        // read the same base document and the second write would clobber the
+        // first reviewer's verdict (lost update). The exclusive file lock must
+        // serialize the critical section so every reviewer's verdict survives.
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".specslice/candidates");
+        std::fs::create_dir_all(&dir).unwrap();
+        const N: usize = 8;
+        let mut yaml = String::from("schema_version: 1\ncandidates:\n");
+        for i in 0..N {
+            yaml.push_str(&format!(
+                "  - id: cand_{i}\n    name: \"c{i}\"\n    description: \"d{i}\"\n    \
+                 evidence: []\n    confidence: 0.5\n    open_questions: []\n    status: proposed\n"
+            ));
+        }
+        std::fs::write(dir.join("business_logic.yaml"), yaml).unwrap();
+
+        let repo_root = Arc::new(tmp.path().to_path_buf());
+        // Barrier maximises overlap so the lost-update window is actually hit.
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let repo_root = Arc::clone(&repo_root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    apply_review(
+                        repo_root.as_path(),
+                        &format!("cand_{i}"),
+                        ReviewVerdict {
+                            status: ReviewStatus::Accepted,
+                            reviewer: Some(format!("reviewer_{i}")),
+                            note: None,
+                            answered_questions: Vec::new(),
+                            reviewed_at: Some("2026-01-01T00:00:00Z".into()),
+                        },
+                    )
+                    .expect("apply_review");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let doc = load_business_candidates(repo_root.as_path())
+            .unwrap()
+            .document;
+        for i in 0..N {
+            let id = format!("cand_{i}");
+            let c = doc.candidates.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(
+                c.status, "accepted",
+                "cand_{i} lost its verdict — concurrent read-modify-write was not serialized"
+            );
+        }
     }
 
     #[test]

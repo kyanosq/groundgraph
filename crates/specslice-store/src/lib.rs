@@ -38,29 +38,131 @@ pub enum StoreError {
         source: rusqlite::Error,
     },
 
+    #[error(
+        "database schema version {found} is newer than this build supports (max {supported}); \
+         upgrade specslice, or delete .specslice/graph.db to rebuild the index"
+    )]
+    SchemaTooNew { found: i32, supported: i32 },
+
+    /// `SQLITE_BUSY` / `SQLITE_LOCKED`: another connection holds the write lock
+    /// past `busy_timeout`. Transient — a caller may back off and retry (#215).
+    #[error("database is busy (locked by another process): {0}")]
+    Busy(#[source] rusqlite::Error),
+
+    /// `SQLITE_CORRUPT` / `SQLITE_NOTADB`: the file is malformed. Not
+    /// retryable — the (rebuildable) index must be deleted and re-indexed (#215).
+    #[error("database file is corrupt; delete .specslice/graph.db and re-index: {0}")]
+    Corrupt(#[source] rusqlite::Error),
+
+    /// `SQLITE_READONLY` / `SQLITE_CANTOPEN` / `SQLITE_PERM` / `SQLITE_AUTH`:
+    /// the process cannot write — a permission or mount problem, not transient (#215).
+    #[error("database is read-only or inaccessible (check permissions): {0}")]
+    ReadOnly(#[source] rusqlite::Error),
+
+    /// `SQLITE_FULL`: the disk filled while writing (#215).
+    #[error("disk is full while writing the database: {0}")]
+    DiskFull(#[source] rusqlite::Error),
+
+    // Catch-all. `{0}` inlines the rusqlite detail on purpose: decode failures
+    // wrap a *meaningful* message (e.g. "unknown edge kind X") in a rusqlite
+    // error, and bare `{}` formatting must surface it (see repositories
+    // decode_tests). The mild anyhow `{:#}` double-print is the standard
+    // thiserror trade-off and accepted here (#165). Operationally-actionable
+    // result codes are split into the typed variants above (#215).
     #[error("sqlite error: {0}")]
     Sqlite(#[source] rusqlite::Error),
 }
 
+/// Operational class of a `rusqlite::Error`, decided by its primary result
+/// code. Kept local (not part of the public surface) so the variant routing
+/// lives in one place (#215).
+enum SqliteKind {
+    Busy,
+    Corrupt,
+    ReadOnly,
+    DiskFull,
+    Other,
+}
+
+/// Map a rusqlite error to its operational class. Only `SqliteFailure` (a real
+/// SQLite result code) is classified; decode / type errors — which carry the
+/// meaningful inline messages — stay `Other` so their text is preserved (#215).
+fn classify_sqlite(err: &rusqlite::Error) -> SqliteKind {
+    let rusqlite::Error::SqliteFailure(e, _) = err else {
+        return SqliteKind::Other;
+    };
+    match e.code {
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => SqliteKind::Busy,
+        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+            SqliteKind::Corrupt
+        }
+        rusqlite::ErrorCode::ReadOnly
+        | rusqlite::ErrorCode::CannotOpen
+        | rusqlite::ErrorCode::PermissionDenied
+        | rusqlite::ErrorCode::AuthorizationForStatementDenied => SqliteKind::ReadOnly,
+        rusqlite::ErrorCode::DiskFull => SqliteKind::DiskFull,
+        _ => SqliteKind::Other,
+    }
+}
+
 impl StoreError {
+    /// Wrap a rusqlite error, routing operationally-distinct result codes into
+    /// typed variants so callers can react (retry on [`Busy`](StoreError::Busy),
+    /// stop+report on [`Corrupt`](StoreError::Corrupt), fix permissions on
+    /// [`ReadOnly`](StoreError::ReadOnly), free space on
+    /// [`DiskFull`](StoreError::DiskFull)) instead of scraping message strings (#215).
     pub(crate) fn sqlite(err: rusqlite::Error) -> Self {
-        Self::Sqlite(err)
+        match classify_sqlite(&err) {
+            SqliteKind::Busy => Self::Busy(err),
+            SqliteKind::Corrupt => Self::Corrupt(err),
+            SqliteKind::ReadOnly => Self::ReadOnly(err),
+            SqliteKind::DiskFull => Self::DiskFull(err),
+            SqliteKind::Other => Self::Sqlite(err),
+        }
+    }
+
+    /// Whether retrying the operation might succeed. Only [`Busy`](StoreError::Busy)
+    /// (contended lock) is transient; corruption, permissions and a full disk
+    /// all need operator action first (#215).
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy(_))
     }
 }
 
 impl From<rusqlite::Error> for StoreError {
     fn from(err: rusqlite::Error) -> Self {
-        Self::Sqlite(err)
+        // `?` conversions classify too, so a `BUSY`/`CORRUPT` surfaced via the
+        // blanket `From` lands in the right variant, not the catch-all (#215).
+        Self::sqlite(err)
     }
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
 /// Handle to the SpecSlice SQLite graph store.
+///
+/// **Threading (#169)**: single-threaded *by design*, and the type system
+/// already enforces it. `rusqlite::Connection` is `Send` but **not** `Sync`, so
+/// `Store` is `Send + !Sync` (auto-derived). Because `Connection: !Sync`, a
+/// `&Store` — and the `&Connection` handed out by [`Store::connection`] — is
+/// itself `!Send`, so the compiler *rejects* sharing a store (or its raw
+/// connection) across threads. There is no silent footgun: a store can be
+/// *moved* to another thread (it is `Send`) but never *shared*. To use one from
+/// several threads, wrap it in `Arc<Mutex<Store>>` — do **not** reach for
+/// `unsafe impl Sync` (that would violate SQLite's single-handle contract).
 pub struct Store {
     pub(crate) conn: Connection,
     path: PathBuf,
 }
+
+// #169: lock the documented threading contract in at compile time. `Store` must
+// stay `Send` (movable across threads, the basis of the `Arc<Mutex<Store>>`
+// recommendation); a regression that adds a non-`Send` field (e.g. an `Rc`)
+// would fail to compile here rather than silently breaking downstream users.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<Store>;
+};
 
 impl Store {
     /// Open (or create) the SQLite database at `path`.
@@ -131,7 +233,7 @@ impl Store {
             return Ok(());
         }
         self.conn
-            .execute_batch(include_str!("./migrations_sql/002_edge_indexes.sql"))
+            .execute_batch(include_str!("./migrations_sql/query_indexes.sql"))
             .map_err(StoreError::sqlite)
     }
 
@@ -182,9 +284,22 @@ impl Store {
             // re-run a whole ingest for nothing, and bailing between the
             // statements used to leave `wal_autocheckpoint=0` behind so
             // the WAL grew without bound (issues2.md #55).
-            self.conn
-                .execute_batch("COMMIT")
-                .map_err(StoreError::sqlite)?;
+            if let Err(e) = self.conn.execute_batch("COMMIT") {
+                // COMMIT failed (e.g. SQLITE_BUSY): SQLite leaves the
+                // transaction *active*, so the connection is still non-
+                // autocommit. Without an explicit ROLLBACK the next
+                // `begin_bulk` would see `is_autocommit() == false`, skip its
+                // `BEGIN IMMEDIATE`, and silently append the next ingest into
+                // this dead transaction — corrupting the commit/rollback
+                // boundary (#254). Roll back to return the connection to
+                // autocommit; then restore `wal_autocheckpoint` (suspended in
+                // begin_bulk) so the WAL can't grow unbounded (the failure twin
+                // of issues2.md #55, #218). Both are best-effort — the original
+                // COMMIT error is what we report.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                let _ = self.conn.execute_batch("PRAGMA wal_autocheckpoint=1000;");
+                return Err(StoreError::sqlite(e));
+            }
             let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             let _ = self.conn.execute_batch("PRAGMA wal_autocheckpoint=1000;");
         }
@@ -283,9 +398,12 @@ mod tests {
             rows
         };
         for expected in [
-            "idx_edge_assertions_from",
-            "idx_edge_assertions_to",
-            "idx_edge_assertions_kind",
+            // #140: composite `(<col>, id)` covering indexes (the old
+            // single-column `idx_edge_assertions_{from,to,kind}` were renamed and
+            // dropped by migration 004).
+            "idx_edge_assertions_from_ord",
+            "idx_edge_assertions_to_ord",
+            "idx_edge_assertions_kind_ord",
             "idx_evidence_artifact",
             // Ingest-path indexes: SCIP suppression deletes per source_file
             // (django: 3026 files × full scan of 96k edges dominated the
@@ -327,9 +445,9 @@ mod tests {
             store
                 .connection()
                 .execute_batch(
-                    "DROP INDEX idx_edge_assertions_from;\
-                     DROP INDEX idx_edge_assertions_to;\
-                     DROP INDEX idx_edge_assertions_kind;\
+                    "DROP INDEX idx_edge_assertions_from_ord;\
+                     DROP INDEX idx_edge_assertions_to_ord;\
+                     DROP INDEX idx_edge_assertions_kind_ord;\
                      DROP INDEX idx_evidence_artifact;",
                 )
                 .unwrap();
@@ -340,8 +458,8 @@ mod tests {
             .connection()
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' \
-                 AND name IN ('idx_edge_assertions_from','idx_edge_assertions_to',\
-                 'idx_edge_assertions_kind','idx_evidence_artifact')",
+                 AND name IN ('idx_edge_assertions_from_ord','idx_edge_assertions_to_ord',\
+                 'idx_edge_assertions_kind_ord','idx_evidence_artifact')",
                 [],
                 |r| r.get(0),
             )

@@ -24,7 +24,7 @@
 //! nodes that already exist; it never creates a node and never panics on
 //! malformed input (D1 non-invasive, D4 determinism).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -58,7 +58,20 @@ pub fn parse_index(bytes: &[u8]) -> Result<Index> {
 /// (extra ranges for other files are harmless). Output edges carry
 /// `resolver = "scip"`; the caller ingests them like any other
 /// [`ReferenceEdge`].
-pub fn overlay_edges(index: &Index, ranges: &[SymbolRange]) -> Vec<ReferenceEdge> {
+///
+/// One [`OverlayEdge`] is returned per distinct `(caller, callee, kind)` triple,
+/// carrying **every** call-site line that produced it (#75).
+pub struct OverlayEdge {
+    /// The edge to ingest. `edge.line` mirrors the first (lowest) call site.
+    pub edge: ReferenceEdge,
+    /// Every distinct call-site line, ascending. SCIP can see the same
+    /// `(caller, callee, kind)` at many lines (a loop, repeated branches); the
+    /// old dedup kept only the first, so the stored evidence under-reported the
+    /// call sites (#75). Keeping them all lets the trace/UI list each one.
+    pub lines: Vec<u32>,
+}
+
+pub fn overlay_edges(index: &Index, ranges: &[SymbolRange]) -> Vec<OverlayEdge> {
     // Index our ranges by file so each occurrence only searches its own file.
     let mut by_file: HashMap<&str, Vec<&SymbolRange>> = HashMap::new();
     for r in ranges {
@@ -88,8 +101,10 @@ pub fn overlay_edges(index: &Index, ranges: &[SymbolRange]) -> Vec<ReferenceEdge
     // innermost range that encloses it (the caller) and linked to the symbol's
     // definition node. Self-edges, unresolved targets and references to
     // symbols defined outside the indexed files are dropped.
-    let mut seen: HashSet<(&str, &str, EdgeKind)> = HashSet::new();
-    let mut edges = Vec::new();
+    // Preserve first-seen pair order for deterministic output while collecting
+    // *all* call-site lines for each (caller, callee, kind) triple (#75).
+    let mut order: Vec<(String, String, EdgeKind)> = Vec::new();
+    let mut acc: HashMap<(String, String, EdgeKind), (ReferenceEdge, Vec<u32>)> = HashMap::new();
     for doc in &index.documents {
         let Some(file_ranges) = by_file.get(doc.relative_path.as_str()) else {
             continue;
@@ -113,21 +128,44 @@ pub fn overlay_edges(index: &Index, ranges: &[SymbolRange]) -> Vec<ReferenceEdge
             } else {
                 EdgeKind::References
             };
-            if !seen.insert((from.symbol_id.as_str(), to.symbol_id.as_str(), kind)) {
-                continue;
-            }
-            edges.push(ReferenceEdge {
-                from_symbol_id: from.symbol_id.clone(),
-                to_symbol_id: to.symbol_id.clone(),
+            let key = (
+                from.symbol_id.as_str().to_string(),
+                to.symbol_id.as_str().to_string(),
                 kind,
-                source_file: doc.relative_path.clone(),
-                line,
-                snippet: String::new(),
-                resolver: RESOLVER_SCIP.to_string(),
-            });
+            );
+            match acc.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    order.push(key);
+                    slot.insert((
+                        ReferenceEdge {
+                            from_symbol_id: from.symbol_id.clone(),
+                            to_symbol_id: to.symbol_id.clone(),
+                            kind,
+                            source_file: doc.relative_path.clone(),
+                            line,
+                            snippet: String::new(),
+                            resolver: RESOLVER_SCIP.to_string(),
+                        },
+                        vec![line],
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().1.push(line);
+                }
+            }
         }
     }
-    edges
+    order
+        .into_iter()
+        .map(|key| {
+            let (mut edge, mut lines) = acc.remove(&key).expect("key was just inserted");
+            lines.sort_unstable();
+            lines.dedup();
+            // `edge.line` mirrors the first (lowest) call site for back-compat.
+            edge.line = *lines.first().unwrap_or(&edge.line);
+            OverlayEdge { edge, lines }
+        })
+        .collect()
 }
 
 /// A SCIP symbol we link on. Empty strings and document-scoped `local …`
@@ -154,7 +192,10 @@ fn innermost_containing<'a>(ranges: &[&'a SymbolRange], line: u32) -> Option<&'a
     ranges
         .iter()
         .copied()
-        .filter(|r| r.start_line <= line && line <= r.end_line)
+        // `start_line > 0`: lines are 1-based here, so a range starting at 0 is
+        // a degenerate sentinel (e.g. an external `DbTable` range). It would
+        // otherwise "contain" any line and mis-attribute SCIP calls (#204).
+        .filter(|r| r.start_line > 0 && r.start_line <= line && line <= r.end_line)
         .min_by(|a, b| {
             a.end_line
                 .saturating_sub(a.start_line)
@@ -231,7 +272,7 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
             }
         }
 
-        for e in overlay_edges(&index, &ranges) {
+        for OverlayEdge { edge: e, lines } in overlay_edges(&index, &ranges) {
             let mut edge = EdgeAssertion::fact(
                 e.from_symbol_id.clone(),
                 e.to_symbol_id.clone(),
@@ -242,7 +283,7 @@ pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOv
             if !e.source_file.is_empty() {
                 edge.source_file = Some(e.source_file.clone());
             }
-            edge.evidence_json = Some(evidence_json(e.line, &e.resolver));
+            edge.evidence_json = Some(evidence_json(&lines, &e.resolver));
             store
                 .upsert_edge(&edge)
                 .context("upserting SCIP overlay edge")?;
@@ -322,8 +363,19 @@ fn collect_scip_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Minimal evidence blob, same shape the heuristic/analyzer edges carry so the
 /// trace/UI can render `file:line` provenance and the resolver name.
-fn evidence_json(line: u32, resolver: &str) -> String {
-    serde_json::json!({ "line": line, "snippet": "", "resolver": resolver }).to_string()
+/// Serialise the call-site evidence for one overlay edge. `line` (the first,
+/// lowest call site) is retained for back-compat with readers that predate #75;
+/// `lines` carries **every** distinct call site SCIP observed for this edge so
+/// the stored evidence is no longer lossy when a callee is hit at many lines.
+fn evidence_json(lines: &[u32], resolver: &str) -> String {
+    let first = lines.first().copied().unwrap_or(0);
+    serde_json::json!({
+        "line": first,
+        "lines": lines,
+        "snippet": "",
+        "resolver": resolver,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -387,13 +439,14 @@ mod tests {
         let edges = overlay_edges(&index, &ranges);
 
         assert_eq!(edges.len(), 1, "exactly one cross-file edge expected");
-        let e = &edges[0];
+        let e = &edges[0].edge;
         assert_eq!(e.from_symbol_id.as_str(), "S:caller");
         assert_eq!(e.to_symbol_id.as_str(), "S:bar");
         assert_eq!(e.kind, EdgeKind::Calls);
         assert_eq!(e.resolver, RESOLVER_SCIP);
         assert_eq!(e.source_file, "src/caller.rs");
         assert_eq!(e.line, 15);
+        assert_eq!(edges[0].lines, vec![15], "single call site");
     }
 
     /// A reference whose definition lives outside the indexed files (an
@@ -450,12 +503,62 @@ mod tests {
         let edges = overlay_edges(&index, &ranges);
         assert_eq!(edges.len(), 1);
         assert_eq!(
-            edges[0].from_symbol_id.as_str(),
+            edges[0].edge.from_symbol_id.as_str(),
             "S:make",
             "innermost caller"
         );
-        assert_eq!(edges[0].to_symbol_id.as_str(), "S:Point");
-        assert_eq!(edges[0].kind, EdgeKind::References, "type ref, not a call");
+        assert_eq!(edges[0].edge.to_symbol_id.as_str(), "S:Point");
+        assert_eq!(
+            edges[0].edge.kind,
+            EdgeKind::References,
+            "type ref, not a call"
+        );
+    }
+
+    /// #75: the same `(caller, callee, kind)` hit at *several* lines collapses to
+    /// one edge that nevertheless carries **every** call site — ascending and
+    /// de-duplicated — and `edge.line` mirrors the lowest one for back-compat.
+    #[test]
+    fn repeated_call_sites_aggregate_every_line() {
+        const BAR: &str = "rust-analyzer cargo demo 0.1.0 demo/Foo#bar().";
+        let index = Index {
+            documents: vec![Document {
+                relative_path: "src/h.rs".into(),
+                occurrences: vec![
+                    occ(4, BAR, true),   // def of bar at line 5
+                    occ(20, BAR, false), // call at line 21 (inside caller)
+                    occ(24, BAR, false), // call at line 25
+                    occ(20, BAR, false), // duplicate of line 21 — must collapse
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ranges = vec![
+            range("src/h.rs", "S:bar", 5, 6, NodeKind::RustMethod),
+            range("src/h.rs", "S:caller", 18, 30, NodeKind::RustFunction),
+        ];
+
+        let edges = overlay_edges(&index, &ranges);
+        assert_eq!(edges.len(), 1, "still one edge per (caller, callee, kind)");
+        assert_eq!(edges[0].edge.from_symbol_id.as_str(), "S:caller");
+        assert_eq!(edges[0].edge.to_symbol_id.as_str(), "S:bar");
+        assert_eq!(
+            edges[0].lines,
+            vec![21, 25],
+            "all distinct call sites, ascending, de-duplicated"
+        );
+        assert_eq!(
+            edges[0].edge.line, 21,
+            "edge.line mirrors the lowest call site"
+        );
+
+        // The serialised evidence carries the full list, with `line` kept for
+        // back-compat readers (#75).
+        let json: serde_json::Value =
+            serde_json::from_str(&evidence_json(&edges[0].lines, RESOLVER_SCIP)).unwrap();
+        assert_eq!(json["line"], 21);
+        assert_eq!(json["lines"], serde_json::json!([21, 25]));
     }
 
     #[test]

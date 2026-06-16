@@ -25,6 +25,7 @@ mod explain_symbol;
 mod get_subgraph;
 mod impact_tool;
 mod search_graph;
+mod validate;
 
 /// Static catalogue of every tool the server exposes. Order is the
 /// order returned to `tools/list`, which becomes the order shown to
@@ -55,6 +56,17 @@ pub fn is_known(name: &str) -> bool {
     )
 }
 
+/// Validate `args` against the named tool's advertised `inputSchema` (#89).
+/// Returns the first contract violation as a message the dispatcher turns into
+/// a `-32602 Invalid params` error. An unknown tool is a no-op here — the
+/// dispatcher already rejects it before reaching this point.
+pub(crate) fn validate_call_arguments(name: &str, args: &Value) -> Result<(), String> {
+    let Some(descriptor) = descriptors().into_iter().find(|d| d.name == name) else {
+        return Ok(());
+    };
+    validate::validate_arguments(&descriptor.input_schema, args)
+}
+
 pub fn call(server: &Server, name: &str, args: &Value) -> Result<Value> {
     match name {
         "search_graph" => search_graph::call(server, args),
@@ -72,20 +84,40 @@ pub fn call(server: &Server, name: &str, args: &Value) -> Result<Value> {
 // Shared helpers used by multiple tool handlers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_repo_root(server: &Server, args: &Value) -> PathBuf {
-    if let Some(s) = args.get("repo_root").and_then(|v| v.as_str()) {
-        let p = PathBuf::from(s);
-        if p.is_absolute() {
-            return p;
-        }
-        return server.default_repo_root.join(p);
+pub(crate) fn resolve_repo_root(server: &Server, args: &Value) -> Result<PathBuf> {
+    // Missing / null / non-string `repo_root` keeps the lenient default — no
+    // change for the common case. Only an *explicit string* is validated.
+    let Some(s) = args.get("repo_root").and_then(|v| v.as_str()) else {
+        return Ok(server.default_repo_root.clone());
+    };
+    // `""` previously folded to `default_repo_root.join("")` == the default by
+    // accident; make the intent explicit instead of silently guessing (#108).
+    if s.is_empty() {
+        bail!("`repo_root` must not be an empty string; omit it to use the server default");
     }
-    server.default_repo_root.clone()
+    let p = Path::new(s);
+    if p.is_absolute() {
+        // An absolute path is the client explicitly naming the repo to analyse.
+        return Ok(p.to_path_buf());
+    }
+    // Confine a *relative* root to the server default: a `..` escape would let
+    // a request walk out of the intended workspace into e.g. the user's home,
+    // where a stray `.specslice.yaml` could be mistaken for the workspace
+    // (#108). Callers that genuinely want another repo pass an absolute path.
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!(
+            "`repo_root` ({s}) must not contain `..`; pass an absolute path to \
+             analyse a repo outside the default root"
+        );
+    }
+    Ok(server.default_repo_root.join(p))
 }
 
 pub(crate) fn open_store(repo_root: &Path) -> Result<Store> {
     let config = load_engine_config(repo_root)?;
-    let db_path = resolve_db_path(repo_root, &config);
+    let db_path = resolve_db_path(repo_root, &config)?;
     Store::open(&db_path)
         .with_context(|| format!("opening SQLite database at {}", db_path.display()))
 }
@@ -100,21 +132,34 @@ pub(crate) fn load_engine_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    serde_yaml::from_str::<EngineConfig>(&raw)
+    serde_yml::from_str::<EngineConfig>(&raw)
         .with_context(|| format!("parsing config {}", path.display()))
 }
 
-pub(crate) fn resolve_db_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
+pub(crate) fn resolve_db_path(repo_root: &Path, config: &EngineConfig) -> Result<PathBuf> {
     let raw = config.storage.path.clone();
     if raw.is_empty() {
-        return repo_root.join(".specslice/graph.db");
+        return Ok(repo_root.join(".specslice/graph.db"));
     }
     let candidate = PathBuf::from(&raw);
+    // Absolute is an explicit operator override (parity with engine
+    // `resolve_storage_path` and #108 repo_root).
     if candidate.is_absolute() {
-        candidate
-    } else {
-        repo_root.join(candidate)
+        return Ok(candidate);
     }
+    // Confine a *relative* `storage.path`: a `..` escape would let a poisoned
+    // `.specslice.yaml` make the MCP server read/write a SQLite db outside the
+    // analysed repo (#242, mirrors #199 for `links.path` / #108 for repo_root).
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!(
+            "config `storage.path` ({raw}) must not contain `..`; use an absolute path \
+             to place the database outside the workspace"
+        );
+    }
+    Ok(repo_root.join(candidate))
 }
 
 pub(crate) fn parse_node_kinds(values: &Value) -> Result<Vec<NodeKind>> {
@@ -224,4 +269,85 @@ pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
         "required": required,
         "additionalProperties": false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::Server;
+
+    fn server() -> Server {
+        Server::new(PathBuf::from("/work/repo"))
+    }
+
+    #[test]
+    fn resolve_repo_root_defaults_and_joins_relative() {
+        let s = server();
+        // Missing → server default.
+        assert_eq!(
+            resolve_repo_root(&s, &json!({})).unwrap(),
+            PathBuf::from("/work/repo")
+        );
+        // A plain relative path joins under the default.
+        assert_eq!(
+            resolve_repo_root(&s, &json!({ "repo_root": "sub/dir" })).unwrap(),
+            PathBuf::from("/work/repo/sub/dir")
+        );
+        // An absolute path is honoured verbatim (client names its own repo).
+        assert_eq!(
+            resolve_repo_root(&s, &json!({ "repo_root": "/other/repo" })).unwrap(),
+            PathBuf::from("/other/repo")
+        );
+        // Non-string keeps the lenient default rather than erroring.
+        assert_eq!(
+            resolve_repo_root(&s, &json!({ "repo_root": 123 })).unwrap(),
+            PathBuf::from("/work/repo")
+        );
+    }
+
+    #[test]
+    fn resolve_repo_root_rejects_empty_and_parent_dir_escape() {
+        let s = server();
+        // Empty string is no longer silently folded to the default (#108).
+        assert!(resolve_repo_root(&s, &json!({ "repo_root": "" })).is_err());
+        // `..` escapes out of the confined workspace → refused (#108).
+        assert!(resolve_repo_root(&s, &json!({ "repo_root": "../../etc" })).is_err());
+        assert!(resolve_repo_root(&s, &json!({ "repo_root": "sub/../../escape" })).is_err());
+    }
+
+    #[test]
+    fn resolve_db_path_confines_relative_storage_path() {
+        // #242: a poisoned `.specslice.yaml` must not relocate the SQLite db
+        // outside the analysed repo via a `..`-escaping relative `storage.path`.
+        let repo = Path::new("/work/repo");
+        let mut cfg = EngineConfig::default();
+
+        // Default (empty) → repo-local db.
+        cfg.storage.path = String::new();
+        assert_eq!(
+            resolve_db_path(repo, &cfg).unwrap(),
+            repo.join(".specslice/graph.db")
+        );
+
+        // Plain relative → joined under the repo.
+        cfg.storage.path = ".specslice/graph.db".into();
+        assert_eq!(
+            resolve_db_path(repo, &cfg).unwrap(),
+            repo.join(".specslice/graph.db")
+        );
+
+        // `..` escape → refused (mirrors #108 for repo_root, #199 for links).
+        cfg.storage.path = "../../etc/evil.db".into();
+        assert!(resolve_db_path(repo, &cfg).is_err());
+        cfg.storage.path = ".specslice/../../escape.db".into();
+        assert!(resolve_db_path(repo, &cfg).is_err());
+
+        // Absolute remains allowed — an explicit operator override, consistent
+        // with engine `resolve_storage_path` (tested) and #108 repo_root.
+        cfg.storage.path = "/var/lib/specslice/graph.db".into();
+        assert_eq!(
+            resolve_db_path(repo, &cfg).unwrap(),
+            PathBuf::from("/var/lib/specslice/graph.db")
+        );
+    }
 }

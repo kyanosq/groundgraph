@@ -111,7 +111,7 @@ fn graph_json_writes_to_out_path_when_given() {
     bootstrap(tmp.path());
     let out = tmp.path().join("graph.json");
 
-    Command::cargo_bin("specslice")
+    let assert = Command::cargo_bin("specslice")
         .unwrap()
         .current_dir(tmp.path())
         .args(["graph", "--format", "json", "--out"])
@@ -121,6 +121,18 @@ fn graph_json_writes_to_out_path_when_given() {
     assert!(out.exists());
     let body = std::fs::read_to_string(&out).unwrap();
     let _v: serde_json::Value = serde_json::from_str(&body).expect("file is JSON");
+    // #111: when output goes to a file, stdout must stay empty so a piped
+    // `--out` invocation never mixes the "wrote …" status line into data.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "status message must go to stderr, not stdout: {stdout:?}"
+    );
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("wrote"),
+        "status line should be on stderr: {stderr:?}"
+    );
 }
 
 #[test]

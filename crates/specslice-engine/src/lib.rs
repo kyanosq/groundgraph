@@ -4,6 +4,7 @@
 //! - [`EngineConfig`] — workspace-level config persisted to `.specslice.yaml`.
 //! - [`init_repository`] — generate the config file and graph database.
 
+pub(crate) mod atomic_write;
 pub mod business_candidates;
 pub mod business_doc;
 pub mod business_pack;
@@ -50,6 +51,7 @@ pub mod network;
 pub mod path_class;
 pub mod php_treesitter;
 pub mod port_coverage;
+pub(crate) mod proc;
 pub mod python_frameworks;
 pub mod python_indexer;
 pub mod python_treesitter;
@@ -142,7 +144,9 @@ pub use impact::{
     compute_impact, compute_impact_with_policy, merge_confirmed_candidates, run_impact,
     ImpactOptions, ImpactReport,
 };
-pub use index::{index_repository, IndexOptions, IndexResult, TreeSitterLangResult};
+pub use index::{
+    index_repository, unindexed_present_languages, IndexOptions, IndexResult, TreeSitterLangResult,
+};
 pub use init::{init_repository, InitOptions, InitOutcome};
 pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
 pub use logic_confidence::{

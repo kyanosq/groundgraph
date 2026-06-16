@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use specslice_core::language_traits::{is_callable, is_type};
+use specslice_core::language_traits::{is_callable, is_type, Language};
 use specslice_core::EdgeKind;
 use specslice_store::Store;
 
@@ -278,7 +278,10 @@ fn propagate_impurity(store: &Store, facts: &mut [SymbolFact]) -> Result<()> {
         let Some(callers) = callers_of.get(&callee) else {
             continue;
         };
-        for &caller in callers.clone().iter() {
+        // `callers` borrows `callers_of`; the loop body only mutates `facts`
+        // and `worklist`, never `callers_of`, so iterating the borrow directly
+        // is sound — no defensive clone needed. (#261)
+        for &caller in callers.iter() {
             let f = &mut facts[caller];
             if f.purity == Purity::Impure {
                 continue;
@@ -320,9 +323,12 @@ const THROW_WORDS: &[&str] = &[
     "fatalError",
     "abort",
     "unreachable",
-    "unwrap",
-    "expect",
 ];
+/// `unwrap` / `expect` are panic-prone *only* in Rust. Elsewhere they are
+/// ordinary identifiers — most painfully `expect(...)` is the Dart/JS/TS test
+/// assertion DSL — so counting them as throws inflates `throws` and mislabels
+/// purity for every test/helper that spells them. (#252)
+const RUST_PANIC_WORDS: &[&str] = &["unwrap", "expect"];
 const CATCH_WORDS: &[&str] = &["catch", "except", "rescue", "recover"];
 const NULL_WORDS: &[&str] = &["null", "nil", "None", "undefined"];
 
@@ -346,7 +352,9 @@ pub fn build_fact(
         if RETURN_WORDS.contains(&tok) {
             counts.early_returns += 1;
         }
-        if THROW_WORDS.contains(&tok) {
+        if THROW_WORDS.contains(&tok)
+            || (src.language == Language::Rust && RUST_PANIC_WORDS.contains(&tok))
+        {
             counts.throws += 1;
         }
         if CATCH_WORDS.contains(&tok) {
@@ -473,10 +481,11 @@ fn impurity_signals(stripped: &str, tokens: &[&str], awaits: u32) -> Vec<String>
         "sqlite",
         "execute(",
         ".query(",
-        "INSERT ",
-        "SELECT ",
-        "UPDATE ",
-        "DELETE ",
+        // NB: raw SQL verbs (`SELECT `/`INSERT `/…) were probed here but only
+        // ever live inside string literals, which `strip_noise` blanks — so they
+        // never matched (dead markers). The DB *call sites* above
+        // (`execute(`/`.query(`/`prepare(`/`sqlite`) are the real IO signal;
+        // reviving the verbs would mis-flag pure query builders. (#256)
         "prepare(",
         "localStorage",
         "getenv",
@@ -667,7 +676,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -914,5 +923,65 @@ mod tests {
         // filter kept only the pure one
         assert_eq!(report.facts.len(), 1);
         assert_eq!(report.facts[0].name.as_deref(), Some("pure_add"));
+    }
+
+    #[test]
+    fn unwrap_expect_count_as_throws_only_for_rust() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Rust: `.unwrap()` / `.expect()` panic — a real throw-like effect.
+        write(
+            tmp.path(),
+            "src/p.rs",
+            "fn parse(s: &str) -> i32 {\n    s.parse().expect(\"bad\")\n}",
+        );
+        let n = node("src/p.rs", "parse", 1, 3);
+        let src = read_node_source(tmp.path(), &n).unwrap();
+        let fact = build_fact(&n, &src, 60);
+        assert!(
+            fact.counts.throws >= 1,
+            "rust expect() should count as a throw; throws={}",
+            fact.counts.throws
+        );
+
+        // Dart: `expect(...)` is the test-assertion DSL, not a throw. `unwrap`
+        // is not a panic in Dart either. Counting them inflates throws and
+        // mislabels purity for every test/helper that spells `expect`. (#252)
+        write(
+            tmp.path(),
+            "test/x.dart",
+            "void testIt() {\n  expect(actual, equals(expected));\n}",
+        );
+        let mut dn = node("test/x.dart", "testIt", 1, 3);
+        dn.kind = NodeKind::DartFunction;
+        let dsrc = read_node_source(tmp.path(), &dn).unwrap();
+        let dfact = build_fact(&dn, &dsrc, 60);
+        assert_eq!(
+            dfact.counts.throws, 0,
+            "dart expect() must not be counted as a throw"
+        );
+    }
+
+    #[test]
+    fn sql_string_literal_without_call_site_is_not_io() {
+        // Building a SQL string is not itself IO; only executing it is. The
+        // SQL verbs live inside a string literal that `strip_noise` blanks, so
+        // they can never flip purity — the `SELECT `/`INSERT `/… IO markers were
+        // dead. A pure query builder must stay pure. (#256)
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "src/q.rs",
+            "fn build_query() -> &'static str {\n    \"SELECT id FROM users WHERE active = 1\"\n}",
+        );
+        let n = node("src/q.rs", "build_query", 1, 3);
+        let src = read_node_source(tmp.path(), &n).unwrap();
+        let fact = build_fact(&n, &src, 60);
+        assert!(
+            !fact.impurity_signals.contains(&"io".to_string()),
+            "a bare SQL string is not io; signals={:?}",
+            fact.impurity_signals
+        );
+        assert_eq!(fact.purity, Purity::Pure);
     }
 }

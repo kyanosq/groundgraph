@@ -280,6 +280,19 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
         if (c == '"' || c == '\'') && next == Some(c) && next2 == Some(c) {
             let start_line = line;
             let delim = c;
+            // A Python docstring (triple-quoted string opening a def/class body
+            // or the span itself) is documentation, not a magic constant, and
+            // would otherwise dominate the catalogue with prose. Detect it by
+            // walking back over whitespace from the opening quote: a newline
+            // followed by `:` (end of a signature) — or reaching the start of
+            // the span — is the docstring position. An inline `{"k": """v"""}`
+            // has no intervening newline, so its value is still captured.
+            // Docstrings (a bare triple-quoted string in def/class/module
+            // position) are a Python-only concept. Kotlin / Swift / Java text
+            // blocks use `"""` for ordinary multi-line string literals, whose
+            // values must still be mined — so only consult the heuristic for
+            // Python.
+            let is_docstring = matches!(lang, Language::Python) && opens_docstring(&chars, i);
             i += 3;
             let mut buf = String::new();
             while i < n
@@ -294,14 +307,16 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
                 i += 1;
             }
             i += 3;
-            out.push(RawLiteral {
-                line_offset: start_line,
-                kind: LiteralKind::Str,
-                value: format!(
-                    "{delim}{delim}{delim}{}{delim}{delim}{delim}",
-                    truncate(&buf)
-                ),
-            });
+            if !is_docstring {
+                out.push(RawLiteral {
+                    line_offset: start_line,
+                    kind: LiteralKind::Str,
+                    value: format!(
+                        "{delim}{delim}{delim}{}{delim}{delim}{delim}",
+                        truncate(&buf)
+                    ),
+                });
+            }
             prev_word = false;
             continue;
         }
@@ -433,6 +448,30 @@ pub fn scan_literals(src: &str, lang: Language) -> Vec<RawLiteral> {
     out
 }
 
+/// Does the triple-quote opening at `open` sit in Python docstring position?
+/// Walk backwards over whitespace: a crossed newline landing on `:` (the end
+/// of a `def`/`class` signature) — or reaching the start of the span — marks a
+/// docstring. An inline triple-quoted value such as `{"k": """v"""}` has the
+/// `:` on the *same* line (no newline crossed), so it returns `false` and the
+/// value is still mined.
+fn opens_docstring(chars: &[char], open: usize) -> bool {
+    let mut j = open;
+    let mut saw_newline = false;
+    while j > 0 {
+        j -= 1;
+        let c = chars[j];
+        if c == '\n' {
+            saw_newline = true;
+        } else if c == ':' {
+            return saw_newline;
+        } else if !c.is_whitespace() {
+            return false;
+        }
+    }
+    // Reached the start of the scanned span over whitespace only.
+    true
+}
+
 fn find_char_close(chars: &[char], from: usize) -> Option<usize> {
     // expects an escaped char like '\n' '\\' '\'' — closing quote within a
     // couple chars.
@@ -508,7 +547,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -567,6 +606,68 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(chars, vec![&"'z'".to_string()]);
+    }
+
+    #[test]
+    fn python_docstrings_are_not_mined_as_string_constants() {
+        // A function/class docstring (triple-quoted string as the first
+        // statement of the body) is documentation, not a magic value to
+        // reproduce when porting. It must not pollute the catalogue — but a
+        // genuine triple-quoted *value* (e.g. an inline SQL/template assigned
+        // somewhere) must still be captured.
+        let src = "def price_order(items):\n    \"\"\"Compute the total price.\"\"\"\n    sql = \"\"\"SELECT 1\"\"\"\n    return 0";
+        let got = vals(src, Language::Python);
+        let strings: Vec<&String> = got
+            .iter()
+            .filter(|(k, _)| *k == LiteralKind::Str)
+            .map(|(_, v)| v)
+            .collect();
+        assert!(
+            !strings
+                .iter()
+                .any(|s| s.contains("Compute the total price")),
+            "docstring leaked into constants: {strings:?}"
+        );
+        assert!(
+            strings.iter().any(|s| s.contains("SELECT 1")),
+            "a real triple-quoted value must still be captured: {strings:?}"
+        );
+    }
+
+    #[test]
+    fn module_level_docstring_at_span_start_is_skipped() {
+        // When the scanned span begins with a docstring (e.g. a class body that
+        // opens with one), it is still documentation, not a constant.
+        let src = "\"\"\"Module or class doc.\"\"\"\nx = 7";
+        let got = vals(src, Language::Python);
+        assert!(
+            got.iter().all(|(_, v)| !v.contains("Module or class doc")),
+            "leading docstring leaked into constants: {got:?}"
+        );
+        assert!(
+            got.contains(&(LiteralKind::Int, "7".to_string())),
+            "real literal after docstring must survive: {got:?}"
+        );
+    }
+
+    #[test]
+    fn docstring_skipping_is_python_only() {
+        // `:`-newline-`"""` is Python docstring position. But Kotlin / Swift /
+        // Java text blocks use `"""` for *ordinary* multi-line string literals,
+        // where the same bytes are a real value to mine. "Docstring" is a
+        // Python-only concept, so the skip heuristic must not silently drop a
+        // multi-line string in another language.
+        let src = "x:\n\"\"\"value\"\"\"\n";
+        let py = vals(src, Language::Python);
+        assert!(
+            !py.iter().any(|(_, v)| v.contains("value")),
+            "python docstring must still be skipped: {py:?}"
+        );
+        let kt = vals(src, Language::Kotlin);
+        assert!(
+            kt.iter().any(|(_, v)| v.contains("value")),
+            "kotlin multi-line string wrongly skipped as a docstring: {kt:?}"
+        );
     }
 
     #[test]

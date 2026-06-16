@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -289,8 +290,7 @@ class Builder {
               'dart_ctor::lib/widgets.dart#Cell.<default>',
             ),
       ),
-      reason:
-          '嵌套局部函数里的构造调用应归属到外层方法 Builder.build。当前 calls: $calls',
+      reason: '嵌套局部函数里的构造调用应归属到外层方法 Builder.build。当前 calls: $calls',
     );
   });
 
@@ -660,8 +660,8 @@ void run() {
           '$symbolIds',
     );
     expect(
-      hasEdge('dart_fn::lib/x.dart#run', 'dart_ctor::lib/x.dart#Greeter.<default>',
-          EdgeKindString.calls),
+      hasEdge('dart_fn::lib/x.dart#run',
+          'dart_ctor::lib/x.dart#Greeter.<default>', EdgeKindString.calls),
       isTrue,
       reason: 'construction must emit a calls edge to the canonical ctor id: '
           '$references',
@@ -987,6 +987,88 @@ class AppRouter {
       reason: 'onGenerateRoute must link the named route to its page: '
           '$references',
     );
+  });
+
+  group('sanitizeDiagnosticText (#103)', () {
+    test('collapses POSIX home dirs (username leak removed)', () {
+      const raw =
+          'PathNotFoundException: open failed, path = /Users/qjs/Code/specslice/tool/x.dart';
+      final out = sanitizeDiagnosticText(raw);
+      expect(out.contains('/Users/qjs/'), isFalse, reason: out);
+      expect(out, contains('<home>/Code/specslice/tool/x.dart'));
+    });
+
+    test('collapses /home/<user>/ too', () {
+      expect(
+        sanitizeDiagnosticText('boom at /home/alice/proj/lib/a.dart:12:3'),
+        'boom at <home>/proj/lib/a.dart:12:3',
+      );
+    });
+
+    test('collapses Windows C:\\Users\\<user>\\', () {
+      expect(
+        sanitizeDiagnosticText(r'fail C:\Users\bob\proj\a.dart'),
+        r'fail <home>\proj\a.dart',
+      );
+    });
+
+    test('leaves text without a home path untouched', () {
+      expect(sanitizeDiagnosticText('plain error, no paths'),
+          'plain error, no paths');
+    });
+  });
+
+  group('repoRelative (#103)', () {
+    test('returns a forward-slash repo-relative path', () {
+      expect(
+        repoRelative('/home/alice/proj/lib/a.dart', '/home/alice/proj'),
+        'lib/a.dart',
+      );
+    });
+  });
+
+  test('walkRepository does not leak its options temp dir (#126)', () async {
+    int optsDirCount() => Directory.systemTemp
+        .listSync()
+        .whereType<Directory>()
+        .where((d) => p.basename(d.path).startsWith('specslice_opts_'))
+        .length;
+    final before = optsDirCount();
+
+    final root = await Directory.systemTemp.createTemp('specslice_sidecar_');
+    addTearDown(() => root.delete(recursive: true));
+    final libDir = Directory(p.join(root.path, 'lib'))
+      ..createSync(recursive: true);
+    File(p.join(libDir.path, 'x.dart')).writeAsStringSync('int f() => 1;\n');
+
+    await walkRepository(
+      SidecarRequest(repoRoot: root.path, codeRoots: const ['lib']),
+    );
+
+    expect(optsDirCount(), before,
+        reason: 'walkRepository must reclaim its specslice_opts_* temp dir');
+  });
+
+  test('sidecar sanitises absolute paths out of serialised error detail (#103)',
+      () async {
+    // A non-existent --request path makes Dart throw a PathNotFoundException
+    // whose message embeds the absolute path; the serialised `detail` must not
+    // leak a username / home dir into the response (which lands in the graph's
+    // diagnostics + HTML reports).
+    final fake =
+        '/Users/specslice_fake_user_xyz/nope_${DateTime.now().microsecondsSinceEpoch}.json';
+    final result = await Process.run(
+      Platform.resolvedExecutable,
+      ['run', 'bin/specslice_dart_analyzer.dart', '--request', fake],
+      workingDirectory: Directory.current.path,
+    );
+    final out = (result.stdout as String).trim();
+    final json = jsonDecode(out.split('\n').last) as Map<String, dynamic>;
+    expect(json['error_code'], 'bad_request');
+    final detail = json['detail'] as String? ?? '';
+    expect(detail.contains('specslice_fake_user_xyz'), isFalse,
+        reason: 'username leaked into serialised detail: $detail');
+    expect(detail, contains('<home>'), reason: 'detail=$detail');
   });
 
   group('resolveSdkPath', () {

@@ -18,6 +18,9 @@ pub enum ChangeStatus {
     Modified,
     Added,
     Deleted,
+    /// A pure rename / copy (`git diff` rename detection). Carries no content
+    /// hunks; `path` is the *new* path.
+    Renamed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,9 +51,22 @@ fn diff_args(base: &str, head: &str) -> Vec<String> {
     args
 }
 
+/// Reject a git ref that could be misread as a `git` option (`--output=…`,
+/// `-O<orderfile>`, …). `base`/`head` reach here from `impact`'s arguments,
+/// which on the MCP path come straight from a remote client — an unvalidated
+/// leading `-` turns `git diff` into an arbitrary file write/read primitive.
+fn ensure_safe_ref(label: &str, value: &str) -> Result<()> {
+    if value.starts_with('-') {
+        anyhow::bail!("invalid git {label} ref `{value}`: must not start with '-'");
+    }
+    Ok(())
+}
+
 /// Run `git diff --unified=0` for the given refs inside `repo_root` and return
 /// raw text. See [`diff_args`] for the committed-range vs working-tree modes.
 pub fn git_diff(repo_root: &std::path::Path, base: &str, head: &str) -> Result<String> {
+    ensure_safe_ref("base", base)?;
+    ensure_safe_ref("head", head)?;
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -89,6 +105,15 @@ pub fn parse_unified_diff(text: &str) -> Vec<ChangedFile> {
                 file.status = ChangeStatus::Added;
             } else if line.starts_with("deleted file mode") {
                 file.status = ChangeStatus::Deleted;
+            } else if let Some(rest) = line
+                .strip_prefix("rename to ")
+                .or_else(|| line.strip_prefix("copy to "))
+            {
+                // Pure rename/copy: no `+++`/`@@` follow, and `parse_b_path`'s
+                // whitespace split mangles paths with spaces. The `… to` line
+                // carries the new path verbatim — trust it. (#270)
+                file.path = rest.to_string();
+                file.status = ChangeStatus::Renamed;
             } else if let Some(rest) = line.strip_prefix("+++ ") {
                 // Recover the new path; git uses `b/<path>` or `/dev/null`.
                 if rest == "/dev/null" {
@@ -133,7 +158,15 @@ fn parse_hunk_header(line: &str) -> Option<Hunk> {
         Some(s) => s.parse().ok()?,
         None => 1,
     };
-    let new_end = if count == 0 { start } else { start + count - 1 };
+    // `start + count - 1` can overflow u32 on a hostile diff header (diffs come
+    // from `git diff`/`git show`/remote PRs — untrusted). Use checked math so a
+    // bogus hunk is skipped rather than panicking (debug) or wrapping to a wrong
+    // line number (release).
+    let new_end = if count == 0 {
+        start
+    } else {
+        start.checked_add(count - 1)?
+    };
     Some(Hunk {
         new_start: start,
         new_end,
@@ -182,6 +215,23 @@ mod tests {
     }
 
     #[test]
+    fn hostile_hunk_header_does_not_overflow() {
+        // `@@ -1 +2,4294967295 @@`: start=2, count=u32::MAX → `start + count - 1`
+        // exceeds u32::MAX. Must not panic (debug) or wrap to 0 (release): the
+        // hunk is skipped instead. Diffs are untrusted input (remote PRs,
+        // `git show`).
+        assert_eq!(parse_hunk_header("@@ -1 +2,4294967295 @@"), None);
+        // A normal large-but-valid hunk still parses.
+        assert_eq!(
+            parse_hunk_header("@@ -1 +10,5 @@"),
+            Some(Hunk {
+                new_start: 10,
+                new_end: 14,
+            })
+        );
+    }
+
+    #[test]
     fn diff_args_use_committed_range_when_head_present() {
         assert_eq!(
             diff_args("origin/main", "HEAD"),
@@ -197,5 +247,33 @@ mod tests {
             diff_args("HEAD", ""),
             vec!["diff", "--unified=0", "--no-color", "HEAD"],
         );
+    }
+
+    #[test]
+    fn rejects_refs_that_look_like_git_options() {
+        // #241 option-injection guard: a ref starting with `-` must be refused
+        // before it reaches `git diff` — `--output=<path>` / `-O<orderfile>`
+        // would otherwise write/read arbitrary files via the diff subprocess.
+        assert!(ensure_safe_ref("base", "--output=/tmp/pwn").is_err());
+        assert!(ensure_safe_ref("base", "-O/tmp/order").is_err());
+        assert!(ensure_safe_ref("head", "--upload-pack=evil").is_err());
+        // Legitimate refs (including the empty head = working-tree mode) pass.
+        assert!(ensure_safe_ref("base", "origin/main").is_ok());
+        assert!(ensure_safe_ref("base", "HEAD~3").is_ok());
+        assert!(ensure_safe_ref("base", "v1.2.3").is_ok());
+        assert!(ensure_safe_ref("head", "").is_ok());
+        assert!(ensure_safe_ref("base", "@{upstream}").is_ok());
+    }
+
+    #[test]
+    fn rename_with_spaces_recovers_new_path() {
+        // #270: a pure rename (100% similarity) carries no `+++`/`@@`; a path
+        // with spaces breaks `parse_b_path`'s whitespace split, so the
+        // `rename to` line must recover the new path.
+        let raw = "diff --git a/old name.rs b/new name.rs\nsimilarity index 100%\nrename from old name.rs\nrename to new name.rs\n";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new name.rs");
+        assert_eq!(files[0].status, ChangeStatus::Renamed);
     }
 }

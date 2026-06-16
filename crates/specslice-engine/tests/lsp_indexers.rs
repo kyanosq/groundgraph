@@ -49,6 +49,31 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Run `cmd` to completion under a wall-clock `budget`, polling `try_wait`.
+/// Returns `Some(success)` if it exited in time, or `None` if it was killed for
+/// exceeding the budget (#79). Spawn failure maps to `Some(false)`.
+fn run_with_timeout(cmd: &mut std::process::Command, budget: std::time::Duration) -> Option<bool> {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Some(false),
+    };
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return Some(false),
+        }
+    }
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -136,14 +161,29 @@ fn swift_indexer_emits_class_struct_protocol_method_nodes_when_lsp_present() {
     // fast. If the binary is missing or the build fails we still
     // run the structural assertions (they only need documentSymbol)
     // and drop the Calls assertion at the end.
-    let swift_build_ok = std::process::Command::new("swift")
+    // #79: bound `swift build` so a cold SwiftPM cache / blocked registry
+    // fetch can't hang an opt-in `--include-ignored` run forever. A timeout is
+    // treated like a build failure — the structural assertions still run; only
+    // the LSP-overlay Calls assertion is dropped.
+    let mut swift_build = std::process::Command::new("swift");
+    swift_build
         .args(["build", "--package-path"])
         .arg(tmp.path())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stderr(std::process::Stdio::null());
+    let swift_build_ok = match run_with_timeout(
+        &mut swift_build,
+        std::time::Duration::from_secs(120),
+    ) {
+        Some(ok) => ok,
+        None => {
+            eprintln!(
+                    "soft-skip {}: `swift build` exceeded the 120s budget (cold SwiftPM cache / blocked registry?) — dropping the Calls overlay assertion",
+                    module_path!()
+                );
+            false
+        }
+    };
 
     let opts = SwiftIndexOptions {
         repo_root: tmp.path().to_path_buf(),

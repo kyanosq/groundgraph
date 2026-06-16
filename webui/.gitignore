@@ -1,4 +1,3 @@
 node_modules/
 shots/
 data/*.json
-package*.json

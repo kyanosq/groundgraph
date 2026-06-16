@@ -181,9 +181,10 @@ pub fn compute_impact_with_policy(
 
     for file in changed {
         report.changed_files.push(file.path.clone());
-        let is_dart = file.path.ends_with(".dart");
-        let is_test_file = file.path.starts_with("test/") || file.path.contains("/test/");
-        if is_dart && is_test_file {
+        // Language-agnostic test detection: Go `_test.go`, Rust `tests/`,
+        // JS/TS `*.test.ts`, Swift/Java `FooTests` — not just Dart `test/`.
+        // (#247/#248)
+        if crate::path_class::is_test_path(&file.path) {
             any_test_changed = true;
         }
 
@@ -604,8 +605,10 @@ fn filter_most_specific_symbols(
                 other.symbol_id != candidate.symbol_id
                     && candidate.start_line <= other.start_line
                     && other.end_line <= candidate.end_line
-                    && (other.end_line - other.start_line)
-                        < (candidate.end_line - candidate.start_line)
+                    // `saturating_sub`: a drifted/corrupt range with
+                    // `end < start` must not panic (debug) or wrap (release).
+                    && other.end_line.saturating_sub(other.start_line)
+                        < candidate.end_line.saturating_sub(candidate.start_line)
             })
         })
         .cloned()
@@ -648,7 +651,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -659,5 +662,41 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
         raw.to_path_buf()
     } else {
         repo_root.join(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use specslice_core::SymbolRange;
+
+    fn range(id: &str, start: u32, end: u32) -> SymbolRange {
+        SymbolRange {
+            file_path: "f.rs".into(),
+            symbol_id: ArtifactId::new(id),
+            start_line: start,
+            end_line: end,
+            symbol_kind: NodeKind::DartMethod,
+            qualified_name: id.into(),
+            parent_symbol_id: None,
+        }
+    }
+
+    /// A drifted / externally-written `symbol_ranges` row with `end_line <
+    /// start_line` must not panic the "most specific" filter. Real indexers
+    /// always emit `end >= start` (byte-offset derived), so this is the same
+    /// DB-drift / hostile-input hardening the project applies elsewhere
+    /// (#63 decode sanitising, #181 git_diff `checked_add`): the `end - start`
+    /// span math underflows in debug and wraps in release without a guard.
+    #[test]
+    fn filter_most_specific_tolerates_reversed_range() {
+        let enclosing = range("c", 1, 100);
+        let reversed = range("o", 50, 10); // corrupt: end < start
+                                           // Before the fix this panics in debug (`10u32 - 50u32`).
+        let out = filter_most_specific_symbols(vec![enclosing, reversed]);
+        assert!(
+            out.iter().any(|r| r.symbol_id == ArtifactId::new("o")),
+            "filter must complete and keep the innermost range: {out:?}"
+        );
     }
 }

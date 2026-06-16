@@ -371,19 +371,63 @@ fn split_decorator(raw: &str) -> (&str, &str) {
 
 fn first_string_arg(args: &str) -> Option<String> {
     let inner = args.trim().strip_prefix('(')?;
-    let inner = inner.trim_end_matches(')');
-    let candidate = inner.split(',').next()?.trim();
+    // Prefer the first *complete* string literal so a comma inside it does not
+    // truncate the value (`re_path(r'^x{1,3}/$')`) and an empty literal
+    // (`route("")`) yields an empty path rather than the quoted form. (#257)
+    if let Some(literal) = first_string_literal(inner) {
+        return Some(literal);
+    }
+    // No string literal: the first arg is a variable/expression. Return the
+    // first comma-separated token verbatim (e.g. `app.get(path)`).
+    let candidate = inner.trim_end_matches(')').split(',').next()?.trim();
     if candidate.is_empty() {
-        return None;
-    }
-    let value = strip_quotes(candidate.to_string());
-    if value.is_empty() || value == candidate {
-        // Not a literal string — return as-is so callers see whatever
-        // the source had (e.g. `path` for `app.get(path)`).
-        Some(candidate.to_string())
+        None
     } else {
-        Some(value)
+        Some(candidate.to_string())
     }
+}
+
+/// Parse a Python string literal at the start of `s` (after optional
+/// whitespace and an `r`/`b`/`f`/`u` prefix, in any case/combination) and
+/// return its unquoted content. Honors `\`-escapes (non-raw strings) so a
+/// quote or comma *inside* the literal does not end it early. Returns `None`
+/// when `s` does not begin with a (prefixed) quote.
+fn first_string_literal(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    let prefix_start = i;
+    while i < chars.len() && matches!(chars[i], 'r' | 'R' | 'b' | 'B' | 'f' | 'F' | 'u' | 'U') {
+        i += 1;
+    }
+    let raw = chars[prefix_start..i]
+        .iter()
+        .any(|c| matches!(c, 'r' | 'R'));
+    let quote = match chars.get(i) {
+        Some(&c) if c == '"' || c == '\'' => c,
+        _ => return None,
+    };
+    i += 1;
+    let mut out = String::new();
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' && !raw {
+            escaped = true;
+        } else if c == quote {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    // Unterminated literal on this line: treat as not-a-literal.
+    None
 }
 
 fn extract_kwarg(args: &str, key: &str) -> Option<String> {
@@ -434,6 +478,38 @@ fn strip_quotes(value: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_string_arg_keeps_commas_inside_string_literals() {
+        // Django `re_path(r'^x{1,3}/$')`: the comma lives inside the regex
+        // string. Splitting on `,` truncated it to `r'^x{1`. (#257)
+        assert_eq!(
+            first_string_arg("(r'^x{1,3}/$', views.x)"),
+            Some("^x{1,3}/$".to_string())
+        );
+        // A plain quoted literal with a comma inside survives too.
+        assert_eq!(
+            first_string_arg("(\"/a,b\", handler)"),
+            Some("/a,b".to_string())
+        );
+    }
+
+    #[test]
+    fn first_string_arg_empty_literal_is_empty_path() {
+        // `@app.route("")` is an empty path, not the two-character string `""`.
+        assert_eq!(first_string_arg("(\"\")"), Some(String::new()));
+    }
+
+    #[test]
+    fn first_string_arg_plain_and_variable_unchanged() {
+        assert_eq!(first_string_arg("(\"/users\")"), Some("/users".to_string()));
+        // A non-literal first arg (a variable) is returned verbatim.
+        assert_eq!(first_string_arg("(path)"), Some("path".to_string()));
+        assert_eq!(
+            first_string_arg("(\"/items/{id}\", response_model=Item)"),
+            Some("/items/{id}".to_string())
+        );
+    }
 
     #[test]
     fn classifies_fastapi_router_verbs() {

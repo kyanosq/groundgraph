@@ -5,10 +5,12 @@
 //! 1. **Persistence schema** — `CREATE TABLE` statements (table name +
 //!    columns). These live *inside string literals* (`db.execute('CREATE
 //!    TABLE …')`), so the scanner deliberately reads raw text.
-//! 2. **Serialization keymap** — every `obj['key']` / `obj["key"]` map
-//!    access in code, with the default applied via `?? <default>`. This is
-//!    how Dart `fromJson` / `toJson` encode the wire format; getting a key
-//!    name or a default wrong silently corrupts data on the new platform.
+//! 2. **Serialization keymap** — every `obj['key']` / `obj["key"]` subscript
+//!    *and* every `obj.get("key"[, default])` map read in code, with the
+//!    default applied via `?? <default>` (subscripts) or the second argument
+//!    (`.get`). This is how Dart `fromJson` / `toJson` and Python
+//!    `data.get(...)` encode the wire format; getting a key name or a default
+//!    wrong silently corrupts data on the new platform.
 //!
 //! The keymap scan uses [`strip_noise`](crate::source_text::strip_noise) as
 //! a *mask*: a code-level subscript shows up in the masked text as
@@ -139,6 +141,11 @@ pub fn analyze_data_contract_with_store(
 
     for (path, lang) in &files {
         let abs = options.repo_root.join(path);
+        // Skip a file that has grown past the index byte budget rather than
+        // slurp it whole for the keymap scan (#245).
+        if crate::source_text::is_oversized_source(&abs) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&abs) else {
             continue;
         };
@@ -158,7 +165,9 @@ pub fn analyze_data_contract_with_store(
         }
         if !options.tables_only {
             let masked: Vec<char> = strip_noise(&text, *lang).chars().collect();
-            for k in scan_json_keys(&raw, &masked, &line_index) {
+            let subscript_keys = scan_json_keys(&raw, &masked, &line_index);
+            let get_keys = scan_get_call_keys(&raw, &masked, &line_index);
+            for k in subscript_keys.into_iter().chain(get_keys) {
                 let entry = keymap
                     .entry(k.key.clone())
                     .or_insert_with(|| (0, BTreeSet::new(), Vec::new()));
@@ -555,6 +564,106 @@ fn scan_json_keys(raw: &[char], masked: &[char], line_index: &[u32]) -> Vec<RawJ
     out
 }
 
+/// Detect `.get("key")` / `.get('key', default)` map accesses — the idiomatic
+/// dict/Map read in Python (`data.get("field", None)`), JS/Java (`map.get("k")`)
+/// and friends — which subscript scanning alone misses. Mirrors
+/// [`scan_json_keys`]: the masked text blanks string content, so the key is
+/// read back from `raw` and the optional second argument becomes the default.
+fn scan_get_call_keys(raw: &[char], masked: &[char], line_index: &[u32]) -> Vec<RawJsonKey> {
+    let mut out = Vec::new();
+    let n = masked.len().min(raw.len());
+    let mut i = 0usize;
+    while i + 4 <= n {
+        // Match `.get` as a method name (word boundary after `get`).
+        let is_get = masked[i] == '.'
+            && masked.get(i + 1).copied() == Some('g')
+            && masked.get(i + 2).copied() == Some('e')
+            && masked.get(i + 3).copied() == Some('t')
+            && !matches!(masked.get(i + 4), Some(c) if c.is_alphanumeric() || *c == '_');
+        if !is_get {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 4;
+        skip_ws_slice(masked, &mut j);
+        if masked.get(j).copied() != Some('(') {
+            i += 1;
+            continue;
+        }
+        let open_paren = j;
+        j += 1;
+        skip_ws_slice(masked, &mut j);
+        let Some(q) = masked.get(j).copied() else {
+            i += 1;
+            continue;
+        };
+        if q != '"' && q != '\'' && q != '`' {
+            i += 1;
+            continue;
+        }
+        let key_start = j + 1;
+        let mut k = key_start;
+        while k < n && masked[k] != q {
+            k += 1;
+        }
+        if k >= n {
+            i += 1;
+            continue;
+        }
+        let key: String = raw[key_start..k].iter().collect();
+        let mut after = k + 1;
+        skip_ws_slice(masked, &mut after);
+        // The first argument must be the *only* argument (`.get("k")`) or be
+        // followed by a single default (`.get("k", default)`); anything else
+        // (e.g. `.get("k", a, b)`) is not a recognised map read.
+        let mut default = None;
+        match masked.get(after).copied() {
+            Some(')') => {}
+            Some(',') => {
+                let def_start = after + 1;
+                // Read the default up to the `)` that closes this `.get(`,
+                // tracking nested parens so `.get("k", f(a, b))` is captured.
+                let mut depth = 1usize;
+                let mut p = open_paren + 1;
+                while p < n {
+                    match masked[p] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    p += 1;
+                }
+                let def_end = p.min(raw.len());
+                let ds = def_start.min(def_end);
+                let def: String = raw[ds..def_end].iter().collect();
+                let def = def.trim();
+                if !def.is_empty() {
+                    default = Some(truncate_def(def));
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        let trimmed_key = key.trim();
+        if !trimmed_key.is_empty() && is_plain_key(trimmed_key) {
+            out.push(RawJsonKey {
+                key: trimmed_key.to_string(),
+                line: line_at(line_index, i),
+                default,
+            });
+        }
+        i = k + 1;
+    }
+    out
+}
+
 /// A "plain" map key: identifier-ish / dotted / snake — not an expression
 /// (`$var`, interpolation, operators). Filters subscripts like `list[idx]`
 /// that happened to use a string variable, and string-interpolated keys.
@@ -606,7 +715,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -629,6 +738,44 @@ mod tests {
         let masked: Vec<char> = strip_noise(src, lang).chars().collect();
         let idx = build_line_index(&raw);
         scan_json_keys(&raw, &masked, &idx)
+    }
+
+    fn get_keys(src: &str, lang: Language) -> Vec<RawJsonKey> {
+        let raw: Vec<char> = src.chars().collect();
+        let masked: Vec<char> = strip_noise(src, lang).chars().collect();
+        let idx = build_line_index(&raw);
+        scan_get_call_keys(&raw, &masked, &idx)
+    }
+
+    #[test]
+    fn scans_python_get_call_keys_with_defaults() {
+        // Python `dict.get` is the idiomatic wire-format read; subscript
+        // scanning alone is blind to it. Capture both the key and the default.
+        let src = "def parse(data):\n    age = data.get(\"age\", 0)\n    city = payload.get('city')\n    n = items.get(\"count\", len(items))\n";
+        let map: std::collections::HashMap<String, Option<String>> =
+            get_keys(src, Language::Python)
+                .into_iter()
+                .map(|k| (k.key, k.default))
+                .collect();
+        assert_eq!(map.get("age"), Some(&Some("0".to_string())));
+        assert_eq!(map.get("city"), Some(&None), "no default → None");
+        assert_eq!(
+            map.get("count"),
+            Some(&Some("len(items)".to_string())),
+            "default may itself be a call with nested parens/commas"
+        );
+    }
+
+    #[test]
+    fn get_call_ignores_non_string_and_string_literal_occurrences() {
+        // `.get(idx)` (numeric/var) is not a string-keyed read; a `.get('x')`
+        // sitting inside a string literal is masked away and must be skipped.
+        let src = "v = arr.get(0)\nc = \"obj.get('fake')\"\nr = m.get('real')\n";
+        let names: Vec<String> = get_keys(src, Language::Python)
+            .into_iter()
+            .map(|k| k.key)
+            .collect();
+        assert_eq!(names, vec!["real".to_string()]);
     }
 
     #[test]

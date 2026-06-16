@@ -138,6 +138,9 @@ pub fn try_run(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // #68: own process group so a timeout kill also reaps the analyzer
+    // subprocesses `dart run` forks (analysis_server, build tools).
+    crate::proc::detach_process_group(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -197,8 +200,9 @@ pub fn try_run(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() > budget {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // #68/#77: take the whole group down (reaping forked
+                    // analyzer subprocesses) and bound the reap.
+                    crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
                     let _ = stdout_thread.join();
                     let _ = stderr_thread.join();
                     return SidecarOutcome::Skipped {
@@ -327,12 +331,27 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Split a shell-style command into program + args (whitespace, no
-/// quoting). Intentionally simple — users with truly exotic paths can
-/// build a wrapper script.
+/// Split a shell-style command into program + args, honouring quotes and
+/// backslash escapes so a binary path containing spaces
+/// (`'/opt/my dart/dart' run ...`) is parsed as one argument. Falls back to
+/// whitespace splitting if the string has unbalanced quotes (never panics).
+fn split_command(raw: &str) -> Vec<String> {
+    match shlex::split(raw) {
+        Some(parts) if !parts.is_empty() => parts,
+        // `shlex` returns `None` on unbalanced quotes and `Some([])` when it
+        // treats the whole value as a comment (a leading `#`, e.g. a
+        // `#!`-shebang path). For a non-blank override, falling through to bare
+        // `dart` would silently mask the misconfiguration — so split on
+        // whitespace instead, letting the user's value reach `Command` (and
+        // fail loudly if it cannot exec). (#258)
+        _ if !raw.trim().is_empty() => raw.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn command_from_str(raw: &str) -> Command {
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    let mut cmd = Command::new(parts.first().copied().unwrap_or("dart"));
+    let parts = split_command(raw);
+    let mut cmd = Command::new(parts.first().map(String::as_str).unwrap_or("dart"));
     for p in parts.iter().skip(1) {
         cmd.arg(p);
     }
@@ -452,6 +471,41 @@ mod tests {
     fn with_env_lock<F: FnOnce()>(f: F) {
         let _guard = ENV_LOCK.lock().expect("env test mutex poisoned");
         f();
+    }
+
+    #[test]
+    fn split_command_honours_quotes_and_falls_back_safely() {
+        // A quoted binary path with spaces stays a single argv[0].
+        assert_eq!(
+            split_command("'/opt/my dart/dart' run tool/x.dart"),
+            vec!["/opt/my dart/dart", "run", "tool/x.dart"]
+        );
+        // Plain whitespace commands are unchanged.
+        assert_eq!(
+            split_command("dart run x.dart"),
+            vec!["dart", "run", "x.dart"]
+        );
+        // Unbalanced quotes must not panic — fall back to whitespace split.
+        assert_eq!(split_command("dart 'unclosed"), vec!["dart", "'unclosed"]);
+    }
+
+    #[test]
+    fn split_command_does_not_swallow_hash_led_override() {
+        // `shlex` treats `#` as a comment start and returns an *empty* vec, so
+        // a `#!`-shebang-like override silently collapsed to bare `dart`. A
+        // non-blank override must still reach argv. (#258)
+        assert_eq!(
+            split_command("#!/opt/dart"),
+            vec!["#!/opt/dart".to_string()]
+        );
+        assert_eq!(
+            split_command("/opt/dart # note"),
+            vec!["/opt/dart".to_string()],
+            "a trailing comment is fine as long as the program survives"
+        );
+        // A truly blank value still yields no tokens (caller falls back to the
+        // default `dart` only when the override is unset/blank).
+        assert!(split_command("   ").is_empty());
     }
 
     fn with_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {

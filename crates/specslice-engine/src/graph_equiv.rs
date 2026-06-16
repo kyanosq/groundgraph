@@ -380,13 +380,18 @@ fn compare_tables(
                     .filter(|c| !src_norm.contains(&normalize_column(c)))
                     .cloned()
                     .collect();
-                let matched = src_cols.len().saturating_sub(missing_columns.len());
-                total_src_cols += src_cols.len();
+                // Count matches on the deduped, normalized column sets so a
+                // duplicate column name (e.g. parser emitting `id, id`, or an
+                // un-deduped `ALTER TABLE ADD COLUMN`) can neither over- nor
+                // under-count coverage — `matched + missing` need not equal the
+                // raw `src_cols.len()` (#96).
+                let matched = src_norm.iter().filter(|c| tgt_norm.contains(*c)).count();
+                total_src_cols += src_norm.len();
                 total_matched_cols += matched;
-                let coverage = if src_cols.is_empty() {
+                let coverage = if src_norm.is_empty() {
                     1.0
                 } else {
-                    matched as f32 / src_cols.len() as f32
+                    matched as f32 / src_norm.len() as f32
                 };
                 missing_columns.sort();
                 extra_columns.sort();

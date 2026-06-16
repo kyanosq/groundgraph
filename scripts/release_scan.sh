@@ -22,6 +22,40 @@ NAME="${1:?need name}"
 SRC="${2:?need src path}"
 LANG="${3:?need language: dart|typescript|python|java}"
 
+# issues.md #83: NAME becomes a directory under release-scans/_scratch and is
+# the target of `rsync --delete`. A traversal value like "../../crates" would
+# make rsync wipe the specslice tree. Restrict NAME to a safe slug; reject any
+# slash, leading dot, or `..` component before we touch the filesystem.
+case "$NAME" in
+  "" | . | .. | */* | *..* | .*)
+    echo "error: invalid NAME '$NAME' — must be a plain slug ([A-Za-z0-9._-], no '/', no '..', no leading '.')" >&2
+    exit 2
+    ;;
+esac
+case "$NAME" in
+  *[!A-Za-z0-9._-]*)
+    echo "error: invalid NAME '$NAME' — only [A-Za-z0-9._-] allowed" >&2
+    exit 2
+    ;;
+esac
+if [ ! -d "$SRC" ]; then
+  echo "error: SRC '$SRC' is not an existing directory" >&2
+  exit 2
+fi
+
+# issues.md #81: never copy run-time secrets out of the target repo into our
+# scratch tree (a later `tar -czf backup.tar.gz .` would otherwise leak third
+# party production keys). Applied to every language's rsync below.
+SECRET_EXCLUDES=(
+  --exclude '.env' --exclude '.env.*' --exclude '*.env'
+  --exclude '**/.env' --exclude '**/.env.*' --exclude '**/*.env'
+  --exclude '*.pem' --exclude '*.key' --exclude '*.p12' --exclude '*.pfx'
+  --exclude '*.keystore' --exclude 'secrets.*' --exclude '*secrets*.json'
+  --exclude 'credentials' --exclude 'credentials.*' --exclude '*credentials*'
+  --exclude '.aws/' --exclude '.ssh/' --exclude '.netrc'
+  --exclude '.npmrc' --exclude '.pypirc'
+)
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPECSLICE="$ROOT/target/release/specslice"
 SCRATCH_BASE="$ROOT/release-scans/_scratch"
@@ -34,7 +68,7 @@ mkdir -p "$SCRATCH" "$REPORT"
 echo "==> [$NAME] rsync $SRC → $SCRATCH"
 case "$LANG" in
   dart)
-    rsync -a --delete \
+    rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude '.dart_tool/' --exclude 'build/' \
       --exclude '.idea/' --exclude '.vscode/' --exclude '.specslice/' \
       --exclude '**/node_modules/' --exclude 'macos/Pods/' --exclude 'ios/Pods/' \
@@ -53,7 +87,7 @@ code:
 YAML
     ;;
   typescript)
-    rsync -a --delete \
+    rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude 'node_modules/' --exclude 'dist/' \
       --exclude '.next/' --exclude '.turbo/' --exclude 'coverage/' \
       --exclude '.specslice/' --exclude '*.lock' --exclude 'package-lock.json' \
@@ -68,7 +102,7 @@ typescript:
 YAML
     ;;
   python)
-    rsync -a --delete \
+    rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude '.venv/' --exclude 'venv/' --exclude '__pycache__/' \
       --exclude '.pytest_cache/' --exclude '.ruff_cache/' --exclude '.mypy_cache/' \
       --exclude '.specslice/' --exclude 'node_modules/' --exclude 'dist/' \
@@ -86,7 +120,7 @@ python:
 YAML
     ;;
   java)
-    rsync -a --delete \
+    rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude 'target/' --exclude 'build/' \
       --exclude '.idea/' --exclude '.vscode/' --exclude '.gradle/' \
       --exclude '.specslice/' --exclude '*.class' --exclude '*.jar' \
@@ -106,6 +140,15 @@ esac
 # Some scratched trees may still ship a `.specslice.yaml` from the
 # source repo (none of the targets do today, but be defensive).
 rm -rf "$SCRATCH/.specslice"
+
+# issues.md #81 belt-and-braces: delete any secret files that slipped past the
+# rsync excludes (unusual names) before anything reads the scratch copy. Keep
+# *.example templates which are safe by convention.
+find "$SCRATCH" -type f \( \
+  -name '.env' -o -name '.env.*' -o -name '*.env' \
+  -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' \
+  -o -name '*.keystore' -o -name '.netrc' \) \
+  ! -name '*.example' -delete 2>/dev/null || true
 
 echo "==> [$NAME] init"
 "$SPECSLICE" --repo-root "$SCRATCH" init >"$REPORT/init.txt" 2>&1 || \
@@ -133,8 +176,20 @@ echo "==> [$NAME] dead-code (best-effort)"
 # render real numbers without re-parsing the JSON.
 FILES_SCANNED=$(grep -E "files:" "$REPORT/index.txt" | head -5 | tr -d ' ' | paste -sd ' ' - || true)
 SYMBOLS_SCANNED=$(grep -E "Symbols:" "$REPORT/index.txt" | head -5 | tr -d ' ' | paste -sd ' ' - || true)
-NODE_COUNT=$(python3 -c "import json,sys; d=json.load(open('$REPORT/graph-code.json')); print(len(d.get('nodes',[])))" 2>/dev/null || echo "n/a")
-EDGE_COUNT=$(python3 -c "import json,sys; d=json.load(open('$REPORT/graph-code.json')); print(len(d.get('edges',[])))" 2>/dev/null || echo "n/a")
+# issues.md #85/#185: pass the report path and array key as argv, never
+# interpolate them into the Python source. A `$REPORT` containing a single
+# quote or `__import__(...)` payload can no longer break out of the string.
+count_json_array() {
+  python3 -c 'import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        doc = json.load(fh)
+    print(len(doc.get(sys.argv[2], [])))
+except Exception:
+    print("n/a")' "$1" "$2"
+}
+NODE_COUNT=$(count_json_array "$REPORT/graph-code.json" nodes)
+EDGE_COUNT=$(count_json_array "$REPORT/graph-code.json" edges)
 
 echo "==> [$NAME] writing report"
 {

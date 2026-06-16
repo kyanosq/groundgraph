@@ -42,7 +42,7 @@ SpecSlice 为代码库构建一张**带证据**的图——把需求、文档、
 - 📊 **`dashboard`** — 单文件离线 HTML 管理面板：概览 / 业务模块 / 功能簇 / 检查 / 死代码 / 待澄清 / 纯度一页聚合，浏览器直接打开（`file://`），无服务、无 CDN。
 - 🔌 **MCP 服务** — 通过 Model Context Protocol 把图暴露给 AI 智能体。
 
-在多语言大型代码库上实战验证：Redis（C，约 20 万行）索引约 11 秒；TypeScript 编译器仓库（2 万+ 文件）约 52 秒——并行解析 + 单文件解析预算，能扛住带故意语法错误的 fixture 语料；Django（Python）、gin（Go）、gson（Java/Maven）端到端验证。SCIP 富集支持增量——源码未变时直接复用上次 `.scip`，免去重跑类型检查器；搜索排序对 tests/tools/examples 降权，issue 式查询优先命中生产代码（用 Redis 真实 issues 验证）。
+在多语言大型代码库上实战验证：Redis（C，约 20 万行）索引约 11 秒；TypeScript 编译器仓库（2 万+ 文件）约 28 秒——并行解析 + 单文件解析预算，能扛住带故意语法错误的 fixture 语料；Django（Python）、gin（Go）、gson（Java/Maven）端到端验证。SCIP 富集支持增量——源码未变时直接复用上次 `.scip`，免去重跑类型检查器；搜索排序对 tests/tools/examples 降权，issue 式查询优先命中生产代码（用 Redis 真实 issues 验证）。
 
 ## 安装
 
@@ -52,9 +52,10 @@ SpecSlice 是一个 Rust workspace。从源码构建（`rust-toolchain.toml` 已
 git clone https://github.com/specslice/specslice.git
 cd specslice
 
-# 安装 CLI（`specslice`）与 MCP 服务（`specslice-mcp`）
-cargo install --path crates/specslice-cli
-cargo install --path crates/specslice-mcp   # 可选，供 AI 智能体使用
+# 安装 CLI（`specslice`）与 MCP 服务（`specslice-mcp`）。
+# `--locked` 会遵循已提交的 Cargo.lock，使构建可复现。
+cargo install --locked --path crates/specslice-cli
+cargo install --locked --path crates/specslice-mcp   # 可选，供 AI 智能体使用
 
 # …或直接把二进制构建到 target/release/
 cargo build --release
@@ -100,7 +101,7 @@ specslice dashboard                 # 单文件离线 HTML 管理面板
 | --- | --- | --- |
 | 广度（默认） | 进程内 **tree-sitter** | Rust、TypeScript、Python、Go、Java、C、C++、Swift、C#、Ruby、PHP、Kotlin |
 | Dart | 内置**分析器 sidecar**（领域感知：Riverpod / Hive / 导航 / 内购） | Dart |
-| 文档 | Markdown / 需求 / ADR | `.md`、`.mdx` |
+| 文档 | Markdown / RST / AsciiDoc / 需求 / ADR | `.md`、`.mdx`、`.rst`、`.adoc` |
 
 在 `.specslice.yaml` 的统一 `languages:` 选择器里选语言，再跑 `specslice index`。
 
@@ -143,13 +144,18 @@ storage:
   path: .specslice/graph.db   # 图缓存（可重建）
 docs:
   paths: [docs, specs, adr]   # 文档/需求所在目录
-  include: ["**/*.md", "**/*.mdx"]
-treesitter:
-  languages: [rust]           # 统一语言选择器
+  include: ["**/*.md", "**/*.mdx", "**/*.rst", "**/*.adoc"]
+languages:                    # 统一、canonical 的语言选择器
+  - id: rust
+    paths: [crates]           # 该语言要扫描的根目录
 enrichment:
   scip: true                  # 存在时自动调用 SCIP indexer
   analyzer: true              # Dart 分析器 sidecar（配置了 Dart 时）
 ```
+
+> 顶层 `languages:` 列表才是 canonical 选择器。旧写法 `treesitter.languages:
+> [rust]` 仍作为**向后兼容别名**生效，但仅当 `languages:` 缺省时——不要两者同时
+> 设置（normalisation 时存在的 `languages:` 会清空该别名）。
 
 ## 工作原理
 

@@ -367,6 +367,18 @@ pub struct ScipRunOutcome {
 /// a missing or failing indexer degrades to a recorded `Skipped`/`Failed`
 /// outcome so the structural graph still indexes.
 pub fn run_indexers(repo_root: &Path, languages: &[String]) -> Vec<ScipRunOutcome> {
+    run_indexers_with(repo_root, languages, &|b| binary_on_path(b))
+}
+
+/// [`run_indexers`] with an injectable binary resolver. Tests pass a stub
+/// `probe` so they never have to mutate the process environment to point at a
+/// fake indexer (process-wide `set_var` races with every other test thread that
+/// reads `std::env`, which is UB — #269). Production uses the real `PATH` probe.
+pub(crate) fn run_indexers_with(
+    repo_root: &Path,
+    languages: &[String],
+    probe: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Vec<ScipRunOutcome> {
     // Absolutize the root for subprocess use: Go's `scip-go` runs in a *module*
     // subdir (its `cwd` ≠ repo root), so a relative `--output ./.specslice/...`
     // would resolve against that subdir and fail ("no such file or directory").
@@ -382,7 +394,7 @@ pub fn run_indexers(repo_root: &Path, languages: &[String]) -> Vec<ScipRunOutcom
         if !seen.insert(language.as_str()) {
             continue;
         }
-        let plans = plan_language(language, repo_root, &scip_dir, &|b| binary_on_path(b));
+        let plans = plan_language(language, repo_root, &scip_dir, probe);
         // Incremental gate: when EVERY runnable plan's source digest matches
         // the digest recorded by the last successful run (and its `.scip` is
         // still on disk), reuse the whole language's outputs without spawning
@@ -525,6 +537,14 @@ fn inputs_digest(cwd: &Path, language: &str) -> u64 {
     hasher.finish()
 }
 
+/// A cheap change-detector for a file: `(mtime, len)`. `None` when the file is
+/// absent. Used to tell a freshly written `index.scip` from a pre-existing one
+/// (#268); the `len` guards the rare case of a same-instant overwrite.
+fn file_signature(p: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 /// `<out>.inputs` sidecar holding the digest of the run that produced `out`.
 fn inputs_sidecar(out: &Path) -> PathBuf {
     let mut s = out.as_os_str().to_owned();
@@ -551,14 +571,40 @@ fn execute(
     writes_cwd_index: bool,
     language: String,
 ) -> ScipRunOutcome {
+    // `writes_cwd_index` indexers (Dart `scip_dart`) ignore `--output` and emit
+    // a fixed `index.scip` into the cwd (= repo root). Snapshot any pre-existing
+    // file *before* the run so we only ever move one this run actually wrote:
+    // otherwise a user's own committed `index.scip` gets moved aside, or a stale
+    // leftover from a prior run is ingested as if fresh. (#268)
+    let cwd_index = cwd.join("index.scip");
+    let pre = if writes_cwd_index {
+        file_signature(&cwd_index)
+    } else {
+        None
+    };
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
     match run_with_capped_stderr(&mut cmd) {
         Ok((status, _)) if status.success() => {
             if writes_cwd_index {
-                let produced = cwd.join("index.scip");
-                if produced.exists() {
-                    if let Err(e) = std::fs::rename(&produced, out) {
+                let post = file_signature(&cwd_index);
+                let fresh = match (&pre, &post) {
+                    (_, None) => false,           // nothing at index.scip
+                    (None, Some(_)) => true,      // created this run
+                    (Some(a), Some(b)) => a != b, // overwritten this run
+                };
+                if post.is_some() && !fresh {
+                    return ScipRunOutcome {
+                        language,
+                        status: ScipRunStatus::Failed(
+                            "scip_dart 成功退出但未生成新的 index.scip（仓库根已存在同名旧文件，已保留未触碰）"
+                                .to_string(),
+                        ),
+                        output: None,
+                    };
+                }
+                if fresh {
+                    if let Err(e) = std::fs::rename(&cwd_index, out) {
                         return ScipRunOutcome {
                             language,
                             status: ScipRunStatus::Failed(format!("移动 index.scip 失败: {e}")),
@@ -593,6 +639,15 @@ fn execute(
                 output: None,
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ScipRunOutcome {
+            language,
+            // A hung indexer is non-fatal: the structural graph still indexed,
+            // only the precision overlay is missing (#77).
+            status: ScipRunStatus::Failed(format!(
+                "`{program}` 超时被终止（{e}）；可设 {SCIP_TIMEOUT_ENV} 调整预算，结构图不受影响"
+            )),
+            output: None,
+        },
         Err(e) => ScipRunOutcome {
             language,
             status: ScipRunStatus::Failed(format!("无法启动 `{program}`: {e}")),
@@ -609,37 +664,106 @@ const STDERR_CAP_BYTES: usize = 64 * 1024;
 /// Run `cmd`, discarding stdout entirely (the index artefact goes to a file,
 /// never to stdout) and retaining only a capped prefix of stderr. The pipe is
 /// drained to EOF past the cap so the child can never block on a full pipe.
+/// `SPECSLICE_SCIP_TIMEOUT_SECS` overrides the per-indexer wall-clock budget
+/// (#77). Generous default: `rust-analyzer scip` / `scip-python` on a large
+/// monorepo legitimately runs for minutes, so we only guard against a *hung*
+/// indexer (one that never closes stderr / never exits), not a slow one.
+const SCIP_TIMEOUT_ENV: &str = "SPECSLICE_SCIP_TIMEOUT_SECS";
+const DEFAULT_SCIP_TIMEOUT_SECS: u64 = 600;
+
+fn scip_timeout() -> std::time::Duration {
+    parse_scip_timeout(std::env::var(SCIP_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Pure policy for [`scip_timeout`] — kept env-free so it is unit-testable
+/// without mutating process-global state (cf. #65). A missing, non-numeric, or
+/// zero value falls back to the default budget.
+fn parse_scip_timeout(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(DEFAULT_SCIP_TIMEOUT_SECS),
+            std::time::Duration::from_secs,
+        )
+}
+
 fn run_with_capped_stderr(
     cmd: &mut Command,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    run_with_capped_stderr_budget(cmd, scip_timeout())
+}
+
+/// Run `cmd` under a wall-clock `budget` (#77). A reader thread drains stderr
+/// to EOF (capped) so the child can never block on a full pipe, while the main
+/// thread polls `try_wait`; if the budget is exceeded the child is killed and
+/// `ErrorKind::TimedOut` is returned. Previously this blocked on
+/// `stderr.read()` to EOF with no timeout, so a hung indexer (rust-analyzer
+/// stuck on a bad toolchain, a sidecar that never exits) hung `specslice index`
+/// indefinitely. The Dart sidecar already had this guard; SCIP did not.
+fn run_with_capped_stderr_budget(
+    cmd: &mut Command,
+    budget: std::time::Duration,
 ) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
     use std::io::Read;
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // #68: own process group so a budget kill also reaps any subprocesses the
+    // indexer forked (rust-analyzer / scip-* tooling).
+    crate::proc::detach_process_group(cmd);
     let mut child = cmd.spawn()?;
-    let mut stderr = child.stderr.take().expect("stderr was requested as piped");
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stderr.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() < STDERR_CAP_BYTES {
-                    let take = n.min(STDERR_CAP_BYTES - buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
+    // `Stdio::piped()` makes this Some in practice, but surface an error instead
+    // of panicking if a future refactor (or fd exhaustion) breaks that invariant.
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("stderr pipe missing despite Stdio::piped()"))?;
+    let reader = std::thread::spawn(move || -> Vec<u8> {
+        let mut pipe = stderr;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() < STDERR_CAP_BYTES {
+                        let take = n.min(STDERR_CAP_BYTES - buf.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                    }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        }
+        buf
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let buf = reader.join().unwrap_or_default();
+                return Ok((status, buf));
+            }
+            Ok(None) => {
+                if started.elapsed() > budget {
+                    // #68/#77: take the whole group down, bound the reap.
+                    crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
+                    let _ = reader.join();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("indexer exceeded the {}s budget", budget.as_secs()),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
+                let _ = reader.join();
                 return Err(e);
             }
         }
     }
-    let status = child.wait()?;
-    Ok((status, buf))
 }
 
 /// Distil an indexer's stderr into one actionable line. Indexers print the real
@@ -716,6 +840,38 @@ mod tests {
         assert!(!stderr.is_empty(), "capped prefix must still be kept");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_with_capped_stderr_budget_kills_a_hung_indexer() {
+        // #77: a child that never exits (and never closes stderr) must not hang
+        // `index` — the budget kills it and reports a timeout promptly.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let err = run_with_capped_stderr_budget(&mut cmd, std::time::Duration::from_millis(300))
+            .expect_err("a hung child must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must return ~immediately after the budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn parse_scip_timeout_defaults_and_honours_positive_overrides() {
+        let default = std::time::Duration::from_secs(DEFAULT_SCIP_TIMEOUT_SECS);
+        assert_eq!(parse_scip_timeout(None), default, "unset → default");
+        assert_eq!(parse_scip_timeout(Some("nope")), default, "non-numeric");
+        assert_eq!(parse_scip_timeout(Some("0")), default, "zero rejected");
+        assert_eq!(parse_scip_timeout(Some("")), default, "empty rejected");
+        assert_eq!(
+            parse_scip_timeout(Some("  5 ")),
+            std::time::Duration::from_secs(5),
+            "trimmed positive override honoured"
+        );
+    }
+
     #[test]
     fn summarize_stderr_prefers_the_error_line_over_a_backtrace_tail() {
         // rust-analyzer prints the cause first, then a panic backtrace whose
@@ -766,15 +922,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let env_key = env_override_for("python");
-        std::env::set_var(&env_key, &fake);
+        // Inject the fake via a probe instead of `SPECSLICE_SCIP_PYTHON_BIN`:
+        // a process-wide `set_var` races with every other test thread reading
+        // `std::env` (UB). (#269)
+        let fake_path = fake.clone();
+        let probe = move |b: &str| (b == "scip-python").then(|| fake_path.clone());
 
         let calls = || {
             std::fs::read_to_string(repo.join("calls.log"))
                 .map(|s| s.lines().count())
                 .unwrap_or(0)
         };
-        let r1 = run_indexers(repo, &["python".to_string()]);
+        let r1 = run_indexers_with(repo, &["python".to_string()], &probe);
         assert!(
             matches!(r1[0].status, ScipRunStatus::Generated),
             "first run generates: {:?}",
@@ -782,7 +941,7 @@ mod tests {
         );
         assert_eq!(calls(), 1);
 
-        let r2 = run_indexers(repo, &["python".to_string()]);
+        let r2 = run_indexers_with(repo, &["python".to_string()], &probe);
         assert!(
             matches!(r2[0].status, ScipRunStatus::UpToDate),
             "unchanged tree reuses the output: {:?}",
@@ -793,15 +952,78 @@ mod tests {
 
         // Touching a source invalidates the digest and re-runs the indexer.
         std::fs::write(repo.join("a.py"), "def f():\n    return 2\n").unwrap();
-        let r3 = run_indexers(repo, &["python".to_string()]);
+        let r3 = run_indexers_with(repo, &["python".to_string()], &probe);
         assert!(
             matches!(r3[0].status, ScipRunStatus::Generated),
             "changed tree regenerates: {:?}",
             r3[0].status
         );
         assert_eq!(calls(), 2);
+    }
 
-        std::env::remove_var(&env_key);
+    #[cfg(unix)]
+    #[test]
+    fn execute_does_not_consume_preexisting_cwd_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path();
+        // A user's own (or stale) index.scip already sits at the repo root.
+        std::fs::write(cwd.join("index.scip"), "PREEXISTING-STALE").unwrap();
+        // Fake scip_dart that "succeeds" but writes no index.scip.
+        let fake = cwd.join("noop.sh");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = cwd.join("dart.scip");
+        let outcome = execute(
+            fake.to_str().unwrap(),
+            &[],
+            cwd,
+            &out,
+            true,
+            "dart".to_string(),
+        );
+        assert!(
+            matches!(outcome.status, ScipRunStatus::Failed(_)),
+            "a pre-existing/stale index.scip must not be consumed: {:?}",
+            outcome.status
+        );
+        assert!(!out.exists(), "must not move the stale file to the output");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("index.scip")).unwrap(),
+            "PREEXISTING-STALE",
+            "the pre-existing file must be left untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_moves_freshly_written_cwd_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path();
+        // Fake scip_dart that writes a fresh index.scip into the cwd.
+        let fake = cwd.join("gen.sh");
+        std::fs::write(&fake, "#!/bin/sh\necho FRESH-INDEX > index.scip\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = cwd.join("dart.scip");
+        let outcome = execute(
+            fake.to_str().unwrap(),
+            &[],
+            cwd,
+            &out,
+            true,
+            "dart".to_string(),
+        );
+        assert!(
+            matches!(outcome.status, ScipRunStatus::Generated),
+            "a freshly written index.scip is moved to the output: {:?}",
+            outcome.status
+        );
+        assert!(out.is_file());
+        assert!(
+            !cwd.join("index.scip").exists(),
+            "the fresh file is moved, not copied"
+        );
     }
 
     fn never_found() -> BinFinder {

@@ -55,7 +55,7 @@ pub fn index_links(store: &mut Store, options: &LinksIndexOptions) -> Result<Lin
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading links manifest {}", path.display()))?;
-    let manifest: LinksManifest = serde_yaml::from_str(&raw)
+    let manifest: LinksManifest = serde_yml::from_str(&raw)
         .with_context(|| format!("parsing links manifest {}", path.display()))?;
     let rel_manifest = path
         .strip_prefix(&options.repo_root)

@@ -93,7 +93,7 @@ crates/
 ├── specslice-store     # SQLite 存储 + 迁移(.specslice/graph.db),FTS5 全文层
 ├── specslice-engine    # 索引器、扫描器、搜索、全部分析(大脑)
 ├── specslice-lang-dart # Dart analyzer sidecar(领域感知:Riverpod/Hive/导航/IAP)
-├── specslice-cli       # specslice 二进制(31 个子命令)
+├── specslice-cli       # specslice 二进制(33 个子命令)
 └── specslice-mcp       # specslice-mcp:Model Context Protocol 服务器(7 个工具)
 ```
 
@@ -135,7 +135,7 @@ SCIP 增量:`.scip.inputs` 摘要未变即整语言复用上次输出,典型增�
 
 ---
 
-## 3. 功能全景(31 个 CLI 命令 + 7 个 MCP 工具)
+## 3. 功能全景(33 个 CLI 命令 + 7 个 MCP 工具)
 
 ### 3.1 建立与维护
 

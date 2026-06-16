@@ -163,6 +163,12 @@ pub fn analyze_questions_with_store(
                                 | EdgeKind::NavigatesTo
                                 | EdgeKind::PersistsTo
                                 | EdgeKind::SubscribesStream
+                                // An interface→impl link is a real user: the
+                                // method satisfies an interface contract even
+                                // when the interface itself has no inbound edge
+                                // (#119). dead_code treats DeclaresVerification
+                                // as usage symmetrically.
+                                | EdgeKind::DeclaresImplementation
                         )
                     })
                 })
@@ -555,6 +561,46 @@ mod tests {
         assert!(!orphans
             .iter()
             .any(|q| q.artifact_id.as_deref() == Some("python::foo.py::callee")));
+    }
+
+    #[test]
+    fn interface_implementation_is_not_surfaced_as_orphan() {
+        // schema_indexer links an interface to its impl with a
+        // `DeclaresImplementation` edge (interface→impl). The interface may
+        // itself have no inbound edge, so the impl's only "user" is that edge.
+        // It must count as a real user, not be reported as an orphan (#119).
+        let (mut store, _d) = empty_store();
+        upsert(
+            &mut store,
+            "java::Svc.java::DictService",
+            NodeKind::JavaInterface,
+            Some("Svc.java"),
+            Some("DictService"),
+        );
+        upsert(
+            &mut store,
+            "java::SvcImpl.java::DictServiceImpl.queryById",
+            NodeKind::JavaMethod,
+            Some("SvcImpl.java"),
+            Some("queryById"),
+        );
+        upsert_edge(
+            &mut store,
+            "java::Svc.java::DictService",
+            "java::SvcImpl.java::DictServiceImpl.queryById",
+            EdgeKind::DeclaresImplementation,
+        );
+        let r = analyze_questions_with_store(&store, &QuestionsOptions::default()).unwrap();
+        let orphans: Vec<_> = r
+            .questions
+            .iter()
+            .filter(|q| q.category == "orphan_symbol")
+            .filter_map(|q| q.artifact_id.clone())
+            .collect();
+        assert!(
+            !orphans.contains(&"java::SvcImpl.java::DictServiceImpl.queryById".to_string()),
+            "interface impl wrongly flagged as orphan: {orphans:?}"
+        );
     }
 
     #[test]

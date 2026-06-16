@@ -50,7 +50,12 @@ fn flush_cjk(run: &mut Vec<char>, out: &mut Vec<String>) {
     match run.len() {
         0 => {}
         1 => out.push(run[0].to_string()),
-        _ => {
+        n => {
+            // `n` CJK chars yield `n - 1` overlapping bigrams (the `0`/`1`
+            // arms above guarantee `n >= 2`). Reserve once up front so the
+            // inner pushes never re-grow `out` — this is the FTS index's
+            // innermost loop on CJK-heavy corpora (issues3.md #141).
+            out.reserve(n - 1);
             for pair in run.windows(2) {
                 out.push(pair.iter().collect());
             }

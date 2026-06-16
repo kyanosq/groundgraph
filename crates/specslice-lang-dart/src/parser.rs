@@ -744,6 +744,15 @@ fn update_depth(line: &str, depth: &mut usize, state: &mut ScanState) {
                 escaped = false;
             } else if ch == '\\' && !raw_string {
                 escaped = true;
+            } else if !raw_string && ch == '$' && chars.get(i + 1) == Some(&'{') {
+                // String interpolation `${ expr }`: the expression can carry its
+                // own quotes and braces (`"${m["k"]}"`). Skip to the matching
+                // `}` so a nested quote does not prematurely end the string and
+                // the interpolation's braces are not counted as code blocks.
+                // (#259) (Raw strings — `r"..."` — do not interpolate.)
+                i = skip_interpolation(&chars, i + 2);
+                prev = ' ';
+                continue;
             } else if ch == quote_char {
                 in_string = false;
             }
@@ -777,6 +786,59 @@ fn update_depth(line: &str, depth: &mut usize, state: &mut ScanState) {
         prev = ch;
         i += 1;
     }
+}
+
+/// Given `chars[start..]` positioned just *after* a `${`, return the index of
+/// the char past the `}` that closes the interpolation. Counts nested braces
+/// and skips nested string literals (which may themselves interpolate), so the
+/// interpolation's own braces are never mistaken for code blocks. Single-line:
+/// an unterminated interpolation returns `chars.len()`. (#259)
+fn skip_interpolation(chars: &[char], start: usize) -> usize {
+    let mut i = start;
+    let mut brace = 1usize;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => brace += 1,
+            '}' => {
+                brace -= 1;
+                if brace == 0 {
+                    return i + 1;
+                }
+            }
+            c @ ('\'' | '"') => {
+                let raw = i > 0 && chars[i - 1] == 'r';
+                i = skip_inline_string(chars, i, c, raw);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Skip a single-line string literal whose opening quote is at `chars[open]`.
+/// Returns the index past the closing quote. Honors `\`-escapes (non-raw) and
+/// recurses into `${...}` interpolations so a brace inside a nested string is
+/// not counted. (#259)
+fn skip_inline_string(chars: &[char], open: usize, quote: char, raw: bool) -> usize {
+    let mut i = open + 1;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && !raw {
+            escaped = true;
+        } else if !raw && ch == '$' && chars.get(i + 1) == Some(&'{') {
+            i = skip_interpolation(chars, i + 2);
+            continue;
+        } else if ch == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Byte index of the first unescaped `quote` in `s`, honouring `\\` pairs.
@@ -1295,6 +1357,23 @@ mod tests {
 
         // Even-length backslash runs end the escape: `"a\\\\"` closes too.
         assert_eq!(depth_of(&[r#"var s = "a\\\\"; {"#]), 1);
+    }
+
+    #[test]
+    fn update_depth_handles_string_interpolation_with_nested_quotes() {
+        // `"${a["{"]}"` — the `{` lives inside the *nested* string of an
+        // interpolation expression. The nested `"` must not end the outer
+        // string, and the `{` must not be counted as a code block. Only the
+        // trailing real `{` counts. (#259)
+        assert_eq!(
+            depth_of(&[r#"var s = "${a["{"]}"; if (c) {"#]),
+            1,
+            "nested quote/brace inside ${{...}} must not corrupt depth"
+        );
+        // A collection literal inside an interpolation is not a code block.
+        assert_eq!(depth_of(&[r#"var s = "a ${ {1: 2} } b";"#]), 0);
+        // Raw strings do not interpolate: `$`, `{`, `}` are literal content.
+        assert_eq!(depth_of(&[r#"var s = r"${not[an]i}"; {"#]), 1);
     }
 
     #[test]

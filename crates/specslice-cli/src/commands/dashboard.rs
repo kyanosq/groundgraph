@@ -34,8 +34,8 @@ pub fn run(args: DashboardRunArgs) -> Result<()> {
     };
     super::output::write_atomic(&target, &html)
         .with_context(|| format!("writing dashboard to {}", target.display()))?;
-    println!("wrote {}", target.display());
-    println!("open it in any browser — fully offline, no server required.");
+    eprintln!("wrote {}", target.display());
+    eprintln!("open it in any browser — fully offline, no server required.");
     Ok(())
 }
 

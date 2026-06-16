@@ -128,6 +128,54 @@ fn stats_reset_clears_ledger() {
 }
 
 #[test]
+fn stats_reset_json_emits_machine_readable_output() {
+    // `--reset --json` must honour `--json` (not swallow it), so CI can parse
+    // the outcome instead of a localized human string (issues2.md #92).
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["stats", "--reset", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stats --reset --json must emit JSON");
+    assert_eq!(v["reset"], serde_json::Value::Bool(true), "stdout={stdout}");
+    // bootstrap (init + index) wrote ledger records, so it existed.
+    assert_eq!(
+        v["existed"],
+        serde_json::Value::Bool(true),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn stats_reset_reports_when_ledger_absent() {
+    // Resetting a non-existent ledger must not claim it was cleared (#92).
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap(tmp.path());
+    let ledger = tmp.path().join(".specslice").join("stats.jsonl");
+    if ledger.exists() {
+        std::fs::remove_file(&ledger).unwrap();
+    }
+    let assert = Command::cargo_bin("specslice")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["stats", "--reset", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        v["existed"],
+        serde_json::Value::Bool(false),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
 fn stats_index_run_records_symbol_counts() {
     let tmp = tempfile::TempDir::new().unwrap();
     bootstrap(tmp.path());

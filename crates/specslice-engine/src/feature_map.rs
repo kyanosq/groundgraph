@@ -195,6 +195,10 @@ pub fn analyze_feature_map_with_store(
                 }
             }
         }
+        // `external_refs.min(20)` is in [0, 20]. `try_from` keeps clippy happy
+        // (no lossy `as`); the `unwrap_or(20)` can't actually fire, and 20 is
+        // exactly the clamp ceiling, so the fallback is consistent rather than
+        // an arbitrary sentinel. (#260)
         score += u32::try_from(external_refs.min(20)).unwrap_or(20);
         seeds.push((node.id.clone(), score, path, roles.into_iter().collect()));
     }
@@ -240,10 +244,13 @@ pub fn analyze_feature_map_with_store(
             // Insert assignment if this seed has a higher score
             // than whoever previously claimed this node, OR if
             // same seed but at a shorter distance.
+            // A node already claimed by another seed is re-claimed only by a
+            // strictly higher-scoring seed. The old "same seed, shorter
+            // distance" sub-condition was unreachable: each seed runs exactly
+            // one BFS whose per-seed `visited` set pops every node at most once,
+            // so a seed never revisits a node it already assigned. (#260)
             let beats = match assignments.get(&cur) {
-                Some((prev_idx, prev_score, prev_dist)) => {
-                    *seed_score > *prev_score || (*prev_idx == cluster_idx && depth < *prev_dist)
-                }
+                Some((_, prev_score, _)) => *seed_score > *prev_score,
                 None => true,
             };
             if beats {

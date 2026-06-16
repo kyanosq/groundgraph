@@ -202,6 +202,119 @@ fn symbol_ranges_query_by_file_and_line() {
     assert!(ids.contains(&method_id));
 }
 
+/// Pins the *asymmetric* intersection semantics so a future param reshuffle in
+/// `find_symbols_intersecting` (the query mixes `start`/`end` across the two
+/// columns) cannot silently swap them (#178). One symbol spans `[5, 10]`; every
+/// boundary case below distinguishes the correct predicate
+/// (`start_line <= end AND end_line >= start`) from a transposed one.
+#[test]
+fn find_symbols_intersecting_respects_asymmetric_bounds() {
+    let (_tmp, mut store) = fresh_store();
+    let sym = ArtifactId::new("dart_method::b.dart#Foo.bar");
+    store
+        .upsert_symbol_range(&SymbolRange {
+            file_path: "b.dart".into(),
+            symbol_id: sym.clone(),
+            start_line: 5,
+            end_line: 10,
+            symbol_kind: NodeKind::DartMethod,
+            qualified_name: "Foo.bar".into(),
+            parent_symbol_id: None,
+        })
+        .unwrap();
+
+    let hit = |start: u32, end: u32| {
+        store
+            .find_symbols_intersecting("b.dart", start, end)
+            .unwrap()
+            .iter()
+            .any(|r| r.symbol_id == sym)
+    };
+
+    // Partial overlaps from each side — a transposed predicate misses these.
+    assert!(
+        hit(8, 12),
+        "query starts inside the symbol, extends past its end"
+    );
+    assert!(hit(1, 7), "query ends inside the symbol, starts before it");
+    // Exact edge touches must count as intersecting.
+    assert!(hit(1, 5), "touch at the symbol's first line");
+    assert!(hit(10, 15), "touch at the symbol's last line");
+    // Fully disjoint on either side must not.
+    assert!(!hit(1, 4), "entirely above the symbol");
+    assert!(!hit(11, 20), "entirely below the symbol");
+    // Wrong file never matches.
+    assert!(
+        store
+            .find_symbols_intersecting("other.dart", 5, 10)
+            .unwrap()
+            .is_empty(),
+        "file_path is scoped"
+    );
+}
+
+/// #140: every adjacency lookup runs `WHERE <col> = ? ORDER BY id`. The `id`
+/// column is TEXT, so a single-column index on `<col>` locates the rows but
+/// leaves their TEXT-id order to a `USE TEMP B-TREE FOR ORDER BY` — paid on
+/// every call, and search/slice/impact fan out thousands per query. A composite
+/// `(<col>, id)` covering index yields the rows already in id order, so the sort
+/// disappears. This pins the query plan: each lookup must use its composite
+/// index and never sort.
+#[test]
+fn adjacency_queries_avoid_a_sort_via_composite_indexes() {
+    let (_tmp, mut store) = fresh_store();
+
+    // A handful of edges so the planner reasons about real rows, not an empty
+    // table (where a full scan can look cheaper than any index).
+    for i in 0..8 {
+        store
+            .upsert_edge(&EdgeAssertion::declared(
+                ArtifactId::new(format!("sym::a{i}")),
+                ArtifactId::new(format!("sym::b{i}")),
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            ))
+            .unwrap();
+    }
+
+    let plan = |where_order: &str| -> String {
+        let conn = store.connection();
+        let sql = format!("EXPLAIN QUERY PLAN SELECT * FROM edge_assertions {where_order}");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let details: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        details.join(" | ")
+    };
+
+    for (where_order, idx) in [
+        (
+            "WHERE kind = 'Calls' ORDER BY id",
+            "idx_edge_assertions_kind_ord",
+        ),
+        (
+            "WHERE from_id = 'sym::a0' ORDER BY id",
+            "idx_edge_assertions_from_ord",
+        ),
+        (
+            "WHERE to_id = 'sym::b0' ORDER BY id",
+            "idx_edge_assertions_to_ord",
+        ),
+    ] {
+        let p = plan(where_order);
+        assert!(
+            p.contains(idx),
+            "`{where_order}` should use composite index {idx}; plan was: {p}"
+        );
+        assert!(
+            !p.contains("TEMP B-TREE"),
+            "`{where_order}` must not sort (composite index gives id order); plan was: {p}"
+        );
+    }
+}
+
 #[test]
 fn file_index_upserts_and_reads_back_hash() {
     let (_tmp, mut store) = fresh_store();
@@ -591,6 +704,37 @@ fn fulltext_rebuild_then_match_ranks_bodies_by_bm25() {
         .expect("second rebuild");
     let hits = store.fulltext_match("\"boundary\"", 10).expect("match");
     assert!(hits.is_empty(), "old rows must be gone after rebuild");
+}
+
+#[test]
+fn repeated_fulltext_rebuilds_stay_queryable_after_optimize() {
+    // Regression for issues3.md #138: every rebuild ends with an FTS5
+    // `'optimize'` merge. Simulate many `specslice index` runs and assert the
+    // content layer keeps returning correct, single-hit matches — i.e. the
+    // optimize step neither errors nor corrupts the segment merge.
+    let (_tmp, mut store) = fresh_store();
+    for generation in 0..8 {
+        let body = format!("generation {generation} unique boundary marker");
+        let inserted = store
+            .rebuild_fulltext(&[
+                FulltextRow {
+                    node_id: format!("rust::a.rs::gen{generation}"),
+                    body,
+                },
+                FulltextRow {
+                    node_id: "rust::b.rs::stable".into(),
+                    body: "stable routing words".into(),
+                },
+            ])
+            .expect("rebuild fulltext with optimize");
+        assert_eq!(inserted, 2, "both non-empty bodies indexed each pass");
+
+        let hits = store
+            .fulltext_match("\"boundary\"", 10)
+            .expect("match after optimize");
+        assert_eq!(hits.len(), 1, "exactly one body mentions `boundary`");
+        assert_eq!(hits[0].node_id, format!("rust::a.rs::gen{generation}"));
+    }
 }
 
 #[test]

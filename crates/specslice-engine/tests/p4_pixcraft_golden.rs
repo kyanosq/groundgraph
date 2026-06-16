@@ -25,6 +25,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use specslice_engine::business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates, ReviewStatus,
     ReviewVerdict,
@@ -86,46 +88,16 @@ fn sidecar_source_present() -> bool {
         .exists()
 }
 
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
-}
-
-fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
-    if !sidecar_source_present() || !dart_available() {
-        eprintln!("skipping: dart sidecar unavailable");
+fn setup_indexed_repo() -> Option<tempfile::TempDir> {
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p4_pixcraft_golden",
+    ) {
         return None;
     }
-    let on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -150,12 +122,12 @@ fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
         result.resolver_used, RESOLVER_DART_ANALYZER,
         "P4 golden requires the sidecar to actually run"
     );
-    Some((tmp, on, bin))
+    Some(tmp)
 }
 
 #[test]
 fn p4_sidecar_resolves_all_four_feature_slices_with_semantic_edges() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -407,7 +379,7 @@ fn p4_candidate_review_cycle_persists_to_yaml_and_dedupes_questions() {
 
 #[test]
 fn p4_logic_confidence_report_reflects_review_outcomes() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -539,7 +511,7 @@ fn p4_accepted_candidate_promotes_into_confirmed_graph_layer() {
     //   * source = "human_confirmed"
     //   * default_visible = true (so the confirmed view actually shows them)
     //   * outgoing derives_from edges inherit the same layer/status
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 
@@ -655,7 +627,7 @@ fn p4_impact_surfaces_accepted_candidate_when_its_evidence_changes() {
     // surface the candidate under `affected_confirmed_candidates`
     // so the reviewer notices the drift instead of silently
     // letting the AI claim stand.
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
 

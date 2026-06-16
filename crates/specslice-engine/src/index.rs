@@ -23,6 +23,54 @@ use crate::swift_indexer::{
 use crate::treesitter::{self, TsIndexOptions};
 use crate::typescript_indexer::{index_typescript, TypescriptIndexOptions, TypescriptIndexResult};
 
+/// #187: opt-in to executing commands that came from the *repo's*
+/// `.specslice.yaml`. Off by default so pointing `specslice index` at an
+/// untrusted clone can never run an attacker-chosen binary.
+pub const TRUST_CONFIG_COMMANDS_ENV: &str = "SPECSLICE_TRUST_CONFIG_COMMANDS";
+
+/// Decide whether a command string that originated in the repo-controlled
+/// config should be honoured (#187).
+///
+/// `.specslice.yaml` is part of the *target* repository, so a poisoned
+/// `swift.lsp_command: /tmp/payload.sh` would otherwise run on `index`. We
+/// honour such a value only when the operator explicitly trusts the workspace
+/// (`trusted == true`); otherwise we drop it and return a human-readable notice
+/// so the skip is visible rather than silent. Operator-set env vars
+/// (`SPECSLICE_SWIFT_LSP_BIN`, `SPECSLICE_SCIP_*_BIN`, …) bypass this gate by
+/// construction — they are not repo-controlled.
+///
+/// Pure (the `trusted` flag is read from the environment by the caller) so the
+/// policy is unit-testable without mutating process env.
+pub(crate) fn resolve_config_command(
+    trusted: bool,
+    field: &str,
+    value: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match value {
+        None => (None, None),
+        Some(v) if trusted => (Some(v.to_string()), None),
+        Some(v) => (
+            None,
+            Some(format!(
+                "ignoring `{field}: {v}` from .specslice.yaml — repo-provided commands are not \
+                 executed by default; set {TRUST_CONFIG_COMMANDS_ENV}=1 to trust this workspace, \
+                 or pass the command via its operator env var instead"
+            )),
+        ),
+    }
+}
+
+/// Env-reading wrapper over [`resolve_config_command`]; prints the "ignored"
+/// notice to stderr and returns the command to honour (if any).
+fn config_command(field: &str, value: Option<&str>) -> Option<String> {
+    let trusted = std::env::var_os(TRUST_CONFIG_COMMANDS_ENV).is_some();
+    let (cmd, notice) = resolve_config_command(trusted, field, value);
+    if let Some(notice) = notice {
+        eprintln!("specslice: {notice}");
+    }
+    cmd
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
     pub repo_root: PathBuf,
@@ -116,6 +164,9 @@ pub struct TreeSitterLangResult {
     /// (tree-sitter error recovery on fixture corpora).
     #[serde(default)]
     pub parse_timeouts: usize,
+    /// Files skipped because they exceeded the per-file size budget.
+    #[serde(default)]
+    pub skipped_oversized: usize,
     pub resolver_used: String,
 }
 
@@ -229,9 +280,11 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
                 repo_root: options.repo_root.clone(),
                 code_roots: swift_paths.iter().map(PathBuf::from).collect(),
                 exclude_globs: config.swift.exclude.clone(),
-                lsp_command: std::env::var(SWIFT_LSP_COMMAND_ENV)
-                    .ok()
-                    .or_else(|| config.swift.lsp_command.clone()),
+                // Operator env var is trusted; a command from the repo's
+                // `.specslice.yaml` is gated behind `SPECSLICE_TRUST_CONFIG_COMMANDS` (#187).
+                lsp_command: std::env::var(SWIFT_LSP_COMMAND_ENV).ok().or_else(|| {
+                    config_command("swift.lsp_command", config.swift.lsp_command.as_deref())
+                }),
             };
             let swift =
                 index_swift(&mut store, &swift_options).context("indexing Swift sources")?;
@@ -384,6 +437,7 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
                     symbols: ts.symbols,
                     imports: ts.imports,
                     parse_timeouts: ts.parse_timeouts,
+                    skipped_oversized: ts.skipped_oversized,
                     resolver_used: ts.resolver_used,
                 });
                 timer.mark(&format!("treesitter:{}", spec.language_id));
@@ -480,8 +534,13 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
+    // #72 — warn (don't fail) when the file was written by a newer specslice
+    // whose config keys this build may misinterpret.
+    if let Some(notice) = cfg.schema_version_notice() {
+        eprintln!("specslice: {notice}");
+    }
     // P23.7 — fold the unified `languages:` selector onto the legacy
     // per-language switches so the index pass below has a single source.
     Ok(cfg.normalized())
@@ -539,6 +598,38 @@ fn indexed_languages(config: &EngineConfig) -> Vec<String> {
     langs
 }
 
+/// Canonical ids of languages that have enough first-party source to be
+/// auto-elected by `init` but that the current config does **not** index — the
+/// silent blind spots a stale config leaves behind (e.g. a repo `init`-ed when
+/// it was pure Python that later grew a `web/` TypeScript front-end). Returns a
+/// sorted, deduplicated list; empty when the config already covers everything
+/// detection would elect. Threshold matches `init`'s own elector (≥3 files /
+/// ≥25% of sources / a language manifest), so stray scripts never trip it.
+pub fn unindexed_present_languages(repo_root: &Path) -> Result<Vec<String>> {
+    let config = load_config(repo_root)?;
+    Ok(unindexed_languages_against_config(repo_root, &config))
+}
+
+/// Pure set-difference half of [`unindexed_present_languages`], split out so it
+/// can be unit-tested without a real `.specslice.yaml` on disk.
+fn unindexed_languages_against_config(repo_root: &Path, config: &EngineConfig) -> Vec<String> {
+    let detected: std::collections::BTreeSet<String> =
+        crate::init::detect_language_selections(repo_root)
+            .into_iter()
+            .map(|sel| sel.id)
+            .collect();
+    let mut covered: std::collections::BTreeSet<String> =
+        indexed_languages(config).into_iter().collect();
+    // Dart is indexed by its bespoke analyzer sidecar, which the SCIP-oriented
+    // `indexed_languages` intentionally omits when the analyzer is on. Count it
+    // as covered whenever Dart is the configured code language, so a Flutter
+    // repo never gets a false "dart not indexed" warning.
+    if config.code.language == "dart" {
+        covered.insert("dart".to_string());
+    }
+    detected.difference(&covered).cloned().collect()
+}
+
 /// Number of files actually indexed for canonical `lang` this run, summed over
 /// the dedicated adapter result and the unified tree-sitter pass (a language's
 /// `language_id` in `treesitter` equals its canonical id). Used to gate SCIP
@@ -568,6 +659,33 @@ fn language_file_count(result: &IndexResult, lang: &str) -> usize {
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
+
+    #[test]
+    fn config_command_is_dropped_unless_workspace_is_trusted() {
+        // #187: a repo-provided command must NOT run by default.
+        let (cmd, notice) =
+            resolve_config_command(false, "swift.lsp_command", Some("/tmp/payload.sh"));
+        assert_eq!(cmd, None, "untrusted repo command must be ignored");
+        let notice = notice.expect("an ignored command must surface a visible notice");
+        assert!(notice.contains("/tmp/payload.sh"), "{notice}");
+        assert!(notice.contains(TRUST_CONFIG_COMMANDS_ENV), "{notice}");
+
+        // Trusted workspace honours it, with no notice.
+        let (cmd, notice) =
+            resolve_config_command(true, "swift.lsp_command", Some("/tmp/payload.sh"));
+        assert_eq!(cmd.as_deref(), Some("/tmp/payload.sh"));
+        assert_eq!(notice, None);
+
+        // Absent value is a no-op either way.
+        assert_eq!(
+            resolve_config_command(false, "swift.lsp_command", None),
+            (None, None)
+        );
+        assert_eq!(
+            resolve_config_command(true, "swift.lsp_command", None),
+            (None, None)
+        );
+    }
 
     fn dart_config(analyzer: bool) -> EngineConfig {
         let mut cfg = EngineConfig::default();
@@ -602,6 +720,62 @@ mod tests {
         assert!(
             langs.contains(&"dart".to_string()),
             "scip_dart should fill the precision gap when the sidecar is disabled: {langs:?}"
+        );
+    }
+
+    /// A repo `init`-ed when it was pure Python that later grew a Rust crate
+    /// must surface `rust` as an unindexed blind spot — otherwise the graph
+    /// silently omits an entire language and the agent never learns it exists.
+    #[test]
+    fn unindexed_languages_flags_present_but_unconfigured_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                root.join("src").join(format!("m{i}.py")),
+                "def f():\n    return 1\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src").join(format!("r{i}.rs")),
+                "fn f() -> i32 { 1 }\n",
+            )
+            .unwrap();
+        }
+        let mut cfg = EngineConfig::default();
+        cfg.python.enabled = true;
+        let drift = unindexed_languages_against_config(root, &cfg);
+        assert!(
+            drift.contains(&"rust".to_string()),
+            "rust present but unconfigured → must be flagged: {drift:?}"
+        );
+        assert!(
+            !drift.contains(&"python".to_string()),
+            "python is configured → not flagged: {drift:?}"
+        );
+    }
+
+    /// When the config already indexes every detected language there is no
+    /// blind spot, so the warning must stay silent (no false nagging).
+    #[test]
+    fn unindexed_languages_empty_when_config_covers_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                root.join("src").join(format!("m{i}.py")),
+                "def f():\n    return 1\n",
+            )
+            .unwrap();
+        }
+        let mut cfg = EngineConfig::default();
+        cfg.python.enabled = true;
+        let drift = unindexed_languages_against_config(root, &cfg);
+        assert!(
+            drift.is_empty(),
+            "python-only repo fully covered → no drift: {drift:?}"
         );
     }
 

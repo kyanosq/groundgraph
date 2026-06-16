@@ -71,7 +71,8 @@ bool isValidSdk(String dir) {
 /// found (in which case the analyzer keeps its current behaviour).
 ///
 /// [resolvedExecutable] and [environment] are injectable for testing.
-String? resolveSdkPath({String? resolvedExecutable, Map<String, String>? environment}) {
+String? resolveSdkPath(
+    {String? resolvedExecutable, Map<String, String>? environment}) {
   final exe = resolvedExecutable ?? Platform.resolvedExecutable;
   final env = environment ?? Platform.environment;
 
@@ -100,13 +101,36 @@ String? resolveSdkPath({String? resolvedExecutable, Map<String, String>? environ
     }
     final candidates = [
       p.dirname(p.dirname(real)), // <sdk>/bin/dart        → <sdk>
-      p.join(p.dirname(real), 'cache', 'dart-sdk'), // <flutter>/bin/dart → cache/dart-sdk
+      p.join(p.dirname(real), 'cache',
+          'dart-sdk'), // <flutter>/bin/dart → cache/dart-sdk
     ];
     for (final c in candidates) {
       if (isValidSdk(c)) return c;
     }
   }
   return null;
+}
+
+/// Forward-slash, repo-relative path for [absPath]. This is the canonical id
+/// component for every emitted node (`file::<rel>`, `dart_*::<rel>#…`) **and**
+/// the only path we ever put into diagnostic messages — diagnostics flow into
+/// the graph + CLI output, so they must never embed an absolute (and possibly
+/// user-identifying) path (#103). Kept as a top-level pure function so the
+/// relativisation is unit-testable without a real analysis run.
+String repoRelative(String absPath, String repoRoot) =>
+    p.relative(absPath, from: repoRoot).replaceAll(r'\\', '/');
+
+/// Strip user-identifying absolute path prefixes from text that will be
+/// serialised into the sidecar response (and so end up in the Rust-side
+/// `diagnostics` table and HTML reports) — #103. We collapse POSIX home dirs
+/// (`/Users/<name>/`, `/home/<name>/`) and the Windows equivalent
+/// (`C:\Users\<name>\`) to `<home>/`, removing the username + machine layout
+/// leak while keeping the diagnostic legible. Full, unredacted detail still
+/// goes to stderr for local debugging.
+String sanitizeDiagnosticText(String raw) {
+  return raw
+      .replaceAll(RegExp(r'/(?:Users|home)/[^/\s:]+/'), '<home>/')
+      .replaceAll(RegExp(r'[A-Za-z]:\\Users\\[^\\\s:]+\\'), r'<home>\');
 }
 
 /// Entry point. Returns the JSON-encodable batch.
@@ -165,180 +189,186 @@ Future<SidecarBatchResponse> walkRepository(SidecarRequest req) async {
   // consume) while package resolution + language version still come from the
   // project's package config.
   final optionsDir = await Directory.systemTemp.createTemp('specslice_opts_');
-  final optionsFile = File(p.join(optionsDir.path, 'analysis_options.yaml'))
-    ..writeAsStringSync('analyzer:\n');
+  // #126: guarantee the temp dir is reclaimed even if the walk throws partway
+  // through (a visitor bug, a bad SDK path, …). Previously a non-happy-path
+  // exit leaked one `specslice_opts_*` dir per sidecar invocation.
+  try {
+    final optionsFile = File(p.join(optionsDir.path, 'analysis_options.yaml'))
+      ..writeAsStringSync('analyzer:\n');
 
-  // P2 — pass the repo root as a single included path so the analyzer
-  // treats the whole repo as one context. Otherwise (without a
-  // pubspec.yaml) it spawns a separate context per directory, and
-  // cross-directory element identity (e.g. `IapProductIds` referenced
-  // from `test/` and declared in `lib/`) breaks: the byElement lookup
-  // returns null because the analyzer resynthesises the class under a
-  // different Element2 instance per context. We still honour the
-  // requested code roots when *enumerating* files to index.
-  final collection = AnalysisContextCollectionImpl(
-    includedPaths: [repoRoot],
-    optionsFile: optionsFile.path,
-    // null → analyzer auto-detects (correct under `dart run`); non-null →
-    // an SDK we resolved for the AOT-compiled-binary deployment (see
-    // [resolveSdkPath]).
-    sdkPath: resolveSdkPath(),
-  );
+    // P2 — pass the repo root as a single included path so the analyzer
+    // treats the whole repo as one context. Otherwise (without a
+    // pubspec.yaml) it spawns a separate context per directory, and
+    // cross-directory element identity (e.g. `IapProductIds` referenced
+    // from `test/` and declared in `lib/`) breaks: the byElement lookup
+    // returns null because the analyzer resynthesises the class under a
+    // different Element2 instance per context. We still honour the
+    // requested code roots when *enumerating* files to index.
+    final collection = AnalysisContextCollectionImpl(
+      includedPaths: [repoRoot],
+      optionsFile: optionsFile.path,
+      // null → analyzer auto-detects (correct under `dart run`); non-null →
+      // an SDK we resolved for the AOT-compiled-binary deployment (see
+      // [resolveSdkPath]).
+      sdkPath: resolveSdkPath(),
+    );
 
-  // First pass: declarations. We build a "qualified-name → symbol id"
-  // map so the second pass can resolve calls/references against the
-  // batch's own symbols rather than just opaque elements.
-  final byElement = <Element2, String>{};
-  // Providers also accessed via their synthetic getter element — Riverpod
-  // usage sites resolve `proProvider` to a getter, not to the variable.
-  // We keep a per-file name-based lookup so [_resolveProviderId] can fall
-  // back when the getter element isn't in [byElement].
-  final providerByFileAndName = <String, String>{};
-  final constStringByFileAndName = <String, String>{};
-  final dartFiles = <String>[];
-  for (final ctx in collection.contexts) {
-    for (final f in ctx.contextRoot.analyzedFiles()) {
-      if (!f.endsWith('.dart')) continue;
-      // Restrict to files under one of the requested code roots — the
-      // analysis context covers the whole repo (for element identity),
-      // but we only want to *emit* nodes/edges for the user-selected
-      // roots.
-      final inRoot = absoluteRoots
-          .any((root) => p.isWithin(root, f) || p.equals(root, f));
-      if (!inRoot) continue;
-      // Honour exclude globs (very simple matcher: substring on relative path).
-      final relCheck = p.relative(f, from: repoRoot).replaceAll(r'\\', '/');
-      if (req.excludeGlobs.any((g) => _matchesGlob(g, relCheck))) {
+    // First pass: declarations. We build a "qualified-name → symbol id"
+    // map so the second pass can resolve calls/references against the
+    // batch's own symbols rather than just opaque elements.
+    final byElement = <Element2, String>{};
+    // Providers also accessed via their synthetic getter element — Riverpod
+    // usage sites resolve `proProvider` to a getter, not to the variable.
+    // We keep a per-file name-based lookup so [_resolveProviderId] can fall
+    // back when the getter element isn't in [byElement].
+    final providerByFileAndName = <String, String>{};
+    final constStringByFileAndName = <String, String>{};
+    final dartFiles = <String>[];
+    for (final ctx in collection.contexts) {
+      for (final f in ctx.contextRoot.analyzedFiles()) {
+        if (!f.endsWith('.dart')) continue;
+        // Restrict to files under one of the requested code roots — the
+        // analysis context covers the whole repo (for element identity),
+        // but we only want to *emit* nodes/edges for the user-selected
+        // roots.
+        final inRoot = absoluteRoots
+            .any((root) => p.isWithin(root, f) || p.equals(root, f));
+        if (!inRoot) continue;
+        // Honour exclude globs (very simple matcher: substring on relative path).
+        final relCheck = p.relative(f, from: repoRoot).replaceAll(r'\\', '/');
+        if (req.excludeGlobs.any((g) => _matchesGlob(g, relCheck))) {
+          continue;
+        }
+        dartFiles.add(f);
+      }
+    }
+    dartFiles.sort();
+
+    for (final absPath in dartFiles) {
+      final rel = repoRelative(absPath, repoRoot);
+      final ctx = collection.contextFor(absPath);
+
+      ResolvedUnitResult? unit;
+      try {
+        final r = await ctx.currentSession.getResolvedUnit(absPath);
+        if (r is ResolvedUnitResult) {
+          unit = r;
+        }
+      } catch (e) {
+        diagnostics.add({
+          'code': 'resolved_unit_failed',
+          'severity': 'warning',
+          // #103: repo-relative, never the absolute path.
+          'message': '$rel: $e',
+        });
         continue;
       }
-      dartFiles.add(f);
-    }
-  }
-  dartFiles.sort();
-
-  for (final absPath in dartFiles) {
-    final rel = p.relative(absPath, from: repoRoot).replaceAll(r'\\', '/');
-    final ctx = collection.contextFor(absPath);
-
-    ResolvedUnitResult? unit;
-    try {
-      final r = await ctx.currentSession.getResolvedUnit(absPath);
-      if (r is ResolvedUnitResult) {
-        unit = r;
-      }
-    } catch (e) {
-      diagnostics.add({
-        'code': 'resolved_unit_failed',
-        'severity': 'warning',
-        'message': '$absPath: $e',
-      });
-      continue;
-    }
-    if (unit == null) {
-      diagnostics.add({
-        'code': 'resolved_unit_missing',
-        'severity': 'warning',
-        'message': absPath,
-      });
-      continue;
-    }
-
-    final source = unit.content;
-    final hash = sha256.convert(utf8.encode(source)).toString();
-    final fileId = 'file::$rel';
-    files.add({
-      'id': fileId,
-      'path': rel,
-      'language': 'dart',
-      'content_hash': hash,
-    });
-
-    // Imports — emit only when the import resolves to a file inside the repo.
-    for (final directive in unit.unit.directives) {
-      if (directive is ImportDirective) {
-        final uri = directive.uri.stringValue;
-        if (uri == null) continue;
-        final targetAbs = _resolveImportPath(absPath, uri);
-        if (targetAbs == null) continue;
-        final targetRel =
-            p.relative(targetAbs, from: repoRoot).replaceAll(r'\\', '/');
-        // Stay inside repo only.
-        if (targetRel.startsWith('..')) continue;
-        imports.add({
-          'from_file': fileId,
-          'to_path': targetRel,
+      if (unit == null) {
+        diagnostics.add({
+          'code': 'resolved_unit_missing',
+          'severity': 'warning',
+          'message': rel,
         });
+        continue;
+      }
+
+      final source = unit.content;
+      final hash = sha256.convert(utf8.encode(source)).toString();
+      final fileId = 'file::$rel';
+      files.add({
+        'id': fileId,
+        'path': rel,
+        'language': 'dart',
+        'content_hash': hash,
+      });
+
+      // Imports — emit only when the import resolves to a file inside the repo.
+      for (final directive in unit.unit.directives) {
+        if (directive is ImportDirective) {
+          final uri = directive.uri.stringValue;
+          if (uri == null) continue;
+          final targetAbs = _resolveImportPath(absPath, uri);
+          if (targetAbs == null) continue;
+          final targetRel =
+              p.relative(targetAbs, from: repoRoot).replaceAll(r'\\', '/');
+          // Stay inside repo only.
+          if (targetRel.startsWith('..')) continue;
+          imports.add({
+            'from_file': fileId,
+            'to_path': targetRel,
+          });
+        }
+      }
+
+      final declared = _DeclarationVisitor(
+        rel: rel,
+        fileId: fileId,
+        lineInfo: unit.lineInfo,
+        byElement: byElement,
+        symbols: symbols,
+        symbolRanges: symbolRanges,
+        providerByFileAndName: providerByFileAndName,
+        constStringByFileAndName: constStringByFileAndName,
+      );
+      unit.unit.visitChildren(declared);
+
+      if (_isTestSourcePath(rel)) {
+        final testDeclarations = _TestDeclarationVisitor(
+          rel: rel,
+          lineInfo: unit.lineInfo,
+          tests: tests,
+        );
+        unit.unit.visitChildren(testDeclarations);
       }
     }
 
-    final declared = _DeclarationVisitor(
-      rel: rel,
-      fileId: fileId,
-      lineInfo: unit.lineInfo,
-      byElement: byElement,
-      symbols: symbols,
-      symbolRanges: symbolRanges,
-      providerByFileAndName: providerByFileAndName,
-      constStringByFileAndName: constStringByFileAndName,
-    );
-    unit.unit.visitChildren(declared);
+    // Second pass: bodies. Walk every method/function/constructor body for
+    // calls (MethodInvocation, InstanceCreationExpression) and references
+    // (PrefixedIdentifier / SimpleIdentifier resolving to a known
+    // declaration), tagging each edge with file:line + snippet.
+    for (final absPath in dartFiles) {
+      final rel = repoRelative(absPath, repoRoot);
+      final ctx = collection.contextFor(absPath);
+      ResolvedUnitResult? unit;
+      try {
+        final r = await ctx.currentSession.getResolvedUnit(absPath);
+        if (r is ResolvedUnitResult) unit = r;
+      } catch (_) {
+        continue;
+      }
+      if (unit == null) continue;
 
-    if (_isTestSourcePath(rel)) {
-      final testDeclarations = _TestDeclarationVisitor(
+      final body = _BodyVisitor(
         rel: rel,
         lineInfo: unit.lineInfo,
-        tests: tests,
+        source: unit.content,
+        byElement: byElement,
+        providerByFileAndName: providerByFileAndName,
+        constStringByFileAndName: constStringByFileAndName,
+        references: references,
+        syntheticNodes: syntheticNodes,
       );
-      unit.unit.visitChildren(testDeclarations);
+      unit.unit.visitChildren(body);
     }
-  }
 
-  // Second pass: bodies. Walk every method/function/constructor body for
-  // calls (MethodInvocation, InstanceCreationExpression) and references
-  // (PrefixedIdentifier / SimpleIdentifier resolving to a known
-  // declaration), tagging each edge with file:line + snippet.
-  for (final absPath in dartFiles) {
-    final rel = p.relative(absPath, from: repoRoot).replaceAll(r'\\', '/');
-    final ctx = collection.contextFor(absPath);
-    ResolvedUnitResult? unit;
-    try {
-      final r = await ctx.currentSession.getResolvedUnit(absPath);
-      if (r is ResolvedUnitResult) unit = r;
-    } catch (_) {
-      continue;
-    }
-    if (unit == null) continue;
-
-    final body = _BodyVisitor(
-      rel: rel,
-      lineInfo: unit.lineInfo,
-      source: unit.content,
-      byElement: byElement,
-      providerByFileAndName: providerByFileAndName,
-      constStringByFileAndName: constStringByFileAndName,
+    return SidecarBatchResponse(
+      files: files,
+      symbols: symbols,
+      tests: tests,
+      symbolRanges: symbolRanges,
+      imports: imports,
       references: references,
-      syntheticNodes: syntheticNodes,
+      syntheticNodes: syntheticNodes.values.toList(),
+      diagnostics: diagnostics,
     );
-    unit.unit.visitChildren(body);
+  } finally {
+    // The analyzer has read the override options file by now; drop the temp dir.
+    try {
+      optionsDir.deleteSync(recursive: true);
+    } catch (_) {
+      // Best-effort cleanup; a leftover temp file is harmless.
+    }
   }
-
-  // The analyzer has read the override options file by now; drop the temp dir.
-  try {
-    optionsDir.deleteSync(recursive: true);
-  } catch (_) {
-    // Best-effort cleanup; a leftover temp file is harmless.
-  }
-
-  return SidecarBatchResponse(
-    files: files,
-    symbols: symbols,
-    tests: tests,
-    symbolRanges: symbolRanges,
-    imports: imports,
-    references: references,
-    syntheticNodes: syntheticNodes.values.toList(),
-    diagnostics: diagnostics,
-  );
 }
 
 String? _resolveImportPath(String fromAbs, String uri) {
@@ -1337,7 +1367,8 @@ class _BodyVisitor extends RecursiveAstVisitor<void> {
   /// depth guards pathological nesting.
   String? _widgetClassId(Expression widgetExpr, {int depth = 0}) {
     if (widgetExpr is! InstanceCreationExpression) return null;
-    final typeName = widgetExpr.constructorName.type.toSource().split('<').first;
+    final typeName =
+        widgetExpr.constructorName.type.toSource().split('<').first;
     if (depth < 3 && _isWrapperWidget(typeName)) {
       for (final a in widgetExpr.argumentList.arguments) {
         if (a is NamedExpression && a.name.label.name == 'child') {

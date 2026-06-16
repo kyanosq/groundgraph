@@ -1,0 +1,19 @@
+{
+  "name": "specslice-webui",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Offline WebGL graph viewer assets for SpecSlice.",
+  "type": "module",
+  "scripts": {
+    "audit": "npm audit --audit-level=high",
+    "build:vendor": "bash vendor-src/build.sh",
+    "screenshot": "node shoot.mjs"
+  },
+  "license": "MIT OR Apache-2.0",
+  "devDependencies": {
+    "3d-force-graph": "^1.73.4",
+    "esbuild": "^0.28.1",
+    "playwright": "^1.60.0",
+    "three": "^0.180.0"
+  }
+}

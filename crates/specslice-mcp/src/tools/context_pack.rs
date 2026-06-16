@@ -17,6 +17,17 @@ use crate::server::Server;
 
 use super::{object_schema, open_store, resolve_repo_root};
 
+/// Skip inlining a snippet from a file larger than this. Reading a 50 MB
+/// generated bundle / minified file to surface a handful of lines is not worth
+/// the allocation and risks OOM on a corrupt `end_line` (#88; mirrors
+/// `search.rs` `SNIPPET_MAX_FILE_BYTES` / issues2.md #51).
+const SNIPPET_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Cap the neighbours materialised for a symbol pack. A hub symbol can have a
+/// 5-digit edge count; one `context_pack` call must not buffer them all into a
+/// single response (#88; sibling of explain_symbol #87 / get_subgraph #9).
+const MAX_PACK_NEIGHBORS: usize = 300;
+
 pub fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: "context_pack",
@@ -56,7 +67,7 @@ pub fn descriptor() -> ToolDescriptor {
 }
 
 pub fn call(server: &Server, args: &Value) -> Result<Value> {
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let include_snippets = args
         .get("include_snippets")
         .and_then(|v| v.as_bool())
@@ -93,7 +104,12 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
     if let Some(cand) = candidate_id {
         return build_candidate_pack(&repo_root, cand, include_snippets);
     }
-    let sym = symbol_id.expect("checked above");
+    // `provided != 1` above guarantees `symbol_id` is the remaining option, but
+    // guard explicitly so a future change to the validation can't turn this into
+    // a panic on a malformed MCP request.
+    let Some(sym) = symbol_id else {
+        bail!("supply exactly one of `requirement_id`, `candidate_id`, `symbol_id`");
+    };
     build_symbol_pack(&repo_root, sym, include_snippets)
 }
 
@@ -191,26 +207,14 @@ fn build_symbol_pack(repo_root: &Path, symbol_id: &str, include_snippets: bool) 
         None
     };
 
-    for edge in store.list_edges_from(&aid)? {
-        if let Some(n) = store.find_node(&edge.to_id)? {
-            if let Some(p) = &n.path {
-                files_to_read.insert(p.clone());
-            }
-            neighbours.push(json!({
-                "direction": "downstream",
-                "edge_kind": edge.kind.as_str(),
-                "neighbor_id": n.id.to_string(),
-                "neighbor_kind": n.kind.as_str(),
-                "neighbor_label": n.name.clone(),
-                "neighbor_path": n.path.clone(),
-                "line_range": match (n.start_line, n.end_line) {
-                    (Some(s), Some(e)) => Some(json!([s, e])),
-                    _ => None,
-                },
-            }));
-        }
-    }
-    for edge in store.list_edges_to(&aid)? {
+    let from_edges = store.list_edges_from(&aid)?;
+    let to_edges = store.list_edges_to(&aid)?;
+    let truncated = from_edges.len() + to_edges.len() > MAX_PACK_NEIGHBORS;
+
+    // Upstream (incl. `declares_verification` tests) first so tests survive
+    // truncation on a hub whose downstream fan-out blew the neighbour budget.
+    let up_taken = to_edges.len().min(MAX_PACK_NEIGHBORS);
+    for edge in to_edges.iter().take(MAX_PACK_NEIGHBORS) {
         if let Some(n) = store.find_node(&edge.from_id)? {
             if let Some(p) = &n.path {
                 files_to_read.insert(p.clone());
@@ -245,12 +249,33 @@ fn build_symbol_pack(repo_root: &Path, symbol_id: &str, include_snippets: bool) 
             }));
         }
     }
+    let down_budget = MAX_PACK_NEIGHBORS.saturating_sub(up_taken);
+    for edge in from_edges.iter().take(down_budget) {
+        if let Some(n) = store.find_node(&edge.to_id)? {
+            if let Some(p) = &n.path {
+                files_to_read.insert(p.clone());
+            }
+            neighbours.push(json!({
+                "direction": "downstream",
+                "edge_kind": edge.kind.as_str(),
+                "neighbor_id": n.id.to_string(),
+                "neighbor_kind": n.kind.as_str(),
+                "neighbor_label": n.name.clone(),
+                "neighbor_path": n.path.clone(),
+                "line_range": match (n.start_line, n.end_line) {
+                    (Some(s), Some(e)) => Some(json!([s, e])),
+                    _ => None,
+                },
+            }));
+        }
+    }
 
     let mut files_to_read: Vec<String> = files_to_read.into_iter().collect();
     files_to_read.sort();
 
     Ok(json!({
         "mode": "symbol",
+        "truncated": truncated,
         "pack": {
             "node": {
                 "id": node.id.to_string(),
@@ -281,9 +306,30 @@ fn read_snippet(repo_root: &Path, node: &specslice_core::Node) -> Result<Option<
     if end < start {
         return Ok(None);
     }
-    let abs = repo_root.join(rel_path);
+    // Confine to the repo: a malicious / corrupt graph whose `node.path` is
+    // absolute or contains `..` must not let us read (and return to the client)
+    // files outside `repo_root` (#243). Snippets are best-effort, so a refused
+    // path simply yields no snippet.
+    let rel = Path::new(rel_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Ok(None);
+    }
+    let abs = repo_root.join(rel);
     if !abs.exists() {
         return Ok(None);
+    }
+    // Bound memory: a symbol whose `path` points at a generated / minified /
+    // vendored multi-MB file must not be slurped whole just to extract a few
+    // lines (#88). A corrupt `end_line` would otherwise also force an O(file)
+    // `lines()` walk over that whole blob.
+    if let Ok(meta) = std::fs::metadata(&abs) {
+        if meta.len() > SNIPPET_MAX_FILE_BYTES {
+            return Ok(None);
+        }
     }
     let body =
         std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
@@ -296,4 +342,125 @@ fn read_snippet(repo_root: &Path, node: &specslice_core::Node) -> Result<Option<
         .collect::<Vec<&str>>()
         .join("\n");
     Ok(Some(slice))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_symbol_pack, read_snippet, MAX_PACK_NEIGHBORS, SNIPPET_MAX_FILE_BYTES};
+    use specslice_core::{ArtifactId, EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind};
+
+    /// #88: a snippet must not slurp a multi-MB file into memory. An oversized
+    /// file yields no snippet; a small one with the same range still does.
+    #[test]
+    fn read_snippet_skips_oversized_files_but_reads_small_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("gen")).unwrap();
+        let big_rel = "gen/huge.dart";
+        std::fs::write(
+            dir.path().join(big_rel),
+            vec![b'x'; usize::try_from(SNIPPET_MAX_FILE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let mut node = Node::new(
+            ArtifactId::new("dart::gen/huge.dart#x"),
+            NodeKind::DartFunction,
+        );
+        node.path = Some(big_rel.to_string());
+        node.start_line = Some(1);
+        node.end_line = Some(2);
+        assert_eq!(
+            read_snippet(dir.path(), &node).unwrap(),
+            None,
+            "oversized file must be skipped, not slurped"
+        );
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let small_rel = "src/a.dart";
+        std::fs::write(dir.path().join(small_rel), "line1\nline2\nline3\n").unwrap();
+        node.path = Some(small_rel.to_string());
+        assert!(
+            read_snippet(dir.path(), &node).unwrap().is_some(),
+            "a small file must still produce a snippet"
+        );
+    }
+
+    /// #243: a malicious / corrupt graph whose `node.path` escapes the repo
+    /// (via `..` or an absolute path) must NOT let `context_pack` read files
+    /// outside `repo_root` and leak them to the MCP client.
+    #[test]
+    fn read_snippet_refuses_path_traversal() {
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "TOP SECRET\nx\n").unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut node = Node::new(
+            ArtifactId::new("x::../secret.txt#s"),
+            NodeKind::DartFunction,
+        );
+        node.start_line = Some(1);
+        node.end_line = Some(1);
+
+        // `..` escape → no snippet.
+        node.path = Some("../secret.txt".to_string());
+        assert_eq!(
+            read_snippet(&repo, &node).unwrap(),
+            None,
+            "`..` traversal must not read files outside repo_root"
+        );
+
+        // Absolute path → no snippet.
+        node.path = Some(
+            outer
+                .path()
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(
+            read_snippet(&repo, &node).unwrap(),
+            None,
+            "absolute node.path must not read files outside repo_root"
+        );
+    }
+
+    /// #88: a hub symbol's pack caps the neighbour list and flags truncation
+    /// instead of buffering a 5-digit fan-out into one response.
+    #[test]
+    fn symbol_pack_caps_neighbours_and_flags_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".specslice")).unwrap();
+        std::fs::write(dir.path().join(".specslice.yaml"), "{}\n").unwrap();
+        let mut store =
+            specslice_store::Store::open(dir.path().join(".specslice/graph.db")).unwrap();
+        store.migrate().unwrap();
+
+        let hub = ArtifactId::new("java::Hub.java#Hub.m".to_string());
+        store
+            .upsert_node(&Node::new(hub.clone(), NodeKind::JavaMethod))
+            .unwrap();
+        for i in 0..(MAX_PACK_NEIGHBORS + 150) {
+            let to = ArtifactId::new(format!("java::Leaf{i}.java#Leaf{i}.m"));
+            store
+                .upsert_node(&Node::new(to.clone(), NodeKind::JavaMethod))
+                .unwrap();
+            let mut e = EdgeAssertion::fact(
+                hub.clone(),
+                to,
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            );
+            e.id = ArtifactId::new(format!("edge::{i}"));
+            store.upsert_edge(&e).unwrap();
+        }
+
+        let out = build_symbol_pack(dir.path(), &hub.to_string(), false).unwrap();
+        assert_eq!(out["truncated"], serde_json::json!(true));
+        let neighbours = out["pack"]["neighbours"].as_array().unwrap();
+        assert!(
+            neighbours.len() <= MAX_PACK_NEIGHBORS,
+            "neighbour budget must hold: {}",
+            neighbours.len()
+        );
+    }
 }

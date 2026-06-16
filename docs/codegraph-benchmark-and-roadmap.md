@@ -151,7 +151,7 @@
    - **C**：`call_expression`（含函数指针 `s.cb()` 的 `field_expression`）。
    - **C++**：`call_expression` + `new_expression`，`qualified_identifier`（`Class::method`）/`template_function` 一律取**尾部裸名**走同一解析路径。
    - **Swift**：`call_expression` + `navigation_expression`（`obj.method()`）。
-   - 至此 `rust_treesitter.rs` 的回归测试由「只有 Rust 有解析器」改为 `every_language_spec_opts_into_the_call_resolver`——**断言 9 门 spec 全部 opt-in**（仅 Dart 走 LSP/analyzer 精度层，不在此列）。
+   - 至此 `rust_treesitter.rs` 的回归测试由「只有 Rust 有解析器」改为 `every_language_spec_opts_into_the_call_resolver`——**断言全部 tree-sitter spec opt-in**（自 C#/Ruby/PHP/Kotlin 落地后已扩到 13 门：Rust/TypeScript/TSX/Python/Go/Java/C/C++/Swift/C#/Ruby/PHP/Kotlin；仅 Dart 走 analyzer 精度层，不在此列）。
 
 2. **Python `src_roots` 死循环真 bug 修复（生产级缺陷）。** 激活 Python 解析器后，索引带**仓库根级 `__init__.py`** 的工程（如 deer-flow 的 `src/` 整树）会 90% CPU **无限挂起**。根因：`python_src_roots` 的父目录回溯循环——根级 `__init__.py` 让 `init_dirs` 含空串 `""`，而 `"".rfind('/')` 恒得 `""`、`init_dirs.contains("")` 恒真，回溯永不终止。修复：当 `parent == cur`（已到仓库根，无更高目录可攀）即 `break`。这是 `src_roots_of` 在**每次索引开头无条件调用**的早期阶段，与解析器本身无关，但被新解析器激活的完整流水线暴露。先写回归测试 `src_roots_terminate_when_repo_root_is_itself_a_package`（fix 前挂死、fix 后秒过）→ 实现。
    - **真实验收**：deer-flow `src/`（70 Python 文件，根级 `__init__.py`）由**无限挂起 → 0.247s 完成**，产 29 条 `calls` 启发式边；最小复现工作区（9 文件、根 `__init__.py`）0.045s 完成。

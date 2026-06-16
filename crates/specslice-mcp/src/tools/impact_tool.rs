@@ -58,7 +58,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .get("reindex")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let options = ImpactOptions {
         repo_root,
         base_ref: base,

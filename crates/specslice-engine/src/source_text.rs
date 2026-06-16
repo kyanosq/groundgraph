@@ -23,6 +23,22 @@ use std::path::Path;
 use specslice_core::language_traits::{language_of, lex_syntax, Language};
 use specslice_core::Node;
 
+/// Upper bound (bytes) on a single source file the in-process indexers will
+/// read into memory. The tree-sitter and full-text passes read files with
+/// `rayon` (one worker per core), so an accidental giant file — generated
+/// code, a vendored bundle, a committed protobuf blob — would otherwise be
+/// loaded N-up and can OOM `specslice index`. Files over this are skipped.
+pub(crate) const MAX_INDEX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// `true` when `path` exists and its size exceeds [`MAX_INDEX_FILE_BYTES`].
+/// Missing/unreadable metadata returns `false` so the caller falls through
+/// to its normal read path (which surfaces its own IO error).
+pub(crate) fn is_oversized_source(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > MAX_INDEX_FILE_BYTES)
+        .unwrap_or(false)
+}
+
 /// The recovered source span of a graph node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeSource {
@@ -44,6 +60,13 @@ pub fn read_node_source(repo_root: &Path, node: &Node) -> Option<NodeSource> {
         _ => return None,
     };
     let abs = repo_root.join(path);
+    // Bound memory: skip files past the index budget so a node whose `path`
+    // points at a generated / vendored multi-MB blob is not slurped whole by
+    // the parallel fact passes (#245; same budget as the tree-sitter / FTS
+    // passes via `is_oversized_source`).
+    if is_oversized_source(&abs) {
+        return None;
+    }
     let text = std::fs::read_to_string(&abs).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     let total = u32::try_from(lines.len()).unwrap_or(u32::MAX);
@@ -238,6 +261,25 @@ mod tests {
     use specslice_core::{ArtifactId, Node, NodeKind};
 
     #[test]
+    fn is_oversized_source_flags_only_files_past_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let small = tmp.path().join("small.rs");
+        std::fs::write(&small, "fn a() {}").unwrap();
+        assert!(!is_oversized_source(&small));
+
+        let big = tmp.path().join("big.rs");
+        std::fs::write(
+            &big,
+            vec![b'x'; usize::try_from(MAX_INDEX_FILE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(is_oversized_source(&big));
+
+        // Missing files fall through (caller's read handles the error).
+        assert!(!is_oversized_source(&tmp.path().join("nope.rs")));
+    }
+
+    #[test]
     fn strip_noise_blanks_line_comments_but_keeps_newlines() {
         let src = "let x = 1; // if for while\nlet y = 2;";
         let out = strip_noise(src, Language::Rust);
@@ -308,6 +350,30 @@ mod tests {
         assert_eq!(src.start_line, 2);
         assert_eq!(src.raw, "fn foo() {\n    return 1;\n}");
         assert_eq!(src.language, Language::Rust);
+    }
+
+    #[test]
+    fn read_node_source_skips_oversized_files() {
+        // #245: a node whose path points at a multi-MB blob must not be slurped
+        // whole — the fact passes read files with one rayon worker per core, so
+        // an unguarded read can OOM `specslice index` (parity with the
+        // tree-sitter / full-text passes that already gate on this budget).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = "gen/huge.rs";
+        std::fs::create_dir_all(tmp.path().join("gen")).unwrap();
+        std::fs::write(
+            tmp.path().join(file),
+            vec![b'x'; usize::try_from(MAX_INDEX_FILE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let mut node = Node::new(
+            ArtifactId::new("rust::gen/huge.rs#foo"),
+            NodeKind::RustFunction,
+        );
+        node.path = Some(file.to_string());
+        node.start_line = Some(1);
+        node.end_line = Some(1);
+        assert!(read_node_source(tmp.path(), &node).is_none());
     }
 
     #[test]

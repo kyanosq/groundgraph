@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    EngineConfig, LanguageSelection, DEFAULT_CONFIG_FILE_NAME, DEFAULT_STORAGE_DIR,
+    EngineConfig, LanguageSelection, CONFIG_SCHEMA_VERSION, DEFAULT_CONFIG_FILE_NAME,
+    DEFAULT_STORAGE_DIR,
 };
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
         load_existing_config(&config_path)?
     } else {
         let cfg = default_config_for(&repo_root);
-        let yaml = serde_yaml::to_string(&cfg).context("serialising default config to YAML")?;
+        let yaml = serde_yml::to_string(&cfg).context("serialising default config to YAML")?;
         std::fs::write(&config_path, yaml)
             .with_context(|| format!("writing default config to {}", config_path.display()))?;
         cfg
@@ -156,19 +157,27 @@ fn default_config_for(repo_root: &Path) -> EngineConfig {
     // on-disk config stays minimal. The authoritative `languages:` list is only
     // emitted once a *second* first-party language appears — i.e. a polyglot
     // monorepo, the case the single-language detector got wrong.
-    if selections.iter().all(|s| s.id == "dart") {
-        return EngineConfig::default();
-    }
-    let mut cfg = EngineConfig {
-        languages: selections,
-        ..EngineConfig::default()
+    let mut cfg = if selections.iter().all(|s| s.id == "dart") {
+        // Pure-Dart (or unrecognised/empty) repo: keep the historical
+        // `code`-section default so a bare Dart skeleton's `lib/`/`test/`
+        // still works and the on-disk config stays minimal.
+        EngineConfig::default()
+    } else {
+        let mut cfg = EngineConfig {
+            languages: selections,
+            ..EngineConfig::default()
+        };
+        // Zero external dependencies out of the box; the per-language LSP
+        // adapters can be opted back in by flipping this flag.
+        cfg.enrichment.lsp = false;
+        // `languages` is authoritative: `normalized()` repopulates the Dart
+        // `code` section from a `dart` selection when present, else clears it.
+        cfg.code.paths = Vec::new();
+        cfg
     };
-    // Zero external dependencies out of the box; the per-language LSP adapters
-    // can be opted back in by flipping this flag.
-    cfg.enrichment.lsp = false;
-    // `languages` is authoritative: `normalized()` repopulates the Dart `code`
-    // section from a `dart` selection when present, and clears it otherwise.
-    cfg.code.paths = Vec::new();
+    // #72 — stamp every freshly-written config with the current schema version
+    // so a future build can detect (and warn about) version skew.
+    cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
     cfg
 }
 
@@ -312,7 +321,7 @@ const LANGUAGE_MANIFESTS: &[(&str, &str)] = &[
     ("setup.py", "python"),
 ];
 
-fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
+pub(crate) fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut manifest_langs: BTreeSet<&'static str> = BTreeSet::new();
     let mut topdirs: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
@@ -435,7 +444,7 @@ fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelection> {
 fn load_existing_config(path: &Path) -> Result<EngineConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading existing config {}", path.display()))?;
-    serde_yaml::from_str::<EngineConfig>(&contents)
+    serde_yml::from_str::<EngineConfig>(&contents)
         .with_context(|| format!("parsing existing config {}", path.display()))
 }
 

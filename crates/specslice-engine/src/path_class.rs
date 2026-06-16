@@ -21,7 +21,12 @@ pub fn is_test_path(path: &str) -> bool {
                 | "specs"
         )
     });
+    // pytest/Go conventions on the file name itself: `test_*.py` (prefix) and
+    // `*_test.*` (suffix). The prefix is a basename check so a business word
+    // like `contest_results.py` (substring `test_`) never matches.
+    let base = p.rsplit('/').next().unwrap_or(&p);
     if in_test_dir
+        || base.starts_with("test_")
         || p.ends_with("_test.dart")
         || p.contains("_test.")
         || p.contains(".test.")
@@ -117,7 +122,14 @@ mod tests {
         ));
         assert!(is_test_path("src/__tests__/a.ts"));
         assert!(is_test_path("lib/a.spec.ts"));
+        // Go suffix and pytest prefix conventions outside any `test/` dir.
+        assert!(is_test_path("pkg/handler_test.go"));
+        assert!(is_test_path("app/services/test_auth.py"));
         assert!(!is_test_path("lib/models/shift.dart"));
+        // `test_`/`_test` prefix/suffix must be a real word boundary, not a
+        // substring of a business name.
+        assert!(!is_test_path("src/contest_results.py"));
+        assert!(!is_test_path("lib/fastest.go"));
         assert!(!is_test_path("App/Views/Home/HomeView.swift"));
         // Xcode / SPM / JUnit conventions: `<Target>Tests/` target dirs and
         // `FooTests.swift` / `FooTest.java` files outside any `test/` dir.

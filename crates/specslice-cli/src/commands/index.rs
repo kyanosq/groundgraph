@@ -13,6 +13,25 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
     let result = index_repository(options)?;
     print!("{}", format_result(&result));
     record_index_metrics(&result);
+    // Blind-spot guard: a config written when the repo was single-language
+    // silently omits any language added later. Surface it so the graph's
+    // coverage gaps are visible instead of looking like an empty repo.
+    if !docs_only {
+        match specslice_engine::unindexed_present_languages(repo_root) {
+            Ok(langs) if !langs.is_empty() => {
+                // `init` is non-destructive — it never rewrites an existing
+                // `.specslice.yaml` — so the actionable fix is editing the
+                // `languages:` list, not re-running `init` (which would no-op).
+                eprintln!(
+                    "warning: {} 门语言有源文件但未被索引: {} — 在 .specslice.yaml 的 `languages:` 列表中加入它们后重新 `specslice index`（init 仅在首次创建配置时自动检测一次，不会覆盖已有配置）",
+                    langs.len(),
+                    langs.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("（语言覆盖自检跳过：{e:#}）"),
+        }
+    }
     // P25: fold the persistence contract into the same graph. Best-effort —
     // a schema scan failure must not abort a successful code/docs index.
     if !docs_only {
@@ -261,6 +280,14 @@ pub(crate) fn format_result(result: &IndexResult) -> String {
                     out,
                     "  warn: {} 个 {} 文件解析超出预算被跳过（多为含故意语法错误的 fixture；可用 SPECSLICE_PARSE_BUDGET_MS 调整）",
                     lang.parse_timeouts, lang.language
+                )
+                .ok();
+            }
+            if lang.skipped_oversized > 0 {
+                writeln!(
+                    out,
+                    "  warn: {} 个 {} 文件超出大小上限（5 MiB）被跳过（多为生成代码 / vendored 产物 / 提交的二进制 blob）",
+                    lang.skipped_oversized, lang.language
                 )
                 .ok();
             }
@@ -710,6 +737,7 @@ mod tests {
                     symbols: 64,
                     imports: 30,
                     parse_timeouts: 0,
+                    skipped_oversized: 0,
                     resolver_used: "typescript_treesitter".into(),
                 },
                 specslice_engine::TreeSitterLangResult {
@@ -718,6 +746,7 @@ mod tests {
                     symbols: 21,
                     imports: 5,
                     parse_timeouts: 0,
+                    skipped_oversized: 0,
                     resolver_used: "cpp_treesitter".into(),
                 },
             ],

@@ -10,8 +10,16 @@ env:
 
 jobs:
   lint-and-test:
-    name: fmt · clippy · test
-    runs-on: ubuntu-latest
+    # issues.md #101: the flagship distribution artifact is a macOS universal
+    # binary, yet CI previously only exercised Linux. Run the test suite on both
+    # so macOS-specific regressions (path handling, process/stdio behaviour, the
+    # #[cfg(unix)] LSP tests) are caught before release.
+    name: ${{ matrix.os }} · fmt · clippy · test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -24,18 +32,54 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # The project's discipline is "zero warnings". Enforce it: any fmt diff,
-      # any clippy warning, or any test failure fails the build.
+      # fmt / clippy are platform-independent — run them once (Linux) to avoid
+      # duplicating work on the slower/limited macOS runner.
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `--locked` makes CI fail if Cargo.lock is stale, pinning the dependency
+      # graph for deterministic, reproducible indexing (issues.md #226 / #240).
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # LSP / Dart-sidecar integration tests are #[ignore] by default and soft
       # skip when their external binary is absent, so the job stays green on a
       # clean runner. They can be exercised in a dedicated job that installs the
       # toolchains, if/when desired.
+
+  supply-chain:
+    # issues.md #102: 167 Rust dependencies had zero supply-chain scanning.
+    # cargo-deny gates RUSTSEC advisories (what cargo-audit checks), license
+    # compatibility, untrusted sources, and surfaces duplicate versions
+    # (#223/#224/#225). Configuration lives in deny.toml.
+    name: supply-chain · cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny check
+        run: cargo deny check
+
+  webui-audit:
+    # issues.md #102: the bundled web UI ships npm dependencies. Audit the
+    # checked-in lockfile so the release bundle's JS supply chain is gated too.
+    name: supply-chain · npm audit (webui)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm audit
+        working-directory: webui
+        run: npm audit --audit-level=high

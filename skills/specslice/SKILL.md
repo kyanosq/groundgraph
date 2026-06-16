@@ -177,6 +177,29 @@ specslice --repo-root /path/to/repo graph-diff <base.db> <head.db>   # snapshot 
 
 Default HTML output is `.specslice/export/graph.html` unless `--out` is passed.
 
+## MCP Integration (stdio)
+
+For AI agents, the graph is also exposed over the [Model Context Protocol](https://modelcontextprotocol.io) by a separate binary, `specslice-mcp`, which speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP). It reads its workspace from the repo's `.specslice.yaml` and never writes to source files. Launch it directly:
+
+```bash
+specslice-mcp --repo-root /path/to/repo
+```
+
+Or point any stdio-capable MCP client (Cursor, Claude Desktop, …) at that command:
+
+```jsonc
+{
+  "mcpServers": {
+    "specslice": {
+      "command": "specslice-mcp",
+      "args": ["--repo-root", "/path/to/repo"]
+    }
+  }
+}
+```
+
+It advertises these tools, each with a JSON-Schema `inputSchema`: `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack`, `check_drift`. Business-logic candidates are exposed through `context_pack` / `explain_symbol` (there are no separate candidate tools), matching the CLI's evidence-then-confirm model.
+
 ## Dead-Code Candidate Workflow
 
 Use `dead-code` only as a candidate report. It is not an automatic deletion tool and must not be presented as proof that a symbol is removable.

@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use specslice_engine::business_candidates::load_business_candidates;
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::graph::{build_graph_view, GraphOptions, GraphView};
@@ -63,34 +65,6 @@ fn sidecar_source_present() -> bool {
     workspace_dir()
         .join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart")
         .exists()
-}
-
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
 }
 
 #[test]
@@ -156,17 +130,15 @@ fn p9_every_candidate_carries_evidence_and_open_questions() {
 
 #[test]
 fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
-    if !sidecar_source_present() || !dart_available() {
-        eprintln!("skipping: dart sidecar unavailable");
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p9_business_candidates",
+    ) {
         return;
     }
-    let _on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let _bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -284,17 +256,15 @@ fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
 
 #[test]
 fn p9_include_candidates_false_hides_business_candidates() {
-    if !sidecar_source_present() || !dart_available() {
-        eprintln!("skipping: dart sidecar unavailable");
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p9_business_candidates",
+    ) {
         return;
     }
-    let _on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let _bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {

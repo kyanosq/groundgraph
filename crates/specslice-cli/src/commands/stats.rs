@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use specslice_engine::stats::{load_stats, summarize, StatsSummary, STATS_REL_PATH};
+use specslice_engine::stats::{summarize_files, StatsSummary, STATS_REL_PATH};
 
 pub struct StatsRunArgs {
     pub repo_root: PathBuf,
@@ -19,17 +19,39 @@ pub struct StatsRunArgs {
 
 pub fn run(args: StatsRunArgs) -> Result<()> {
     let path = args.repo_root.join(".specslice").join(STATS_REL_PATH);
+    // The ledger rotates at a size cap (#250): old records spill into a single
+    // `.1` sibling, so the summary must fold both files and reset must clear both.
+    let rotated = args
+        .repo_root
+        .join(".specslice")
+        .join(format!("{STATS_REL_PATH}.1"));
 
     if args.reset {
+        let existed = path.exists() || rotated.exists();
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
-        println!("已清空命令统计：{}", path.display());
+        if rotated.exists() {
+            std::fs::remove_file(&rotated)?;
+        }
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "reset": true,
+                    "existed": existed,
+                    "path": path.display().to_string(),
+                }))?
+            );
+        } else if existed {
+            println!("已清空命令统计：{}", path.display());
+        } else {
+            println!("命令统计账本不存在，无需清空：{}", path.display());
+        }
         return Ok(());
     }
 
-    let stats = load_stats(&path)?;
-    let summary = summarize(&stats);
+    let summary = summarize_files(&[rotated.as_path(), path.as_path()])?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);

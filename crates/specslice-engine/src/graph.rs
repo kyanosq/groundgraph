@@ -357,6 +357,13 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<Graph
     }
 
     // 7. max_nodes truncation: priority order keeps focus + confirmed first.
+    //
+    // `max_nodes` bounds the *model* size (how many nodes the view carries),
+    // applied here *before* step 8 decides per-view `default_visible`. So a
+    // Business view with `--max-nodes 50` may end up showing fewer than 50
+    // visible nodes — the rest are present-but-collapsed. This ordering is
+    // deliberate: truncating by priority first keeps the focus/confirmed core
+    // regardless of view, and visibility is a presentation layer on top. (#266)
     if let Some(limit) = options.max_nodes {
         if nodes.len() > limit {
             let priority = priority_order(&nodes, &edges, options.focus.as_deref());
@@ -1449,7 +1456,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }

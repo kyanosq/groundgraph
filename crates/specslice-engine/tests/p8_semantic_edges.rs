@@ -21,6 +21,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::graph::{build_graph_view, GraphOptions, GraphView};
 use specslice_engine::init::{init_repository, InitOptions};
@@ -74,48 +76,19 @@ fn sidecar_source_present() -> bool {
         .exists()
 }
 
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
-}
-
 /// Materialise the pixcraft_iap fixture into a fresh repo, run the
 /// analyzer sidecar, and return the resulting graph view. We focus on
 /// the paywall feature so the test stays scoped.
 fn analyze_pixcraft_with_sidecar() -> Option<specslice_engine::graph::GraphViewModel> {
-    if !sidecar_source_present() || !dart_available() {
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p8_semantic_edges",
+    ) {
         return None;
     }
-    let _on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let _bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -155,7 +128,6 @@ fn analyze_pixcraft_with_sidecar() -> Option<specslice_engine::graph::GraphViewM
 #[test]
 fn p8_reads_provider_edge_points_at_pro_provider() {
     let Some(view) = analyze_pixcraft_with_sidecar() else {
-        eprintln!("skipping: dart sidecar unavailable");
         return;
     };
 
@@ -196,7 +168,6 @@ fn p8_reads_provider_edge_points_at_pro_provider() {
 #[test]
 fn p8_navigates_to_edge_uses_synthetic_route_node() {
     let Some(view) = analyze_pixcraft_with_sidecar() else {
-        eprintln!("skipping: dart sidecar unavailable");
         return;
     };
 
@@ -230,7 +201,6 @@ fn p8_navigates_to_edge_uses_synthetic_route_node() {
 #[test]
 fn p8_persists_to_edge_uses_synthetic_storage_node() {
     let Some(view) = analyze_pixcraft_with_sidecar() else {
-        eprintln!("skipping: dart sidecar unavailable");
         return;
     };
 
@@ -265,7 +235,6 @@ fn p8_persists_to_edge_uses_synthetic_storage_node() {
 #[test]
 fn p8_subscribes_stream_edge_exists() {
     let Some(view) = analyze_pixcraft_with_sidecar() else {
-        eprintln!("skipping: dart sidecar unavailable");
         return;
     };
 
@@ -288,7 +257,6 @@ fn p8_subscribes_stream_edge_exists() {
 #[test]
 fn p8_semantic_edges_displace_generic_calls_for_the_same_site() {
     let Some(view) = analyze_pixcraft_with_sidecar() else {
-        eprintln!("skipping: dart sidecar unavailable");
         return;
     };
 

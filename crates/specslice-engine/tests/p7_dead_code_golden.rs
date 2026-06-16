@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use specslice_engine::config::DeadCodeConfig;
 use specslice_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use specslice_engine::dead_code::{
@@ -67,46 +69,16 @@ fn sidecar_source_present() -> bool {
         .exists()
 }
 
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
-}
-
-fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
-    if !sidecar_source_present() || !dart_available() {
-        eprintln!("skipping: dart sidecar unavailable");
+fn setup_indexed_repo() -> Option<tempfile::TempDir> {
+    if !common::dart_golden_ready(
+        sidecar_source_present() && dart_available(),
+        "p7_dead_code_golden",
+    ) {
         return None;
     }
-    let on = EnvGuard::set("SPECSLICE_DART_ANALYZER", Some("1"));
     let sidecar_abs =
         workspace_dir().join("tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart");
-    let bin = EnvGuard::set(
-        "SPECSLICE_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
-    );
+    common::enable_dart_sidecar_env(&sidecar_abs);
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
@@ -130,7 +102,7 @@ fn setup_indexed_repo() -> Option<(tempfile::TempDir, EnvGuard, EnvGuard)> {
         result.resolver_used, RESOLVER_DART_ANALYZER,
         "P7 dead-code golden requires sidecar resolver"
     );
-    Some((tmp, on, bin))
+    Some(tmp)
 }
 
 fn default_config() -> DeadCodeConfig {
@@ -143,7 +115,7 @@ fn default_config() -> DeadCodeConfig {
 
 #[test]
 fn p7_dead_code_lists_unreached_pixcraft_symbols_with_confidence() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
     let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();
@@ -205,7 +177,7 @@ fn p7_dead_code_lists_unreached_pixcraft_symbols_with_confidence() {
 
 #[test]
 fn p7_dead_code_respects_ignore_glob_for_codegen_files() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
     // Drop a synthetic generated file to ensure the ignore glob keeps
@@ -254,7 +226,7 @@ fn p7_dead_code_respects_ignore_glob_for_codegen_files() {
 
 #[test]
 fn p7_public_api_roots_demote_high_to_medium() {
-    let Some((tmp, _on, _bin)) = setup_indexed_repo() else {
+    let Some(tmp) = setup_indexed_repo() else {
         return;
     };
     let store = specslice_store::Store::open(tmp.path().join(".specslice/graph.db")).unwrap();

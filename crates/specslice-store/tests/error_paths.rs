@@ -57,3 +57,56 @@ fn sqlite_error_round_trips_through_from() {
     let msg = format!("{via_from}");
     assert!(msg.contains("sqlite error"));
 }
+
+/// #215: operationally-distinct SQLite result codes route into typed variants
+/// (BUSY/CORRUPT/READONLY/FULL) so callers can react, rather than collapsing
+/// into a single opaque `Sqlite`. Driven straight off the primary result codes
+/// — and an extended code (`SQLITE_BUSY_SNAPSHOT = 517`, whose low byte is
+/// `SQLITE_BUSY`) to prove extended codes are folded to their primary class.
+#[test]
+fn sqlite_errors_classify_by_result_code() {
+    use rusqlite::ffi;
+
+    fn classify(code: i32) -> StoreError {
+        rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some("synth".into())).into()
+    }
+
+    assert!(matches!(classify(ffi::SQLITE_BUSY), StoreError::Busy(_)));
+    assert!(matches!(classify(ffi::SQLITE_LOCKED), StoreError::Busy(_)));
+    // Extended busy code (517) must still classify as Busy.
+    assert!(matches!(
+        classify(ffi::SQLITE_BUSY_SNAPSHOT),
+        StoreError::Busy(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_CORRUPT),
+        StoreError::Corrupt(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_NOTADB),
+        StoreError::Corrupt(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_READONLY),
+        StoreError::ReadOnly(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_CANTOPEN),
+        StoreError::ReadOnly(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_PERM),
+        StoreError::ReadOnly(_)
+    ));
+    assert!(matches!(
+        classify(ffi::SQLITE_FULL),
+        StoreError::DiskFull(_)
+    ));
+    // A generic SQLITE_ERROR (1) has no operational class → catch-all.
+    assert!(matches!(classify(1), StoreError::Sqlite(_)));
+
+    // Only Busy is retryable.
+    assert!(classify(ffi::SQLITE_BUSY).is_retryable());
+    assert!(!classify(ffi::SQLITE_CORRUPT).is_retryable());
+    assert!(!classify(1).is_retryable());
+}

@@ -92,7 +92,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let store = open_store(&repo_root)?;
 
     let anchor = store

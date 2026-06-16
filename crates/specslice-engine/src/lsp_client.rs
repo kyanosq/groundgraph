@@ -11,7 +11,9 @@
 //!
 //! What the client supports today:
 //! - Spawning a server process with `Stdio::piped()` on stdin / stdout
-//!   and `Stdio::inherit()` for stderr (so users see warnings).
+//!   and a capped, drained `Stdio::piped()` for stderr (so the server's
+//!   log noise is captured for diagnostics instead of leaking onto
+//!   specslice's own stderr — see `captured_stderr`).
 //! - LSP-conforming `Content-Length:` message framing.
 //! - Synchronous `request` (correlated by integer id) and `notify`
 //!   (fire-and-forget) primitives. Server-initiated requests and other
@@ -27,11 +29,12 @@
 //! - Subscribing to diagnostics. We do not consume them.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -181,7 +184,17 @@ pub struct LspClient {
     next_id: AtomicI64,
     server_name: String,
     response_timeout: Duration,
+    /// Tail of the server's stderr, captured by a drainer thread (#214).
+    /// We pipe + drain instead of inheriting so sourcekit-lsp / gopls log
+    /// noise never leaks into specslice's own stderr (which an MCP client
+    /// captures as diagnostics). Capped at [`MAX_STDERR_TAIL`] bytes.
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
 }
+
+/// Keep at most the last 64 KiB of server stderr — enough to surface a
+/// crash backtrace in `skip_reason`, bounded so a chatty server cannot
+/// grow the buffer without limit.
+const MAX_STDERR_TAIL: usize = 64 * 1024;
 
 impl LspClient {
     /// Spawn an LSP server. `command` is the executable, `args` are the
@@ -189,12 +202,19 @@ impl LspClient {
     /// (which both `sourcekit-lsp` and `gopls` use as the implicit root
     /// when no explicit `workspaceFolders` are supplied).
     pub fn spawn(command: &str, args: &[&str], cwd: &Path) -> Result<Self> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // #214: capture stderr rather than inheriting it. An inherited
+            // stream lets the server scribble onto specslice's stderr, which
+            // an MCP client reads as our diagnostics.
+            .stderr(Stdio::piped());
+        // #68: own process group so a teardown also reaps the analysis-server /
+        // build-tool grandchildren that sourcekit-lsp / gopls fork.
+        crate::proc::detach_process_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning LSP server `{command}`"))?;
         let stdin = child
@@ -205,6 +225,10 @@ impl LspClient {
             .stdout
             .take()
             .context("LSP server did not expose stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("LSP server did not expose stderr")?;
 
         let (tx, rx) = mpsc::channel::<ReaderMessage>();
         let server_name = command.to_string();
@@ -235,6 +259,38 @@ impl LspClient {
             })
             .context("spawning LSP stdout reader thread")?;
 
+        // Drainer thread: continuously read the server's stderr into a capped
+        // buffer so the pipe never fills (which would block the server) and so
+        // the tail is available for diagnostics on failure. Detached: it exits
+        // on stderr EOF when the child dies.
+        let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
+        {
+            let sink = Arc::clone(&stderr_tail);
+            std::thread::Builder::new()
+                .name(format!("lsp-stderr[{server_name}]"))
+                .spawn(move || {
+                    let mut reader = BufReader::new(stderr);
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break, // EOF: server closed stderr / exited
+                            Ok(n) => {
+                                if let Ok(mut buf) = sink.lock() {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    // Retain only the last MAX_STDERR_TAIL bytes.
+                                    let len = buf.len();
+                                    if len > MAX_STDERR_TAIL {
+                                        buf.drain(0..len - MAX_STDERR_TAIL);
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .context("spawning LSP stderr drainer thread")?;
+        }
+
         Ok(Self {
             child: Some(child),
             stdin,
@@ -242,7 +298,18 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             server_name,
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+            stderr_tail,
         })
+    }
+
+    /// The captured tail (≤ 64 KiB) of the server's stderr. Used by indexers
+    /// to fold a failing server's diagnostics into their `skip_reason` instead
+    /// of letting the noise escape onto specslice's own stderr (#214).
+    pub fn captured_stderr(&self) -> String {
+        match self.stderr_tail.lock() {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(_) => String::new(),
+        }
     }
 
     /// Override the per-request timeout (mainly so tests can shrink it).
@@ -414,16 +481,33 @@ impl LspClient {
         }
         let shutdown_result = self.request("shutdown", json!(null));
         let exit_notify = self.notify("exit", json!(null));
-        let wait_result = self
-            .child
-            .as_mut()
-            .map(|c| c.wait())
-            .transpose()
-            .context("waiting on LSP server process");
+        // #77: bound the wait. A server that ignores `exit` (or whose `kill`
+        // we couldn't deliver) must not hang the indexer — reap within a
+        // budget, then take the whole process group down as a fallback.
+        if let Some(mut child) = self.child.take() {
+            if !crate::proc::reap_within(&mut child, Duration::from_secs(2)) {
+                crate::proc::kill_and_reap(&mut child, Duration::from_secs(2));
+            }
+        }
+        self.rx.take();
         shutdown_result.context("LSP shutdown request failed")?;
         exit_notify.context("LSP exit notification failed")?;
-        wait_result?;
         Ok(())
+    }
+
+    /// Fire-and-forget LSP `shutdown` + `exit` so a dropped client gives the
+    /// server a chance to release its lock files before we SIGKILL it (#69).
+    /// Never waits for the response — [`Drop`] must not block on I/O.
+    fn try_graceful_exit(&mut self) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let shutdown = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "shutdown",
+            "params": null,
+        });
+        let _ = write_message(&mut self.stdin, &shutdown);
+        let _ = self.notify("exit", json!(null));
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -536,8 +620,9 @@ impl LspClient {
     /// asks for a forceful shutdown. Idempotent.
     fn force_kill(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // #68/#77: kill the whole process group and bound the reap so a
+            // failed signal cannot wedge us.
+            crate::proc::kill_and_reap(&mut child, Duration::from_secs(2));
         }
         // Drop the receiver so the reader thread observes a disconnect
         // and exits. The thread itself is detached.
@@ -548,8 +633,14 @@ impl LspClient {
 impl Drop for LspClient {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // #69: best-effort graceful shutdown first so sourcekit-lsp / gopls
+            // release their sourcekitd + index-store locks (a hard SIGKILL
+            // leaves them stale and stalls the next index by 8-12s). Tightly
+            // bounded so Drop can never hang (#77).
+            self.try_graceful_exit();
+            if !crate::proc::reap_within(&mut child, Duration::from_millis(300)) {
+                crate::proc::kill_and_reap(&mut child, Duration::from_secs(2));
+            }
         }
         self.rx.take();
     }
@@ -844,15 +935,26 @@ fn write_message<W: Write>(writer: &mut W, body: &Value) -> Result<()> {
 }
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<Value> {
+    // A single header line is tiny in practice (`Content-Length: <digits>`,
+    // `Content-Type: …`). Cap each line so a hostile server streaming an
+    // endless, newline-less header cannot grow `header` to OOM — the body
+    // already has its own cap (#32), this closes the header side (#249).
+    const MAX_HEADER_LINE_BYTES: u64 = 8 * 1024;
     let mut content_length: Option<usize> = None;
     let mut header = String::new();
     loop {
         header.clear();
         let read = reader
+            .by_ref()
+            .take(MAX_HEADER_LINE_BYTES)
             .read_line(&mut header)
             .context("reading LSP header line")?;
         if read == 0 {
             bail!("LSP server closed stdout before sending a complete message");
+        }
+        // Hit the per-line cap without a terminator → unbounded header.
+        if read as u64 == MAX_HEADER_LINE_BYTES && !header.ends_with('\n') {
+            bail!("LSP header line exceeds the {MAX_HEADER_LINE_BYTES}-byte cap");
         }
         let trimmed = header.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -1032,6 +1134,36 @@ mod tests {
         assert!(text.ends_with(&payload));
     }
 
+    /// issues.md #214: an LSP server's stderr (sourcekit-lsp / gopls push
+    /// `window/logMessage`, crash backtraces, JVM warnings) must be *captured*
+    /// — piped + drained into a capped buffer — never `Stdio::inherit()`ed into
+    /// specslice's own stderr, or an MCP client treats SpecSlice as "randomly
+    /// vomiting log noise". We spawn a stand-in server that writes a marker to
+    /// stderr, then confirm the client drained it into its own buffer.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_captures_server_stderr_instead_of_inheriting_it() {
+        let dir = std::env::temp_dir();
+        // The stand-in writes one stderr line, then blocks on stdin (`cat`) so
+        // the child stays alive long enough for the drainer to read it.
+        let client = LspClient::spawn("sh", &["-c", "echo specslice-stderr-probe 1>&2; cat"], &dir)
+            .expect("spawn stand-in server");
+
+        // Poll the captured tail (drainer runs on its own thread).
+        let mut captured = String::new();
+        for _ in 0..40 {
+            captured = client.captured_stderr();
+            if captured.contains("specslice-stderr-probe") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            captured.contains("specslice-stderr-probe"),
+            "child stderr must be captured, not inherited; got: {captured:?}"
+        );
+    }
+
     #[test]
     fn reads_a_message_with_extra_header() {
         let mut data: Vec<u8> = Vec::new();
@@ -1066,6 +1198,23 @@ mod tests {
         assert!(
             msg.contains("exceeds") || msg.contains("too large"),
             "expected a size-cap error, got: {msg}"
+        );
+    }
+
+    /// #249: the body cap (#32) protected `Content-Length`, but a single
+    /// header *line* with no terminator was still read unbounded. A hostile
+    /// server streaming an endless header must be refused, not buffered to OOM.
+    #[test]
+    fn read_message_rejects_unbounded_header_line() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"Content-Length: ");
+        data.extend(std::iter::repeat_n(b'0', 64 * 1024)); // 64 KiB, no '\n'
+        let mut reader = std::io::BufReader::new(data.as_slice());
+        let err = read_message(&mut reader).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("header line exceeds"),
+            "expected a header-line cap error, got: {msg}"
         );
     }
 

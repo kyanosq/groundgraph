@@ -2141,9 +2141,9 @@ fn slugify(name: &str) -> String {
     if trimmed.is_empty() {
         return "module".to_string();
     }
-    // Must start with alnum.
-    let first = trimmed.chars().next().unwrap();
-    if first.is_ascii_alphanumeric() {
+    // Must start with alnum (after trimming `_`, a non-empty slug always does;
+    // `starts_with` keeps this panic-free even if the trim logic changes).
+    if trimmed.starts_with(|c: char| c.is_ascii_alphanumeric()) {
         trimmed
     } else {
         format!("m_{trimmed}")
@@ -2347,7 +2347,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -3132,6 +3132,10 @@ mod tests {
         assert_eq!(slugify("ai-tryon"), "ai_tryon");
         assert_eq!(slugify("123abc"), "123abc");
         assert_eq!(slugify("!!!"), "module");
+        // Empty / all-underscore inputs hit the `trimmed.is_empty()` guard that
+        // protects the leading-char inspection (#206) — no panic, "module".
+        assert_eq!(slugify(""), "module");
+        assert_eq!(slugify("___"), "module");
     }
 
     #[test]

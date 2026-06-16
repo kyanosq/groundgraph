@@ -211,7 +211,7 @@ pub struct PortMapFile {
 pub fn load_port_map(path: &std::path::Path) -> Result<PortMapFile> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading port-map {}", path.display()))?;
-    let parsed: PortMapFile = serde_yaml::from_str(&text)
+    let parsed: PortMapFile = serde_yml::from_str(&text)
         .with_context(|| format!("parsing port-map {}", path.display()))?;
     Ok(parsed)
 }
@@ -364,7 +364,9 @@ pub fn analyze_port_coverage_with_stores(
     });
 
     for n in &sorted_source {
-        let name = n.name.clone().unwrap();
+        // Defensive: nameless nodes are filtered upstream, but DB drift or a
+        // weakened filter must skip rather than panic mid-analysis.
+        let Some(name) = n.name.clone() else { continue };
         let key = key_of(&name);
         source_names.insert(key.clone());
         let matched = resolve_match(&name, &key);

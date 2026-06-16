@@ -194,6 +194,12 @@ fn build_dart_structure(options: &DartIndexOptions) -> Result<LanguageIndexBatch
 
     for rel in &files {
         let abs = options.repo_root.join(rel);
+        // Bound memory: a multi-MB .dart blob (generated, vendored, or a binary
+        // mis-extensioned as .dart) must not be slurped whole for hashing +
+        // tree-sitter (#245; same budget as the other read paths).
+        if crate::source_text::is_oversized_source(&abs) {
+            continue;
+        }
         let Ok(source) = std::fs::read_to_string(&abs) else {
             continue; // unreadable / non-UTF-8: skip, never abort.
         };
@@ -969,6 +975,38 @@ mod reconcile_tests {
             "phantom range must be dropped"
         );
         assert!(batch.symbol_ranges.iter().any(|r| r.symbol_id == method.id));
+    }
+
+    #[test]
+    fn build_dart_structure_skips_oversized_files() {
+        // #245: a multi-MB .dart blob must be skipped during discovery, not
+        // slurped whole for hashing + tree-sitter — parity with the index byte
+        // budget every other read path already honours.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/small.dart"), "class A {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("lib/huge.dart"),
+            vec![b'x'; usize::try_from(crate::source_text::MAX_INDEX_FILE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+
+        let batch = build_dart_structure(&DartIndexOptions {
+            repo_root: tmp.path().to_path_buf(),
+            code_roots: vec![std::path::PathBuf::from("lib")],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let files: Vec<&str> = batch.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            files.iter().any(|p| p.ends_with("small.dart")),
+            "small file must still be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("huge.dart")),
+            "oversized .dart must be skipped: {files:?}"
+        );
     }
 
     #[test]

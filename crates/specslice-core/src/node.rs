@@ -723,6 +723,48 @@ mod tests {
     }
 
     #[test]
+    fn language_round_trips_for_every_kind() {
+        // Full-enum guard (the sampled test above only checks a handful): for
+        // EVERY `NodeKind`, `language()` must equal the unique `<lang>_` prefix
+        // of its wire name, or `None`. This catches a new kind silently
+        // misreporting its language and pins the `cpp` vs `c` disambiguation
+        // (the `language()` table is order-sensitive: `cpp` must win over `c`).
+        const LANGS: [&str; 13] = [
+            "dart",
+            "swift",
+            "go",
+            "python",
+            "typescript",
+            "java",
+            "rust",
+            "csharp",
+            "ruby",
+            "php",
+            "kotlin",
+            "cpp",
+            "c",
+        ];
+        for kind in NodeKind::ALL {
+            let s = kind.as_str();
+            // The `_` separator means at most one language can match; pick the
+            // longest so `cpp_*` resolves to `cpp`, never `c`.
+            let expected = LANGS
+                .iter()
+                .filter(|l| s.strip_prefix(**l).is_some_and(|r| r.starts_with('_')))
+                .max_by_key(|l| l.len())
+                .copied();
+            assert_eq!(
+                kind.language(),
+                expected,
+                "{kind:?} ({s}): language() disagrees with prefix analysis"
+            );
+        }
+        // Explicit sentinels for the ambiguous pair.
+        assert_eq!(NodeKind::CppFunction.language(), Some("cpp"));
+        assert_eq!(NodeKind::CFunction.language(), Some("c"));
+    }
+
+    #[test]
     fn node_new_sets_defaults_and_serialises() {
         let node = Node::new(ArtifactId::new("a"), NodeKind::Requirement);
         let json = serde_json::to_string(&node).expect("serialise");

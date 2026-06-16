@@ -32,7 +32,7 @@ pub fn descriptor() -> ToolDescriptor {
 }
 
 pub fn call(server: &Server, args: &Value) -> Result<Value> {
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let report = run_checks(CheckOptions {
         repo_root,
         impact: None,

@@ -113,9 +113,9 @@ SpecSlice 运行时产物 `.specslice/candidates/business_logic.yaml` 不应报�
     init_repository(InitOptions::new(root)).unwrap();
     let cfg_path = root.join(".specslice.yaml");
     let mut cfg: specslice_engine::config::EngineConfig =
-        serde_yaml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        serde_yml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
     cfg.checks.doc_drift_ignore = vec!["legacy/**".into()];
-    std::fs::write(&cfg_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+    std::fs::write(&cfg_path, serde_yml::to_string(&cfg).unwrap()).unwrap();
     let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
     store.migrate().unwrap();
     index_rust(

@@ -52,8 +52,17 @@ fn php_test_of(
     if kind != NodeKind::PhpMethod {
         return None;
     }
-    if name.starts_with("test") && name.len() > 4 {
-        return Some(TestKind::Case);
+    // PHPUnit convention: `test` followed by an uppercase letter or `_`.
+    // Plain `test` prefixes with a lowercase continuation (`testingHelper`,
+    // `testable`) are ordinary methods, not cases.
+    if let Some(rest) = name.strip_prefix("test") {
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        {
+            return Some(TestKind::Case);
+        }
     }
     php_attribute_heads(node, src)
         .iter()
@@ -345,6 +354,49 @@ function top_level(int $x): int { return $x * 2; }
         assert!(
             qnames(&s, NodeKind::PhpFunction).contains(&"top_level".to_string()),
             "free functions"
+        );
+    }
+
+    #[test]
+    fn php_methods_with_lowercase_after_test_stay_structural() {
+        // PHPUnit's convention is `test` followed by an uppercase letter or
+        // `_` (`testGreets`, `test_greets`). Methods like `testingHelper` /
+        // `testable` are ordinary business code and must NOT be reclassified
+        // as test cases (which would drop them from the structural symbols).
+        let src = r#"<?php
+class Widget {
+    public function testingHelper(): void {}
+    public function testable(): void {}
+    public function testGreets(): void {}
+}
+"#;
+        let s = scan(src);
+        let methods = qnames(&s, NodeKind::PhpMethod);
+        assert!(
+            methods.contains(&"Widget::testingHelper".to_string()),
+            "testingHelper should stay structural: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"Widget::testable".to_string()),
+            "testable should stay structural: {methods:?}"
+        );
+        let cases: Vec<&str> = s
+            .tests
+            .iter()
+            .filter(|t| t.kind == TestKind::Case)
+            .map(|t| t.qualified_name.as_str())
+            .collect();
+        assert!(
+            cases.contains(&"Widget::testGreets"),
+            "real PHPUnit case still detected: {cases:?}"
+        );
+        assert!(
+            !cases.contains(&"Widget::testingHelper"),
+            "testingHelper is not a case: {cases:?}"
+        );
+        assert!(
+            !cases.contains(&"Widget::testable"),
+            "testable is not a case: {cases:?}"
         );
     }
 

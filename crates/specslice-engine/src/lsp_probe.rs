@@ -92,13 +92,14 @@ impl ProbeReport {
 /// stubs all turn into `Unrunnable` with a reason that points the
 /// operator at the actual diagnostic.
 pub fn probe_lsp_command(command: &str, args: &[&str], timeout: Duration) -> ProbeReport {
-    let mut child = match Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // #68: own process group so a hung probe's grandchildren are reaped too.
+    crate::proc::detach_process_group(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return ProbeReport::Unrunnable {
@@ -113,8 +114,8 @@ pub fn probe_lsp_command(command: &str, args: &[&str], timeout: Duration) -> Pro
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // #68/#77: group kill + bounded reap.
+                    crate::proc::kill_and_reap(&mut child, Duration::from_secs(2));
                     return ProbeReport::Unrunnable {
                         reason: format!("`{command} --help` 在 {timeout:?} 内未退出，疑似挂起"),
                     };

@@ -57,7 +57,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .get("include_tests")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let opts = DeadCodeOptions {
         repo_root,
         min_confidence,

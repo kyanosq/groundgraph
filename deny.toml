@@ -1,0 +1,44 @@
+# cargo-deny configuration — supply-chain gate for SpecSlice (issues.md #102).
+#
+# Run locally with `cargo deny check`. CI runs the same in the `supply-chain`
+# job. The goal: fail on real vulnerabilities, untrusted sources, and
+# incompatible licenses; surface (but don't yet block on) the known-deferred
+# items tracked elsewhere in issues.md.
+
+[graph]
+all-features = false
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Real vulnerabilities and yanked crates fail the build (cargo-deny defaults).
+# issues.md #70: migrated off the unmaintained `serde_yaml` / `unsafe-libyaml`
+# onto the maintained `serde_yml` (backed by `libyml`). No advisories ignored.
+ignore = []
+
+[bans]
+# issues.md #223/#224/#225: duplicate transitive versions (hashbrown,
+# wit-bindgen, getrandom, r-efi) are upstream-driven. Warn so they stay visible
+# without blocking, until the upstream upgrades land.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[licenses]
+# Permissive licenses compatible with SpecSlice's own "MIT OR Apache-2.0".
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

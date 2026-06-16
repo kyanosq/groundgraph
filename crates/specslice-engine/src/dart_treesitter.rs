@@ -612,6 +612,7 @@ pub fn dart_extract_structure(file_rel: &str, source: &str) -> DartFileStructure
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn ids(s: &DartFileStructure) -> Vec<String> {
         s.symbols.iter().map(|x| x.id.to_string()).collect()
@@ -886,6 +887,32 @@ void main() {
             &"class A { void m() {} } ".repeat(500),
         ] {
             let _ = dart_extract_structure("lib/x.dart", src);
+        }
+    }
+
+    // issues.md #220: the hand-written Dart scanner was the only one of the 13
+    // tree-sitter languages with no `proptest!` totality net. These mirror the
+    // `c_treesitter.rs` template so the scanner is fuzzed for panics on UTF-8
+    // boundaries, unbalanced quotes, nested comments, and emoji.
+    proptest! {
+        #[test]
+        fn dart_scanner_never_panics_and_is_deterministic(s in ".*") {
+            let a = dart_extract_structure("lib/x.dart", &s);
+            let b = dart_extract_structure("lib/x.dart", &s);
+            prop_assert_eq!(
+                a.symbols.iter().map(|x| x.id.to_string()).collect::<Vec<_>>(),
+                b.symbols.iter().map(|x| x.id.to_string()).collect::<Vec<_>>(),
+            );
+        }
+
+        // `(?s)` lets `.` match newlines so the line-oriented scanner is
+        // exercised across real multi-line shapes, not just single lines.
+        #[test]
+        fn dart_scanner_symbols_are_well_formed(s in "(?s).{0,600}") {
+            for sym in &dart_extract_structure("lib/x.dart", &s).symbols {
+                prop_assert!(!sym.qualified_name.is_empty());
+                prop_assert!(sym.end_line >= sym.start_line);
+            }
         }
     }
 }

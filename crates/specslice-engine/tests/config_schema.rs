@@ -10,7 +10,9 @@
 
 use std::path::PathBuf;
 
-use specslice_engine::config::{EngineConfig, DEFAULT_CONFIG_FILE_NAME};
+use specslice_engine::config::{
+    config_schema_notice, EngineConfig, CONFIG_SCHEMA_VERSION, DEFAULT_CONFIG_FILE_NAME,
+};
 use specslice_engine::impact::{run_impact, ImpactOptions};
 use specslice_engine::index::{index_repository, IndexOptions};
 use specslice_engine::init::{init_repository, InitOptions};
@@ -22,10 +24,23 @@ fn write_config(repo_root: &std::path::Path, yaml: &str) {
     std::fs::write(repo_root.join(DEFAULT_CONFIG_FILE_NAME), yaml).unwrap();
 }
 
+/// Run a git command and assert it succeeded (#78). Without the success
+/// assertion a non-zero git exit (lock file, hook, detached HEAD) would let the
+/// test proceed on a broken repo and fail elsewhere with a misleading message.
+fn run_git(repo: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
 #[test]
 fn minimal_config_still_parses() {
     let yaml = "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\n";
-    let cfg: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
     assert_eq!(cfg.repo.root, ".");
     assert_eq!(cfg.storage.path, ".specslice/graph.db");
     // Sections that were not provided fall back to defaults.
@@ -103,7 +118,7 @@ checks:
   missing_linked_test_level: warning
   orphan_requirement_level: warning
 "#;
-    let cfg: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
     assert_eq!(cfg.docs.paths.len(), 3);
     assert_eq!(cfg.code.paths.len(), 2);
     assert_eq!(cfg.code.exclude.len(), 5);
@@ -315,50 +330,15 @@ fn run_impact_honours_configured_doc_and_warning_levels() {
         root,
         "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\ndocs:\n  paths: []\ncode:\n  paths: []\nimpact:\n  include_doc_changes: false\n  missing_test_change_level: off\n",
     );
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["init", "-q", "-b", "main"])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "user.email", "t@t"])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "user.name", "T"])
-        .status()
-        .unwrap();
+    run_git(root, &["init", "-q", "-b", "main"]);
+    run_git(root, &["config", "user.email", "t@t"]);
+    run_git(root, &["config", "user.name", "T"]);
     std::fs::write(root.join("note.md"), "one\n").unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["add", "."])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["commit", "-q", "-m", "base"])
-        .status()
-        .unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-q", "-m", "base"]);
     std::fs::write(root.join("note.md"), "two\n").unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["add", "."])
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["commit", "-q", "-m", "edit"])
-        .status()
-        .unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-q", "-m", "edit"]);
 
     let report = run_impact(ImpactOptions {
         repo_root: root.into(),
@@ -374,10 +354,95 @@ fn run_impact_honours_configured_doc_and_warning_levels() {
 #[test]
 fn default_config_serialises_with_new_sections_for_round_trip() {
     let cfg = EngineConfig::default();
-    let yaml = serde_yaml::to_string(&cfg).unwrap();
+    let yaml = serde_yml::to_string(&cfg).unwrap();
     // Forward-compatibility: round-trip without losing the optional sections.
-    let round_trip: EngineConfig = serde_yaml::from_str(&yaml).unwrap();
+    let round_trip: EngineConfig = serde_yml::from_str(&yaml).unwrap();
     assert_eq!(round_trip, cfg);
+}
+
+/// #72: the forward-compat guard warns *only* when the declared schema version
+/// is strictly newer than this build supports. Legacy (unversioned) files and
+/// any version at-or-below the supported one pass silently.
+#[test]
+fn config_schema_notice_warns_only_on_newer_than_supported() {
+    assert!(
+        config_schema_notice(None, 1).is_none(),
+        "a legacy file with no schema_version must not warn"
+    );
+    assert!(
+        config_schema_notice(Some(1), 1).is_none(),
+        "the exact supported version must not warn"
+    );
+    assert!(
+        config_schema_notice(Some(0), 1).is_none(),
+        "an older version must not warn (this build understands it)"
+    );
+    let notice = config_schema_notice(Some(2), 1).expect("a newer version must warn");
+    assert!(
+        notice.contains('2') && notice.contains('1'),
+        "names both versions: {notice}"
+    );
+    assert!(
+        notice.contains("schema_version"),
+        "names the field so the operator can find it: {notice}"
+    );
+}
+
+/// #72: a config without the field parses (legacy) and emits no notice.
+#[test]
+fn legacy_config_without_schema_version_loads_and_is_silent() {
+    let yaml = "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\n";
+    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
+    assert_eq!(cfg.schema_version, None);
+    assert!(cfg.schema_version_notice().is_none());
+}
+
+/// #72: `init` stamps every freshly-written `.specslice.yaml` with the current
+/// schema version (Dart and polyglot branches both), so future builds can
+/// detect version skew. Mirrors how the DB and every other contract is versioned.
+#[test]
+fn init_stamps_config_schema_version() {
+    // Dart branch (legacy `code` default).
+    let dart = TempDir::new().unwrap();
+    std::fs::write(dart.path().join("pubspec.yaml"), "name: x\n").unwrap();
+    std::fs::create_dir_all(dart.path().join("lib")).unwrap();
+    std::fs::write(dart.path().join("lib/main.dart"), "void main() {}\n").unwrap();
+    init_repository(InitOptions {
+        repo_root: dart.path().into(),
+    })
+    .unwrap();
+    let cfg: EngineConfig = serde_yml::from_str(
+        &std::fs::read_to_string(dart.path().join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg.schema_version, Some(CONFIG_SCHEMA_VERSION));
+    assert!(
+        cfg.languages.is_empty(),
+        "Dart still uses the legacy default"
+    );
+
+    // Polyglot branch (unified `languages` list).
+    let poly = TempDir::new().unwrap();
+    std::fs::create_dir_all(poly.path().join("Sources")).unwrap();
+    std::fs::write(
+        poly.path().join("Package.swift"),
+        "// swift-tools-version:5.9\n",
+    )
+    .unwrap();
+    std::fs::write(
+        poly.path().join("Sources/Engine.swift"),
+        "struct Engine {}\n",
+    )
+    .unwrap();
+    init_repository(InitOptions {
+        repo_root: poly.path().into(),
+    })
+    .unwrap();
+    let cfg: EngineConfig = serde_yml::from_str(
+        &std::fs::read_to_string(poly.path().join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg.schema_version, Some(CONFIG_SCHEMA_VERSION));
 }
 
 #[test]
@@ -412,7 +477,7 @@ go:
   exclude:
     - "**/vendor/**"
 "#;
-    let cfg: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
     assert!(cfg.swift.enabled, "swift.enabled must round-trip");
     assert_eq!(cfg.swift.paths_or(&["Sources"]), vec!["Sources", "Tests"]);
     assert_eq!(
@@ -423,7 +488,7 @@ go:
     assert_eq!(cfg.go.paths_or(&["."]), vec![".", "cmd"]);
     assert_eq!(cfg.go.exclude, vec!["**/vendor/**".to_string()]);
     // Sections default to disabled when omitted.
-    let minimal: EngineConfig = serde_yaml::from_str(
+    let minimal: EngineConfig = serde_yml::from_str(
         "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .specslice/graph.db\n",
     )
     .unwrap();
@@ -450,10 +515,9 @@ fn init_autodetects_swift_repo_and_writes_treesitter_config() {
     })
     .unwrap();
 
-    let cfg: EngineConfig = serde_yaml::from_str(
-        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
-    )
-    .unwrap();
+    let cfg: EngineConfig =
+        serde_yml::from_str(&std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap())
+            .unwrap();
     assert_eq!(cfg.languages.len(), 1, "exactly one detected language");
     assert_eq!(cfg.languages[0].id, "swift");
     assert!(
@@ -490,10 +554,9 @@ fn init_on_dart_repo_keeps_legacy_default() {
     })
     .unwrap();
 
-    let cfg: EngineConfig = serde_yaml::from_str(
-        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
-    )
-    .unwrap();
+    let cfg: EngineConfig =
+        serde_yml::from_str(&std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap())
+            .unwrap();
     assert!(
         cfg.languages.is_empty(),
         "Dart keeps the legacy code-section default, not a languages list"
@@ -521,6 +584,24 @@ fn index_repository_skips_swift_adapter_when_disabled() {
 
 #[test]
 fn index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing() {
+    // #187 gates a repo-provided `swift.lsp_command` behind a trust env, so a
+    // bogus command in `.specslice.yaml` is *ignored* and the adapter falls
+    // back to the default `sourcekit-lsp` — which exists on a macOS dev box,
+    // making this test's "lsp missing" premise machine-dependent. The operator
+    // override `SPECSLICE_SWIFT_LSP_BIN` is always honoured (it bypasses the
+    // gate), so inject a guaranteed-missing binary through it to exercise the
+    // "missing → skip with a PATH reason" path deterministically on any host.
+    // Set once per process and never restored: env is global and `cargo test`
+    // is multi-threaded; only this (swift-enabled) test reads the variable, so
+    // a single write under `Once` cannot race a removal (#65).
+    static SET_MISSING_SWIFT_LSP: std::sync::Once = std::sync::Once::new();
+    SET_MISSING_SWIFT_LSP.call_once(|| {
+        std::env::set_var(
+            specslice_engine::SWIFT_LSP_COMMAND_ENV,
+            "specslice_missing_sourcekit_lsp",
+        );
+    });
+
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     init_repository(InitOptions {
@@ -534,7 +615,7 @@ fn index_repository_runs_swift_adapter_when_enabled_and_skips_when_lsp_missing()
             "storage:\n  path: .specslice/graph.db\n",
             "docs:\n  paths: []\n",
             "code:\n  paths: []\n",
-            "swift:\n  enabled: true\n  paths: [Sources]\n  lsp_command: specslice_missing_sourcekit_lsp\n",
+            "swift:\n  enabled: true\n  paths: [Sources]\n",
             "go:\n  enabled: true\n  paths: ['.']\n",
         ),
     );

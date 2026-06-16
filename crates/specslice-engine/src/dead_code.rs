@@ -148,7 +148,7 @@ fn load_workspace_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    serde_yaml::from_str::<EngineConfig>(&raw)
+    serde_yml::from_str::<EngineConfig>(&raw)
         .with_context(|| format!("parsing config {}", path.display()))
 }
 

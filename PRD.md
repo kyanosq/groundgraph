@@ -1518,6 +1518,8 @@ AgentContextPack:
 
 ## Phase 6：SCIP / 多语言 / 高性能图存储
 
+> **✅ 已落地（v0.2.0+）** — 本节描述的能力已实现，不再是"后续计划"：SCIP adapter（`scip_runner` + 5 个 indexer，`index` 自动调用）、Tree-sitter fallback（12 门广度后端）、compact graph store（SQLite + WAL + checkpoint + bulk upsert + FTS5）、faster PR impact 与 additional language adapters 均已交付。GitNexus adapter / multi-repo support 仍属增量方向。
+
 ### 目标
 
 在 Rust Core 已经存在的基础上，从“Rust Core + Dart Adapter”升级为高性能、多语言基础库。
@@ -1564,7 +1566,9 @@ Rust MVP 必须保留：
 | Phase 3 | Dart analyzer sidecar | 后续 |
 | Phase 4 | MCP / Agent 集成 | 后续 |
 | Phase 5 | GraphRAG / Semantic Query | 后续 |
-| Phase 6 | SCIP / 多语言 / 高性能图存储 | 后续 |
+| Phase 6 | SCIP / 多语言 / 高性能图存储 | 后续（✅ 已落地 v0.2.0+） |
+
+> **实现状态对照（v0.2.0+，2026-06）**：本表的"后续"指**优先级**而非"尚未实现"。截至 v0.2.0，Phase 2（Review Workflow，`candidate review`）、Phase 3（Dart analyzer sidecar）、Phase 4（MCP / Agent 集成，`specslice-mcp`）、**Phase 6（SCIP overlay 自动调用 + 12 门 tree-sitter 多语言 + 高性能图存储：WAL + checkpoint + bulk upsert + FTS5）均已落地**。仅 **Phase 5（GraphRAG / Semantic Query）仍为规划项**。
 
 ---
 

@@ -37,12 +37,17 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn run_git(repo: &Path, args: &[&str]) {
-    StdCommand::new("git")
+    // #78: assert the git command actually succeeded. A leftover
+    // `.git/index.lock`, a failing pre-commit hook, or detached HEAD makes git
+    // exit non-zero; without this the test would silently build on a broken
+    // repo and fail far away with a confusing message.
+    let status = StdCommand::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .status()
         .unwrap();
+    assert!(status.success(), "git {args:?} failed with {status}");
 }
 
 fn setup_repo() -> TempDir {

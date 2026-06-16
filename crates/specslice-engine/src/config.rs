@@ -15,8 +15,23 @@ pub const DEFAULT_CONFIG_FILE_NAME: &str = ".specslice.yaml";
 pub const DEFAULT_STORAGE_DIR: &str = ".specslice";
 pub const DEFAULT_DB_FILENAME: &str = "graph.db";
 
+/// Schema version of the `.specslice.yaml` contract this build understands
+/// (#72). Bump on any breaking change to a config key's name or semantics, and
+/// add the matching migration / warning. Every other external SpecSlice
+/// contract is versioned (evidence, candidates, questions, the DB `schema_version`
+/// table); the config file is the last one that was not.
+pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EngineConfig {
+    /// Version of the config schema this file was written against (#72).
+    /// `None` for legacy files written before the field existed (treated as
+    /// "compatible"); `init` stamps freshly-written configs with
+    /// [`CONFIG_SCHEMA_VERSION`]. A value greater than this build supports
+    /// triggers a forward-compat warning on load (see
+    /// [`EngineConfig::schema_version_notice`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     #[serde(default)]
     pub repo: RepoConfig,
     #[serde(default)]
@@ -264,6 +279,30 @@ impl EngineConfig {
             self.treesitter.exclude = ts_exclude;
         }
         self
+    }
+
+    /// Forward-compat guard for `.specslice.yaml` (#72): a warning string when
+    /// this file declares a schema version newer than the build supports, else
+    /// `None`. Thin wrapper over [`config_schema_notice`] bound to
+    /// [`CONFIG_SCHEMA_VERSION`].
+    pub fn schema_version_notice(&self) -> Option<String> {
+        config_schema_notice(self.schema_version, CONFIG_SCHEMA_VERSION)
+    }
+}
+
+/// Forward-compat guard for the config schema (#72). Returns a warning when a
+/// loaded config declares a `schema_version` newer than `supported` — its keys
+/// may carry meanings this build will misinterpret, mirroring the DB's
+/// `SchemaTooNew` guard (#153). An unversioned (`None`, legacy) file and any
+/// `declared <= supported` pass silently. Pure, so the policy is unit-testable
+/// without touching the filesystem.
+pub fn config_schema_notice(declared: Option<u32>, supported: u32) -> Option<String> {
+    match declared {
+        Some(v) if v > supported => Some(format!(
+            ".specslice.yaml declares schema_version {v}, but this specslice supports up to \
+             {supported}; upgrade specslice or some config keys may be misinterpreted"
+        )),
+        _ => None,
     }
 }
 

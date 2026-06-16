@@ -94,6 +94,11 @@ pub fn rebuild_fulltext_index(store: &mut Store, repo_root: &Path) -> Result<Ful
         .par_iter()
         .map(|(path, spans)| {
             let abs = repo_root.join(path);
+            // Capacity gate: skip files past the size budget rather than
+            // reading them N-up across rayon workers (OOM guard).
+            if crate::source_text::is_oversized_source(&abs) {
+                return (0usize, spans.len(), Vec::new());
+            }
             let Ok(contents) = std::fs::read_to_string(&abs) else {
                 return (0usize, spans.len(), Vec::new());
             };
@@ -142,6 +147,22 @@ pub fn rebuild_fulltext_index(store: &mut Store, repo_root: &Path) -> Result<Ful
 /// Dart/Go/TS/Swift/Java), `#` (Python — also matches Rust `#[attr]`,
 /// harmless), `--` (SQL), `*` `/*` `*/` (block comments), `"""` (Python
 /// docstring fences). Bounded by [`MAX_LEADING_COMMENT_LINES`].
+/// True when a `#`-prefixed (already `trim_start`'d) line is a C/C++
+/// preprocessor directive rather than a Python comment or Rust attribute.
+/// The directive keyword must end on a non-identifier boundary so that a
+/// Python comment like `#important` (→ `important`) is not misclassified.
+fn is_c_preprocessor_directive(line: &str) -> bool {
+    const DIRECTIVES: &[&str] = &[
+        "include", "define", "undef", "ifdef", "ifndef", "if", "elif", "else", "endif", "pragma",
+        "error", "warning", "line", "import",
+    ];
+    let rest = line.strip_prefix('#').unwrap_or(line).trim_start();
+    DIRECTIVES.iter().any(|d| {
+        rest.strip_prefix(d)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    })
+}
+
 pub(crate) fn extend_over_leading_comments<S: AsRef<str>>(lines: &[S], start: u32) -> u32 {
     let mut idx = (start.max(1) as usize).saturating_sub(1); // 0-based decl line
     let mut taken = 0usize;
@@ -150,7 +171,10 @@ pub(crate) fn extend_over_leading_comments<S: AsRef<str>>(lines: &[S], start: u3
         let is_comment = above.starts_with("///")
             || above.starts_with("//!")
             || above.starts_with("//")
-            || above.starts_with('#')
+            // `#` covers Python comments and Rust `#[attr]`, but NOT C/C++
+            // preprocessor directives (`#include`/`#define`/…), which are code
+            // and would otherwise pollute the BM25 body (issues2.md #98).
+            || (above.starts_with('#') && !is_c_preprocessor_directive(above))
             || above.starts_with("--")
             || above.starts_with("/*")
             || above.starts_with('*')
@@ -223,6 +247,35 @@ mod tests {
         assert_eq!(extend_over_leading_comments(&lines, 6), 3);
         // No comments above → unchanged.
         assert_eq!(extend_over_leading_comments(&lines, 1), 1);
+    }
+
+    #[test]
+    fn c_preprocessor_directives_do_not_fold_into_the_symbol_body() {
+        // `#include` / `#define` / `#ifdef` are NOT comments; folding them into
+        // the BM25 body pollutes search (issues2.md #98).
+        let lines = vec![
+            "#include <stdio.h>",
+            "#define MAX_CONN 10",
+            "int open_conn(void) {",
+        ];
+        // Decl on line 3; the two preprocessor lines must stay out of the body.
+        assert_eq!(extend_over_leading_comments(&lines, 3), 3);
+
+        // A real `//` comment directly above a directive still folds, but the
+        // walk stops at the directive boundary.
+        let mixed = vec![
+            "#define MAX_CONN 10",
+            "// explains open_conn",
+            "int open_conn(void) {",
+        ];
+        assert_eq!(extend_over_leading_comments(&mixed, 3), 2);
+    }
+
+    #[test]
+    fn hash_comments_and_rust_attributes_still_fold() {
+        // Python `#` comments and Rust `#[attr]` are still comment-like.
+        let lines = vec!["# a python style note", "#[inline]", "fn advance() {}"];
+        assert_eq!(extend_over_leading_comments(&lines, 3), 1);
     }
 
     #[test]

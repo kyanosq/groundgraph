@@ -64,10 +64,17 @@ fn dashboard_writes_self_contained_html_with_all_sections() {
         .args(["dashboard"])
         .assert()
         .success();
+    // #111: the "wrote …" status line goes to stderr so stdout stays clean
+    // for piping; stdout must therefore carry no status noise.
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("wrote"),
+        "must report output path on stderr: {stderr}"
+    );
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
-        stdout.contains("wrote"),
-        "must report output path: {stdout}"
+        stdout.trim().is_empty(),
+        "dashboard writes a file; stdout must stay empty, got: {stdout:?}"
     );
 
     let out = tmp.path().join(".specslice/export/dashboard.html");

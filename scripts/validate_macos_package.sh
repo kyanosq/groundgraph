@@ -10,7 +10,24 @@ ARCHIVE="$1"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# issues.md #80: refuse archives whose members use absolute paths or `..`
+# components before extracting — bsdtar warns but still writes such members,
+# letting a tampered upstream archive escape "$TMP".
+if tar -tzf "$ARCHIVE" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
+  echo "error: archive contains absolute or parent-relative (..) member paths; refusing to extract" >&2
+  exit 1
+fi
+
 tar -xzf "$ARCHIVE" -C "$TMP"
+
+# A well-formed package has exactly one top-level directory. `find ... | head`
+# silently picked the first of several; require exactly one so a multi-root
+# (or traversal-padded) archive is rejected rather than mis-validated.
+TOP_COUNT="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+if [ "$TOP_COUNT" != "1" ]; then
+  echo "error: archive must contain exactly one top-level directory, found $TOP_COUNT" >&2
+  exit 1
+fi
 ROOT="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 
 test -x "$ROOT/bin/specslice"

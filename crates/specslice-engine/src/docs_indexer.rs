@@ -79,6 +79,7 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
             continue;
         }
         for entry in walkdir::WalkDir::new(&abs_root)
+            .sort_by_file_name()
             .into_iter()
             .filter_entry(|e| !is_pruned_dir(e))
             .filter_map(|e| e.ok())
@@ -117,6 +118,7 @@ pub fn index_docs(store: &mut Store, options: &DocsIndexOptions) -> Result<DocsI
     // has. Vendored trees stay out via the same prune filter.
     if !bare_names.is_empty() || !options.doc_roots.is_empty() {
         for entry in walkdir::WalkDir::new(&options.repo_root)
+            .sort_by_file_name()
             .into_iter()
             .filter_entry(|e| !is_pruned_dir(e))
             .filter_map(|e| e.ok())
@@ -357,6 +359,11 @@ fn index_one_file(
     abs_path: &Path,
     result: &mut DocsIndexResult,
 ) -> Result<()> {
+    // Skip oversized docs (giant generated CHANGELOGs / vendored API dumps)
+    // to bound memory, matching the code indexers (issues2.md #67/#76).
+    if crate::source_text::is_oversized_source(abs_path) {
+        return Ok(());
+    }
     let raw = std::fs::read_to_string(abs_path)
         .with_context(|| format!("reading {}", abs_path.display()))?;
     let ext = rel_path
@@ -370,6 +377,9 @@ fn index_one_file(
 
     let mut file_node = Node::new(file_id(rel_path), NodeKind::File);
     file_node.path = Some(rel_path.to_string());
+    // Match requirements_md_indexer / schema_indexer: record which file this
+    // node was indexed from, so audits / UI / file-scoped filters work (#189).
+    file_node.source_file = Some(rel_path.to_string());
     file_node.name = abs_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned());
@@ -383,6 +393,11 @@ fn index_one_file(
     // Build doc sections from headings. A section runs from its heading line
     // until the next heading of equal or lower level (smaller `level` value
     // means a higher heading), or EOF.
+    //
+    // Two headings in one file can slugify to the same value (`Hello, World!`
+    // vs `Hello World`, or distinct CJK that share an ASCII stem): de-duplicate
+    // per file so the second section does not UPSERT over the first (#255).
+    let mut slug_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for (idx, heading) in parsed.headings.iter().enumerate() {
         let end_line = parsed
             .headings
@@ -391,10 +406,18 @@ fn index_one_file(
             .find(|h| h.level <= heading.level)
             .map(|h| h.line.saturating_sub(1))
             .unwrap_or(parsed.total_lines);
-        let slug = slugify(&heading.text);
+        let base_slug = slugify(&heading.text);
+        let count = slug_counts.entry(base_slug.clone()).or_insert(0);
+        *count += 1;
+        let slug = if *count == 1 {
+            base_slug
+        } else {
+            format!("{base_slug}-{count}")
+        };
         let section_id = doc_section_id(rel_path, &slug);
         let mut node = Node::new(section_id.clone(), NodeKind::DocSection);
         node.path = Some(rel_path.to_string());
+        node.source_file = Some(rel_path.to_string());
         node.name = Some(heading.text.clone());
         node.start_line = Some(heading.line);
         node.end_line = Some(end_line);
@@ -442,6 +465,10 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
         }
     }
 
+    // Track fenced code blocks so a `#` line inside ``` / ~~~ is treated as
+    // code, not a heading (#246) — matching `parse_adoc` and
+    // `requirements_md_indexer::parse_requirements`.
+    let mut in_fence = false;
     for (idx, line) in raw.lines().enumerate() {
         total_lines = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
         content_hasher.update(line.as_bytes());
@@ -450,6 +477,13 @@ fn parse_markdown(raw: &str) -> ParsedDoc {
             continue;
         }
         let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if let Some((level, text)) = parse_heading(trimmed) {
             headings.push(Heading {
                 level,
@@ -654,6 +688,65 @@ mod tests {
     fn parse_markdown_handles_no_frontmatter() {
         let parsed = parse_markdown("# Hello\n\nBody\n");
         assert_eq!(parsed.headings.len(), 1);
+    }
+
+    /// #246: `#` lines inside fenced code blocks (``` / ~~~) are code, not
+    /// headings. Without fence tracking they become phantom DocSections —
+    /// and `parse_adoc` / `requirements_md_indexer::parse_requirements`
+    /// already track fences, so markdown was the inconsistent one.
+    #[test]
+    fn parse_markdown_ignores_headings_inside_code_fences() {
+        let src = "# Real Heading\n\n\
+                   ```sh\n\
+                   # shell comment, not a heading\n\
+                   echo hi\n\
+                   ```\n\n\
+                   ## Another Real\n\n\
+                   ~~~\n\
+                   ### fenced too\n\
+                   ~~~\n";
+        let parsed = parse_markdown(src);
+        let texts: Vec<&str> = parsed.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["Real Heading", "Another Real"]);
+    }
+
+    /// #255: two headings that differ only in dropped ASCII punctuation
+    /// (`Hello, World!` vs `Hello World`) slugify identically. Without
+    /// per-file de-duplication the second DocSection UPSERTs over the first,
+    /// silently losing a section. Each heading must get a distinct id.
+    #[test]
+    fn colliding_heading_slugs_get_distinct_section_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/x.md"),
+            "# Hello, World!\n\nbody\n\n# Hello World\n\nmore\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into()],
+        };
+        let result = index_docs(&mut store, &opts).unwrap();
+        assert_eq!(
+            result.doc_sections, 2,
+            "both headings must survive as distinct sections; got {result:?}"
+        );
+        let sections = store
+            .list_all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::DocSection && n.path.as_deref() == Some("docs/x.md"))
+            .count();
+        assert_eq!(
+            sections, 2,
+            "colliding slugs must not UPSERT over each other"
+        );
     }
 
     #[test]

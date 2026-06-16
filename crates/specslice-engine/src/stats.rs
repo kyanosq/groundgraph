@@ -23,6 +23,12 @@ use serde::{Deserialize, Serialize};
 /// File name (under `.specslice/`) of the append-only stats ledger.
 pub const STATS_REL_PATH: &str = "stats.jsonl";
 
+/// Rotate the ledger once it reaches this size so an append-only file on a
+/// long-lived repo (years of CI) cannot grow without bound and force a huge
+/// read at `specslice stats` time (#250). The previous ledger is kept as a
+/// single `.1` sibling, so at most ~2× this is retained on disk.
+pub const MAX_STATS_BYTES: u64 = 8 * 1024 * 1024;
+
 /// One recorded command invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandStat {
@@ -99,10 +105,29 @@ pub fn make_stat(
 /// outside a workspace, e.g. `graph-equiv` over bare db paths) it does nothing,
 /// so statistics never break a command.
 pub fn append_stat(specslice_dir: &Path, stat: &CommandStat) -> std::io::Result<()> {
+    append_stat_inner(specslice_dir, stat, MAX_STATS_BYTES)
+}
+
+/// [`append_stat`] with an injectable rotation cap (so tests can exercise
+/// rotation without writing megabytes).
+fn append_stat_inner(
+    specslice_dir: &Path,
+    stat: &CommandStat,
+    max_bytes: u64,
+) -> std::io::Result<()> {
     if !specslice_dir.is_dir() {
         return Ok(());
     }
     let path = specslice_dir.join(STATS_REL_PATH);
+    // Rotate before appending if the ledger has reached the cap. Best-effort:
+    // a lost race between concurrent processes at worst drops a handful of
+    // best-effort stat lines, never breaks a command.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() >= max_bytes {
+            let rotated = specslice_dir.join(format!("{STATS_REL_PATH}.1"));
+            let _ = std::fs::rename(&path, &rotated);
+        }
+    }
     let mut line = serde_json::to_string(stat)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
@@ -159,18 +184,24 @@ pub struct StatsSummary {
     pub commands: Vec<CommandSummary>,
 }
 
-/// Aggregate raw stats into per-command summaries, sorted by call count
-/// (descending), then command name (ascending) for stable output.
-pub fn summarize(stats: &[CommandStat]) -> StatsSummary {
-    let mut by: BTreeMap<String, CommandSummary> = BTreeMap::new();
-    let mut total_calls = 0u64;
-    let mut total_errors = 0u64;
-    for s in stats {
-        total_calls += 1;
+/// Incremental ledger aggregator. Folding one [`CommandStat`] at a time keeps
+/// memory at O(distinct commands) regardless of ledger size, so [`summarize_file`]
+/// can stream a multi-MB `stats.jsonl` instead of buffering every record (#250).
+#[derive(Default)]
+struct Aggregator {
+    by: BTreeMap<String, CommandSummary>,
+    total_calls: u64,
+    total_errors: u64,
+}
+
+impl Aggregator {
+    fn add(&mut self, s: &CommandStat) {
+        self.total_calls += 1;
         if !s.ok {
-            total_errors += 1;
+            self.total_errors += 1;
         }
-        let entry = by
+        let entry = self
+            .by
             .entry(s.command.clone())
             .or_insert_with(|| CommandSummary {
                 command: s.command.clone(),
@@ -191,27 +222,72 @@ pub fn summarize(stats: &[CommandStat]) -> StatsSummary {
             *entry.metrics.entry(k.clone()).or_insert(0) += *v;
         }
     }
-    let mut commands: Vec<CommandSummary> = by
-        .into_values()
-        .map(|mut c| {
-            c.avg_ms = if c.calls > 0 {
-                c.total_ms as f64 / c.calls as f64
-            } else {
-                0.0
-            };
-            c
-        })
-        .collect();
-    commands.sort_by(|a, b| {
-        b.calls
-            .cmp(&a.calls)
-            .then_with(|| a.command.cmp(&b.command))
-    });
-    StatsSummary {
-        total_calls,
-        total_errors,
-        commands,
+
+    fn finish(self) -> StatsSummary {
+        let mut commands: Vec<CommandSummary> = self
+            .by
+            .into_values()
+            .map(|mut c| {
+                c.avg_ms = if c.calls > 0 {
+                    c.total_ms as f64 / c.calls as f64
+                } else {
+                    0.0
+                };
+                c
+            })
+            .collect();
+        commands.sort_by(|a, b| {
+            b.calls
+                .cmp(&a.calls)
+                .then_with(|| a.command.cmp(&b.command))
+        });
+        StatsSummary {
+            total_calls: self.total_calls,
+            total_errors: self.total_errors,
+            commands,
+        }
     }
+}
+
+/// Aggregate raw stats into per-command summaries, sorted by call count
+/// (descending), then command name (ascending) for stable output.
+pub fn summarize(stats: &[CommandStat]) -> StatsSummary {
+    let mut agg = Aggregator::default();
+    for s in stats {
+        agg.add(s);
+    }
+    agg.finish()
+}
+
+/// Stream a single JSONL ledger into a [`StatsSummary`] without materialising
+/// every record — the memory-safe path for `specslice stats` (#250).
+pub fn summarize_file(path: &Path) -> std::io::Result<StatsSummary> {
+    summarize_files(&[path])
+}
+
+/// Stream several ledgers (e.g. rotated `stats.jsonl.1` + current `stats.jsonl`)
+/// into one summary. Missing files are skipped; malformed lines are ignored so a
+/// partially-written ledger is still summarisable.
+pub fn summarize_files(paths: &[&Path]) -> std::io::Result<StatsSummary> {
+    let mut agg = Aggregator::default();
+    for path in paths {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(stat) = serde_json::from_str::<CommandStat>(trimmed) {
+                agg.add(&stat);
+            }
+        }
+    }
+    Ok(agg.finish())
 }
 
 #[cfg(test)]
@@ -323,6 +399,78 @@ mod tests {
         let index = &sum.commands[1];
         assert_eq!(index.calls, 1);
         assert_eq!(index.metrics.get("symbols"), Some(&82));
+    }
+
+    /// #250: the summary must be computable by streaming the ledger so a
+    /// multi-MB `stats.jsonl` never has to be materialised into a `Vec` first.
+    #[test]
+    fn summarize_file_streams_to_same_result_as_load_plus_summarize() {
+        let dir = tempfile::tempdir().unwrap();
+        let ss = dir.path();
+        append_stat(ss, &make_stat("search", 10, true, btree(&[("hits", 3)]))).unwrap();
+        append_stat(ss, &make_stat("search", 30, false, btree(&[("hits", 5)]))).unwrap();
+        append_stat(
+            ss,
+            &make_stat("index", 100, true, btree(&[("symbols", 82)])),
+        )
+        .unwrap();
+
+        let path = ss.join(STATS_REL_PATH);
+        let streamed = summarize_file(&path).unwrap();
+        let materialised = summarize(&load_stats(&path).unwrap());
+        assert_eq!(streamed, materialised);
+        assert_eq!(streamed.total_calls, 3);
+        assert_eq!(streamed.commands[0].command, "search");
+        assert_eq!(streamed.commands[0].metrics.get("hits"), Some(&8));
+    }
+
+    /// #250: after rotation the recent history lives across `stats.jsonl.1`
+    /// (rotated) + `stats.jsonl` (current); the summary must fold both.
+    #[test]
+    fn summarize_files_merges_rotated_and_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("stats.jsonl.1");
+        let p0 = dir.path().join("stats.jsonl");
+        std::fs::write(
+            &p1,
+            serde_json::to_string(&make_stat("search", 5, true, BTreeMap::new())).unwrap() + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &p0,
+            serde_json::to_string(&make_stat("index", 9, true, BTreeMap::new())).unwrap() + "\n",
+        )
+        .unwrap();
+        let sum = summarize_files(&[p1.as_path(), p0.as_path()]).unwrap();
+        assert_eq!(sum.total_calls, 2);
+        // A missing path is skipped, not an error.
+        let only =
+            summarize_files(&[dir.path().join("absent.jsonl").as_path(), p0.as_path()]).unwrap();
+        assert_eq!(only.total_calls, 1);
+    }
+
+    /// #250: an unbounded append-only ledger must rotate so it cannot grow
+    /// without limit. Past the byte cap, the old ledger moves to `.1` and the
+    /// current file restarts with just the new record.
+    #[test]
+    fn append_rotates_when_ledger_exceeds_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let ss = dir.path();
+        let path = ss.join(STATS_REL_PATH);
+        // Seed an over-cap ledger (content is irrelevant; rotation is by size).
+        std::fs::write(&path, b"{\"command\":\"old\",\"ok\":true}\n").unwrap();
+
+        append_stat_inner(ss, &make_stat("search", 1, true, BTreeMap::new()), 8).unwrap();
+
+        let rotated = ss.join(format!("{STATS_REL_PATH}.1"));
+        assert!(rotated.exists(), "over-cap ledger must rotate to .1");
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            current.lines().count(),
+            1,
+            "current ledger restarts with only the new line after rotation"
+        );
+        assert!(current.contains("search"));
     }
 
     #[test]

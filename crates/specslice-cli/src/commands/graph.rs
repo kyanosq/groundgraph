@@ -79,6 +79,12 @@ pub fn run(args: GraphRunArgs) -> Result<()> {
     let view = build_graph_view(&args.repo_root, options)
         .with_context(|| format!("building graph view at {}", args.repo_root.display()))?;
 
+    // A typo'd `--focus` otherwise produces a silent empty export with a
+    // `wrote …` success line — indistinguishable from an empty repo.
+    if let Some(w) = focus_miss_warning(args.focus.as_deref(), view.nodes.len()) {
+        eprintln!("{w}");
+    }
+
     match args.format {
         GraphFormat::Json => emit_json(&view, args.out.as_deref(), args.pretty)?,
         GraphFormat::Mermaid => emit_mermaid(&view, args.out.as_deref())?,
@@ -86,6 +92,19 @@ pub fn run(args: GraphRunArgs) -> Result<()> {
         GraphFormat::Web => unreachable!("web handled above"),
     }
     Ok(())
+}
+
+/// Warn when `--focus <id>` yielded an empty view: the id almost certainly
+/// didn't match any business id / module path / artifact id. Returns `None`
+/// (stay silent) when no focus was requested — an empty overview is a
+/// legitimate result for a freshly-initialised repo.
+fn focus_miss_warning(focus: Option<&str>, node_count: usize) -> Option<String> {
+    match focus {
+        Some(f) if node_count == 0 => Some(format!(
+            "warning: --focus `{f}` matched no nodes — check the id (expected a REQ-… business id, a module path, or a full artifact id)"
+        )),
+        _ => None,
+    }
 }
 
 fn emit_json(view: &GraphViewModel, out: Option<&Path>, pretty: bool) -> Result<()> {
@@ -98,7 +117,7 @@ fn emit_json(view: &GraphViewModel, out: Option<&Path>, pretty: bool) -> Result<
     match out {
         Some(path) => {
             super::output::write_atomic(path, &json)?;
-            println!("wrote {}", path.display());
+            eprintln!("wrote {}", path.display());
             Ok(())
         }
         None => {
@@ -113,7 +132,7 @@ fn emit_mermaid(view: &GraphViewModel, out: Option<&Path>) -> Result<()> {
     match out {
         Some(path) => {
             super::output::write_atomic(path, &body)?;
-            println!("wrote {}", path.display());
+            eprintln!("wrote {}", path.display());
             Ok(())
         }
         None => {
@@ -130,7 +149,7 @@ fn emit_html(view: &GraphViewModel, repo_root: &Path, out: Option<&Path>) -> Res
     };
     let body = render_html(view);
     super::output::write_atomic(&target, &body)?;
-    println!("wrote {}", target.display());
+    eprintln!("wrote {}", target.display());
     Ok(())
 }
 
@@ -147,7 +166,7 @@ fn emit_web(repo_root: &Path, out: Option<&Path>) -> Result<()> {
         None => repo_root.join(DEFAULT_WEB_OUT),
     };
     super::output::write_atomic(&target, &html)?;
-    println!(
+    eprintln!(
         "wrote {} ({} nodes, {} links)",
         target.display(),
         net.meta.nodes,
@@ -199,6 +218,17 @@ fn inline_vendor_bundle(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_miss_warns_only_when_focus_set_and_view_empty() {
+        // Typo'd focus → empty view → warn (mentions the offending id).
+        let w = focus_miss_warning(Some("python::nope"), 0).expect("should warn");
+        assert!(w.contains("python::nope"), "warning must name the id: {w}");
+        // Focus that matched nodes → silent.
+        assert!(focus_miss_warning(Some("REQ-PRICE"), 5).is_none());
+        // No focus → never warn (an empty overview is legitimate).
+        assert!(focus_miss_warning(None, 0).is_none());
+    }
 
     #[test]
     fn viewer_template_has_the_data_slot_marker() {

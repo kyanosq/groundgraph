@@ -200,7 +200,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -250,6 +250,15 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // Bound memory before any full-file `read_to_string` in this loop (XML
+        // mapper, route scan, Dart/TS consumed-call scan, DDL `read_and`): an
+        // 8 GB vendored/generated file, minified bundle or `.g.dart` would
+        // otherwise be slurped whole into a String and OOM-kill the indexer.
+        // Same capacity gate as the code/docs indexers (#67/#76/#186); an
+        // oversized file simply contributes no schema/route evidence.
+        if crate::source_text::is_oversized_source(path) {
+            continue;
+        }
         // MyBatis mapper XML: index each statement as a SqlMapperStmt node so
         // the SQL becomes searchable graph evidence (porting bible).
         if ext == "xml" {
@@ -1442,7 +1451,9 @@ pub fn is_plausible_table_name(name: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
@@ -1760,7 +1771,7 @@ fn parse_java_field(line: &str) -> Option<String> {
     if tokens.iter().any(|t| *t == "static" || *t == "class") {
         return None; // serialVersionUID and friends
     }
-    let name = *tokens.last().unwrap();
+    let &name = tokens.last()?;
     if name == "serialVersionUID" || !is_ident(name) {
         return None;
     }
@@ -3673,7 +3684,7 @@ fn first_quoted(s: &str) -> Option<String> {
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !s.chars().next().unwrap().is_ascii_digit()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
 fn line_of(text: &str, byte_idx: usize) -> u32 {
@@ -5559,6 +5570,36 @@ public class SizeSysVO implements Serializable {
         assert!(!is_plausible_table_name(""));
         // Trailing `_` is the residue of a dynamic name `express_dict_${x}`.
         assert!(!is_plausible_table_name("express_dict_"));
+        // 2-char minimum boundary (the `name.len() < 2` guard above the
+        // `chars.next()` extraction): a valid 2-char name passes.
+        assert!(is_plausible_table_name("ab"));
+    }
+
+    #[test]
+    fn is_ident_handles_degenerate_inputs() {
+        // Pins the contract around the `!s.is_empty()` guard that protects the
+        // leading-char inspection (#206): empty and leading-digit reject
+        // without panicking even if the guard is later refactored.
+        assert!(is_ident("name"));
+        assert!(is_ident("_private"));
+        assert!(is_ident("col_1"));
+        assert!(!is_ident(""));
+        assert!(!is_ident("1col"));
+        assert!(!is_ident("a-b"));
+    }
+
+    #[test]
+    fn parse_java_field_rejects_degenerate_lines() {
+        // Pins the contract around the `tokens.len() < 2` guard that protects
+        // the `tokens.last()` extraction (#206).
+        assert_eq!(
+            parse_java_field("private int count;"),
+            Some("count".to_string())
+        );
+        assert_eq!(parse_java_field(";"), None);
+        assert_eq!(parse_java_field("   ;"), None);
+        assert_eq!(parse_java_field("void run();"), None);
+        assert_eq!(parse_java_field("static final int X = 1;"), None);
     }
 
     #[test]

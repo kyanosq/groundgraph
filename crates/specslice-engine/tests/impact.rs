@@ -201,6 +201,43 @@ fn changing_test_file_does_not_emit_missing_test_warning() {
         .all(|w| !w.contains("no linked test changed")));
 }
 
+#[test]
+fn changing_non_dart_test_file_also_suppresses_missing_test_warning() {
+    // #247/#248: test-change detection must be language-agnostic. The same impl
+    // change that fires the advisory in `changing_method_walks_...` must stay
+    // silent when a non-Dart test (Go `_test.go`) is changed alongside it.
+    let (_tmp, store) = fresh_store_with_index();
+
+    let changed = vec![
+        ChangedFile {
+            path: "lib/domain/watermark/auto_placement_service.dart".into(),
+            status: ChangeStatus::Modified,
+            hunks: vec![Hunk {
+                new_start: 8,
+                new_end: 8,
+            }],
+        },
+        ChangedFile {
+            path: "internal/watermark/placement_test.go".into(),
+            status: ChangeStatus::Modified,
+            hunks: vec![Hunk {
+                new_start: 1,
+                new_end: 1,
+            }],
+        },
+    ];
+
+    let report = compute_impact(&store, &changed).unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|w| !w.contains("no linked test changed")),
+        "non-Dart test change must count as a test change: {:?}",
+        report.warnings
+    );
+}
+
 /// P14 — impact must follow `Calls` / `References` edges from the
 /// changed symbols outward so reviewers see (a) who is affected
 /// downstream and (b) which tests exercise the changed code even when

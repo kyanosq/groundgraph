@@ -507,7 +507,12 @@ fn only_a_helper() {}
         // tree-sitter backends.
         use crate::treesitter::{no_call_idents, LangSpec};
         let default = no_call_idents as *const () as usize;
-        let specs: [(&str, &LangSpec); 9] = [
+        // Every tree-sitter backend shipped today, including the four added
+        // after this test was first written (csharp/ruby/php/kotlin). Keep the
+        // list exhaustive so deleting a `call_idents_of` wiring turns this guard
+        // red instead of silently degrading a language to structure-only
+        // (issues3.md #134).
+        let specs: [(&str, &LangSpec); 13] = [
             ("rust", &RUST_SPEC),
             ("python", &crate::python_treesitter::PYTHON_SPEC),
             ("go", &crate::go_treesitter::GO_SPEC),
@@ -517,6 +522,10 @@ fn only_a_helper() {}
             ("swift", &crate::swift_treesitter::SWIFT_SPEC),
             ("typescript", &crate::typescript_treesitter::TYPESCRIPT_SPEC),
             ("tsx", &crate::typescript_treesitter::TSX_SPEC),
+            ("csharp", &crate::csharp_treesitter::CSHARP_SPEC),
+            ("ruby", &crate::ruby_treesitter::RUBY_SPEC),
+            ("php", &crate::php_treesitter::PHP_SPEC),
+            ("kotlin", &crate::kotlin_treesitter::KOTLIN_SPEC),
         ];
         for (name, spec) in specs {
             assert!(

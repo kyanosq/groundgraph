@@ -1300,6 +1300,10 @@ pub struct TsIndexResult {
     /// fixture/corpus files) and were skipped. Surfaced as a CLI warning.
     #[serde(default)]
     pub parse_timeouts: usize,
+    /// Files skipped because they exceeded [`crate::source_text::MAX_INDEX_FILE_BYTES`]
+    /// — a capacity gate (read before the time gate) bounding peak memory.
+    #[serde(default)]
+    pub skipped_oversized: usize,
     /// `<language_id>_treesitter` when anything was produced.
     pub resolver_used: String,
 }
@@ -1320,6 +1324,10 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "swift",
     "c",
     "cpp",
+    "csharp",
+    "ruby",
+    "php",
+    "kotlin",
 ];
 
 /// Resolve a configured language id (with a few common aliases) to its
@@ -1448,7 +1456,10 @@ fn index_repo_with_spec_impl(
     // caller's thread merges concurrently; the channel bound keeps peak
     // memory in check (only ~1k sources alive at once).
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let mut parse_timeouts: usize = 0;
+    let skipped_oversized = AtomicUsize::new(0);
+    let skipped_ref = &skipped_oversized;
     let files_ref: &[DiscoveredFile] = &files;
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, String, Scan)>(1024);
     std::thread::scope(|scope| {
@@ -1457,6 +1468,12 @@ fn index_repo_with_spec_impl(
                 .par_iter()
                 .enumerate()
                 .for_each_with(tx, |tx, (i, file)| {
+                    // Capacity gate before the time gate: never read a file
+                    // past the size budget into memory.
+                    if crate::source_text::is_oversized_source(&file.absolute) {
+                        skipped_ref.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     let Ok(source) = std::fs::read_to_string(&file.absolute) else {
                         return;
                     };
@@ -1584,6 +1601,7 @@ fn index_repo_with_spec_impl(
     if parse_timeouts > 0 {
         result.parse_timeouts = parse_timeouts;
     }
+    result.skipped_oversized = skipped_oversized.load(Ordering::Relaxed);
 
     // Resolve captured body identifiers to concrete in-repo symbols and
     // append medium-confidence Calls / References edges. The ingestion path
@@ -1730,8 +1748,10 @@ pub(crate) fn resolve_heuristic_refs(
         if r.to_name.contains(sep) {
             let parts: Vec<&str> = r.to_name.split(sep).filter(|p| !p.is_empty()).collect();
             if parts.len() >= 2 {
-                let head = parts[0];
-                let leaf = *parts.last().unwrap();
+                // `parts.len() >= 2` (checked above) guarantees both ends; the
+                // `expect` messages document that invariant in place (#206).
+                let head = *parts.first().expect("parts.len() >= 2 verified above");
+                let leaf = *parts.last().expect("parts.len() >= 2 verified above");
                 let want = format!("{head}{sep}{leaf}");
                 let mut search: Vec<&str> = vec![file.as_str()];
                 if let Some(t) = import_targets.get(file) {
@@ -1801,7 +1821,10 @@ pub(crate) fn resolve_heuristic_refs(
                 if let Some(defs) = module_index.get(name) {
                     let distinct_files: HashSet<&str> = defs.iter().map(|(f, _)| *f).collect();
                     if distinct_files.len() == 1 {
-                        let tf = *distinct_files.iter().next().unwrap();
+                        let tf = *distinct_files
+                            .iter()
+                            .next()
+                            .expect("len == 1 verified above");
                         if tf != file.as_str() {
                             for (_, qn) in defs {
                                 targets.push((tf, (*qn).to_string(), r.kind.edge_kind()));
@@ -1812,10 +1835,23 @@ pub(crate) fn resolve_heuristic_refs(
             }
         }
 
-        for (tf, tq, kind) in targets.into_iter().take(MAX_REF_TARGETS) {
+        // Dedup BEFORE applying MAX_REF_TARGETS so the cap counts *unique*
+        // targets. Otherwise duplicate (file, qualified-name) entries — e.g.
+        // several imports resolving to the same definition — fill the budget
+        // and starve real edges past index MAX_REF_TARGETS (#124).
+        let mut unique_targets = 0usize;
+        let mut local_seen: HashSet<String> = HashSet::new();
+        for (tf, tq, kind) in targets {
             let to_id = symbol_id(spec, tf, &tq);
             if to_id == from_id {
                 continue;
+            }
+            if !local_seen.insert(format!("{to_id}\u{1}{kind:?}")) {
+                continue;
+            }
+            unique_targets += 1;
+            if unique_targets > MAX_REF_TARGETS {
+                break;
             }
             let dedup = format!("{from_id}\u{1}{to_id}\u{1}{kind:?}");
             if !seen.insert(dedup) {
@@ -1916,12 +1952,18 @@ fn discover_files(
 ) -> Result<Vec<DiscoveredFile>> {
     let mut out: Vec<DiscoveredFile> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    let roots: Vec<PathBuf> = if code_roots.is_empty() {
-        vec![PathBuf::from(".")]
+    // Compile the (constant) exclude globs once instead of re-collecting each
+    // pattern's chars for every candidate file (#142).
+    let exclude = crate::lsp_indexer::ExcludeGlobs::compile(exclude_globs);
+    // Borrow `code_roots` directly; only synthesise a default `["."]` when the
+    // caller passed none, avoiding a clone of the whole root list (#159).
+    let default_root = [PathBuf::from(".")];
+    let roots: &[PathBuf] = if code_roots.is_empty() {
+        &default_root
     } else {
-        code_roots.to_vec()
+        code_roots
     };
-    for root in &roots {
+    for root in roots {
         let abs = repo_root.join(root);
         if !abs.exists() {
             continue;
@@ -1946,10 +1988,7 @@ fn discover_files(
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if exclude_globs
-                .iter()
-                .any(|g| crate::lsp_indexer::simple_glob_match(g, &rel))
-            {
+            if exclude.matches(&rel) {
                 continue;
             }
             // Content gate for dialects that share an extension (C/C++ `.h`):
@@ -2053,6 +2092,73 @@ fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
 #[cfg(test)]
 mod driver_capability_tests {
     use super::*;
+
+    #[test]
+    fn oversized_source_files_are_skipped() {
+        use specslice_store::Store;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Small.java"), "class Small { void run() {} }").unwrap();
+        // A file past the size budget must be skipped *before* it is read
+        // into memory (rayon reads one file per core — an accidental giant
+        // generated/vendored file would otherwise risk OOM).
+        std::fs::write(
+            root.join("Big.java"),
+            vec![b'x'; usize::try_from(crate::source_text::MAX_INDEX_FILE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let result = index_repo_with_spec(
+            &mut store,
+            &crate::java_treesitter::JAVA_SPEC,
+            &TsIndexOptions {
+                repo_root: root.to_path_buf(),
+                code_roots: vec![],
+                exclude_globs: vec![],
+                resolution_paths: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(result.skipped_oversized, 1, "Big.java must be skipped");
+        assert_eq!(result.files, 1, "only Small.java is parsed");
+    }
+
+    #[test]
+    fn supported_languages_matches_spec_for_language() {
+        // `SUPPORTED_LANGUAGES` is the public "languages the engine parses"
+        // enumeration. It must stay in lock-step with `spec_for_language`,
+        // otherwise downstream code (CLI listings, docs, capability probes)
+        // silently hides languages the engine actually supports.
+        let mut listed: Vec<&str> = SUPPORTED_LANGUAGES.to_vec();
+        listed.sort_unstable();
+        let mut want = vec![
+            "rust",
+            "typescript",
+            "python",
+            "go",
+            "java",
+            "swift",
+            "c",
+            "cpp",
+            "csharp",
+            "ruby",
+            "php",
+            "kotlin",
+        ];
+        want.sort_unstable();
+        assert_eq!(
+            listed, want,
+            "SUPPORTED_LANGUAGES drifted from the set spec_for_language resolves"
+        );
+        // Every listed id resolves, and its canonical id round-trips.
+        for lang in SUPPORTED_LANGUAGES {
+            let spec = spec_for_language(lang).unwrap_or_else(|| {
+                panic!("SUPPORTED_LANGUAGES lists `{lang}` but spec_for_language returns None")
+            });
+            assert_eq!(spec.language_id, *lang, "canonical id mismatch for {lang}");
+        }
+    }
 
     // --- A Python spec wired with declaration-based test detection,
     //     metadata, and src-root import resolution. ---

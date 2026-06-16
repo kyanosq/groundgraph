@@ -32,6 +32,7 @@
 //!   `DeclaresImplementation`, `DeclaresVerification`, all pointing **into**
 //!   the requirement so `slice` / `impact` / `checks` treat them identically.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -63,6 +64,10 @@ pub struct RequirementsMdIndexResult {
     /// References whose target could not be located in the current graph
     /// (still wired as a best-effort edge so `checks` can flag them).
     pub unresolved: usize,
+    /// Requirement ids declared in more than one file (sorted, de-duplicated).
+    /// The later file's node silently UPSERTs over the earlier one, so this is
+    /// surfaced for `checks`/reporting rather than swallowed. (#264)
+    pub duplicate_ids: Vec<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -93,6 +98,12 @@ pub fn index_requirements_md(
     // Snapshot existing nodes once for language-agnostic strict resolution.
     let all_nodes = store.list_all_nodes().context("listing nodes")?;
 
+    // Track the first file each requirement id appears in so a *cross-file*
+    // redeclaration (which silently UPSERTs the later node over the earlier) is
+    // surfaced. Repeats inside one file are an allowed shape and not flagged.
+    let mut first_seen: HashMap<String, String> = HashMap::new();
+    let mut duplicates: BTreeSet<String> = BTreeSet::new();
+
     // Deterministic file order.
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(&dir).sort_by_file_name() {
@@ -122,6 +133,21 @@ pub fn index_requirements_md(
         result.files += 1;
 
         for req in parse_requirements(&raw) {
+            match first_seen.get(&req.id) {
+                Some(first) if first != &rel => {
+                    if duplicates.insert(req.id.clone()) {
+                        eprintln!(
+                            "specslice: requirement id `{}` is declared in multiple files \
+                             (`{first}` and `{rel}`); the later one overwrites the earlier node",
+                            req.id
+                        );
+                    }
+                }
+                Some(_) => {} // same id repeated within one file: allowed shape
+                None => {
+                    first_seen.insert(req.id.clone(), rel.clone());
+                }
+            }
             let req_id = requirement_id(&req.id);
             let mut node = Node::new(req_id.clone(), NodeKind::Requirement);
             node.name = Some(if req.title.is_empty() {
@@ -188,6 +214,7 @@ pub fn index_requirements_md(
             }
         }
     }
+    result.duplicate_ids = duplicates.into_iter().collect();
     Ok(result)
 }
 
@@ -448,6 +475,60 @@ fn normalise_reference(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_file_duplicate_requirement_ids_are_reported() {
+        // The same `REQ-xxx` declared in two files silently UPSERTs (second
+        // overwrites first). Indexing must surface the collision. (#264)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let reqdir = root.join(".specslice/requirements");
+        std::fs::create_dir_all(&reqdir).unwrap();
+        std::fs::write(reqdir.join("a.md"), "# REQ-001 Alpha\n\nbody\n").unwrap();
+        std::fs::write(reqdir.join("b.md"), "# REQ-001 Bravo\n\nbody\n").unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = RequirementsMdIndexOptions {
+            repo_root: root.to_path_buf(),
+            requirements_dir: PathBuf::from(".specslice/requirements"),
+        };
+        let result = index_requirements_md(&mut store, &opts).unwrap();
+        assert_eq!(
+            result.duplicate_ids,
+            vec!["REQ-001".to_string()],
+            "cross-file duplicate requirement id must be reported"
+        );
+    }
+
+    #[test]
+    fn same_id_within_one_file_is_not_a_cross_file_duplicate() {
+        // Two H1s with the same id *inside one file* are an existing allowed
+        // shape (each becomes its own section); they must not be flagged as a
+        // cross-file collision. (#264)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let reqdir = root.join(".specslice/requirements");
+        std::fs::create_dir_all(&reqdir).unwrap();
+        std::fs::write(
+            reqdir.join("a.md"),
+            "# REQ-001 Alpha\n\nbody\n\n# REQ-001 Again\n\nbody\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open(root.join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let opts = RequirementsMdIndexOptions {
+            repo_root: root.to_path_buf(),
+            requirements_dir: PathBuf::from(".specslice/requirements"),
+        };
+        let result = index_requirements_md(&mut store, &opts).unwrap();
+        assert!(
+            result.duplicate_ids.is_empty(),
+            "within-file repeats are not cross-file duplicates; got {:?}",
+            result.duplicate_ids
+        );
+    }
 
     #[test]
     fn parses_multiple_requirements_with_chinese_sections() {

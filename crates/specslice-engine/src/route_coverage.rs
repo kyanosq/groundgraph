@@ -332,6 +332,13 @@ fn concrete_segments(path: &str) -> Vec<String> {
 
 /// Normalized match key: the last `suffix` concrete segments (all of them when
 /// `suffix == 0` or the path is shorter), joined by `/`.
+///
+/// # Warning
+/// `suffix == 1` keys on the action segment alone, so same-named actions under
+/// different controllers (`/foo/bar/select` vs `/craft/craftMandatory/select`)
+/// collapse to the same key and are treated as the same route. The default is
+/// `2` for exactly this reason; pass `1` only when matching on action name
+/// across a controller rename is the explicit intent (#93).
 pub fn route_key(path: &str, suffix: usize) -> String {
     let segs = concrete_segments(path);
     if segs.is_empty() {

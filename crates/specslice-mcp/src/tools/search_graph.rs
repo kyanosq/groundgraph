@@ -89,7 +89,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let repo_root = resolve_repo_root(server, args);
+    let repo_root = resolve_repo_root(server, args)?;
     let store = open_store(&repo_root)?;
     let options = SearchOptions {
         repo_root: repo_root.clone(),
@@ -126,7 +126,13 @@ fn build_query(args: &Value) -> Result<SearchQuery> {
     if let Some(c) = code {
         return Ok(SearchQuery::Code(c.to_string()));
     }
-    let path = file.expect("file present").to_string();
+    // The mutual-exclusion + `provided == 0` checks above leave `file` as the
+    // only remaining option, but guard explicitly so loosening that validation
+    // can't turn a malformed request into a panic.
+    let Some(path) = file else {
+        bail!("supply one of `query`, `code` or (`file` + `line`)");
+    };
+    let path = path.to_string();
     let line = line.ok_or_else(|| anyhow::anyhow!("`file` requires `line`"))?;
     let line_u32 = u32::try_from(line).map_err(|_| anyhow::anyhow!("`line` must fit in u32"))?;
     if line_u32 == 0 {

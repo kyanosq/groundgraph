@@ -341,6 +341,27 @@ fn node_spec_for_edge(store: &Store, id: &ArtifactId) -> Result<Option<String>> 
 // apply_candidates
 // ---------------------------------------------------------------------------
 
+/// Resolve the links-manifest path from (untrusted) `.specslice.yaml`, confined
+/// to the workspace. `links.path` is controlled by the *target* repo, so an
+/// absolute path or one escaping via `..` would let a poisoned config make
+/// `connect apply` create/overwrite files anywhere (e.g. `/etc/cron.d/...`,
+/// #199). Refuse those; a relative in-repo path is the only legitimate case.
+fn confine_manifest_path(repo_root: &Path, links_path: &str) -> Result<PathBuf> {
+    let rel = Path::new(links_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "config `links.path` ({links_path}) must be a workspace-relative path without `..`; \
+             absolute paths and parent-dir escapes are refused so a poisoned .specslice.yaml \
+             cannot write outside the repo"
+        );
+    }
+    Ok(repo_root.join(rel))
+}
+
 pub fn apply_candidates(options: ApplyOptions) -> Result<ApplyOutcome> {
     let config = load_config(&options.repo_root)?;
     let db_path = resolve_storage_path(&options.repo_root, &config);
@@ -349,19 +370,14 @@ pub fn apply_candidates(options: ApplyOptions) -> Result<ApplyOutcome> {
 
     let raw = std::fs::read_to_string(&options.candidates_path)
         .with_context(|| format!("reading candidates {}", options.candidates_path.display()))?;
-    let doc: CandidatesDocument = serde_yaml::from_str(&raw).with_context(|| {
+    let doc: CandidatesDocument = serde_yml::from_str(&raw).with_context(|| {
         format!(
             "parsing candidates file {}",
             options.candidates_path.display()
         )
     })?;
 
-    let manifest_rel = config.links.path.clone();
-    let manifest_abs = if Path::new(&manifest_rel).is_absolute() {
-        PathBuf::from(&manifest_rel)
-    } else {
-        options.repo_root.join(&manifest_rel)
-    };
+    let manifest_abs = confine_manifest_path(&options.repo_root, &config.links.path)?;
 
     let mut manifest = load_existing_manifest(&manifest_abs)?;
     let mut accepted = Vec::new();
@@ -395,7 +411,7 @@ pub fn apply_candidates(options: ApplyOptions) -> Result<ApplyOutcome> {
         }
     }
 
-    let manifest_path_rel = manifest_rel.clone();
+    let manifest_path_rel = config.links.path.clone();
     if !accepted.is_empty() && !options.dry_run {
         write_manifest(&manifest_abs, &manifest)?;
     }
@@ -496,7 +512,7 @@ fn load_existing_manifest(path: &Path) -> Result<BTreeMap<String, WriteRequireme
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading existing manifest {}", path.display()))?;
-    let parsed: WriteManifest = serde_yaml::from_str(&raw)
+    let parsed: WriteManifest = serde_yml::from_str(&raw)
         .with_context(|| format!("parsing existing manifest {}", path.display()))?;
     Ok(parsed.requirements)
 }
@@ -509,9 +525,10 @@ fn write_manifest(path: &Path, manifest: &BTreeMap<String, WriteRequirement>) ->
     let doc = WriteManifest {
         requirements: manifest.clone(),
     };
-    let yaml = serde_yaml::to_string(&doc)
+    let yaml = serde_yml::to_string(&doc)
         .with_context(|| format!("serialising manifest {}", path.display()))?;
-    std::fs::write(path, yaml).with_context(|| format!("writing manifest {}", path.display()))?;
+    crate::atomic_write::write_atomic(path, &yaml)
+        .with_context(|| format!("writing manifest {}", path.display()))?;
     Ok(())
 }
 
@@ -537,7 +554,7 @@ fn load_config(repo_root: &Path) -> Result<EngineConfig> {
     }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yaml::from_str(&contents)
+    let cfg: EngineConfig = serde_yml::from_str(&contents)
         .with_context(|| format!("parsing config {}", path.display()))?;
     Ok(cfg)
 }
@@ -548,5 +565,25 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
         raw.to_path_buf()
     } else {
         repo_root.join(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confine_manifest_path_rejects_traversal_and_accepts_relative() {
+        let root = Path::new("/work/repo");
+        // The legitimate default — a workspace-relative manifest.
+        assert_eq!(
+            confine_manifest_path(root, ".specslice/links.yaml").unwrap(),
+            root.join(".specslice/links.yaml")
+        );
+        // Absolute path from a poisoned config → refused (#199).
+        assert!(confine_manifest_path(root, "/etc/cron.d/payload").is_err());
+        // `..` escape → refused, even though it stays "relative".
+        assert!(confine_manifest_path(root, "../../etc/passwd").is_err());
+        assert!(confine_manifest_path(root, ".specslice/../../escape").is_err());
     }
 }

@@ -11,7 +11,9 @@ pub mod language_traits;
 pub mod node;
 
 pub use artifact_id::ArtifactId;
-pub use edge::{EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus};
+pub use edge::{
+    sanitize_confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+};
 pub use evidence::{Evidence, EvidenceKind};
 pub use language_batch::{
     AdapterDiagnostic, FileArtifact, ImportEdge, LanguageIndexBatch, ReferenceEdge, SymbolArtifact,

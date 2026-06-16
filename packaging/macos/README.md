@@ -34,31 +34,51 @@ and add its `bin` directory to PATH.
 
 ## Supported languages (0.2.0)
 
-| Language   | Default | LSP                                                | AST fallback |
-|------------|---------|----------------------------------------------------|--------------|
-| Dart       | on      | bundled `specslice_dart_analyzer` (resolved AST)   | yes          |
-| Swift      | opt-in  | `sourcekit-lsp`                                    | no           |
-| Go         | opt-in  | `gopls`                                            | no           |
-| Python     | opt-in  | `pyright-langserver` / `basedpyright-langserver` / `pylsp` | yes  |
-| TypeScript | opt-in  | `typescript-language-server --stdio`                | yes          |
-| Java       | opt-in  | `jdtls`                                            | yes          |
+SpecSlice indexes in two tiers. **Breadth** is always available (the
+tree-sitter grammars are linked into the binary — no external tool, no
+network). **Precision** call/reference edges come from an optional, offline
+**SCIP overlay** that `index` auto-invokes when the indexer is installed.
 
-For TS / Java the AST pass always runs even when the LSP is unavailable, so
-imports and tests still land in the graph as a usable baseline.
+> The standalone LSP tier for Go / Python / TypeScript / Java was **retired**
+> (ADR-0001 §8.8); precision for those languages now comes from SCIP, not LSP.
+> Swift still supports an optional `sourcekit-lsp` overlay, so `swift.lsp_command`
+> remains meaningful when explicitly trusted by the operator.
+
+| Tier | Mechanism | Languages |
+|------|-----------|-----------|
+| Breadth (default) | In-process **tree-sitter** | Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin |
+| Dart | Bundled **`specslice_dart_analyzer`** sidecar (resolved AST, domain-aware) | Dart |
+| Docs | Markdown / RST / AsciiDoc / requirements / ADR | `.md`, `.mdx`, `.rst`, `.adoc` |
+
+### Optional precision overlay (SCIP)
+
+For precise `Calls` / `References` edges, install a SCIP indexer for the
+language; `index` runs it automatically and ingests the result. Without it
+you still get the full structural graph plus heuristic call/reference edges.
+
+| Language | Indexer | Install |
+|----------|---------|---------|
+| Rust | `rust-analyzer scip` | `rustup component add rust-analyzer` |
+| Go | `scip-go` | `go install github.com/sourcegraph/scip-go/cmd/scip-go@latest` |
+| TypeScript | `scip-typescript` | `npm i -g @sourcegraph/scip-typescript` |
+| Python | `scip-python` | `npm i -g @sourcegraph/scip-python` |
+
+Point SpecSlice at a specific indexer binary with `SPECSLICE_SCIP_<LANG>_BIN`
+(e.g. `SPECSLICE_SCIP_RUST_BIN`). A missing or failing indexer is a clear,
+non-fatal "structure-only" note in the `index` output — never an error.
 
 ### Enable an opt-in adapter
 
 `specslice init` writes every non-Dart adapter to `.specslice.yaml` with
 `enabled: false` so a fresh workspace never pulls in unrelated languages.
-To turn one on, edit the matching block and re-index. Example for a
-TypeScript project:
+To turn one on, edit the matching block (or the unified `languages:`
+selector) and re-index. Example for a TypeScript project:
 
 ```yaml
 typescript:
   enabled: true
   paths: [src, tests]   # roots where SpecSlice should look
   exclude: []
-  lsp_command: null     # null = auto-discover (node_modules/.bin → PATH)
 ```
 
 ```bash
@@ -66,12 +86,13 @@ specslice --repo-root /path/to/repo index
 # look for the `TypeScript index:` block in the output
 ```
 
-Same shape for `swift`, `go`, `python`, `java`. When the LSP is on PATH
-**and** survives a smoke launch (the unified `lsp_probe` runs every
-`*_lsp_command` through `--help` with a 1.5 s timeout), the resolver
-column in `index` output reads `<lang>_lsp`; otherwise it reads
-`<lang>_ast` and `LSP skipped:` explains why (binary missing, broken
-shebang, `SOURCEKITD FATAL ERROR`, missing JRE, etc).
+Same shape for `swift`, `go`, `python`, `java` and the tree-sitter breadth
+languages.
+
+For Swift precision, install `sourcekit-lsp` through Xcode / Swift toolchains
+and either keep auto-discovery or set the trusted operator environment variable
+`SPECSLICE_SWIFT_LSP_BIN`. A repo-provided `swift.lsp_command` is ignored unless
+`SPECSLICE_TRUST_CONFIG_COMMANDS=1` is set for that workspace.
 
 ## Dart analyzer sidecar
 

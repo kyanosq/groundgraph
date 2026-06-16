@@ -40,7 +40,7 @@ pub fn run(
                 Some(path) => {
                     super::output::write_atomic(&path, &mermaid)
                         .with_context(|| format!("writing impact mermaid to {}", path.display()))?;
-                    println!("已写入: {}", path.display());
+                    eprintln!("已写入: {}", path.display());
                 }
                 None => print!("{mermaid}"),
             }
@@ -277,88 +277,92 @@ fn sym_anchor(items: &[SliceItem]) -> Option<String> {
 }
 
 fn print_human(report: &ImpactReport) {
-    println!("SpecSlice Impact Report");
-    println!();
-    println!("Changed files:");
+    print!("{}", render_human(report));
+}
+
+/// Render `item` as `name (path)`. Tests in particular share a file (many
+/// cases in one `*_test.py`), so printing the path alone collapsed distinct
+/// linked tests into identical-looking rows that hid *which* test to run.
+fn impact_item_line(item: &SliceItem) -> String {
+    let where_ = item.path.clone().unwrap_or_else(|| item.id.clone());
+    let label = item.name.clone().unwrap_or_else(|| item.id.clone());
+    format!("- {label} ({where_})")
+}
+
+fn render_human(report: &ImpactReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "SpecSlice Impact Report");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Changed files:");
     if report.changed_files.is_empty() {
-        println!("- (none)");
+        let _ = writeln!(out, "- (none)");
     } else {
         for f in &report.changed_files {
-            println!("- {f}");
+            let _ = writeln!(out, "- {f}");
         }
     }
-    println!();
-    println!("Changed symbols:");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Changed symbols:");
     if report.changed_symbols.is_empty() {
-        println!("- (none)");
+        let _ = writeln!(out, "- (none)");
     } else {
         for s in &report.changed_symbols {
-            println!(
-                "- {} ({})",
-                s.name.clone().unwrap_or_else(|| s.id.clone()),
-                s.path.clone().unwrap_or_else(|| s.id.clone())
-            );
+            let _ = writeln!(out, "{}", impact_item_line(s));
         }
     }
     if !report.changed_doc_sections.is_empty() {
-        println!();
-        println!("Changed doc sections:");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Changed doc sections:");
         for d in &report.changed_doc_sections {
-            println!(
-                "- {} ({})",
-                d.name.clone().unwrap_or_else(|| d.id.clone()),
-                d.path.clone().unwrap_or_default()
-            );
+            let _ = writeln!(out, "{}", impact_item_line(d));
         }
     }
-    println!();
-    println!("Affected requirements:");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Affected requirements:");
     if report.affected_requirements.is_empty() {
-        println!("- (none)");
+        let _ = writeln!(out, "- (none)");
     } else {
         for r in &report.affected_requirements {
-            println!("- {} {}", r.id, r.name.clone().unwrap_or_default());
+            let _ = writeln!(out, "- {} {}", r.id, r.name.clone().unwrap_or_default());
         }
     }
     if !report.linked_implementations.is_empty() {
-        println!();
-        println!("Linked implementation:");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Linked implementation:");
         for i in &report.linked_implementations {
-            println!(
-                "- {} ({})",
-                i.name.clone().unwrap_or_else(|| i.id.clone()),
-                i.path.clone().unwrap_or_else(|| i.id.clone())
-            );
+            let _ = writeln!(out, "{}", impact_item_line(i));
         }
     }
     if !report.linked_tests.is_empty() {
-        println!();
-        println!("Linked tests:");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Linked tests:");
         for t in &report.linked_tests {
-            println!("- {}", t.path.clone().unwrap_or_else(|| t.id.clone()));
+            let _ = writeln!(out, "{}", impact_item_line(t));
         }
     }
     if !report.affected_confirmed_candidates.is_empty() {
-        println!();
-        println!("受影响的已确认业务候选 (需重新审阅):");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "受影响的已确认业务候选 (需重新审阅):");
         for c in &report.affected_confirmed_candidates {
-            println!("- {} {}", c.id, c.name.clone().unwrap_or_default(),);
+            let _ = writeln!(out, "- {} {}", c.id, c.name.clone().unwrap_or_default());
         }
     }
     if !report.warnings.is_empty() {
-        println!();
-        println!("Warnings:");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Warnings:");
         for w in &report.warnings {
-            println!("- {w}");
+            let _ = writeln!(out, "- {w}");
         }
     }
     if !report.info.is_empty() {
-        println!();
-        println!("Info:");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Info:");
         for i in &report.info {
-            println!("- {i}");
+            let _ = writeln!(out, "- {i}");
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -436,6 +440,44 @@ mod tests {
             warnings: vec![],
             info: vec![],
         }
+    }
+
+    /// Two distinct linked tests living in the same file must each show their
+    /// own name. The old formatter printed only the path, so two cases in one
+    /// `*_test.py` rendered as two identical `- tests/test_orders.py` rows that
+    /// read as a duplicate and hid which test to run.
+    #[test]
+    fn linked_tests_show_name_not_just_duplicate_path() {
+        let report = ImpactReport {
+            linked_tests: vec![
+                item(
+                    "python::tests/test_orders.py::test_half_coupon",
+                    "test_case",
+                    "test_half_coupon",
+                    Some("tests/test_orders.py"),
+                ),
+                item(
+                    "python::tests/test_orders.py::test_price_with_tax",
+                    "test_case",
+                    "test_price_with_tax",
+                    Some("tests/test_orders.py"),
+                ),
+            ],
+            ..Default::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("- test_half_coupon (tests/test_orders.py)"),
+            "missing named test line: {out}"
+        );
+        assert!(
+            out.contains("- test_price_with_tax (tests/test_orders.py)"),
+            "missing named test line: {out}"
+        );
+        assert!(
+            !out.contains("Linked tests:\n- tests/test_orders.py\n- tests/test_orders.py"),
+            "linked tests collapsed to duplicate paths: {out}"
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ It indexes your repository into a SQLite graph of **nodes** (symbols, files, doc
 - 📊 **`dashboard`** — a single self-contained offline HTML panel aggregating overview, business modules, feature clusters, checks, dead code, open questions and purity. No server, no CDN — open it from `file://`.
 - 🔌 **MCP server** — expose the graph to AI agents via the Model Context Protocol.
 
-Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexes in ~11s, the TypeScript compiler repo (20k+ files) in ~52s (parallel parsing + a per-file parse budget that survives fixture corpora with intentional syntax errors), Django (Python), gin (Go) and gson (Java/Maven) validated end-to-end. SCIP enrichment is incremental — unchanged sources reuse the previous `.scip` instead of re-running the type-checker — and search ranking demotes tests/tools/examples so issue-style queries hit production code first (validated against real Redis issues).
+Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexes in ~11s, the TypeScript compiler repo (20k+ files) in ~28s (parallel parsing + a per-file parse budget that survives fixture corpora with intentional syntax errors), Django (Python), gin (Go) and gson (Java/Maven) validated end-to-end. SCIP enrichment is incremental — unchanged sources reuse the previous `.scip` instead of re-running the type-checker — and search ranking demotes tests/tools/examples so issue-style queries hit production code first (validated against real Redis issues).
 
 ## Install
 
@@ -52,9 +52,10 @@ SpecSlice is a Rust workspace. Build from source (a `rust-toolchain.toml` pins t
 git clone https://github.com/specslice/specslice.git
 cd specslice
 
-# Install the CLI (`specslice`) and the MCP server (`specslice-mcp`)
-cargo install --path crates/specslice-cli
-cargo install --path crates/specslice-mcp   # optional, for AI agents
+# Install the CLI (`specslice`) and the MCP server (`specslice-mcp`).
+# `--locked` honours the committed Cargo.lock so the build is reproducible.
+cargo install --locked --path crates/specslice-cli
+cargo install --locked --path crates/specslice-mcp   # optional, for AI agents
 
 # …or just build the binaries into target/release/
 cargo build --release
@@ -100,7 +101,7 @@ Run `specslice --help` (or `specslice <command> --help`) for the full, authorita
 | --- | --- | --- |
 | Breadth (default) | In-process **tree-sitter** | Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin |
 | Dart | Bundled **analyzer sidecar** (domain-aware: Riverpod / Hive / navigation / IAP) | Dart |
-| Docs | Markdown / requirements / ADR | `.md`, `.mdx` |
+| Docs | Markdown / RST / AsciiDoc / requirements / ADR | `.md`, `.mdx`, `.rst`, `.adoc` |
 
 Select languages in `.specslice.yaml` (the unified `languages:` selector) and re-run `specslice index`.
 
@@ -121,7 +122,7 @@ A missing or failing indexer is a clear, non-fatal "structure-only" note — nev
 
 ## MCP integration
 
-`specslice-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, dead-code, …) to AI agents. Point your MCP-capable client at the binary:
+`specslice-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, dead-code, …) to AI agents. It speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP), so point any stdio-capable MCP client at the binary:
 
 ```jsonc
 {
@@ -143,13 +144,19 @@ storage:
   path: .specslice/graph.db   # the graph cache (rebuildable)
 docs:
   paths: [docs, specs, adr]   # where to find docs/requirements
-  include: ["**/*.md", "**/*.mdx"]
-treesitter:
-  languages: [rust]           # the unified language selector
+  include: ["**/*.md", "**/*.mdx", "**/*.rst", "**/*.adoc"]
+languages:                    # the unified, canonical language selector
+  - id: rust
+    paths: [crates]           # roots to scan for this language
 enrichment:
   scip: true                  # auto-invoke SCIP indexers when present
   analyzer: true              # Dart analyzer sidecar (when Dart is configured)
 ```
+
+> The top-level `languages:` list is the canonical selector. The older
+> `treesitter.languages: [rust]` form still works as a **backward-compatible
+> alias**, but only when `languages:` is absent — don't set both (a present
+> `languages:` clears the alias during normalisation).
 
 ## How it works
 
