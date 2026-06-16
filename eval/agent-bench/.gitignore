@@ -1,0 +1,5 @@
+# Raw run captures + generated reports are reproducible artifacts, not source.
+runs/
+reports/
+__pycache__/
+*.pyc

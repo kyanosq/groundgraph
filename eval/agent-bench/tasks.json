@@ -1,0 +1,48 @@
+{
+  "_about": "Agent code-lookup benchmark: grep arm vs specslice arm, same model/workspace/prompt. Ground truth is INDEPENDENT of specslice (hand-verified from source + ripgrep), never derived from specslice's own graph, to avoid circular evaluation.",
+  "defaults": {
+    "workspace": "/Users/qjs/Code/Projects/specslice-bench/wt",
+    "model": "composer-2.5",
+    "timeout_secs": 600
+  },
+  "arms": {
+    "grep": "Constraints for THIS task: use ONLY ripgrep (`rg`) / `grep` via the shell plus reading files. You MUST NOT run the `specslice` command or use any specslice tool.",
+    "specslice": "A `specslice` CLI is available on PATH (subcommands: search, trace, impact, dead-code, facts, graph). It is a code-graph replacement for grep. Prefer `specslice` for code navigation; you may also read files. Avoid plain grep/rg where specslice can answer it."
+  },
+  "tasks": [
+    {
+      "id": "t1_def_kill_tree",
+      "bucket": "definitional (grep-fair baseline)",
+      "prompt": "In this Rust workspace, locate the function named `kill_tree`. Reply on a single line in EXACTLY this format: `SIG=<the full fn signature line without the trailing brace> | LOC=<relative/path.rs>:<line>`",
+      "grade": {
+        "type": "fields",
+        "checks": [
+          { "name": "signature", "must_contain_all": ["fn kill_tree", "&mut Child"] },
+          { "name": "location", "must_contain_all": ["proc.rs", "52"] }
+        ]
+      }
+    },
+    {
+      "id": "t2_callcount_kill_tree",
+      "bucket": "call-site precision (specslice-favored)",
+      "prompt": "How many times is the function `kill_tree` actually INVOKED (called) in this workspace? Exclude its own definition, doc comments, string literals, and test code. Reply on a single line in EXACTLY this format: `CALLS=<integer> | SITES=<relative/path.rs>:<line>[,<relative/path.rs>:<line>...]`",
+      "grade": {
+        "type": "fields",
+        "checks": [
+          { "name": "call_count", "must_contain_all": ["CALLS=1"] },
+          { "name": "call_site", "must_contain_all": ["proc.rs", "91"] }
+        ]
+      }
+    },
+    {
+      "id": "t3_callers_detach",
+      "bucket": "relational callers (cross-file set)",
+      "prompt": "List every source FILE that contains a call to `detach_process_group`, EXCLUDING the file where the function is defined. Reply on a single line in EXACTLY this format using bare file basenames: `FILES=<name1.rs>,<name2.rs>,...`",
+      "grade": {
+        "type": "set",
+        "key": "FILES",
+        "truth": ["dart_sidecar.rs", "lsp_client.rs", "scip_runner.rs", "lsp_probe.rs"]
+      }
+    }
+  ]
+}
