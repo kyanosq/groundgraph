@@ -294,3 +294,94 @@ fn orphan_requirements_get_implementation_hints_from_the_graph() {
         "REQ-002 must be called out as likely unimplemented, got {hints:?}"
     );
 }
+
+/// `doc_stale_code_ref` must respect the repository's own `.gitignore`:
+/// a doc referencing a deliberately-untracked generated artifact / credential
+/// (`artifacts/*.json`, `data/.../credentials/*.json`) is NOT a broken code
+/// reference — it points at local evidence the repo intentionally omits from
+/// version control. Real-repo dogfooding (MetaQuant) showed 93% of
+/// `doc_stale_code_ref` warnings were exactly this noise. A genuinely-missing
+/// *tracked* path must still be flagged (the control), so the gitignore skip
+/// never masks real drift.
+#[test]
+fn gitignored_referenced_paths_are_not_flagged_as_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // A real indexed source keeps `src/` an in-scope first segment, so the
+    // control `src/really_gone.rs` is verified rather than skipped as
+    // out-of-scope.
+    write(root, "src/engine.rs", "pub fn run() -> u8 {\n    1\n}\n");
+    write(root, "Cargo.toml", "[package]\nname = \"fixture\"\n");
+    // Generated-artifact / credential trees that EXIST on disk (so the
+    // first-segment in-scope rule keeps refs under them in scope) but are
+    // git-ignored. The *referenced* files below do not exist.
+    write(root, "artifacts/run/other.json", "{}\n");
+    write(root, "data/metaquant/credentials/other.json", "{}\n");
+    write(
+        root,
+        "docs/notes.md",
+        r#"# 证据与漂移
+
+研究产物 `artifacts/run/missing_summary.json` 是 gitignore 的本地证据，不应报漂移。
+凭证 `data/metaquant/credentials/tushare.json` 同样 gitignore，不应报漂移。
+但真实缺失的已跟踪源码 `src/really_gone.rs` 必须报漂移（对照组）。
+"#,
+    );
+
+    init_repository(InitOptions::new(root)).unwrap();
+    // The repo's own .gitignore — written after init so it is authoritative.
+    write(root, ".gitignore", "/artifacts/\n/data/\n");
+
+    let mut store = Store::open(root.join(".specslice/graph.db")).unwrap();
+    store.migrate().unwrap();
+    index_rust(
+        &mut store,
+        &RustIndexOptions {
+            repo_root: root.to_path_buf(),
+            code_roots: vec![PathBuf::from("src")],
+            exclude_globs: vec![],
+        },
+    )
+    .unwrap();
+    index_docs(
+        &mut store,
+        &DocsIndexOptions {
+            repo_root: root.to_path_buf(),
+            doc_roots: vec![PathBuf::from("docs")],
+            include_globs: vec!["**/*.md".into()],
+        },
+    )
+    .unwrap();
+    rebuild_fulltext_index(&mut store, root).unwrap();
+
+    let report = run_checks(CheckOptions {
+        repo_root: root.to_path_buf(),
+        impact: None,
+    })
+    .unwrap();
+    let stale: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.code == "doc_stale_code_ref")
+        .map(|f| f.message.as_str())
+        .collect();
+
+    // Control: a genuinely-missing *tracked* source path is still drift.
+    assert!(
+        stale.iter().any(|m| m.contains("src/really_gone.rs")),
+        "non-ignored missing path must still be flagged, got {stale:?}"
+    );
+    // The fix: git-ignored generated artifacts / credentials are intentionally
+    // untracked, not broken code references — must NOT be flagged.
+    assert!(
+        !stale
+            .iter()
+            .any(|m| m.contains("artifacts/run/missing_summary.json")),
+        "git-ignored artifact ref must NOT be flagged: {stale:?}"
+    );
+    assert!(
+        !stale.iter().any(|m| m.contains("credentials/tushare.json")),
+        "git-ignored credential ref must NOT be flagged: {stale:?}"
+    );
+}

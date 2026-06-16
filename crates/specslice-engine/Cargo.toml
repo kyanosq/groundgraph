@@ -19,6 +19,7 @@ serde_yml = { workspace = true }
 rusqlite = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
+ignore = "0.4"
 sha2 = { workspace = true }
 shlex = { workspace = true }
 time = { workspace = true }

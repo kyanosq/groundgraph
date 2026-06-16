@@ -585,6 +585,32 @@ fn classify_code_ref(span: &str) -> Option<CodeRef> {
     })
 }
 
+/// Build a matcher from the repository-root `.gitignore`. Best-effort: a
+/// missing file or a parse error yields an empty matcher (ignores nothing), so
+/// repos without a `.gitignore` behave exactly as before. Nested per-directory
+/// `.gitignore`s and the global excludes file are intentionally out of scope —
+/// the repo-root file covers the overwhelming majority of generated-artifact
+/// patterns (`/artifacts/`, `/data/`, `*.log`).
+fn build_repo_gitignore(repo_root: &Path) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    let _ = builder.add(repo_root.join(".gitignore"));
+    builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
+/// True when a repo-relative referenced path `rel` is git-ignored — checking
+/// parent directories too, so a file *under* an ignored directory
+/// (`artifacts/x/y.json` beneath `/artifacts/`) also matches. A git-ignored
+/// path is deliberately untracked (generated artifact, credential, runtime
+/// data); a doc that mentions it is citing local evidence, not making a broken
+/// code reference, so it must not surface as `doc_stale_code_ref`.
+fn is_repo_gitignored(gi: &ignore::gitignore::Gitignore, repo_root: &Path, rel: &str) -> bool {
+    let is_dir = repo_root.join(rel).is_dir();
+    gi.matched_path_or_any_parents(Path::new(rel), is_dir)
+        .is_ignore()
+}
+
 /// `doc_stale_code_ref` — walk every doc-structure node's body and verify its
 /// inline code references against the working tree + graph.
 fn compute_doc_drift(
@@ -625,6 +651,12 @@ fn compute_doc_drift(
     let ignored = ignore_builder
         .build()
         .unwrap_or_else(|_| globset::GlobSet::empty());
+
+    // The repo's own `.gitignore` mutes references to deliberately-untracked
+    // paths (generated artifacts, credentials, runtime data). Real-repo
+    // dogfooding (MetaQuant) showed ~93% of `doc_stale_code_ref` warnings were
+    // exactly such gitignored paths — noise that buried the few genuine drifts.
+    let gitignore = build_repo_gitignore(repo_root);
 
     // Read each doc file once; slice every section's span out of it.
     let doc_sections: Vec<_> = nodes
@@ -673,7 +705,11 @@ fn compute_doc_drift(
                     let seg_prefix = format!("{first_seg}/");
                     let in_scope = repo_root.join(first_seg).exists()
                         || node_paths.iter().any(|np| np.starts_with(&seg_prefix));
-                    (!exists && in_scope && !ignored.is_match(p.as_str())).then(|| {
+                    (!exists
+                        && in_scope
+                        && !ignored.is_match(p.as_str())
+                        && !is_repo_gitignored(&gitignore, repo_root, p))
+                    .then(|| {
                         format!("文档引用的路径 `{p}` 在仓库与图中都不存在（文档过期或实现缺失）")
                     })
                 }
@@ -683,7 +719,10 @@ fn compute_doc_drift(
                     // real files that never become graph nodes).
                     let known = node_basenames.contains(&name.to_ascii_lowercase())
                         || repo_root.join(name).exists();
-                    (!known && !ignored.is_match(name.as_str())).then(|| {
+                    (!known
+                        && !ignored.is_match(name.as_str())
+                        && !is_repo_gitignored(&gitignore, repo_root, name))
+                    .then(|| {
                         format!(
                             "文档引用的文件 `{name}` 没有任何已索引路径与之匹配（文档过期或实现缺失）"
                         )
