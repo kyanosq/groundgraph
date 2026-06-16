@@ -53,6 +53,17 @@
         "key": "FUNCS",
         "truth": ["kill_tree", "reap_within"]
       }
+    },
+    {
+      "id": "t5_deadcode_island",
+      "bucket": "whole-graph reachability / dead island (grep's textual ceiling)",
+      "_oracle": "Rust compiler `never used` lint flags BOTH bench_dead_* (injected fixture); independent of specslice. grep is fooled because bench_dead_alpha IS textually referenced (by the equally-dead bench_dead_beta).",
+      "prompt": "Find ALL dead functions in this workspace whose names start with `bench_dead_`. A function is dead if it is unreachable from any program entry point. Crucially, include a function even if other code references it, SO LONG AS that referencing code is itself dead (a transitively-dead 'island'). Reply on a single line in EXACTLY this format using bare function names: `DEAD=<name1>,<name2>,...`",
+      "grade": {
+        "type": "set",
+        "key": "DEAD",
+        "truth": ["bench_dead_alpha", "bench_dead_beta"]
+      }
     }
   ]
 }

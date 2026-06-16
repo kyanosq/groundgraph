@@ -180,7 +180,27 @@ def _basenames_in(text: str) -> list[str]:
 
 
 def _clean_token(t: str) -> str:
-    return t.strip().strip("`'\"(),;").strip().lower()
+    return t.strip().strip("`'\"(),;*").rstrip(".").strip().lower()
+
+
+def _extract_set_value(answer: str, key: str) -> str | None:
+    """Return the comma-list value of the *last* `KEY=` occurrence.
+
+    Agents often emit the formatted answer line and then keep talking on the
+    SAME line (no newline), or repeat it inside a markdown-bold summary
+    (`**DEAD=a,b**`). So: (1) take the LAST `KEY=` — that is the agent's
+    conclusion, not its opening narration; (2) capture only the leading run of
+    comma-separated identifiers / file basenames, stopping at the first char
+    that cannot belong to a bare token (a space, backtick, or `*`). This keeps
+    trailing prose (e.g. "...betaBoth and ... are unreachable") from being
+    scored as dozens of bogus set members (which silently tanked precision).
+    """
+    matches = list(re.finditer(rf"{re.escape(key)}\s*=\s*", answer, re.IGNORECASE))
+    if not matches:
+        return None
+    tail = answer[matches[-1].end() :]
+    m = re.match(r"`?[\w.]+`?(?:\s*,\s*`?[\w.]+`?)*", tail)
+    return m.group(0) if m else ""
 
 
 def grade_set(answer: str, key: str, truth: list[str]) -> tuple[float, dict]:
@@ -191,10 +211,9 @@ def grade_set(answer: str, key: str, truth: list[str]) -> tuple[float, dict]:
     otherwise).
     """
     truth_set = {_clean_token(t) for t in truth}
-    line_m = re.search(rf"{re.escape(key)}\s*=\s*([^\n]+)", answer, re.IGNORECASE)
-    if line_m:
-        raw = line_m.group(1)
-        predicted = {_clean_token(t) for t in re.split(r"[,\s]+", raw) if _clean_token(t)}
+    raw = _extract_set_value(answer, key)
+    if raw is not None:
+        predicted = {_clean_token(t) for t in raw.split(",") if _clean_token(t)}
         source = "key-line"
     elif all(t.endswith(".rs") for t in truth_set):
         predicted = set(_basenames_in(answer))
@@ -353,6 +372,22 @@ def _selftest() -> int:
     f1c, dc = grade_set("FUNCS=`kill_tree`, reap_within", "FUNCS", ["kill_tree", "reap_within"])
     if f1c < 0.999:
         failures.append(f"identifier set should score 1.0, got {f1c} ({dc})")
+    # regression: agent glues prose onto the answer line AND repeats a bold
+    # summary later. The OLD scorer matched the first `DEAD=` and swept the
+    # prose words in as bogus members (precision ~0.11). Must score 1.0 now.
+    glued = (
+        "I'll run dead-code analysis.\n"
+        "DEAD=bench_dead_alpha,bench_dead_betaBoth `bench_dead_alpha` and "
+        "`bench_dead_beta` are unreachable from any entry point.\n"
+        "**DEAD=bench_dead_alpha,bench_dead_beta**"
+    )
+    f1d, dd = grade_set(glued, "DEAD", ["bench_dead_alpha", "bench_dead_beta"])
+    if f1d < 0.999:
+        failures.append(f"glued-prose answer should score 1.0, got {f1d} ({dd})")
+    # an honest miss must still be penalized (no over-rescue)
+    f1e, _ = grade_set("DEAD=bench_dead_beta", "DEAD", ["bench_dead_alpha", "bench_dead_beta"])
+    if not (0.0 < f1e < 0.8):
+        failures.append(f"partial DEAD f1 out of range: {f1e}")
     sc, d = grade_fields("CALLS = 1 | SITES=crates/x/proc.rs:91", [
         {"name": "call_count", "must_contain_all": ["CALLS=1"]},
         {"name": "call_site", "must_contain_all": ["proc.rs", "91"]},

@@ -31,25 +31,45 @@ auditable.
 | `t2_callcount_kill_tree` | call-site precision | bare grep over-counts (def + 4 doc-comment mentions); true call count is 1 → rewards graph precision |
 | `t3_callers_detach` | relational callers | "which files call X" across the repo; set-graded P/R/F1 |
 | `t4_trace_kill_and_reap` | transitive call closure | downstream closure of `kill_and_reap` ({kill_tree, reap_within}); a deeper closure forces multi-hop reasoning |
+| `t5_deadcode_island` | whole-graph reachability / dead island | injected fixture: `bench_dead_beta` calls `bench_dead_alpha`, nothing calls `beta` → BOTH dead. Oracle = Rust compiler `never used` (flags both). grep's trap: `alpha` *is* textually referenced (by the equally-dead `beta`) |
 
-## First findings (composer-2.5, N≤3 seeds — anecdote, not proof)
+## Findings (composer-2.5, N≤3 seeds — anecdote, not proof)
 
-- **t2 is the decisive win.** The `grep` arm could not converge on the true
+- **t2 is the only decisive win.** The `grep` arm could not converge on the true
   call count (1) within a 600 s budget — bare text search drowns in the
   definition + 4 doc-comment mentions of `kill_tree`. The `specslice` arm
-  answered in ~44 s. This "precision against textual noise" is where the graph
-  pays off.
-- **t1 / t3 / t4 tie.** Definitional lookup, cross-file caller listing, and a
-  *shallow* (1-hop, 2-node) call closure are all grep-tractable; `specslice`
-  matched accuracy and was sometimes faster/cheaper (t3) but not always (t4, where
-  its trace exploration used *more* tool calls). The benchmark thus **falsifies
-  the over-strong claim that "trace is something grep can't do"** at trivial
-  depth.
-- **Implication for the next iteration:** to demonstrate the structural
-  advantage convincingly, add tasks grep genuinely cannot do at any reasonable
-  cost — deep/wide call closures, whole-graph reachability (`dead-code`), or
-  semantic facts (`purity`/`facts`). For `dead-code`, use the Rust compiler's
-  `never used` lint as the independent oracle (not specslice's own output).
+  answered in ~44 s. This "precision against textual noise" — distinguishing
+  real uses from textual hits at a scale where reading every hit is infeasible —
+  is the one place the graph clearly paid off.
+- **t1 / t3 / t4 / t5 all tie at 1.00.** Definitional lookup, cross-file caller
+  listing, a *shallow* (2-node) call closure, **and even a transitively-dead
+  island** are all grep-tractable for a capable model: on t5 the `grep` arm got
+  {alpha, beta} 3/3 by *reasoning* (`beta` has no caller → dead; `alpha` is only
+  called by the dead `beta` → transitively dead). So the benchmark **falsifies
+  the over-strong claims that "trace / dead-code are things grep can't do"** at
+  trivial graph sizes. `specslice` matched accuracy but on t4/t5 often spent
+  *more* tool calls and tokens exploring.
+- **A specslice rough edge t5 surfaced:** `specslice dead-code` defaults to
+  `--min-confidence medium`, which deliberately *hides* the dead island
+  (`alpha` is classified a Low-confidence "dead island" because it has an inbound
+  edge from the also-dead `beta`). The full set only appears with
+  `--min-confidence low`. Good for precision, but an agent that trusts the
+  default under-reports — the recall/precision default is a real usability
+  trade-off worth surfacing to MCP/CLI consumers.
+- **The scorer had to be hardened (self-fix).** The first t5 scoring falsely gave
+  one `specslice` run 0.11: the agent glued prose onto its answer line
+  (`DEAD=alpha,betaBoth alpha and beta are unreachable...`) and `grade_set`
+  matched the *first* `KEY=` and swept every prose word in as a bogus set member.
+  Fix: take the *last* `KEY=` and capture only the leading comma-run of bare
+  identifiers (regression-locked in `score.py --selftest`). Lesson: a buggy
+  grader silently maligns whichever arm phrases its answer chattily.
+- **Implication for the next iteration:** trivial fixtures don't separate the
+  arms — a strong model reasons through small graphs with grep. To show a real
+  *accuracy* gap you need **scale**: deep/wide call closures (10+ hops, fan-out),
+  large dead clusters, or whole-repo reachability where reading every grep hit is
+  infeasible. The honest thesis so far is narrow: *specslice wins when the answer
+  requires separating real structure from textual noise at a scale that defeats
+  read-every-hit* (t2), and otherwise mostly ties on accuracy.
 
 ## Setup (pinned, isolated workspace)
 
@@ -60,9 +80,15 @@ once, so runs are reproducible and the real working tree is never touched:
 SS=/Users/qjs/Code/Projects/specslice
 git -C "$SS" worktree add --detach /Users/qjs/Code/Projects/specslice-bench/wt HEAD
 ( cd /Users/qjs/Code/Projects/specslice-bench/wt && specslice index )   # builds .specslice/graph.db
+
+# t5 only: inject the dead-code fixture, print the compiler oracle, reindex
+./setup_fixture.sh /Users/qjs/Code/Projects/specslice-bench/wt
 ```
 
 `specslice` must be on `PATH` (`cargo install --path crates/specslice-cli`).
+The `t5` fixture (`fixtures/_bench_deadcode_fixture.rs` + `setup_fixture.sh`)
+lives in this dir and is injected only into the disposable worktree — never the
+real crate. Its ground truth is whatever `cargo check` reports as `never used`.
 
 ## Run
 
@@ -90,6 +116,7 @@ are gitignored (reproducible artifacts).
 - **v1 benchmarks the specslice CLI**, not the MCP server integration. A v2 can
   attach `specslice-mcp` via a per-arm `.cursor/mcp.json` to test the real agent
   wiring.
-- **Small N tasks.** This is a skeleton that closes the record→score→table loop;
-  add tasks (especially trace/impact/dead-code, which grep cannot answer at all)
-  to make it a real signal.
+- **Small N tasks.** This is a skeleton that closes the record→score→table loop.
+  Note the measured reality: at *trivial* graph sizes grep + a capable model can
+  answer trace (t4) and dead-island (t5) too — the structural advantage needs
+  **scale** (deep/wide closures, large dead clusters) to become an accuracy gap.
