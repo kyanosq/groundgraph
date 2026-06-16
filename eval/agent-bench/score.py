@@ -179,16 +179,29 @@ def _basenames_in(text: str) -> list[str]:
     return [m.lower() for m in re.findall(r"[A-Za-z0-9_]+\.rs", text)]
 
 
+def _clean_token(t: str) -> str:
+    return t.strip().strip("`'\"(),;").strip().lower()
+
+
 def grade_set(answer: str, key: str, truth: list[str]) -> tuple[float, dict]:
-    truth_set = {t.lower() for t in truth}
+    """Set-graded P/R/F1. Works for file-basename sets and bare-identifier sets.
+
+    Prefers the `KEY=a,b,c` one-line answer format; falls back to scanning when
+    that line is absent (`.rs` basenames for file-type truth, membership scan
+    otherwise).
+    """
+    truth_set = {_clean_token(t) for t in truth}
     line_m = re.search(rf"{re.escape(key)}\s*=\s*([^\n]+)", answer, re.IGNORECASE)
     if line_m:
         raw = line_m.group(1)
-        predicted = {b.lower() for b in _basenames_in(raw)}
+        predicted = {_clean_token(t) for t in re.split(r"[,\s]+", raw) if _clean_token(t)}
         source = "key-line"
+    elif all(t.endswith(".rs") for t in truth_set):
+        predicted = set(_basenames_in(answer))
+        source = "fallback-rs"
     else:
-        predicted = {b for b in _basenames_in(answer)}
-        source = "fallback-scan"
+        predicted = {t for t in truth_set if t in answer.lower()}
+        source = "fallback-membership"
     tp = len(predicted & truth_set)
     precision = tp / len(predicted) if predicted else 0.0
     recall = tp / len(truth_set) if truth_set else 0.0
@@ -336,6 +349,10 @@ def _selftest() -> int:
     f1b, _ = grade_set("FILES=lsp_client.rs", "FILES", ["dart_sidecar.rs", "lsp_client.rs", "scip_runner.rs", "lsp_probe.rs"])
     if not (0.0 < f1b < 0.6):
         failures.append(f"partial set f1 out of range: {f1b}")
+    # identifier set (function names, not files)
+    f1c, dc = grade_set("FUNCS=`kill_tree`, reap_within", "FUNCS", ["kill_tree", "reap_within"])
+    if f1c < 0.999:
+        failures.append(f"identifier set should score 1.0, got {f1c} ({dc})")
     sc, d = grade_fields("CALLS = 1 | SITES=crates/x/proc.rs:91", [
         {"name": "call_count", "must_contain_all": ["CALLS=1"]},
         {"name": "call_site", "must_contain_all": ["proc.rs", "91"]},

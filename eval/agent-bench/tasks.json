@@ -43,6 +43,16 @@
         "key": "FILES",
         "truth": ["dart_sidecar.rs", "lsp_client.rs", "scip_runner.rs", "lsp_probe.rs"]
       }
+    },
+    {
+      "id": "t4_trace_kill_and_reap",
+      "bucket": "transitive call closure (grep needs many hops)",
+      "prompt": "Compute the COMPLETE downstream call closure of the function `kill_and_reap`: every first-party function it calls, directly or transitively, within this workspace. Exclude standard-library / external-crate calls and test code. Reply on a single line in EXACTLY this format using bare function names: `FUNCS=<name1>,<name2>,...`",
+      "grade": {
+        "type": "set",
+        "key": "FUNCS",
+        "truth": ["kill_tree", "reap_within"]
+      }
     }
   ]
 }
