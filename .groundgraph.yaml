@@ -1,0 +1,60 @@
+# GroundGraph 对自身仓库的工作区配置（中文 dogfood）。
+# 非侵入式：所有产物都写入 .groundgraph/，不修改任何源代码。
+schema_version: 1
+repo:
+  root: .
+  default_branch: main
+
+storage:
+  path: .groundgraph/graph.db
+
+docs:
+  paths:
+    - docs
+
+# 本仓库主体为 Rust 工作区，同时包含用于自测/演示的多语言 fixture、
+# WebUI 构建脚本和少量 Python 工具脚本。显式列出这些一等范围，避免
+# dogfood 时把真实覆盖缺口和外部扫描快照混在一起。
+languages:
+  - id: rust
+    paths:
+      - crates
+  - id: go
+    paths:
+      - tests/fixtures/go_hello
+  - id: java
+    paths:
+      - tests/fixtures/java_hello
+  - id: python
+    paths:
+      - eval/agent-bench
+      - scripts
+      - tests/fixtures/python_hello
+      - webui
+  - id: swift
+    paths:
+      - tests/fixtures/swift_hello/Sources
+      - tests/fixtures/swift_hello/Tests
+  - id: typescript
+    paths:
+      - tests/fixtures/typescript_hello
+      - webui/vendor-src
+
+enrichment:
+  lsp: false
+  analyzer: false
+
+checks:
+  # doc -> code 漂移检查的豁免清单：
+  # - docs/plans/**、docs/superpowers/**、docs/implementation-plan.md 是阶段
+  #   日志/历史档案，记录的是"当时"的文件名与路径，不随重构改写。
+  # - docs/sourcecode/**、docs/codegraph-benchmark-and-roadmap.md 是对外部
+  #   仓库的分析笔记，引用的是别人仓库的文件。
+  # - docs/watermark.md 是 PRD 中 PixCraft 示例仓库的假想路径。
+  doc_drift_ignore:
+    - "docs/plans/**"
+    - "docs/superpowers/**"
+    - "docs/implementation-plan.md"
+    - "docs/sourcecode/**"
+    - "docs/codegraph-benchmark-and-roadmap.md"
+    - "docs/watermark.md"

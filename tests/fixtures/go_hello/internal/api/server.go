@@ -6,7 +6,7 @@ type Greeter interface {
 }
 
 // Server is a tiny domain object that holds a greeter name and the
-// methods exercised by the SpecSlice Go indexer fixture.
+// methods exercised by the GroundGraph Go indexer fixture.
 type Server struct {
 	Name string
 }

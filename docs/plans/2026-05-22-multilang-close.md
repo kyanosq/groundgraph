@@ -14,9 +14,9 @@
    `binary_on_path` (`path.is_file()`)，不真启动；本机 `pylsp` 文件存在但
    shebang 指向已删除的 Anaconda 解释器，导致 probe 返回可用、`run_profile`
    启动失败、`assert_eq!(result.resolver_used, "python_lsp")` 失败。
-3. **[P1] `specslice questions` 读不到真实 pending candidates。** `questions.rs`
+3. **[P1] `groundgraph questions` 读不到真实 pending candidates。** `questions.rs`
    只扫 `Store` 里的 `BusinessCandidate` 节点；实际候选来自
-   `.specslice/candidates/business_logic.yaml`，从未持久写入 store。结果是真实
+   `.groundgraph/candidates/business_logic.yaml`，从未持久写入 store。结果是真实
    仓库的 pending 候选永远不在报告里。
 4. **[P2] `graph-diff` 注释承诺了 candidate diff，但实现没做。**
    `GraphDiffOptions` 只接 `base_db / head_db`，不读仓库根；输出也没有
@@ -40,7 +40,7 @@
 
 ### Phase A — `language_traits` 公共谓词层
 
-文件：`crates/specslice-core/src/language_traits.rs`
+文件：`crates/groundgraph-core/src/language_traits.rs`
 
 API（全部以 `NodeKind` 为输入，纯函数）：
 
@@ -55,12 +55,12 @@ pub fn is_module_or_file(kind: NodeKind) -> bool;        // File / *Module / *Pa
 pub fn is_test(kind: NodeKind) -> bool;                  // TestCase / TestGroup
 pub fn default_dead_code_reason(kind: NodeKind) -> &'static str;
 pub fn search_aliases(kind: NodeKind) -> &'static [&'static str];
-pub fn graph_column(kind: NodeKind) -> GraphColumn;      // 与 specslice-engine 的 GraphColumn 复用
+pub fn graph_column(kind: NodeKind) -> GraphColumn;      // 与 groundgraph-engine 的 GraphColumn 复用
 pub fn similarity_supported(kind: NodeKind) -> bool;     // tier 1 / tier 2 是否扫该 kind
 ```
 
-> `GraphColumn` 在 `specslice-engine`，为避免循环依赖，`graph_column` 留在
-> `specslice-engine::graph` 里再调 `language_traits` 的若干小谓词；而不是把
+> `GraphColumn` 在 `groundgraph-engine`，为避免循环依赖，`graph_column` 留在
+> `groundgraph-engine::graph` 里再调 `language_traits` 的若干小谓词；而不是把
 > `GraphColumn` 下沉到 core。
 
 矩阵测试：用 `NodeKind` 的所有变体跑一次，断言每个谓词都有定义、且
@@ -117,7 +117,7 @@ pub candidates_status_changed: Vec<DiffCandidateStatusChange>,
 from_status, to_status }`。两边都传 repo_root 才比较；任一缺失则三个 vec 留空且
 stats 不计入。
 
-CLI：`specslice graph-diff` 增 `--base-root <path>` / `--head-root <path>`。
+CLI：`groundgraph graph-diff` 增 `--base-root <path>` / `--head-root <path>`。
 
 ### Phase E — Python LSP 真启动 probe
 
@@ -178,7 +178,7 @@ IndexResult {
 
 - LSP：`typescript-language-server --stdio`（npm 包：
   `typescript-language-server` 依赖 `typescript`），env 覆盖
-  `SPECSLICE_TYPESCRIPT_LSP_BIN`。
+  `GROUNDGRAPH_TYPESCRIPT_LSP_BIN`。
 - AST 补强：`scan_typescript` 用 `tree-sitter-typescript` 解 imports +
   `describe/it`（jest/vitest）。
 - 框架：Express (`app.get('/x', handler)`), Hono, Fastify, Next API routes
@@ -187,17 +187,17 @@ IndexResult {
 #### F4 `java_indexer.rs`
 
 - LSP：`jdtls`（Eclipse JDT Language Server）。配置复杂、启动慢 → smoke 测试只
-  在 `SPECSLICE_JAVA_LSP_BIN` 显式设置时跑。
+  在 `GROUNDGRAPH_JAVA_LSP_BIN` 显式设置时跑。
 - AST 补强：`scan_java` 用 `tree-sitter-java`，提 package 声明 +
   `@Test`（JUnit 4/5）。
 - 框架：Spring Boot (`@RestController` + `@GetMapping/@PostMapping`)。
 
 #### F5 Fixtures
 
-- `crates/specslice-engine/tests/fixtures/typescript_hello/`：含
+- `crates/groundgraph-engine/tests/fixtures/typescript_hello/`：含
   `src/greeter.ts`, `src/api.ts` (Express route), `tests/greeter.test.ts`
   (jest)。
-- `crates/specslice-engine/tests/fixtures/java_hello/`：含
+- `crates/groundgraph-engine/tests/fixtures/java_hello/`：含
   `src/main/java/com/example/Greeter.java`, `src/main/java/com/example/api/HelloController.java`
   (Spring), `src/test/java/com/example/GreeterTest.java` (JUnit5)。
 
@@ -212,7 +212,7 @@ IndexResult {
 
 - `docs/implementation-plan.md`：补本次审查纪要；列出实际落地语言；删除任何"已
   支持 TS / Java"的暗示。
-- `packaging/skills/specslice/SKILL.md`：同上，并补 TS / Java 的输出 schema 与
+- `packaging/skills/groundgraph/SKILL.md`：同上，并补 TS / Java 的输出 schema 与
   框架识别清单。
 - 本计划文档的"完成"勾选与命令输出。
 
@@ -230,7 +230,7 @@ IndexResult {
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`（含 TS / Java 默认测试）
-- [ ] `cargo test -p specslice-engine --test lsp_indexers -- --include-ignored`
+- [ ] `cargo test -p groundgraph-engine --test lsp_indexers -- --include-ignored`
       要么 Python/TS/Java 三个 smoke 都过，要么按上述 soft-skip 协议跳过且打印
       可读原因，绝不留断言失败。
 - [ ] `dart test`（保持当前 6 通过）。

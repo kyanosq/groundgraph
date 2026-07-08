@@ -2,7 +2,7 @@
 
 > 数据源：`reports/release-v0.3.0a/<repo>/dead-code-low.json` 与
 > `reports/release-v0.3.0a/<repo>/search-*.json`，由
-> `./target/release/specslice --repo-root release-scans/_scratch/<repo>` 直跑生成。
+> `./target/release/groundgraph --repo-root release-scans/_scratch/<repo>` 直跑生成。
 > 四个 scratch 副本沿用 v0.2.0 收口阶段的 graph.db，**目标仓零侵入**。
 
 ## A. 死代码 only-low-tier-inbound reason
@@ -15,7 +15,7 @@
 | vub | 15045 | 0 | 0 |
 
 **解读**：四个仓的 only-low-tier-inbound 命中都是 0。这与
-`crates/specslice-engine/src/edge_confidence.rs:174` 的现实一致 ——
+`crates/groundgraph-engine/src/edge_confidence.rs:174` 的现实一致 ——
 `*_ast` indexer 出的边落到 `EdgeConfidence::Medium`，`Low` 只留给
 AI-derived / overridden / ignored 三类罕见情况。Phase 2 的 reason
 加得到位但不会误报，等到后续接 AI derive 时会自然变得有意义。
@@ -67,7 +67,7 @@ AI-derived / overridden / ignored 三类罕见情况。Phase 2 的 reason
 
 ## C. 已知遗留 bug（不属于 v0.3.0-A 引入）
 
-- `specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁只补了
+- `groundgraph-cli/src/commands/search.rs::parse_kind` 的 P20 补丁只补了
   Dart / Swift / Go / Python 的别名表，**TypeScript / Java NodeKind**
   仍然不在 match 中，所以 `--kind typescript_function` / `--kind java_method`
   会被 CLI 自身的别名解析器以 `unknown --kind` 拒绝，尽管 engine 的
@@ -81,13 +81,13 @@ AI-derived / overridden / ignored 三类罕见情况。Phase 2 的 reason
 ## D. 复现方式
 
 ```bash
-cargo build -p specslice-cli --release
+cargo build -p groundgraph-cli --release
 for repo in pixcraft-app atagent pixcraft-landing vub; do
-  ./target/release/specslice --repo-root release-scans/_scratch/$repo \
+  ./target/release/groundgraph --repo-root release-scans/_scratch/$repo \
     dead-code --json --min-confidence low \
     > reports/release-v0.3.0a/$repo/dead-code-low.json
 done
-./target/release/specslice --repo-root release-scans/_scratch/pixcraft-app \
+./target/release/groundgraph --repo-root release-scans/_scratch/pixcraft-app \
   search --kind dart_method --json --limit 100 build \
   > reports/release-v0.3.0a/pixcraft-app/search-build.json
 # ... etc, see scripts/release_scan_v030a_metrics.py for the full matrix

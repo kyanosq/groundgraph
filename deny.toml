@@ -1,4 +1,4 @@
-# cargo-deny configuration — supply-chain gate for SpecSlice (issues.md #102).
+# cargo-deny configuration — supply-chain gate for GroundGraph (issues.md #102).
 #
 # Run locally with `cargo deny check`. CI runs the same in the `supply-chain`
 # job. The goal: fail on real vulnerabilities, untrusted sources, and
@@ -23,7 +23,7 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [licenses]
-# Permissive licenses compatible with SpecSlice's own "MIT OR Apache-2.0".
+# Permissive licenses compatible with GroundGraph's own "MIT OR Apache-2.0".
 allow = [
   "MIT",
   "Apache-2.0",

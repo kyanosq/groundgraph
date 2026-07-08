@@ -1,12 +1,12 @@
-# SpecSlice Web Visualization Design
+# GroundGraph Web Visualization Design
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a browser-viewable, read-only visualization for SpecSlice graphs so users can inspect document facts, code facts, semantic code edges, confirmed business logic links, AI candidates and risks without modifying the target repository.
+**Goal:** Build a browser-viewable, read-only visualization for GroundGraph graphs so users can inspect document facts, code facts, semantic code edges, confirmed business logic links, AI candidates and risks without modifying the target repository.
 
-**Architecture:** The engine exports a stable `GraphViewModel` JSON from `.specslice/graph.db`. The CLI can render that model as JSON, Mermaid, or a self-contained HTML file under `.specslice/export/graph.html`. P6 shipped a deterministic lane layout; P6.1 replaced the default HTML experience with a module tree + SVG graph + detail panel browser so large real repos do not collapse into thousands of flat nodes.
+**Architecture:** The engine exports a stable `GraphViewModel` JSON from `.groundgraph/graph.db`. The CLI can render that model as JSON, Mermaid, or a self-contained HTML file under `.groundgraph/export/graph.html`. P6 shipped a deterministic lane layout; P6.1 replaced the default HTML experience with a module tree + SVG graph + detail panel browser so large real repos do not collapse into thousands of flat nodes.
 
-**P6.x — Search-driven Reader (current default for HTML):** A real-world repo's full graph is too noisy to read by eye. The user-facing entrypoint is now `specslice search <query> --format html`, which renders a search-centric **code-graph reader** instead of a full graph dump:
+**P6.x — Search-driven Reader (current default for HTML):** A real-world repo's full graph is too noisy to read by eye. The user-facing entrypoint is now `groundgraph search <query> --format html`, which renders a search-centric **code-graph reader** instead of a full graph dump:
 
 - **No default global graph.** The HTML opens directly to the search result. The operator picks the entry (keyword, code snippet via `--code`, or `file:line` via `--file/--line`) and the canvas focuses on what they asked about.
 - **Per-match focus card.** Each ranked match owns its own canvas of ≤ 25 nodes — anchor in the centre, neighbours arranged in a ring sorted by edge-readability priority (tests > business-semantic > calls/references > misc).
@@ -16,9 +16,9 @@
 - **Edge-kind filter toolbar (P0b, schema 2).** The header carries one filter chip per edge kind in `payload.edge_kinds` (priority-sorted: tests > storage/route/provider > derives_from > calls/refs > contains). Clicking a chip toggles edges of that kind across the canvas *and* the inspector's upstream/downstream list, so the operator can isolate "what depends on the paywall via persists_to" or "show me only tests" without re-running search.
 - **Expand / collapse neighbours (P0b, schema 2).** Each focus card ships its initial canvas (≤ 25 nodes) plus `payload.full_subgraph` — the union of every match's 1-hop neighbourhood. Nodes on the canvas show a `+N` badge when they still have hidden neighbours; clicking pulls them in (re-using the existing ring layout). Manually expanded nodes get a solid stroke so a second click collapses just that branch.
 
-Generated to `<repo>/.specslice/export/search-<slug>.html` by default; pass `--output` to override. Same self-containment contract as `graph --format html` (no remote URLs, no CDN, one HTML file).
+Generated to `<repo>/.groundgraph/export/search-<slug>.html` by default; pass `--output` to override. Same self-containment contract as `graph --format html` (no remote URLs, no CDN, one HTML file).
 
-**Agent surface (P0a, `specslice-mcp`):** the same engine surface is exposed to AI agents through an MCP stdio server so they do not have to parse CLI text. Six structured tools are advertised in `tools/list` — `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack` — each returning a single `text` content block whose body is the engine response serialized as pretty JSON. Tool errors land as `isError: true` content; only protocol-level failures (unknown method / tool) use JSON-RPC error envelopes. Launch with `specslice-mcp --repo-root <repo>` (or `SPECSLICE_REPO_ROOT=...`); tool calls may override `repo_root` per-call.
+**Agent surface (P0a, `groundgraph-mcp`):** the same engine surface is exposed to AI agents through an MCP stdio server so they do not have to parse CLI text. Six structured tools are advertised in `tools/list` — `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack` — each returning a single `text` content block whose body is the engine response serialized as pretty JSON. Tool errors land as `isError: true` content; only protocol-level failures (unknown method / tool) use JSON-RPC error envelopes. Launch with `groundgraph-mcp --repo-root <repo>` (or `GROUNDGRAPH_REPO_ROOT=...`); tool calls may override `repo_root` per-call.
 
 **Tech Stack:** Rust engine/CLI, `serde` data contracts, self-contained HTML/CSS/vanilla JS, optional Mermaid text export.
 
@@ -26,8 +26,8 @@ Generated to `<repo>/.specslice/export/search-<slug>.html` by default; pass `--o
 
 ## Design Principles
 
-- **Read-only first:** Visualization must not write `.specslice/links.yaml`, candidates, requirements, code, docs, or tests.
-- **No repository intrusion:** Output only goes to `.specslice/export/` unless the user passes `--out`.
+- **Read-only first:** Visualization must not write `.groundgraph/links.yaml`, candidates, requirements, code, docs, or tests.
+- **No repository intrusion:** Output only goes to `.groundgraph/export/` unless the user passes `--out`.
 - **Offline browser support:** Generated HTML must work without CDN, npm, Vite, React, or a dev server.
 - **Facts vs AI vs confirmed:** The UI must visually separate deterministic facts, AI candidates, human-confirmed links, and risk signals.
 - **Stable and testable:** Graph JSON is the contract. HTML is a rendering of that contract, not the source of truth.
@@ -86,17 +86,17 @@ Avoid a one-color graph. The visual distinction between “known fact”, “AI 
 Add a new command:
 
 ```bash
-specslice graph --format html
-specslice graph --format json
-specslice graph --format mermaid
+groundgraph graph --format html
+groundgraph graph --format json
+groundgraph graph --format mermaid
 ```
 
 Flags:
 
 ```bash
---out <path>              # default .specslice/export/graph.html for html
+--out <path>              # default .groundgraph/export/graph.html for html
 --focus <id>              # requirement id, module path, artifact id, stable key
---include-candidates      # include .specslice/candidates/business_logic.yaml
+--include-candidates      # include .groundgraph/candidates/business_logic.yaml
 --include-risks           # include check/confidence findings, default true
 --max-nodes <n>           # default 80 for html, unlimited for json
 --open                    # optional later; not required for CI
@@ -202,7 +202,7 @@ Mapping rules:
 - Test cases and groups -> `GraphLayer::Fact`, column `Tests`.
 - `EdgeCertainty::Fact` -> `GraphLayer::Fact`.
 - `EdgeSource::ExternalManifest` + `Confirmed` -> `GraphLayer::Confirmed`.
-- `.specslice/candidates/business_logic.yaml` entries -> `GraphLayer::Candidate`.
+- `.groundgraph/candidates/business_logic.yaml` entries -> `GraphLayer::Candidate`.
 - Checks and LogicConfidence findings -> `GraphLayer::Risk`.
 
 Important: Do not create business logic nodes from Markdown frontmatter or heading patterns. Business nodes come only from confirmed external graph data or future accepted AI requirement registry entries.
@@ -217,12 +217,12 @@ Generated HTML structure:
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>SpecSlice Graph</title>
+    <title>GroundGraph Graph</title>
     <style>/* embedded */</style>
   </head>
   <body>
     <main id="app"></main>
-    <script id="specslice-data" type="application/json">{...}</script>
+    <script id="groundgraph-data" type="application/json">{...}</script>
     <script>/* embedded renderer */</script>
   </body>
 </html>
@@ -230,7 +230,7 @@ Generated HTML structure:
 
 Renderer responsibilities:
 
-- Parse `#specslice-data`.
+- Parse `#groundgraph-data`.
 - Build the module/file/symbol tree from `parent_id`.
 - Render nodes as buttons for keyboard accessibility.
 - Render edges in an absolute-positioned SVG overlay after layout.
@@ -274,25 +274,25 @@ Mermaid export rules:
 
 ## Files To Create Or Modify
 
-- Create `crates/specslice-engine/src/graph.rs`
+- Create `crates/groundgraph-engine/src/graph.rs`
   - Build `GraphViewModel` from `Store`.
   - Apply focus and max-node filtering.
   - Convert checks/risks into `GraphFinding`.
-- Modify `crates/specslice-engine/src/lib.rs`
+- Modify `crates/groundgraph-engine/src/lib.rs`
   - Export `build_graph_view`, `GraphOptions`, `GraphViewModel`.
-- Create `crates/specslice-cli/src/commands/graph.rs`
+- Create `crates/groundgraph-cli/src/commands/graph.rs`
   - Print JSON, write HTML, write Mermaid.
-- Modify `crates/specslice-cli/src/commands/mod.rs`
+- Modify `crates/groundgraph-cli/src/commands/mod.rs`
   - Add `pub mod graph;`.
-- Modify `crates/specslice-cli/src/main.rs`
+- Modify `crates/groundgraph-cli/src/app.rs`
   - Add `Graph` subcommand and CLI flags.
-- Create `crates/specslice-cli/src/commands/graph_html.rs`
+- Create `crates/groundgraph-cli/src/commands/graph_html.rs`
   - Self-contained HTML renderer template.
-- Create `crates/specslice-cli/src/commands/graph_mermaid.rs`
+- Create `crates/groundgraph-cli/src/commands/graph_mermaid.rs`
   - Mermaid serializer.
-- Create `crates/specslice-engine/tests/graph.rs`
+- Create `crates/groundgraph-engine/tests/graph.rs`
   - Engine behavior tests.
-- Create `crates/specslice-cli/tests/graph.rs`
+- Create `crates/groundgraph-cli/tests/graph.rs`
   - CLI e2e tests.
 - Modify `docs/implementation-plan.md`
   - Link to this design from P6.
@@ -303,18 +303,18 @@ Mermaid export rules:
 
 **Files:**
 
-- Create: `crates/specslice-engine/src/graph.rs`
-- Modify: `crates/specslice-engine/src/lib.rs`
-- Test: `crates/specslice-engine/tests/graph.rs`
+- Create: `crates/groundgraph-engine/src/graph.rs`
+- Modify: `crates/groundgraph-engine/src/lib.rs`
+- Test: `crates/groundgraph-engine/tests/graph.rs`
 
 - [ ] **Step 1: Write the failing engine test**
 
-Create a fixture graph with one doc section, one requirement from `.specslice/links.yaml`, one Dart class, and one test. Assert that `build_graph_view` returns layered nodes and confirmed edges.
+Create a fixture graph with one doc section, one requirement from `.groundgraph/links.yaml`, one Dart class, and one test. Assert that `build_graph_view` returns layered nodes and confirmed edges.
 
 Run:
 
 ```bash
-cargo test -p specslice-engine --test graph graph_view_contains_layered_confirmed_nodes --quiet
+cargo test -p groundgraph-engine --test graph graph_view_contains_layered_confirmed_nodes --quiet
 ```
 
 Expected: fail because `graph` module does not exist.
@@ -333,7 +333,7 @@ Minimal behavior:
 - [ ] **Step 3: Run the focused test**
 
 ```bash
-cargo test -p specslice-engine --test graph graph_view_contains_layered_confirmed_nodes --quiet
+cargo test -p groundgraph-engine --test graph graph_view_contains_layered_confirmed_nodes --quiet
 ```
 
 Expected: pass.
@@ -341,7 +341,7 @@ Expected: pass.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/specslice-engine/src/graph.rs crates/specslice-engine/src/lib.rs crates/specslice-engine/tests/graph.rs
+git add crates/groundgraph-engine/src/graph.rs crates/groundgraph-engine/src/lib.rs crates/groundgraph-engine/tests/graph.rs
 git commit -m "增加图谱可视化视图模型"
 ```
 
@@ -349,8 +349,8 @@ git commit -m "增加图谱可视化视图模型"
 
 **Files:**
 
-- Modify: `crates/specslice-engine/src/graph.rs`
-- Test: `crates/specslice-engine/tests/graph.rs`
+- Modify: `crates/groundgraph-engine/src/graph.rs`
+- Test: `crates/groundgraph-engine/tests/graph.rs`
 
 - [ ] **Step 1: Write the failing focus test**
 
@@ -359,7 +359,7 @@ Add a second unrelated requirement and assert `GraphOptions { focus: Some("REQ-W
 Run:
 
 ```bash
-cargo test -p specslice-engine --test graph graph_focus_keeps_only_connected_neighbourhood --quiet
+cargo test -p groundgraph-engine --test graph graph_focus_keeps_only_connected_neighbourhood --quiet
 ```
 
 Expected: fail because focus is ignored.
@@ -385,7 +385,7 @@ When `max_nodes` is set and the graph exceeds the limit:
 - [ ] **Step 4: Run tests**
 
 ```bash
-cargo test -p specslice-engine --test graph --quiet
+cargo test -p groundgraph-engine --test graph --quiet
 ```
 
 Expected: pass.
@@ -394,17 +394,17 @@ Expected: pass.
 
 **Files:**
 
-- Create: `crates/specslice-cli/src/commands/graph.rs`
-- Modify: `crates/specslice-cli/src/commands/mod.rs`
-- Modify: `crates/specslice-cli/src/main.rs`
-- Test: `crates/specslice-cli/tests/graph.rs`
+- Create: `crates/groundgraph-cli/src/commands/graph.rs`
+- Modify: `crates/groundgraph-cli/src/commands/mod.rs`
+- Modify: `crates/groundgraph-cli/src/app.rs`
+- Test: `crates/groundgraph-cli/tests/graph.rs`
 
 - [ ] **Step 1: Write the failing CLI test**
 
-Use the watermark fixture, run `specslice init`, `specslice index`, then:
+Use the watermark fixture, run `groundgraph init`, `groundgraph index`, then:
 
 ```bash
-specslice graph --format json
+groundgraph graph --format json
 ```
 
 Assert stdout is valid JSON and contains `schema_version`, `nodes`, and `edges`.
@@ -412,7 +412,7 @@ Assert stdout is valid JSON and contains `schema_version`, `nodes`, and `edges`.
 Run:
 
 ```bash
-cargo test -p specslice-cli --test graph graph_json_prints_view_model --quiet
+cargo test -p groundgraph-cli --test graph graph_json_prints_view_model --quiet
 ```
 
 Expected: fail because command does not exist.
@@ -448,7 +448,7 @@ pub struct GraphArgs {
 - [ ] **Step 3: Run CLI JSON test**
 
 ```bash
-cargo test -p specslice-cli --test graph graph_json_prints_view_model --quiet
+cargo test -p groundgraph-cli --test graph graph_json_prints_view_model --quiet
 ```
 
 Expected: pass.
@@ -457,22 +457,22 @@ Expected: pass.
 
 **Files:**
 
-- Create: `crates/specslice-cli/src/commands/graph_html.rs`
-- Modify: `crates/specslice-cli/src/commands/graph.rs`
-- Test: `crates/specslice-cli/tests/graph.rs`
+- Create: `crates/groundgraph-cli/src/commands/graph_html.rs`
+- Modify: `crates/groundgraph-cli/src/commands/graph.rs`
+- Test: `crates/groundgraph-cli/tests/graph.rs`
 
 - [ ] **Step 1: Write the failing HTML test**
 
 Run:
 
 ```bash
-specslice graph --format html
+groundgraph graph --format html
 ```
 
-Assert `.specslice/export/graph.html` exists and contains:
+Assert `.groundgraph/export/graph.html` exists and contains:
 
-- `<script id="specslice-data" type="application/json">`
-- `SpecSlice Graph`
+- `<script id="groundgraph-data" type="application/json">`
+- `GroundGraph Graph`
 - no `https://`
 - no `http://`
 
@@ -493,7 +493,7 @@ Do not add npm, Vite, React, or external JS dependencies.
 - [ ] **Step 3: Run HTML test**
 
 ```bash
-cargo test -p specslice-cli --test graph graph_html_writes_self_contained_file --quiet
+cargo test -p groundgraph-cli --test graph graph_html_writes_self_contained_file --quiet
 ```
 
 Expected: pass.
@@ -502,16 +502,16 @@ Expected: pass.
 
 **Files:**
 
-- Create: `crates/specslice-cli/src/commands/graph_mermaid.rs`
-- Modify: `crates/specslice-cli/src/commands/graph.rs`
-- Test: `crates/specslice-cli/tests/graph.rs`
+- Create: `crates/groundgraph-cli/src/commands/graph_mermaid.rs`
+- Modify: `crates/groundgraph-cli/src/commands/graph.rs`
+- Test: `crates/groundgraph-cli/tests/graph.rs`
 
 - [ ] **Step 1: Write the failing Mermaid test**
 
 Run:
 
 ```bash
-specslice graph --format mermaid
+groundgraph graph --format mermaid
 ```
 
 Assert stdout starts with `flowchart LR` and includes at least one edge label.
@@ -529,7 +529,7 @@ Rules:
 - [ ] **Step 3: Run Mermaid test**
 
 ```bash
-cargo test -p specslice-cli --test graph graph_mermaid_prints_flowchart --quiet
+cargo test -p groundgraph-cli --test graph graph_mermaid_prints_flowchart --quiet
 ```
 
 Expected: pass.
@@ -538,10 +538,10 @@ Expected: pass.
 
 **Files:**
 
-- Modify: `crates/specslice-engine/src/graph.rs`
-- Modify: `crates/specslice-cli/src/commands/graph_html.rs`
-- Test: `crates/specslice-engine/tests/graph.rs`
-- Test: `crates/specslice-cli/tests/graph.rs`
+- Modify: `crates/groundgraph-engine/src/graph.rs`
+- Modify: `crates/groundgraph-cli/src/commands/graph_html.rs`
+- Test: `crates/groundgraph-engine/tests/graph.rs`
+- Test: `crates/groundgraph-cli/tests/graph.rs`
 
 - [ ] **Step 1: Add risk findings test**
 
@@ -553,13 +553,13 @@ Call existing checks from graph build, or accept check findings as input if avoi
 
 - [ ] **Step 3: Add candidate placeholder test**
 
-Until `.specslice/candidates/` is implemented, `--include-candidates` should not fail. It should return zero candidate edges and a stable empty state.
+Until `.groundgraph/candidates/` is implemented, `--include-candidates` should not fail. It should return zero candidate edges and a stable empty state.
 
 - [ ] **Step 4: Run related tests**
 
 ```bash
-cargo test -p specslice-engine --test graph --quiet
-cargo test -p specslice-cli --test graph --quiet
+cargo test -p groundgraph-engine --test graph --quiet
+cargo test -p groundgraph-cli --test graph --quiet
 ```
 
 Expected: pass.
@@ -606,14 +606,14 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/specslice-engine/src/graph.rs crates/specslice-cli/src/commands/graph.rs crates/specslice-cli/src/commands/graph_html.rs crates/specslice-cli/src/commands/graph_mermaid.rs crates/specslice-engine/tests/graph.rs crates/specslice-cli/tests/graph.rs crates/specslice-engine/src/lib.rs crates/specslice-cli/src/main.rs crates/specslice-cli/src/commands/mod.rs docs/implementation-plan.md docs/visualization-design.md
+git add crates/groundgraph-engine/src/graph.rs crates/groundgraph-cli/src/commands/graph.rs crates/groundgraph-cli/src/commands/graph_html.rs crates/groundgraph-cli/src/commands/graph_mermaid.rs crates/groundgraph-engine/tests/graph.rs crates/groundgraph-cli/tests/graph.rs crates/groundgraph-engine/src/lib.rs crates/groundgraph-cli/src/app.rs crates/groundgraph-cli/src/commands/mod.rs docs/implementation-plan.md docs/visualization-design.md
 git commit -m "增加可视化图谱导出"
 ```
 
 ## Acceptance Criteria
 
-- `specslice graph --format json` outputs valid JSON.
-- `specslice graph --format html` writes `.specslice/export/graph.html`.
+- `groundgraph graph --format json` outputs valid JSON.
+- `groundgraph graph --format html` writes `.groundgraph/export/graph.html`.
 - Opening the HTML file in a browser shows a graph viewer without a dev server.
 - The HTML has no remote network dependency.
 - Confirmed edges and fact edges are visually distinct.
@@ -631,8 +631,8 @@ git diff --check
 
 ## Future Extensions
 
-- `specslice graph serve` for auto-refresh during local exploration.
+- `groundgraph graph serve` for auto-refresh during local exploration.
 - Interactive candidate accept/reject UI after candidate storage is stable.
-- Diff overlay for `specslice impact --base <ref> --graph`.
+- Diff overlay for `groundgraph impact --base <ref> --graph`.
 - File opener integration through configurable `link_mode = "none" | "file" | "vscode"`.
 - Export PNG/SVG after HTML renderer is stable.

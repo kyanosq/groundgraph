@@ -1,0 +1,22 @@
+[package]
+name = "groundgraph-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite-backed graph store for GroundGraph."
+
+[dependencies]
+groundgraph-core = { path = "../groundgraph-core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = "1.11.0"
+
+[lints]
+workspace = true

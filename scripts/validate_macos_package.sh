@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
-  echo "usage: scripts/validate_macos_package.sh dist/specslice-<version>-macos-universal.tar.gz" >&2
+  echo "usage: scripts/validate_macos_package.sh dist/groundgraph-<version>-macos-universal.tar.gz" >&2
   exit 2
 fi
 
@@ -30,12 +30,12 @@ if [ "$TOP_COUNT" != "1" ]; then
 fi
 ROOT="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 
-test -x "$ROOT/bin/specslice"
-test -x "$ROOT/libexec/specslice"
-test -f "$ROOT/tool/specslice_dart_analyzer/bin/specslice_dart_analyzer.dart"
-test -f "$ROOT/tool/specslice_dart_analyzer/pubspec.yaml"
-test -f "$ROOT/skills/specslice/SKILL.md"
-test -f "$ROOT/skills/specslice/agents/openai.yaml"
+test -x "$ROOT/bin/groundgraph"
+test -x "$ROOT/libexec/groundgraph"
+test -f "$ROOT/tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart"
+test -f "$ROOT/tool/groundgraph_dart_analyzer/pubspec.yaml"
+test -f "$ROOT/skills/groundgraph/SKILL.md"
+test -f "$ROOT/skills/groundgraph/agents/openai.yaml"
 test -f "$ROOT/README.md"
 test -f "$ROOT/README-AI-SKILL.md"
 
@@ -44,8 +44,8 @@ if find "$ROOT" -path "*/.dart_tool/*" -print -quit | grep -q .; then
   exit 1
 fi
 
-lipo -info "$ROOT/libexec/specslice" | grep -q "x86_64"
-lipo -info "$ROOT/libexec/specslice" | grep -q "arm64"
-"$ROOT/bin/specslice" --help >/dev/null
+lipo -info "$ROOT/libexec/groundgraph" | grep -q "x86_64"
+lipo -info "$ROOT/libexec/groundgraph" | grep -q "arm64"
+"$ROOT/bin/groundgraph" --help >/dev/null
 
 echo "package is valid: $ARCHIVE"

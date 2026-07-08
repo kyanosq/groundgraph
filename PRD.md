@@ -1,10 +1,10 @@
-# SpecSlice Rust Core + Dart Adapter 分阶段 MVP 与后续演进方案 v0.5
+# GroundGraph Rust Core + Dart Adapter 分阶段 MVP 与后续演进方案 v0.5
 
 ## 0. 文档定位
 
-本文档用于重新收敛 SpecSlice 的开发范围，并明确一个关键边界：
+本文档用于重新收敛 GroundGraph 的开发范围，并明确一个关键边界：
 
-> **SpecSlice 本体不是 Dart 库，而是 Rust 构建的 CLI / Engine / Library；Dart 只是 MVP 阶段优先支持的目标语言 Adapter。**
+> **GroundGraph 本体不是 Dart 库，而是 Rust 构建的 CLI / Engine / Library；Dart 只是 MVP 阶段优先支持的目标语言 Adapter。**
 
 当前 MVP 不追求“自动理解整个仓库”，而是先跑通一个对 AI 编程最有价值的非侵入式关系闭环：
 
@@ -126,38 +126,38 @@ MVP 核心原则：
 
 ### 2.1 非侵入式硬约束
 
-SpecSlice 对目标仓库的默认工作方式必须是只读扫描业务内容，只写 SpecSlice 自己拥有的目录。
+GroundGraph 对目标仓库的默认工作方式必须是只读扫描业务内容，只写 GroundGraph 自己拥有的目录。
 
 ```text
 业务代码：只读扫描，不要求、不支持工具专用注解。
 业务测试：只读扫描，不要求、不支持工具专用注解。
 业务文档：只读扫描，不要求新增 frontmatter、Related 段落或工具标记。
 
-SpecSlice 可写位置：
-- .specslice.yaml
-- .specslice/links.yaml
-- .specslice/graph.db
-- .specslice/export/
-- 后续 .specslice/requirements.yaml
-- 后续 .specslice/candidates/
+GroundGraph 可写位置：
+- .groundgraph.yaml
+- .groundgraph/links.yaml
+- .groundgraph/graph.db
+- .groundgraph/export/
+- 后续 .groundgraph/requirements.yaml
+- 后续 .groundgraph/candidates/
 ```
 
-已有业务文档中的 frontmatter 可以被兼容读取，但不能成为接入前置条件。没有 frontmatter 的 Markdown 仍应能被索引为 File / DocSection，并通过 `.specslice/links.yaml` 或后续 `.specslice/requirements.yaml` 建立需求关系。
+已有业务文档中的 frontmatter 可以被兼容读取，但不能成为接入前置条件。没有 frontmatter 的 Markdown 仍应能被索引为 File / DocSection，并通过 `.groundgraph/links.yaml` 或后续 `.groundgraph/requirements.yaml` 建立需求关系。
 
-任何 LLM、候选发现、用户澄清结果都不得自动写回业务代码、业务测试或业务文档；只能写入 `.specslice/` 下的外置元数据，或者作为报告输出等待用户确认。
+任何 LLM、候选发现、用户澄清结果都不得自动写回业务代码、业务测试或业务文档；只能写入 `.groundgraph/` 下的外置元数据，或者作为报告输出等待用户确认。
 
 业务逻辑文档与代码/测试的关联不得由人工标注产生，也不得由文件名、类名、测试名、关键词等规则匹配直接产生。规则只能做三件事：
 
 ```text
 1. 解析事实：文件、标题、符号、测试、行号、hash。
 2. 校验事实：AI 候选引用的节点是否存在、是否唯一、是否可定位。
-3. 维护已确认关系：列出、检查、删除或修正 `.specslice/` 中的外置元数据。
+3. 维护已确认关系：列出、检查、删除或修正 `.groundgraph/` 中的外置元数据。
 ```
 
 关联生成流程必须是：
 
 ```text
-facts -> AI candidate links/questions -> human confirm/edit/reject -> .specslice/links.yaml
+facts -> AI candidate links/questions -> human confirm/edit/reject -> .groundgraph/links.yaml
 ```
 
 人工可以修改已确认的外置关系，但这属于维护和纠错，不是主要建链方式。
@@ -200,7 +200,7 @@ MVP 不承诺：
 5. route graph。
 ```
 
-Dart Adapter 只负责把 Dart/Flutter 源码转成 SpecSlice 统一中间模型，不直接写数据库。
+Dart Adapter 只负责把 Dart/Flutter 源码转成 GroundGraph 统一中间模型，不直接写数据库。
 
 ---
 
@@ -273,9 +273,9 @@ Dart analyzer sidecar
 ### 范围
 
 ```text
-1. specslice init
-2. .specslice.yaml
-3. .specslice/graph.db
+1. groundgraph init
+2. .groundgraph.yaml
+3. .groundgraph/graph.db
 4. ArtifactNode
 5. EdgeAssertion
 6. Evidence
@@ -288,17 +288,17 @@ Dart analyzer sidecar
 运行：
 
 ```bash
-specslice init
-specslice export --format jsonl
+groundgraph init
+groundgraph export --format jsonl
 ```
 
 应能生成：
 
 ```text
-.specslice/
+.groundgraph/
   graph.db
   export/
-.specslice.yaml
+.groundgraph.yaml
 ```
 
 ---
@@ -316,9 +316,9 @@ specslice export --format jsonl
 2. 提取 Markdown File / DocSection。
 3. 兼容读取已有 frontmatter 中的 id / type / title / status。
 4. 不要求业务文档新增 frontmatter。
-5. Requirement 节点可由已有 frontmatter、`.specslice/links.yaml` 或后续 `.specslice/requirements.yaml` 创建。
+5. Requirement 节点可由已有 frontmatter、`.groundgraph/links.yaml` 或后续 `.groundgraph/requirements.yaml` 创建。
 6. 建立 DocSection --documents--> Requirement。
-7. 不解析业务文档中的工具专用关系标记；跨文档/代码/测试关系由 `.specslice/links.yaml` 声明。
+7. 不解析业务文档中的工具专用关系标记；跨文档/代码/测试关系由 `.groundgraph/links.yaml` 声明。
 ```
 
 ### 文档示例
@@ -355,8 +355,8 @@ requirements:
 运行：
 
 ```bash
-specslice index --docs-only
-specslice check
+groundgraph index --docs-only
+groundgraph check
 ```
 
 应能输出：
@@ -373,7 +373,7 @@ Broken links: 0 / N
 
 ### 目标
 
-在 Rust Core 中通过 Dart language adapter，从 Dart/Flutter 代码中提取文件、类、方法、函数、测试；需求关系只从 `.specslice/links.yaml` 读取。
+在 Rust Core 中通过 Dart language adapter，从 Dart/Flutter 代码中提取文件、类、方法、函数、测试；需求关系只从 `.groundgraph/links.yaml` 读取。
 
 ### 重要边界
 
@@ -395,7 +395,7 @@ Dart analyzer sidecar 放到后续 Phase 3。
    - test(...)
    - group(...)
 3. 建立 contains / imports 边。
-4. 索引 `.specslice/links.yaml`。
+4. 索引 `.groundgraph/links.yaml`。
 5. 建立 declared links：
    - CodeSymbol --declaresImplementation--> Requirement
    - TestCase --declaresVerification--> Requirement
@@ -414,15 +414,15 @@ Dart analyzer sidecar 放到后续 Phase 3。
 6. resolved AST。
 ```
 
-代码和测试示例不包含 SpecSlice 注解；关系只写在 `.specslice/links.yaml`。
+代码和测试示例不包含 GroundGraph 注解；关系只写在 `.groundgraph/links.yaml`。
 
 ### 验收标准
 
 运行：
 
 ```bash
-specslice index .
-specslice check
+groundgraph index .
+groundgraph check
 ```
 
 应能识别：
@@ -447,7 +447,7 @@ Broken links: 0 / N
 ### 范围
 
 ```text
-1. specslice slice REQ-ID
+1. groundgraph slice REQ-ID
 2. Requirement Slice Policy
 3. 只走 confirmed/declared 高可信边。
 4. 不默认走 imports。
@@ -500,7 +500,7 @@ Risks:
 运行：
 
 ```bash
-specslice slice REQ-WATERMARK-001
+groundgraph slice REQ-WATERMARK-001
 ```
 
 应能稳定输出：
@@ -611,7 +611,7 @@ Linked tests:
 ### 输出示例
 
 ```text
-SpecSlice Impact Report
+GroundGraph Impact Report
 
 Changed symbols:
 - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService.placeWatermark
@@ -637,7 +637,7 @@ Info:
 在 fixture 中修改实现代码后运行：
 
 ```bash
-specslice impact --base origin/main
+groundgraph impact --base origin/main
 ```
 
 应能输出：
@@ -653,7 +653,7 @@ specslice impact --base origin/main
 在 fixture 中修改需求文档后运行：
 
 ```bash
-specslice impact --base origin/main
+groundgraph impact --base origin/main
 ```
 
 应能输出：
@@ -677,7 +677,7 @@ specslice impact --base origin/main
 
 ```text
 1. Broken Link Check
-   - `.specslice/links.yaml` 指向不存在的 Requirement / DocSection / Symbol / Test
+   - `.groundgraph/links.yaml` 指向不存在的 Requirement / DocSection / Symbol / Test
 
 2. Missing Linked Test Check
    - Requirement 有 linked implementation，但没有 linked verification。
@@ -711,7 +711,7 @@ Info:
 命令：
 
 ```bash
-specslice context REQ-WATERMARK-001 --json
+groundgraph context REQ-WATERMARK-001 --json
 ```
 
 输出：
@@ -750,8 +750,8 @@ specslice context REQ-WATERMARK-001 --json
 运行：
 
 ```bash
-specslice check
-specslice context REQ-WATERMARK-001 --json
+groundgraph check
+groundgraph context REQ-WATERMARK-001 --json
 ```
 
 应能输出可用于 AI Agent 的最小上下文。
@@ -760,7 +760,7 @@ specslice context REQ-WATERMARK-001 --json
 
 ## 5. 逻辑可信度与澄清机制
 
-SpecSlice 需要区分“关系存在”和“业务逻辑可信”。`.specslice/links.yaml` 只能说明某个 Requirement、Symbol、TestCase 被外置关系连接起来，不能证明实现真的满足业务逻辑，也不能证明测试真的覆盖了行为。
+GroundGraph 需要区分“关系存在”和“业务逻辑可信”。`.groundgraph/links.yaml` 只能说明某个 Requirement、Symbol、TestCase 被外置关系连接起来，不能证明实现真的满足业务逻辑，也不能证明测试真的覆盖了行为。
 
 后续应增加一个外置的 Logic Confidence / Logic Review 层：
 
@@ -797,7 +797,7 @@ questions:
 4. 是否需要新建一个外置 Requirement？
 ```
 
-LLM 可以参与生成候选解释和问题，但输出必须是 candidate，不得进入 confirmed graph，也不得写回业务代码、业务测试或业务文档。用户确认后，结果写入 `.specslice/links.yaml` 或后续 `.specslice/requirements.yaml`。
+LLM 可以参与生成候选解释和问题，但输出必须是 candidate，不得进入 confirmed graph，也不得写回业务代码、业务测试或业务文档。用户确认后，结果写入 `.groundgraph/links.yaml` 或后续 `.groundgraph/requirements.yaml`。
 
 ---
 
@@ -917,7 +917,7 @@ llm_runs
 
 ## 7. Language Adapter 契约
 
-Language Adapter 是 SpecSlice 后续扩展到多语言的关键边界。
+Language Adapter 是 GroundGraph 后续扩展到多语言的关键边界。
 
 ### 6.1 核心原则
 
@@ -987,10 +987,10 @@ MVP 阶段不要过度拆 crate。
 推荐先使用 5 个 crate：
 
 ```text
-specslice/
+groundgraph/
   Cargo.toml
   crates/
-    specslice-core/
+    groundgraph-core/
       src/
         artifact_id.rs
         node.rs
@@ -999,13 +999,13 @@ specslice/
         result_types.rs
         language_batch.rs
 
-    specslice-store/
+    groundgraph-store/
       src/
         sqlite.rs
         migrations.rs
         repositories.rs
 
-    specslice-lang-dart/
+    groundgraph-lang-dart/
       src/
         dart_adapter.rs
         lightweight_parser.rs
@@ -1014,7 +1014,7 @@ specslice/
         links_manifest_indexer.rs
         symbol_range_mapper.rs
 
-    specslice-engine/
+    groundgraph-engine/
       src/
         config.rs
         docs_indexer.rs
@@ -1025,7 +1025,7 @@ specslice/
         context_pack.rs
         export.rs
 
-    specslice-cli/
+    groundgraph-cli/
       src/
         main.rs
         commands/
@@ -1041,20 +1041,20 @@ specslice/
 后续稳定后再拆出：
 
 ```text
-specslice-docs
-specslice-git
-specslice-slice
-specslice-impact
-specslice-checks
-specslice-context
-specslice-mcp
+groundgraph-docs
+groundgraph-git
+groundgraph-slice
+groundgraph-impact
+groundgraph-checks
+groundgraph-context
+groundgraph-mcp
 ```
 
 ---
 
 ## 9. MVP 配置文件
 
-`.specslice.yaml`：
+`.groundgraph.yaml`：
 
 ```yaml
 repo:
@@ -1062,7 +1062,7 @@ repo:
   default_branch: main
 
 storage:
-  path: .specslice/graph.db
+  path: .groundgraph/graph.db
 
 docs:
   paths:
@@ -1093,7 +1093,7 @@ code:
     - "**/*.freezed.dart"
 
 links:
-  path: .specslice/links.yaml
+  path: .groundgraph/links.yaml
 
 slice:
   max_depth: 3
@@ -1264,7 +1264,7 @@ test('places watermark outside face region', () {
 });
 ```
 
-### .specslice/links.yaml
+### .groundgraph/links.yaml
 
 ```yaml
 requirements:
@@ -1280,12 +1280,12 @@ requirements:
 ### 验收命令
 
 ```bash
-specslice init
-specslice index .
-specslice slice REQ-WATERMARK-001
-specslice impact --base origin/main
-specslice check
-specslice context REQ-WATERMARK-001 --json
+groundgraph init
+groundgraph index .
+groundgraph slice REQ-WATERMARK-001
+groundgraph impact --base origin/main
+groundgraph check
+groundgraph context REQ-WATERMARK-001 --json
 ```
 
 ### 验收结果
@@ -1309,7 +1309,7 @@ MVP 不负责自动理解无需求文档或无外置关系声明的仓库。
 
 ```text
 无 REQ 文档
-无 .specslice/links.yaml 关系声明
+无 .groundgraph/links.yaml 关系声明
 ```
 
 这种项目需要后续 Phase 1 的 Candidate Layer。
@@ -1318,7 +1318,7 @@ MVP 不负责自动理解无需求文档或无外置关系声明的仓库。
 
 ## 12. 库调用时返回的核心产物
 
-SpecSlice 内部维护完整 Artifact Graph，但外部不应默认返回完整图。
+GroundGraph 内部维护完整 Artifact Graph，但外部不应默认返回完整图。
 
 外部返回任务相关产物：
 
@@ -1343,7 +1343,7 @@ Clone
 ### 11.1 示例调用
 
 ```rust
-let engine = SpecSliceEngine::open(".")?;
+let engine = GroundGraphEngine::open(".")?;
 
 let index_result = engine.index(IndexOptions::default())?;
 
@@ -1390,12 +1390,12 @@ AgentContextPack:
 2. CandidateLinkEdge
 3. candidate_features 表
 4. candidate_edges 表
-5. specslice link-docs
-6. specslice infer-features
-7. specslice accept-feature
-8. specslice ask
-9. .specslice/requirements.yaml
-10. .specslice/candidates/
+5. groundgraph link-docs
+6. groundgraph infer-features
+7. groundgraph accept-feature
+8. groundgraph ask
+9. .groundgraph/requirements.yaml
+10. .groundgraph/candidates/
 ```
 
 ### 原则
@@ -1406,7 +1406,7 @@ AgentContextPack:
 3. Candidate 默认 pendingReview。
 4. CI 不信任 candidate。
 5. Candidate 不写回业务代码、业务测试或业务文档。
-6. 用户确认后只更新 `.specslice/` 下的外置元数据。
+6. 用户确认后只更新 `.groundgraph/` 下的外置元数据。
 7. 规则匹配不能生成业务关联；规则只能解析事实和校验 AI candidate。
 8. 人工可以修改已确认关系，但不是主要建链入口。
 ```
@@ -1419,7 +1419,7 @@ AgentContextPack:
 3. AI 生成 candidate links / missing_doc / missing_link / mismatch_candidate / questions。
 4. 系统校验 candidate 引用的节点是否存在且唯一。
 5. 用户确认、编辑或拒绝候选。
-6. 将确认结果写入 .specslice/requirements.yaml 或 .specslice/links.yaml。
+6. 将确认结果写入 .groundgraph/requirements.yaml 或 .groundgraph/links.yaml。
 7. 重新 index / check / impact。
 ```
 
@@ -1439,7 +1439,7 @@ AgentContextPack:
 1. ReviewSession
 2. ReviewItem
 3. ReviewDecision
-4. specslice review --interactive
+4. groundgraph review --interactive
 5. accept / reject / merge candidate
 6. 批量确认 feature cluster
 ```
@@ -1475,12 +1475,12 @@ AgentContextPack:
 
 ### 目标
 
-把 SpecSlice 接入 AI 编程工具。
+把 GroundGraph 接入 AI 编程工具。
 
 ### 新增能力
 
 ```text
-1. specslice mcp
+1. groundgraph mcp
 2. get_feature_slice
 3. get_pr_impact
 4. find_docs_for_symbol
@@ -1544,7 +1544,7 @@ Rust MVP 必须保留：
 1. JSONL export
 2. stable node IDs
 3. edge assertion schema
-4. .specslice.yaml
+4. .groundgraph.yaml
 ```
 
 这样未来多语言版本、SCIP 版本、GraphRAG 版本都可以读取 MVP 阶段产物。
@@ -1568,7 +1568,7 @@ Rust MVP 必须保留：
 | Phase 5 | GraphRAG / Semantic Query | 后续 |
 | Phase 6 | SCIP / 多语言 / 高性能图存储 | 后续（✅ 已落地 v0.2.0+） |
 
-> **实现状态对照（v0.2.0+，2026-06）**：本表的"后续"指**优先级**而非"尚未实现"。截至 v0.2.0，Phase 2（Review Workflow，`candidate review`）、Phase 3（Dart analyzer sidecar）、Phase 4（MCP / Agent 集成，`specslice-mcp`）、**Phase 6（SCIP overlay 自动调用 + 12 门 tree-sitter 多语言 + 高性能图存储：WAL + checkpoint + bulk upsert + FTS5）均已落地**。仅 **Phase 5（GraphRAG / Semantic Query）仍为规划项**。
+> **实现状态对照（v0.2.0+，2026-06）**：本表的"后续"指**优先级**而非"尚未实现"。截至 v0.2.0，Phase 2（Review Workflow，`candidate review`）、Phase 3（Dart analyzer sidecar）、Phase 4（MCP / Agent 集成，`groundgraph-mcp`）、**Phase 6（SCIP overlay 自动调用 + 12 门 tree-sitter 多语言 + 高性能图存储：WAL + checkpoint + bulk upsert + FTS5）均已落地**。仅 **Phase 5（GraphRAG / Semantic Query）仍为规划项**。
 
 ---
 
@@ -1593,7 +1593,7 @@ Rust MVP 必须保留：
 
 ## 16. 最终结论
 
-SpecSlice 的完整愿景是：
+GroundGraph 的完整愿景是：
 
 > **面向 AI 编程的代码库意图治理层。**
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse captured cursor-agent runs and score grep-arm vs specslice-arm.
+"""Parse captured cursor-agent runs and score grep-arm vs groundgraph-arm.
 
 Reads `runs/<task>__<arm>__s<seed>.jsonl` produced by run.py, extracts the
 final answer + every tool call from the stream-json event log, grades the
@@ -38,8 +38,8 @@ def _cmd_invokes(command: str, binaries: set[str]) -> bool:
 
     Splits on shell separators and inspects the first token of each segment, so
     a search TERM or PATH that merely contains the binary's name (e.g. the
-    `specslice` in the path `crates/specslice-engine/...` or the workspace
-    `.../specslice-bench/wt`) does not count as an invocation.
+    `groundgraph` in the path `crates/groundgraph-engine/...` or the workspace
+    `.../groundgraph-bench/wt`) does not count as an invocation.
     """
     if not command:
         return False
@@ -70,8 +70,8 @@ class ToolCall:
     def tags(self) -> set[str]:
         name_l = self.name.lower()
         tags: set[str] = set()
-        if "specslice" in name_l or _cmd_invokes(self.command, {"specslice"}):
-            tags.add("specslice")
+        if "groundgraph" in name_l or _cmd_invokes(self.command, {"groundgraph"}):
+            tags.add("groundgraph")
         if re.search(r"grep|ripgrep", name_l) or _cmd_invokes(
             self.command, {"rg", "grep", "egrep", "fgrep", "git grep"}
         ):
@@ -249,17 +249,17 @@ def grade_task(task: dict, answer: str) -> tuple[float, dict]:
 
 
 def purity_flag(rd: RunData) -> str:
-    spec = rd.count("specslice")
+    spec = rd.count("groundgraph")
     if rd.arm == "grep":
-        return "ok" if spec == 0 else f"LEAK({spec} specslice)"
-    if rd.arm == "specslice":
+        return "ok" if spec == 0 else f"LEAK({spec} groundgraph)"
+    if rd.arm == "groundgraph":
         return "used" if spec > 0 else "UNUSED"
     return "-"
 
 
 def render(tasks: dict, runs: list[RunData]) -> str:
     by_id = {t["id"]: t for t in tasks["tasks"]}
-    lines = ["# Agent code-lookup benchmark — grep vs specslice", ""]
+    lines = ["# Agent code-lookup benchmark — grep vs groundgraph", ""]
     lines.append(f"model={tasks.get('defaults', {}).get('model', '?')}  |  runs={len(runs)}")
     lines.append("")
     lines.append("| task | arm | score | pass | purity | tools | grep | spec | read | dur(s) | in/out tok | answer |")
@@ -281,7 +281,7 @@ def render(tasks: dict, runs: list[RunData]) -> str:
         passed = "TO" if incomplete else ("Y" if score >= 0.999 else ("." if score > 0 else "N"))
         lines.append(
             f"| {rd.task} | {rd.arm} | {score:.2f} | {passed} | {purity_flag(rd)} | "
-            f"{len(rd.tool_calls)} | {rd.count('grep')} | {rd.count('specslice')} | {rd.count('read')} | "
+            f"{len(rd.tool_calls)} | {rd.count('grep')} | {rd.count('groundgraph')} | {rd.count('read')} | "
             f"{rd.duration_ms/1000:.1f} | {rd.in_tokens}/{rd.out_tokens} | {ans} |"
         )
 
@@ -322,13 +322,13 @@ def _selftest() -> int:
             {
                 "type": "tool_call",
                 "subtype": "started",
-                # path contains "specslice" — must NOT be miscounted as a specslice invocation
-                "tool_call": {"shellToolCall": {"args": {"command": "rg -n detach_process_group /Users/x/specslice-bench/wt/crates/specslice-engine"}}, "toolCallId": "a"},
+                # path contains "groundgraph" — must NOT be miscounted as a groundgraph invocation
+                "tool_call": {"shellToolCall": {"args": {"command": "rg -n detach_process_group /Users/x/groundgraph-bench/wt/crates/groundgraph-engine"}}, "toolCallId": "a"},
             },
             {
                 "type": "tool_call",
                 "subtype": "started",
-                "tool_call": {"shellToolCall": {"args": {"command": "specslice search detach_process_group"}}, "toolCallId": "b"},
+                "tool_call": {"shellToolCall": {"args": {"command": "groundgraph search detach_process_group"}}, "toolCallId": "b"},
             },
             {"type": "tool_call", "subtype": "completed", "tool_call": {"shellToolCall": {"args": {}, "result": {}}}},
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "FILES=lsp_client.rs,scip_runner.rs"}]}},
@@ -344,17 +344,17 @@ def _selftest() -> int:
     )
     failures = []
     with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "t3_callers_detach__specslice__s1.jsonl"
+        p = Path(d) / "t3_callers_detach__groundgraph__s1.jsonl"
         p.write_text(fixture, encoding="utf-8")
         rd = parse_run(p)
-        if rd.task != "t3_callers_detach" or rd.arm != "specslice" or rd.seed != 1:
+        if rd.task != "t3_callers_detach" or rd.arm != "groundgraph" or rd.seed != 1:
             failures.append(f"filename parse: {rd.task}/{rd.arm}/{rd.seed}")
         if len(rd.tool_calls) != 2:
             failures.append(f"expected 2 started tool calls, got {len(rd.tool_calls)}")
         if rd.count("grep") != 1:
             failures.append(f"expected 1 grep call, got {rd.count('grep')}")
-        if rd.count("specslice") != 1:
-            failures.append(f"expected 1 specslice call, got {rd.count('specslice')}")
+        if rd.count("groundgraph") != 1:
+            failures.append(f"expected 1 groundgraph call, got {rd.count('groundgraph')}")
         if rd.duration_ms != 12000 or rd.out_tokens != 40:
             failures.append("result fields not parsed")
         if "result event" not in rd.final_answer and "FILES=dart_sidecar" not in rd.final_answer:

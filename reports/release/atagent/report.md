@@ -1,10 +1,10 @@
-## atagent (python) — specslice 0.2.0 真实扫描
+## atagent (python) — groundgraph 0.2.0 真实扫描
 
 - 源仓: `/Users/qjs/Code/Projects/atagent`
 - scratch 副本: `release-scans/_scratch/atagent/`（已 gitignore）
-- 目标仓副作用: 无 — 没有任何 `.specslice/` / `graph.db` / export 文件落到源仓内。
+- 目标仓副作用: 无 — 没有任何 `.groundgraph/` / `graph.db` / export 文件落到源仓内。
 
-### `specslice index` 输出
+### `groundgraph index` 输出
 
 ```
 Docs index:
@@ -33,10 +33,10 @@ Links index:
   Edges: 0
 ```
 
-### `specslice check` 摘要（前 60 行）
+### `groundgraph check` 摘要（前 60 行）
 
 ```
-SpecSlice Checks: 0 findings.
+GroundGraph Checks: 0 findings.
 ```
 
 ### Graph code-view 规模

@@ -1,13 +1,13 @@
 {
-  "_about": "Agent code-lookup benchmark: grep arm vs specslice arm, same model/workspace/prompt. Ground truth is INDEPENDENT of specslice (hand-verified from source + ripgrep), never derived from specslice's own graph, to avoid circular evaluation.",
+  "_about": "Agent code-lookup benchmark: grep arm vs groundgraph arm, same model/workspace/prompt. Ground truth is INDEPENDENT of groundgraph (hand-verified from source + ripgrep), never derived from GroundGraph's own graph, to avoid circular evaluation.",
   "defaults": {
-    "workspace": "/Users/qjs/Code/Projects/specslice-bench/wt",
+    "workspace": "/Users/qjs/Code/Projects/groundgraph-bench/wt",
     "model": "composer-2.5",
     "timeout_secs": 600
   },
   "arms": {
-    "grep": "Constraints for THIS task: use ONLY ripgrep (`rg`) / `grep` via the shell plus reading files. You MUST NOT run the `specslice` command or use any specslice tool.",
-    "specslice": "A `specslice` CLI is available on PATH (subcommands: search, trace, impact, dead-code, facts, graph). It is a code-graph replacement for grep. Prefer `specslice` for code navigation; you may also read files. Avoid plain grep/rg where specslice can answer it."
+    "grep": "Constraints for THIS task: use ONLY ripgrep (`rg`) / `grep` via the shell plus reading files. You MUST NOT run the `groundgraph` command or use any groundgraph tool.",
+    "groundgraph": "A `groundgraph` CLI is available on PATH (subcommands: search, trace, impact, dead-code, facts, graph). It is a code-graph replacement for grep. Prefer `groundgraph` for code navigation; you may also read files. Avoid plain grep/rg where groundgraph can answer it."
   },
   "tasks": [
     {
@@ -24,7 +24,7 @@
     },
     {
       "id": "t2_callcount_kill_tree",
-      "bucket": "call-site precision (specslice-favored)",
+      "bucket": "call-site precision (groundgraph-favored)",
       "prompt": "How many times is the function `kill_tree` actually INVOKED (called) in this workspace? Exclude its own definition, doc comments, string literals, and test code. Reply on a single line in EXACTLY this format: `CALLS=<integer> | SITES=<relative/path.rs>:<line>[,<relative/path.rs>:<line>...]`",
       "grade": {
         "type": "fields",
@@ -57,7 +57,7 @@
     {
       "id": "t5_deadcode_island",
       "bucket": "whole-graph reachability / dead island (grep's textual ceiling)",
-      "_oracle": "Rust compiler `never used` lint flags BOTH bench_dead_* (injected fixture); independent of specslice. grep is fooled because bench_dead_alpha IS textually referenced (by the equally-dead bench_dead_beta).",
+      "_oracle": "Rust compiler `never used` lint flags BOTH bench_dead_* (injected fixture); independent of groundgraph. grep is fooled because bench_dead_alpha IS textually referenced (by the equally-dead bench_dead_beta).",
       "prompt": "Find ALL dead functions in this workspace whose names start with `bench_dead_`. A function is dead if it is unreachable from any program entry point. Crucially, include a function even if other code references it, SO LONG AS that referencing code is itself dead (a transitively-dead 'island'). Reply on a single line in EXACTLY this format using bare function names: `DEAD=<name1>,<name2>,...`",
       "grade": {
         "type": "set",
@@ -68,8 +68,8 @@
     {
       "id": "t6_biz_guardrail_closure",
       "bucket": "business-logic assembly / cross-symbol closure (real domain repo)",
-      "workspace": "/Users/qjs/Code/Projects/specslice-bench/mq",
-      "_oracle": "INDEPENDENT: hand-traced by reading src/metaquant/packages/research_guardrails.py (530 lines). The 17-fn downstream closure of evaluate_research_guardrails; the ONLY module fn excluded is guardrail_evaluation_to_dict (called by the CLI, NOT by the entry point). Domain term in docs is '防回测欺骗门禁 / anti-deception gate' but the code is named 'research_guardrails' — a real vocabulary gap. NB: `specslice trace` must use `--seeds 1` or its default 6-seed fuzzy match pollutes the closure (38 nodes).",
+      "workspace": "/Users/qjs/Code/Projects/groundgraph-bench/mq",
+      "_oracle": "INDEPENDENT: hand-traced by reading src/metaquant/packages/research_guardrails.py (530 lines). The 17-fn downstream closure of evaluate_research_guardrails; the ONLY module fn excluded is guardrail_evaluation_to_dict (called by the CLI, NOT by the entry point). Domain term in docs is '防回测欺骗门禁 / anti-deception gate' but the code is named 'research_guardrails' — a real vocabulary gap. NB: `groundgraph trace` must use `--seeds 1` or its default 6-seed fuzzy match pollutes the closure (38 nodes).",
       "prompt": "In this Python repo (MetaQuant, an A-share quant system), the research pipeline runs an automated anti-overfit / anti-backtest-deception guardrail that decides each candidate strategy's risk tier (strict_pass / watchlist / research_only / reject). Its entry point is the function `evaluate_research_guardrails` in `src/metaquant/packages/`. Identify the COMPLETE set of first-party (defined-in-this-repo) Python functions in its downstream call closure — every function it calls, directly or transitively, including the entry point itself. EXCLUDE dataclasses, the `*_to_dict` serializer (the entry point does NOT call it), standard-library / third-party calls, and test code. Reply on a single line in EXACTLY this format using bare function names: `FUNCS=<name1>,<name2>,...`",
       "grade": {
         "type": "set",

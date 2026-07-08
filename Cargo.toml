@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/specslice-core",
-    "crates/specslice-store",
-    "crates/specslice-lang-dart",
-    "crates/specslice-engine",
-    "crates/specslice-cli",
-    "crates/specslice-mcp",
+    "crates/groundgraph-core",
+    "crates/groundgraph-store",
+    "crates/groundgraph-lang-dart",
+    "crates/groundgraph-engine",
+    "crates/groundgraph-cli",
+    "crates/groundgraph-mcp",
 ]
 
 [workspace.package]
@@ -15,10 +15,10 @@ edition = "2021"
 # 1.89 for `File::lock` (concurrent stats append, issues2.md #35).
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/specslice/specslice"
+repository = "https://github.com/groundgraph/groundgraph"
 
 [workspace.lints.rust]
-# SpecSlice is a non-invasive, deterministic indexer. There is no scenario in
+# GroundGraph is a non-invasive, deterministic indexer. There is no scenario in
 # which unsafe Rust is justified here.
 unsafe_code = "forbid"
 

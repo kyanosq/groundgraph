@@ -1,8 +1,8 @@
 {
-  "name": "specslice-webui",
+  "name": "groundgraph-webui",
   "version": "0.2.0",
   "private": true,
-  "description": "Offline WebGL graph viewer assets for SpecSlice.",
+  "description": "Offline WebGL graph viewer assets for GroundGraph.",
   "type": "module",
   "scripts": {
     "audit": "npm audit --audit-level=high",

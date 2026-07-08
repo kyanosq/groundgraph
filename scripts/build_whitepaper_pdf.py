@@ -250,7 +250,7 @@ def footer(canvas, doc):
     canvas.saveState()
     canvas.setFont("CJK", 8)
     canvas.setFillColor(MUTED)
-    canvas.drawString(24 * mm, 12 * mm, "SpecSlice 白皮书")
+    canvas.drawString(24 * mm, 12 * mm, "GroundGraph 白皮书")
     canvas.drawRightString(A4[0] - 24 * mm, 12 * mm, f"第 {doc.page} 页")
     canvas.setStrokeColor(LINE)
     canvas.setLineWidth(0.5)
@@ -261,7 +261,7 @@ def footer(canvas, doc):
 def cover():
     return [
         Spacer(1, 55 * mm),
-        Paragraph("SpecSlice 白皮书", S["cover_t"]),
+        Paragraph("GroundGraph 白皮书", S["cover_t"]),
         Spacer(1, 6 * mm),
         Paragraph("非侵入式 AI 编码意图层", S["cover_s"]),
         Paragraph("用证据图回答:这段代码是干什么的,谁能证明。", S["cover_s"]),
@@ -280,7 +280,7 @@ def main():
     doc = BaseDocTemplate(
         str(OUT), pagesize=A4,
         leftMargin=24 * mm, rightMargin=24 * mm, topMargin=20 * mm, bottomMargin=22 * mm,
-        title="SpecSlice 白皮书", author="SpecSlice",
+        title="GroundGraph 白皮书", author="GroundGraph",
     )
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
     doc.addPageTemplates([PageTemplate(id="page", frames=[frame], onPage=footer)])

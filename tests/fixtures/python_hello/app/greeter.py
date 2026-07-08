@@ -1,4 +1,4 @@
-"""Greeter implementation – used by the SpecSlice Python indexer fixture."""
+"""Greeter implementation – used by the GroundGraph Python indexer fixture."""
 
 from dataclasses import dataclass
 

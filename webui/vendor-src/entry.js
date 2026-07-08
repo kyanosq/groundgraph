@@ -1,4 +1,4 @@
-// Offline bundle entry for the SpecSlice graph viewer.
+// Offline bundle entry for the GroundGraph graph viewer.
 // esbuild rolls three + 3d-force-graph + UnrealBloomPass into one IIFE so the
 // viewer runs from file:// with no network (classic scripts load locally; ESM
 // modules do not). A single bundled `three` instance is shared by the graph

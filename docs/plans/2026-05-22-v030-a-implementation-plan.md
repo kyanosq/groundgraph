@@ -7,7 +7,7 @@
 
 ## Phase 1 — confidence_view 模块（含 EdgeKind 矩阵）
 
-**目标:** 新建 `crates/specslice-engine/src/confidence_view.rs`，导出
+**目标:** 新建 `crates/groundgraph-engine/src/confidence_view.rs`，导出
 `EdgeQualityScope` / `EdgeQualitySummary` / `summarize_edges` /
 `inbound_edge_quality` / `outbound_edge_quality` /
 `NeighborInfo` / `neighbors_of`。
@@ -38,11 +38,11 @@
    - `neighbors_of_excludes_self_loops`
 6. **🟢 实现 `neighbors_of`：合并 `list_edges_from + list_edges_to` →
    按对端 id BTreeMap 去重 → 取前 cap → `Vec<NeighborInfo>`**
-7. **🟢 验收门槛**：fmt / clippy / `cargo test -p specslice-engine confidence_view`
+7. **🟢 验收门槛**：fmt / clippy / `cargo test -p groundgraph-engine confidence_view`
 
 **预计产物:**
-- 新增：`crates/specslice-engine/src/confidence_view.rs`（~250 行 + 测试）
-- 修改：`crates/specslice-engine/src/lib.rs`（`pub mod confidence_view;`）
+- 新增：`crates/groundgraph-engine/src/confidence_view.rs`（~250 行 + 测试）
+- 修改：`crates/groundgraph-engine/src/lib.rs`（`pub mod confidence_view;`）
 
 **完成判据:** 矩阵 + 计数 + 邻接 共 ~12 单测全绿；workspace 仍全绿。
 
@@ -77,7 +77,7 @@
    - warnings 当前 plumbing：dead-code 不会触发 sqlite 错（用的是
      in-memory edges），所以 warnings 字段先**保留为空 Vec**，只锁
      字段存在性 + 向后兼容序列化；将来若做按需 sqlite 查询再激活。
-3. **🟢 验收**：fmt / clippy / `cargo test -p specslice-engine dead_code`
+3. **🟢 验收**：fmt / clippy / `cargo test -p groundgraph-engine dead_code`
 
 **完成判据:** 4 新单测绿 + 既有 dead_code 测试 100% 不动也仍绿。
 
@@ -91,7 +91,7 @@
 
 **TDD 顺序:**
 
-1. **🔴 测试**（在 `crates/specslice-engine/src/search.rs::tests`）：
+1. **🔴 测试**（在 `crates/groundgraph-engine/src/search.rs::tests`）：
    - `score_match_includes_edge_evidence_boost_when_high_tier_outbound_exists`
    - `score_match_does_not_include_edge_evidence_boost_when_only_medium_low_outbound`
    - `neighbor_boost_caps_at_single_increment_per_hit`
@@ -112,7 +112,7 @@
        neighbors)，`matches_total = matched.len()`，最多 +1 次
        SCORE_NEIGHBOR，reason 只列前 2 个 name，>2 加 "等"。
    - **engine 层任何 stderr 都禁止** — 改 push 进 `result.warnings`。
-3. **🟢 验收**：fmt / clippy / `cargo test -p specslice-engine search`
+3. **🟢 验收**：fmt / clippy / `cargo test -p groundgraph-engine search`
 
 **完成判据:** 8 新单测绿 + 既有 search 测试全绿。
 
@@ -127,10 +127,10 @@
 
 1. **🔴 测试**：
    - `cli_dead_code_human_renders_warnings_when_present`
-     （在 `crates/specslice-cli`）
+     （在 `crates/groundgraph-cli`）
    - `cli_search_human_renders_warnings_when_present`
    - `mcp_search_graph_passes_through_warnings`
-     （在 `crates/specslice-mcp` 的 tools 测试中）
+     （在 `crates/groundgraph-mcp` 的 tools 测试中）
    - `mcp_dead_code_passes_through_warnings`
 2. **🟢 实现**：
    - CLI human renderer：在 dead-code / search 的人类输出末尾，
@@ -172,7 +172,7 @@ search top-10 diff，写到 `reports/release/v0.3.0-A.md`。
 
 1. `docs/implementation-plan.md` 增 v0.3.0-A 章节，链接 spec + 本文件
    + 报告。
-2. `packaging/skills/specslice/SKILL.md` 增"evidence_quality 现已影响
+2. `packaging/skills/groundgraph/SKILL.md` 增"evidence_quality 现已影响
    dead-code reason 与 search ranking"段。
 3. `docs/superpowers/specs/.../design.md` 添加一个 "Implementation
    addendum: summarize_edges helper" 小段，把第三个 API 入档（避免
@@ -182,7 +182,7 @@ search top-10 diff，写到 `reports/release/v0.3.0-A.md`。
    cargo fmt --all -- --check
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
-   dart test  # 在 tool/specslice_dart_analyzer/
+   dart test  # 在 tool/groundgraph_dart_analyzer/
    ```
 5. 中文 commit 信息分阶段落（每个 Phase 一个 commit，保持 history
    可二分查找）。

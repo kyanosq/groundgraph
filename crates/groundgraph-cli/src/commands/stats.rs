@@ -1,0 +1,96 @@
+//! `groundgraph stats` — summarise the per-command usage ledger written to
+//! `<repo_root>/.groundgraph/stats.jsonl`.
+//!
+//! Every CLI invocation appends one record (command, duration, ok, metrics).
+//! This command aggregates them into per-command call counts, total/avg/max
+//! duration, error counts, and summed metrics (nodes queried / results returned
+//! / coverage …) — answering "每个命令调用了多少，返回了多少".
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use groundgraph_engine::config::workspace_dir_for_repo;
+use groundgraph_engine::stats::{summarize_files, StatsSummary, STATS_REL_PATH};
+
+pub struct StatsRunArgs {
+    pub repo_root: PathBuf,
+    pub json: bool,
+    pub reset: bool,
+}
+
+pub fn run(args: StatsRunArgs) -> Result<()> {
+    let workspace_dir = workspace_dir_for_repo(&args.repo_root);
+    let path = workspace_dir.join(STATS_REL_PATH);
+    // The ledger rotates at a size cap (#250): old records spill into a single
+    // `.1` sibling, so the summary must fold both files and reset must clear both.
+    let rotated = workspace_dir.join(format!("{STATS_REL_PATH}.1"));
+
+    if args.reset {
+        let existed = path.exists() || rotated.exists();
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        if rotated.exists() {
+            std::fs::remove_file(&rotated)?;
+        }
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "reset": true,
+                    "existed": existed,
+                    "path": path.display().to_string(),
+                }))?
+            );
+        } else if existed {
+            println!("已清空命令统计：{}", path.display());
+        } else {
+            println!("命令统计账本不存在，无需清空：{}", path.display());
+        }
+        return Ok(());
+    }
+
+    let summary = summarize_files(&[rotated.as_path(), path.as_path()])?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    print_human(&summary, &path.display().to_string());
+    Ok(())
+}
+
+fn print_human(summary: &StatsSummary, path: &str) {
+    println!("GroundGraph 命令统计");
+    println!("账本: {path}");
+    if summary.total_calls == 0 {
+        println!("（暂无记录：运行任意命令后会自动累积）");
+        return;
+    }
+    println!(
+        "总计: {} 次调用，{} 次失败",
+        summary.total_calls, summary.total_errors
+    );
+    println!();
+    println!(
+        "{:<18} {:>6} {:>6} {:>9} {:>8} {:>8}  指标(累计)",
+        "命令", "调用", "失败", "总耗时ms", "平均ms", "最大ms"
+    );
+    println!("{}", "-".repeat(78));
+    for c in &summary.commands {
+        let metrics = if c.metrics.is_empty() {
+            String::new()
+        } else {
+            c.metrics
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "{:<18} {:>6} {:>6} {:>9} {:>8.1} {:>8}  {}",
+            c.command, c.calls, c.errors, c.total_ms, c.avg_ms, c.max_ms, metrics
+        );
+    }
+}

@@ -1,7 +1,7 @@
 # v0.3.0-A — 把 evidence_quality 接到 dead-code 和 search
 
 - **Status:** Draft (待 user review)
-- **Author / drafter:** SpecSlice agent (Cursor / Claude Opus 4.7)
+- **Author / drafter:** GroundGraph agent (Cursor / Claude Opus 4.7)
 - **Date:** 2026-05-22
 - **Sub-project of:** v0.3.0 主题"图可信度 / 死代码误报收敛 / 候选证据评分 / 搜索排序 / MCP·Skill 闭环"
 - **Depends on:** v0.2.0 已上线的 `edge_confidence` 模块
@@ -10,9 +10,9 @@
 ## 1. 问题陈述
 
 v0.2.0 已经把每条边算成 `EdgeConfidence::High | Medium | Low`
-（`crates/specslice-engine/src/edge_confidence.rs:102-181`），
+（`crates/groundgraph-engine/src/edge_confidence.rs:102-181`），
 并把它作为 `evidence_quality` 字段挂在 `GraphEdge` 上
-（`crates/specslice-engine/src/graph.rs:600-627`），但**下游消费者一个都没用**：
+（`crates/groundgraph-engine/src/graph.rs:600-627`），但**下游消费者一个都没用**：
 
 - `search.rs:48-66` 定义了 `SCORE_EDGE_EVIDENCE = 30` 和
   `SCORE_NEIGHBOR = 20` 两个常量，但代码里**从不 reference**——
@@ -32,9 +32,9 @@ helper 给后续 B/C/D 复用。
 
 具体可观测变化：
 
-- `specslice dead-code --json` 的 high-bucket entry 在"仅有低置信
+- `groundgraph dead-code --json` 的 high-bucket entry 在"仅有低置信
   入边"时多一行 reason，操作者能看出证据强度。
-- `specslice search "<token>"` 的命中排序在以下两种情况里被推前：
+- `groundgraph search "<token>"` 的命中排序在以下两种情况里被推前：
   - 命中节点本身有高置信出边（语义"这是一个有强证据的核心符号"）。
   - 命中节点的 1-hop 邻居里有另一条命中（语义"功能域内多点共现"）。
 - `search` 的 JSON / MCP 输出新增结构化 `warnings: Vec<String>`，
@@ -125,8 +125,8 @@ kind 列表会在 v0.3.0-C 上线时立刻分叉，提前让 scope 参数化是
 //! usage 证据"这个判断。
 
 use crate::edge_confidence::{confidence_for_edge, EdgeConfidence};
-use specslice_core::edge::EdgeKind;
-use specslice_store::Store;
+use groundgraph_core::edge::EdgeKind;
+use groundgraph_store::Store;
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,8 +391,8 @@ dead_code --json
 
 `cargo fmt --all -- --check`、`cargo clippy --workspace
 --all-targets -- -D warnings`、`cargo test --workspace`、
-`dart test` 在 `tool/specslice_dart_analyzer/` 仍是必过门槛；
-`cargo test -p specslice-engine --test lsp_indexers --
+`dart test` 在 `tool/groundgraph_dart_analyzer/` 仍是必过门槛；
+`cargo test -p groundgraph-engine --test lsp_indexers --
 --include-ignored` 不在本轮的 scope 改动里（不动 LSP 路径）。
 
 ## 8. Error handling
@@ -431,7 +431,7 @@ dead_code --json
 
 完成本 sub-project 时，user 应能在 review 阶段看到：
 
-- [ ] `crates/specslice-engine/src/confidence_view.rs` 新增 + ~12 个
+- [ ] `crates/groundgraph-engine/src/confidence_view.rs` 新增 + ~12 个
   单测全绿（含 EdgeKind 矩阵 + neighbors_of 行为）
 - [ ] `dead_code.rs` 改动 + 3 个新单测 + 现有单测全部不动也仍绿
 - [ ] `search.rs` 改动 + 8 个新单测 + 现有单测全部仍绿
@@ -502,7 +502,7 @@ atagent / pixcraft-landing / vub）上跑出真实数据：
 
 ### 14.4 不在 v0.3.0-A 范围内的遗留 bug
 
-- `specslice-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
+- `groundgraph-cli/src/commands/search.rs::parse_kind` 的 P20 补丁
   只覆盖 Dart / Swift / Go / Python 别名，**TypeScript / Java**
   NodeKind 别名缺失。`--kind typescript_function` / `--kind
   java_method` 在 CLI 本地解析器就被拒绝，尽管 engine 已经

@@ -1,0 +1,4065 @@
+//! P24 — Business evidence pack (`groundgraph propose`).
+//!
+//! The product goal is *building business documentation from code*. The
+//! P9 layer already defines the on-disk shape for AI-authored business
+//! claims (`.groundgraph/candidates/business_logic.yaml`) and the human
+//! review loop (`groundgraph candidate review`), but the *generation* of
+//! those candidates was manual: an analyst had to trawl the graph by
+//! hand. `connect propose` (P1) only emits a flat, link-oriented pack
+//! (orphan symbols/tests) and is too slow on real repos to be usable
+//! for this purpose.
+//!
+//! This module closes that gap. [`propose_business_pack`] reads the
+//! indexed graph and produces a **per-business-module evidence pack**:
+//!
+//! - It segments code/test symbols into *business modules* from the
+//!   **code graph itself** — deterministic Louvain community detection
+//!   over the call/import coupling (see [`crate::feature_cluster`]). The
+//!   target repo is *not* assumed to be tidily foldered: a feature whose
+//!   files are scattered across `lib/models`, `lib/services`, `lib/ui`
+//!   still clusters together because its symbols call each other densely.
+//!   Directory convention (`lib/features/<x>`) is used only to *name* a
+//!   community and as a fallback bucket for files with no edges.
+//! - For each module it rolls up the **business signals** already on the
+//!   graph: framework roles (routes/tasks/CLI), Riverpod providers read,
+//!   storage written, navigation routes, stream subscriptions, the
+//!   representative entry-point symbols, the related docs and tests, and
+//!   the cross-module dependencies (imports/calls that cross a module
+//!   boundary).
+//! - It emits a Chinese prompt instructing an external AI to turn the
+//!   pack into `business_logic.yaml` candidates — grounded *only* in the
+//!   evidence ids present in the pack, never inventing paths/names.
+//!
+//! The pack is the input to the existing P9 → human-confirmation loop:
+//!
+//! ```text
+//! groundgraph propose            (this module: code facts -> evidence pack + prompt)
+//!   -> AI writes business_logic.yaml   (grounded in the pack)
+//!   -> groundgraph candidate review      (human confirms / rejects)
+//!   -> confirmed business graph + business doc export
+//! ```
+//!
+//! The whole pass is a single in-memory load of the graph (like
+//! `groundgraph features` after its P23.13 fix), so it stays sub-second on
+//! large repos where `connect propose` timed out.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use groundgraph_core::language_traits;
+use groundgraph_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
+use groundgraph_store::Store;
+use serde::{Deserialize, Serialize};
+
+use crate::config::EngineConfig;
+use crate::feature_cluster::detect_communities_with_resolution;
+
+pub const BUSINESS_PACK_SCHEMA_VERSION: u32 = 1;
+
+/// Directory names that *contain* business modules — the module name is
+/// the path segment immediately after one of these.
+const FEATURE_MARKERS: &[&str] = &["features", "feature", "modules"];
+
+/// Source-root directory names — when no explicit feature marker is
+/// present, the module name is the segment immediately after one of
+/// these (e.g. `lib/<module>`, `src/<module>`).
+const SOURCE_ROOTS: &[&str] = &[
+    "lib", "src", "app", "pkg", "packages", "internal", "crates", "backend",
+];
+
+/// Top-level bucket slugs that are *not* business modules — test
+/// scaffolding, docs trees, build tooling, examples. They are still
+/// counted in the totals (their symbols/tests/docs are real) but never
+/// reported as a business module, so the AI never invents a "Test"
+/// business candidate.
+const NON_BUSINESS_BUCKETS: &[&str] = &[
+    "test",
+    "tests",
+    "testing",
+    "integration_test",
+    "test_driver",
+    "spec",
+    "specs",
+    "__tests__",
+    "docs",
+    "doc",
+    "documentation",
+    "tool",
+    "tools",
+    "script",
+    "scripts",
+    "bin",
+    "build",
+    "dist",
+    "out",
+    "target",
+    "coverage",
+    "example",
+    "examples",
+    "demo",
+    "demos",
+    "node_modules",
+    "vendor",
+    "third_party",
+];
+
+/// Callable names that carry no business meaning — framework lifecycle /
+/// object plumbing. Demoted out of the entry-point ranking.
+const NOISE_METHODS: &[&str] = &[
+    "build",
+    "dispose",
+    "initstate",
+    "tostring",
+    "hashcode",
+    "==",
+    "nosuchmethod",
+    "createstate",
+    "didchangedependencies",
+    "deactivate",
+    "setstate",
+    "main",
+    "new",
+    "default",
+];
+
+/// Symbol-name fragments that mark a *business entry point* — blocs,
+/// use cases, repositories, screens, API clients, etc. Lower-cased
+/// substring match against the symbol name.
+const ENTRY_POINT_KEYWORDS: &[&str] = &[
+    "bloc",
+    "cubit",
+    "notifier",
+    "controller",
+    "usecase",
+    "use_case",
+    "repository",
+    "service",
+    "screen",
+    "page",
+    "view",
+    "widget",
+    "provider",
+    "apiclient",
+    "api_client",
+    "client",
+    "manager",
+    "handler",
+    "mapper",
+    "serializer",
+    "interactor",
+    "facade",
+    "gateway",
+];
+
+#[derive(Debug, Clone)]
+pub struct BusinessPackOptions {
+    pub repo_root: PathBuf,
+    /// Maximum number of business modules to report (highest signal first).
+    pub max_modules: usize,
+    /// Maximum representative entry-point symbols per module.
+    pub max_entry_points: usize,
+    /// Maximum sample values per signal list (routes/providers/storage/...).
+    pub max_signal_samples: usize,
+}
+
+impl Default for BusinessPackOptions {
+    fn default() -> Self {
+        Self {
+            repo_root: PathBuf::from("."),
+            max_modules: 40,
+            max_entry_points: 8,
+            max_signal_samples: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusinessPack {
+    pub schema_version: u32,
+    pub repo_root: String,
+    pub stats: BusinessPackStats,
+    pub modules: Vec<ModuleEvidence>,
+    pub module_dependencies: Vec<ModuleDependency>,
+    /// Product-level documents that describe the repo or a whole package
+    /// (READMEs, ARCHITECTURE) rather than any single module. Global context
+    /// for the AI; forcing them onto one module would mislead.
+    #[serde(default)]
+    pub key_docs: Vec<EvidenceRef>,
+    /// Chinese instructions for the external AI that turns this pack into
+    /// `business_logic.yaml` candidates.
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusinessPackStats {
+    pub total_modules: usize,
+    pub modules_reported: usize,
+    pub total_symbols: usize,
+    pub assigned_symbols: usize,
+    pub unassigned_symbols: usize,
+    pub total_docs: usize,
+    pub total_tests: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModuleEvidence {
+    /// Stable slug, valid as a `business_candidate::<id>` id.
+    pub id: String,
+    /// Human-readable module name (the feature folder, prettified).
+    pub name: String,
+    /// Repo-relative path prefix that anchors this module.
+    pub path_prefix: String,
+    pub file_count: usize,
+    pub symbol_count: usize,
+    pub test_count: usize,
+    /// Heuristic "this module looks like a coherent business surface"
+    /// score; drives ordering. Higher = stronger signal.
+    pub signal_score: u32,
+    /// Graph cohesion in `0.0..=1.0`: share of this module's structural
+    /// coupling that stays *inside* the module (internal / (internal +
+    /// external)). High = self-contained feature; low = leaky / entangled.
+    /// Derived from the call/import community, not the directory layout.
+    pub cohesion: f64,
+    /// Representative business symbols (blocs / use cases / repositories
+    /// / screens / framework entry points), strongest first.
+    pub entry_points: Vec<EvidenceSymbol>,
+    /// Navigation routes reached from this module (`navigates_to`).
+    pub routes: Vec<String>,
+    /// Riverpod providers read by this module (`reads_provider`).
+    pub providers: Vec<String>,
+    /// Storage buckets written by this module (`persists_to`).
+    pub storage: Vec<String>,
+    /// Number of `subscribes_stream` edges originating in this module.
+    pub stream_subscriptions: usize,
+    /// Framework families detected on this module's symbols.
+    pub framework_roles: Vec<String>,
+    /// Documentation sections that describe this module.
+    pub docs: Vec<EvidenceRef>,
+    /// Tests that verify this module.
+    pub tests: Vec<EvidenceRef>,
+    /// Other module ids this module depends on (outgoing imports/calls).
+    pub depends_on: Vec<String>,
+    /// Curated node-id evidence list, ready to paste into a
+    /// `business_logic.yaml` candidate's `evidence:` field.
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceSymbol {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub path: String,
+    pub line_range: Option<(u32, u32)>,
+    /// Framework families detected on this symbol (may be empty).
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleDependency {
+    pub from: String,
+    pub to: String,
+    pub weight: usize,
+}
+
+/// Open the store from `.groundgraph.yaml` and build the pack.
+pub fn propose_business_pack(options: BusinessPackOptions) -> Result<BusinessPack> {
+    let config = load_config(&options.repo_root)?;
+    let db_path = resolve_storage_path(&options.repo_root, &config);
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    propose_business_pack_with_store(&store, &options)
+}
+
+pub fn propose_business_pack_with_store(
+    store: &Store,
+    options: &BusinessPackOptions,
+) -> Result<BusinessPack> {
+    let nodes = store.list_all_nodes().context("listing nodes")?;
+    let edges = store.list_all_edges().context("listing edges")?;
+    Ok(build_pack(&nodes, &edges, options))
+}
+
+fn build_pack(
+    nodes: &[Node],
+    edges: &[EdgeAssertion],
+    options: &BusinessPackOptions,
+) -> BusinessPack {
+    let nodes_by_id: HashMap<&ArtifactId, &Node> = nodes.iter().map(|n| (&n.id, n)).collect();
+
+    // ---- 0. partition files into business modules FROM THE CODE GRAPH ----
+    // Communities are detected on the call/import coupling, not the folder
+    // layout (see `partition_modules`). This is the key correctness change:
+    // a repo organised by layer (`lib/models`, `lib/services`) or one that
+    // is simply messy still yields feature-shaped modules, because a
+    // feature's symbols call each other far more than they call other
+    // features'. Paths are consulted only to *name* a community.
+    let partition = partition_modules(nodes, edges);
+
+    // ---- 1. assign every code symbol / test / file to its module --------
+    // Docs are matched to a module separately (normalised segment match)
+    // because doc trees often sit under `docs/feature-docs/<x>` rather than
+    // the source layout.
+    let mut module_of_node: HashMap<&ArtifactId, String> = HashMap::new();
+    let mut modules: BTreeMap<String, ModuleAcc> = BTreeMap::new();
+
+    let mut total_symbols = 0usize;
+    let mut assigned_symbols = 0usize;
+    let mut total_tests = 0usize;
+    let mut total_docs = 0usize;
+    // stem → owning module, for the doc↔source stem association of pass 2.
+    // Fed from every placed code path (symbols *and* File nodes — symbol-only
+    // graphs exist in unit fixtures and File-less language drivers).
+    let mut stem_owner: HashMap<String, Option<String>> = HashMap::new();
+    // symbol name → owning module, for the heading-mention vote of pass 2c.
+    let mut symbol_name_owner: HashMap<String, Option<String>> = HashMap::new();
+
+    for node in nodes {
+        let is_symbol =
+            language_traits::is_callable(node.kind) || language_traits::is_type(node.kind);
+        let is_test = node.kind.is_test();
+        if is_symbol {
+            total_symbols += 1;
+        }
+        if is_test {
+            total_tests += 1;
+        }
+        if node.kind == NodeKind::DocSection {
+            total_docs += 1;
+            continue; // docs handled in a later pass
+        }
+        let Some(path) = node.path.as_deref() else {
+            continue;
+        };
+        let Some(cidx) = partition.community_of(path) else {
+            continue;
+        };
+        let slug = partition.slug[cidx].clone();
+        let acc = modules.entry(slug.clone()).or_insert_with(|| ModuleAcc {
+            slug: slug.clone(),
+            name: partition.name[cidx].clone(),
+            path_prefix: partition.prefix[cidx].clone(),
+            cohesion: partition.cohesion[cidx],
+            ..Default::default()
+        });
+        module_of_node.insert(&node.id, slug.clone());
+
+        // Only *source* files may own a stem: the docs tree mirrors source
+        // names (`docs/blueprints.rst` ↔ `src/flask/blueprints.py`), so the
+        // doc file itself — a File node in its own path-bucket — must not
+        // claim the stem and turn every mirror pair ambiguous.
+        if (is_symbol || node.kind == NodeKind::File)
+            && !is_test_path(path)
+            && !is_doc_file_path(path)
+        {
+            if let Some(stem) = source_stem_token(path) {
+                stem_owner
+                    .entry(stem)
+                    .and_modify(|owner| {
+                        if owner.as_deref() != Some(slug.as_str()) {
+                            *owner = None; // shared stem → ambiguous
+                        }
+                    })
+                    .or_insert_with(|| Some(slug.clone()));
+            }
+        }
+
+        if node.kind == NodeKind::File {
+            acc.files.insert(path.to_string());
+        } else if is_test {
+            acc.tests.push(node);
+        } else if is_symbol {
+            assigned_symbols += 1;
+            acc.symbols.push(node);
+            // framework role on the symbol
+            if let Some(family) = framework_family(node) {
+                acc.framework_roles.insert(family);
+            }
+            // Distinctive symbol names give pass 2c its vote table. Same
+            // ambiguity rule as stems: a name claimed by two modules votes
+            // for neither.
+            if !is_test_path(path) {
+                if let Some(token) = identifier_token(node.name.as_deref().unwrap_or("")) {
+                    symbol_name_owner
+                        .entry(token)
+                        .and_modify(|owner| {
+                            if owner.as_deref() != Some(slug.as_str()) {
+                                *owner = None;
+                            }
+                        })
+                        .or_insert_with(|| Some(slug.clone()));
+                }
+            }
+        }
+    }
+
+    // Docs may only associate with module slugs that will actually be
+    // *reported*: non-scaffolding AND code-bearing. Scaffolding buckets
+    // (`docs`, `tests`, …) and symbol-less File buckets both exist as
+    // accumulators yet never reach the report, so a doc matched into one
+    // vanishes (real flask bug: stem-matched docs swallowed by the `docs`
+    // bucket; real tokio bug: `tokio/README.md` swallowed by the
+    // symbol-less `tokio` path-bucket instead of reaching key_docs).
+    let known_slugs: BTreeSet<String> = modules
+        .iter()
+        .filter(|(slug, acc)| {
+            !NON_BUSINESS_BUCKETS.contains(&slug.as_str()) && !acc.symbols.is_empty()
+        })
+        .map(|(slug, _)| slug.clone())
+        .collect();
+
+    // ---- 2. associate docs --------------------------------------------
+    // (a) path-segment match: `docs/feature-docs/customer-edit/…` →
+    //     `customer_edit`.
+    // (b) source-file-stem match: docs trees commonly mirror source files
+    //     by *name*, not by directory — flask's `docs/blueprints.rst`
+    //     documents `src/flask/blueprints.py` (same for leveldb's
+    //     `doc/table_format.md` ↔ `table/format.cc` family). A doc stem
+    //     that equals a source-file stem owned by exactly one module is
+    //     that module's documentation; ambiguous or generic stems
+    //     (`index`, `init`) attach nowhere rather than wrongly.
+    // (c) heading-mention vote: design docs often sit at a names-free
+    //     location (tokio's `tokio/docs/reactor-refactor.md`) but cite code
+    //     identifiers in their headings (`Registration`, `ScheduledIo`).
+    //     Each cited identifier owned by exactly one module is a vote; a
+    //     file attaches to a clear winner only (≥2 votes, strictly ahead),
+    //     so a README touching every module attaches nowhere.
+    let mut unmatched_doc_files: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
+    for node in nodes {
+        if node.kind != NodeKind::DocSection {
+            continue;
+        }
+        let Some(path) = node.path.as_deref() else {
+            continue;
+        };
+        let slug = match_doc_to_module(path, &known_slugs)
+            .or_else(|| {
+                source_stem_token(path).and_then(|stem| stem_owner.get(&stem).cloned().flatten())
+            })
+            // The stem fallback consults `stem_owner`, which is fed before
+            // module symbol counts are known — re-check that the owner is a
+            // reportable module, not a symbol-less bucket.
+            .filter(|slug| known_slugs.contains(slug));
+        if let Some(slug) = slug {
+            if let Some(acc) = modules.get_mut(&slug) {
+                acc.docs.push(node);
+            }
+        } else {
+            unmatched_doc_files.entry(path).or_default().push(node);
+        }
+    }
+
+    let mut key_doc_files: Vec<(&str, &Node)> = Vec::new();
+    for (path, sections) in unmatched_doc_files {
+        let mut votes: BTreeMap<&str, usize> = BTreeMap::new();
+        for section in &sections {
+            for token in heading_identifier_tokens(section.name.as_deref().unwrap_or("")) {
+                if let Some(Some(owner)) = symbol_name_owner.get(&token) {
+                    if known_slugs.contains(owner) {
+                        *votes.entry(owner.as_str()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        // Clear winner(s): ≥2 votes. A tie at the top is a doc that
+        // genuinely spans the tied subsystems (tokio's reactor-refactor doc
+        // cites runtime-io and io types alike) — attach to each. Scattered
+        // single mentions stay unattached.
+        let top = votes.values().copied().max().unwrap_or(0);
+        let winners: Vec<String> = if top >= 2 {
+            votes
+                .iter()
+                .filter(|(_, n)| **n == top)
+                .map(|(slug, _)| (*slug).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !winners.is_empty() {
+            for slug in &winners {
+                if let Some(acc) = modules.get_mut(slug.as_str()) {
+                    acc.docs.extend(sections.iter().copied());
+                }
+            }
+            continue;
+        }
+        // Still unattached: product-level documents (READMEs, ARCHITECTURE)
+        // become pack-level key docs instead of disappearing.
+        if is_product_level_doc(path) {
+            if let Some(first) = sections.first() {
+                key_doc_files.push((path, first));
+            }
+        }
+    }
+    // Shallowest first: the repo README outranks nested package READMEs.
+    key_doc_files.sort_by_key(|(path, _)| (path.matches('/').count(), path.to_string()));
+    let key_docs: Vec<EvidenceRef> = key_doc_files
+        .into_iter()
+        .take(12)
+        .map(|(path, node)| EvidenceRef {
+            id: node.id.to_string(),
+            path: path.to_string(),
+            name: node.name.clone().unwrap_or_else(|| path.to_string()),
+        })
+        .collect();
+
+    // ---- 3. roll up semantic signals + dependencies from edges ----------
+    let mut dependency_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for edge in edges {
+        let Some(from_mod) = module_of_node.get(&edge.from_id) else {
+            continue;
+        };
+        match edge.kind {
+            EdgeKind::NavigatesTo => {
+                if let Some(target) = nodes_by_id.get(&edge.to_id) {
+                    if let Some(acc) = modules.get_mut(from_mod) {
+                        acc.routes.insert(display_label(target));
+                    }
+                }
+            }
+            EdgeKind::ReadsProvider => {
+                if let Some(target) = nodes_by_id.get(&edge.to_id) {
+                    if let Some(acc) = modules.get_mut(from_mod) {
+                        acc.providers.insert(display_label(target));
+                    }
+                }
+            }
+            EdgeKind::PersistsTo => {
+                if let Some(target) = nodes_by_id.get(&edge.to_id) {
+                    if let Some(acc) = modules.get_mut(from_mod) {
+                        acc.storage.insert(display_label(target));
+                    }
+                }
+            }
+            EdgeKind::SubscribesStream => {
+                if let Some(acc) = modules.get_mut(from_mod) {
+                    acc.stream_subscriptions += 1;
+                }
+            }
+            EdgeKind::Calls | EdgeKind::References | EdgeKind::Imports => {
+                let from_mod = from_mod.clone();
+                // in-degree of the target module (used for entry-point ranking)
+                in_degree_bump(&mut modules, &edge.to_id, &module_of_node);
+                // cross-module dependency
+                if let Some(to_mod) = module_of_node.get(&edge.to_id) {
+                    if *to_mod != from_mod {
+                        *dependency_weights
+                            .entry((from_mod, to_mod.clone()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- 4. materialise module reports ----------------------------------
+    let mut reports: Vec<ModuleEvidence> = Vec::new();
+    for acc in modules.values() {
+        // scaffolding buckets are real (counted in totals) but never a
+        // business module — skip them at the reporting stage.
+        if NON_BUSINESS_BUCKETS.contains(&acc.slug.as_str()) {
+            continue;
+        }
+        let entry_points = acc.select_entry_points(options.max_entry_points);
+        // Docs/tests are graphed per *section* / per *case*; collapse each to
+        // one evidence per file so a heading-heavy doc or case-heavy test
+        // file does not flood the module.
+        let mut docs = dedup_refs_by_path(&acc.docs);
+        let unique_doc_files = docs.len();
+        docs.truncate(options.max_signal_samples);
+        let mut tests = dedup_refs_by_path(&acc.tests);
+        tests.truncate(options.max_signal_samples);
+
+        let signal_score = acc.signal_score(&entry_points, unique_doc_files);
+        let evidence = build_evidence_list(&entry_points, &docs, &tests);
+
+        reports.push(ModuleEvidence {
+            id: acc.slug.clone(),
+            name: acc.name.clone(),
+            path_prefix: acc.path_prefix.clone(),
+            file_count: acc.files.len(),
+            symbol_count: acc.symbols.len(),
+            test_count: acc.tests.len(),
+            signal_score,
+            cohesion: acc.cohesion,
+            entry_points,
+            routes: capped_sorted(&acc.routes, options.max_signal_samples),
+            providers: capped_sorted(&acc.providers, options.max_signal_samples),
+            storage: capped_sorted(&acc.storage, options.max_signal_samples),
+            stream_subscriptions: acc.stream_subscriptions,
+            framework_roles: acc.framework_roles.iter().cloned().collect(),
+            docs,
+            tests,
+            depends_on: Vec::new(), // filled below once we know which modules survive
+            evidence,
+        });
+    }
+
+    // A business module must hold code. Doc-only communities (`docs/tutorial`
+    // path-buckets in flask/tokio) are manual chapters — their slug dodges
+    // NON_BUSINESS_BUCKETS because only the repo-root "docs" segment is
+    // listed — and reporting them invites the AI to invent a "Tutorial"
+    // business candidate. Their content still reaches real modules through
+    // the doc-association passes above.
+    //
+    // Likewise a module whose path anchor lives in a test tree
+    // (`tests/Jellyfin.Api.Tests/**` buckets with no resolved edges into
+    // production code) is scaffolding: its helpers are real symbols, but
+    // reporting it would let test fixtures outrank every production module
+    // (tests dominate their own signal score).
+    reports.retain(|m| m.symbol_count > 0 && !is_test_path(&m.path_prefix));
+    // `total_modules` counts the discovered *business* modules (after the
+    // scaffolding denylist), independent of the `max_modules` cap.
+    let total_modules = reports.len();
+    reports.sort_by(|a, b| {
+        b.signal_score
+            .cmp(&a.signal_score)
+            .then(b.symbol_count.cmp(&a.symbol_count))
+            .then(a.name.cmp(&b.name))
+    });
+    reports.truncate(options.max_modules);
+
+    let surviving: BTreeSet<String> = reports.iter().map(|m| m.id.clone()).collect();
+
+    // depends_on per module (restricted to surviving modules)
+    let mut deps_by_module: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut module_dependencies: Vec<ModuleDependency> = Vec::new();
+    for ((from, to), weight) in &dependency_weights {
+        if !surviving.contains(from) || !surviving.contains(to) {
+            continue;
+        }
+        deps_by_module
+            .entry(from.clone())
+            .or_default()
+            .insert(to.clone());
+        module_dependencies.push(ModuleDependency {
+            from: from.clone(),
+            to: to.clone(),
+            weight: *weight,
+        });
+    }
+    module_dependencies.sort_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then(a.from.cmp(&b.from))
+            .then(a.to.cmp(&b.to))
+    });
+    for m in reports.iter_mut() {
+        if let Some(deps) = deps_by_module.get(&m.id) {
+            m.depends_on = deps.iter().cloned().collect();
+        }
+    }
+
+    let modules_reported = reports.len();
+    BusinessPack {
+        schema_version: BUSINESS_PACK_SCHEMA_VERSION,
+        repo_root: options.repo_root.to_string_lossy().into_owned(),
+        stats: BusinessPackStats {
+            total_modules,
+            modules_reported,
+            total_symbols,
+            assigned_symbols,
+            unassigned_symbols: total_symbols.saturating_sub(assigned_symbols),
+            total_docs,
+            total_tests,
+        },
+        modules: reports,
+        module_dependencies,
+        key_docs,
+        prompt: prompt_text(),
+    }
+}
+
+/// Bump the in-degree counter for `target`'s module. Kept as a free fn so
+/// the borrow of `modules` is scoped tightly inside the edge loop.
+fn in_degree_bump(
+    modules: &mut BTreeMap<String, ModuleAcc>,
+    target: &ArtifactId,
+    module_of_node: &HashMap<&ArtifactId, String>,
+) {
+    if let Some(slug) = module_of_node.get(target) {
+        if let Some(acc) = modules.get_mut(slug) {
+            *acc.in_degree.entry(target.to_string()).or_default() += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-module accumulator
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ModuleAcc<'a> {
+    slug: String,
+    name: String,
+    path_prefix: String,
+    cohesion: f64,
+    files: BTreeSet<String>,
+    symbols: Vec<&'a Node>,
+    tests: Vec<&'a Node>,
+    docs: Vec<&'a Node>,
+    routes: BTreeSet<String>,
+    providers: BTreeSet<String>,
+    storage: BTreeSet<String>,
+    framework_roles: BTreeSet<String>,
+    stream_subscriptions: usize,
+    in_degree: HashMap<String, usize>,
+}
+
+impl ModuleAcc<'_> {
+    fn select_entry_points(&self, limit: usize) -> Vec<EvidenceSymbol> {
+        let mut scored: Vec<(i64, &Node)> = self
+            .symbols
+            .iter()
+            .map(|n| (self.entry_point_score(n), *n))
+            .filter(|(score, _)| *score > 0)
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(a.1.path.cmp(&b.1.path))
+                .then(a.1.name.cmp(&b.1.name))
+                .then(a.1.id.as_str().cmp(b.1.id.as_str()))
+        });
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, n)| EvidenceSymbol {
+                id: n.id.to_string(),
+                kind: n.kind.as_str().to_string(),
+                name: display_label(n),
+                path: n.path.clone().unwrap_or_default(),
+                line_range: line_range(n),
+                roles: framework_family(n).into_iter().collect(),
+            })
+            .collect()
+    }
+
+    fn entry_point_score(&self, node: &Node) -> i64 {
+        // Symbols defined in test scaffolding (mocks/fakes/helpers) or in
+        // generated codegen files (.freezed.dart / .g.dart / …) are not
+        // business entry points; tests are covered by the tests list and
+        // codegen is noise.
+        if let Some(path) = node.path.as_deref() {
+            if is_test_path(path) || is_generated_path(path) {
+                return 0;
+            }
+        }
+        let name = node
+            .name
+            .clone()
+            .or_else(|| node.stable_key.clone())
+            .unwrap_or_default();
+        // Synthetic / unnamed symbols (e.g. Dart's `<default>` constructor)
+        // are not business entry points.
+        if name.is_empty() || name.contains('<') {
+            return 0;
+        }
+        let name_lower = name.to_ascii_lowercase();
+        // Strip a leading container (`Foo.bar` -> `bar`) for the noise check.
+        let leaf = name_lower.rsplit('.').next().unwrap_or(&name_lower);
+        if NOISE_METHODS.contains(&leaf) {
+            return 0;
+        }
+        let mut score: i64 = 1;
+        if framework_family(node).is_some() {
+            score += 50;
+        }
+        if ENTRY_POINT_KEYWORDS
+            .iter()
+            .any(|kw| name_lower.contains(kw))
+        {
+            score += 20;
+        }
+        if language_traits::is_type(node.kind) {
+            score += 5;
+        }
+        let indeg = self.in_degree.get(node.id.as_str()).copied().unwrap_or(0);
+        score += i64::try_from(indeg.min(15)).unwrap_or(15);
+        score
+    }
+
+    fn signal_score(&self, entry_points: &[EvidenceSymbol], doc_file_count: usize) -> u32 {
+        let mut score: u32 = 0;
+        score += u32::try_from(self.framework_roles.len().min(10)).unwrap_or(10) * 8;
+        score += u32::try_from(self.routes.len().min(20)).unwrap_or(20) * 3;
+        score += u32::try_from(self.providers.len().min(20)).unwrap_or(20) * 3;
+        score += u32::try_from(self.storage.len().min(20)).unwrap_or(20) * 3;
+        score += u32::try_from(self.tests.len().min(30)).unwrap_or(30) * 2;
+        // score on unique doc *files*, not raw sections, so a heading-heavy
+        // single doc cannot dominate the ranking.
+        score += u32::try_from(doc_file_count.min(20)).unwrap_or(20) * 4;
+        score += u32::try_from(entry_points.len().min(20)).unwrap_or(20);
+        score += u32::try_from(self.symbols.len().min(200)).unwrap_or(200) / 10;
+        score
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Graph-driven module partition (code graph is the source of truth)
+// ---------------------------------------------------------------------------
+
+/// The result of clustering files into business modules from the call /
+/// import graph. Maps each file path to a contiguous module index, with a
+/// parallel-indexed slug / name / prefix / cohesion for each module.
+struct ModulePartition {
+    by_file: HashMap<String, usize>,
+    slug: Vec<String>,
+    name: Vec<String>,
+    prefix: Vec<String>,
+    cohesion: Vec<f64>,
+}
+
+impl ModulePartition {
+    fn community_of(&self, path: &str) -> Option<usize> {
+        self.by_file.get(path).copied()
+    }
+}
+
+/// Cluster the file graph into business-sized communities, defeating
+/// modularity's *resolution limit* (a 1k-file app with no feature folders
+/// otherwise collapses into one giant community).
+///
+/// Standard Louvain (γ=1) runs first. Any community larger than a size cap is
+/// then **recursively re-clustered on its own induced subgraph** — dropping
+/// the edges that pull outside the community changes the modularity landscape
+/// so genuine sub-features separate, while a truly monolithic blob stays put.
+/// This refines stubborn cores without over-fragmenting the parts that
+/// already cluster cleanly (a tidy `features/` repo never trips the cap).
+///
+/// `graph_placed[i]` marks files whose community label actually drives
+/// placement (connected, no explicit feature marker); the cap is judged over
+/// just those. `GROUNDGRAPH_LOUVAIN_RESOLUTION` pins a single γ with no
+/// recursion (escape hatch).
+fn choose_communities(
+    n: usize,
+    edges: &[(usize, usize, f64)],
+    graph_placed: &[bool],
+) -> Vec<usize> {
+    if let Some(g) = std::env::var("GROUNDGRAPH_LOUVAIN_RESOLUTION")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+    {
+        return detect_communities_with_resolution(n, edges, g);
+    }
+
+    let target = graph_placed.iter().filter(|&&p| p).count();
+    let base = detect_communities_with_resolution(n, edges, 1.0);
+    if target == 0 {
+        return base;
+    }
+    // A business module should not engulf the repo. Cap the largest module at
+    // ~1/12 of the graph-placed files, never below 40 (small repos cluster
+    // fine at γ=1 and should not be force-split).
+    let cap = (target / 12).max(40);
+    let mut next_label = base.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut labels = base;
+    refine_oversized(&mut labels, edges, graph_placed, cap, &mut next_label);
+    relabel_contiguous(labels)
+}
+
+/// Iteratively split any community whose graph-placed size exceeds `cap` by
+/// re-running Louvain on the subgraph induced by just that community's nodes.
+/// A community that exceeds the cap but does not split is a genuine monolith
+/// and is frozen so it is never reprocessed (guaranteeing termination).
+fn refine_oversized(
+    labels: &mut [usize],
+    edges: &[(usize, usize, f64)],
+    graph_placed: &[bool],
+    cap: usize,
+    next_label: &mut usize,
+) {
+    let mut frozen: HashSet<usize> = HashSet::new();
+    loop {
+        let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, &c) in labels.iter().enumerate() {
+            members.entry(c).or_default().push(i);
+        }
+        let mut changed = false;
+        for (label, nodes) in members {
+            if frozen.contains(&label) || nodes.len() < 2 {
+                continue;
+            }
+            if nodes.iter().filter(|&&i| graph_placed[i]).count() <= cap {
+                continue;
+            }
+            // Induce the subgraph: remap node ids to 0..k, keep only intra edges.
+            let local: HashMap<usize, usize> =
+                nodes.iter().enumerate().map(|(j, &i)| (i, j)).collect();
+            let sub_edges: Vec<(usize, usize, f64)> = edges
+                .iter()
+                .filter_map(|&(a, b, w)| match (local.get(&a), local.get(&b)) {
+                    (Some(&la), Some(&lb)) => Some((la, lb, w)),
+                    _ => None,
+                })
+                .collect();
+            let sub = detect_communities_with_resolution(nodes.len(), &sub_edges, 1.0);
+            if sub.iter().copied().collect::<BTreeSet<usize>>().len() < 2 {
+                frozen.insert(label); // a genuine monolith — leave it whole
+                continue;
+            }
+            // Assign fresh global labels to each sub-community.
+            let mut sub_to_global: HashMap<usize, usize> = HashMap::new();
+            for (j, &i) in nodes.iter().enumerate() {
+                let g = *sub_to_global.entry(sub[j]).or_insert_with(|| {
+                    let l = *next_label;
+                    *next_label += 1;
+                    l
+                });
+                labels[i] = g;
+            }
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Compress arbitrary labels to a contiguous `0..k`, ordered by first
+/// appearance — keeps downstream module ids stable and deterministic.
+fn relabel_contiguous(labels: Vec<usize>) -> Vec<usize> {
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    labels
+        .into_iter()
+        .map(|c| {
+            let next = remap.len();
+            *remap.entry(c).or_insert(next)
+        })
+        .collect()
+}
+
+/// Cluster every code/test file into a business module.
+///
+/// The placement rule deliberately mixes two signals at *different*
+/// confidence levels, which is what makes it robust to both tidy and
+/// chaotic repos:
+///
+/// * **Explicit feature folders win.** A file under an unambiguous feature
+///   marker (`.../features/<x>/...`, `.../modules/<x>/...`) is placed in
+///   module `<x>`. This is a deliberate, business-level boundary the repo
+///   author drew, and the graph invariably agrees (high cohesion). It also
+///   *dissolves* the cross-feature "infrastructure blobs" community
+///   detection would otherwise form (a feature's repository couples to
+///   every other feature's repository), keeping modules feature-shaped.
+/// * **Everything else follows the code graph.** Files with no explicit
+///   feature marker — a flat `lib/`, a layer split (`lib/models`,
+///   `lib/services`), an outright mess — are placed by Louvain community
+///   over their call/import coupling. Loose path conventions
+///   (`lib/<x>`, first-directory) are *never* trusted for placement,
+///   because that is exactly where "the repo is managed chaotically"
+///   bites; the graph is the source of truth there.
+///
+/// So a feature is recovered whether the author filed it under
+/// `features/auth/` or smeared it across `models/`, `services/`, `ui/`.
+fn partition_modules(nodes: &[Node], edges: &[EdgeAssertion]) -> ModulePartition {
+    // ---- file universe: every file that holds code / tests -------------
+    let mut file_idx: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut node_file: HashMap<&ArtifactId, usize> = HashMap::new();
+    for node in nodes {
+        let relevant = node.kind == NodeKind::File
+            || language_traits::is_callable(node.kind)
+            || language_traits::is_type(node.kind)
+            || node.kind.is_test();
+        if !relevant {
+            continue;
+        }
+        let Some(path) = node.path.as_deref() else {
+            continue;
+        };
+        let idx = *file_idx.entry(path.to_string()).or_insert_with(|| {
+            files.push(path.to_string());
+            files.len() - 1
+        });
+        node_file.insert(&node.id, idx);
+    }
+    let n = files.len();
+    if n == 0 {
+        return ModulePartition {
+            by_file: HashMap::new(),
+            slug: Vec::new(),
+            name: Vec::new(),
+            prefix: Vec::new(),
+            cohesion: Vec::new(),
+        };
+    }
+
+    // ---- lift symbol coupling onto a weighted file graph ---------------
+    // Calls / References (behavioural coupling) weigh more than Imports
+    // (structural). Self-edges (same file) are skipped — we want *cross*-
+    // file cohesion to define a module boundary.
+    let mut sym_indegree: HashMap<&ArtifactId, usize> = HashMap::new();
+    let mut weights: HashMap<(usize, usize), f64> = HashMap::new();
+    for edge in edges {
+        let w = match edge.kind {
+            EdgeKind::Calls | EdgeKind::References => 2.0,
+            EdgeKind::Imports => 1.0,
+            _ => continue,
+        };
+        *sym_indegree.entry(&edge.to_id).or_insert(0) += 1;
+        let (Some(&a), Some(&b)) = (node_file.get(&edge.from_id), node_file.get(&edge.to_id))
+        else {
+            continue;
+        };
+        if a == b {
+            continue;
+        }
+        let key = if a < b { (a, b) } else { (b, a) };
+        *weights.entry(key).or_insert(0.0) += w;
+    }
+    let edge_list: Vec<(usize, usize, f64)> =
+        weights.iter().map(|(&(a, b), &w)| (a, b, w)).collect();
+    let mut connected = vec![false; n];
+    for &(a, b, _) in &edge_list {
+        connected[a] = true;
+        connected[b] = true;
+    }
+
+    // ---- community detection -------------------------------------------
+    // Files with an explicit feature marker are placed by that marker, not by
+    // the graph, so the resolution sweep should only judge granularity over
+    // the files whose community label actually drives placement.
+    let graph_placed: Vec<bool> = (0..n)
+        .map(|i| connected[i] && feature_marker_token(&files[i]).is_none())
+        .collect();
+    let comm = choose_communities(n, &edge_list, &graph_placed);
+
+    // ---- business symbols per file (for central-symbol naming) ---------
+    let mut file_symbols: HashMap<usize, Vec<&Node>> = HashMap::new();
+    for node in nodes {
+        if !(language_traits::is_callable(node.kind) || language_traits::is_type(node.kind)) {
+            continue;
+        }
+        if let Some(path) = node.path.as_deref() {
+            if let Some(&fi) = file_idx.get(path) {
+                file_symbols.entry(fi).or_default().push(node);
+            }
+        }
+    }
+
+    // ---- placement key per file ----------------------------------------
+    // `feat::<slug>` for files under an explicit feature marker (trusted
+    // business boundary), else `comm::<id>::<member>` for graph-clustered
+    // files, else `path::<slug>` for isolated files with no graph signal.
+    // This single key space is what later groups files into modules.
+    //
+    // The `<member>` facet splits a community at top-level directory
+    // boundaries: in a monorepo those are publication units (rails gems,
+    // cargo workspace members, gradle subprojects), and a shared utility
+    // that every unit calls (rails: `Object#with` in activesupport) must
+    // make activesupport *depended on*, never fuse four gems into one
+    // module. Single-rooted repos (`src/**`) all share one member, so the
+    // facet is a no-op there. Test files are scaffolding, not members:
+    // they follow their strongest production neighbour inside the
+    // community instead of their own `tests/` top-level dir.
+    let mut adj: HashMap<usize, Vec<(usize, f64)>> = HashMap::new();
+    for &(a, b, w) in &edge_list {
+        adj.entry(a).or_default().push((b, w));
+        adj.entry(b).or_default().push((a, w));
+    }
+    let member_seg = |path: &str| production_member(path).unwrap_or_default().to_string();
+    let group_key: Vec<String> = (0..n)
+        .map(|i| {
+            if let Some(tok) = feature_marker_token(&files[i]) {
+                format!("feat::{}", slugify(&tok))
+            } else if connected[i] {
+                let member = if is_test_path(&files[i]) {
+                    let mut by_member: BTreeMap<String, f64> = BTreeMap::new();
+                    for &(nb, w) in adj.get(&i).into_iter().flatten() {
+                        if comm[nb] == comm[i] && !is_test_path(&files[nb]) {
+                            *by_member.entry(member_seg(&files[nb])).or_default() += w;
+                        }
+                    }
+                    by_member
+                        .into_iter()
+                        // Strongest member wins; ties go to the lexically
+                        // smallest for determinism.
+                        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+                        .map(|(member, _)| member)
+                        .unwrap_or_else(|| member_seg(&files[i]))
+                } else {
+                    member_seg(&files[i])
+                };
+                format!("comm::{}::{member}", comm[i])
+            } else {
+                // Isolated file: bucket by its most specific *feature* dir.
+                let (disp, _) = fallback_feature_token(&files[i]);
+                format!("path::{}", slugify(&disp))
+            }
+        })
+        .collect();
+
+    // ---- group files by placement key, deterministic by key order ------
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, key) in group_key.iter().enumerate() {
+        groups.entry(key.as_str()).or_default().push(i);
+    }
+
+    // ---- name each group, MERGING groups that derive the same slug -----
+    // Distinct graph communities that resolve to the same identity *are*
+    // the same module: e.g. a `lib/core` with no feature marker splits into
+    // several loosely-coupled communities that all name themselves "core";
+    // collapsing them avoids `core / core_2 / …` noise. Two genuinely
+    // different features never collide because they get distinct names
+    // (a dominant token or a distinct central symbol).
+    let mut slug: Vec<String> = Vec::new();
+    let mut name: Vec<String> = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    let mut slug_index: HashMap<String, usize> = HashMap::new();
+    // placement key -> final module index
+    let mut key_module: HashMap<&str, usize> = HashMap::new();
+
+    for (&key, file_idxs) in &groups {
+        let (disp, pfx) = name_module(key, file_idxs, &files, &file_symbols, &sym_indegree);
+        let mut base = slugify(&disp);
+        if base.is_empty() {
+            base = format!("module_{}", slug.len() + 1);
+        }
+        let mi = match slug_index.get(&base) {
+            Some(&existing) => {
+                // merge: a production anchor always outranks a test-tree
+                // anchor (laravel: isolated `tests/Database` buckets merge
+                // into the production "Database" community — anchoring the
+                // merged module at `tests/` would get it deleted by the
+                // test-tree report filter). Within the same class, keep the
+                // shorter (more general) anchor.
+                if !pfx.is_empty() {
+                    let old = &prefix[existing];
+                    let replace = old.is_empty()
+                        || match (is_test_path(old), is_test_path(&pfx)) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => pfx.len() < old.len(),
+                        };
+                    if replace {
+                        prefix[existing] = pfx;
+                    }
+                }
+                existing
+            }
+            None => {
+                let idx = slug.len();
+                slug_index.insert(base.clone(), idx);
+                slug.push(base);
+                name.push(prettify(&disp));
+                prefix.push(pfx);
+                idx
+            }
+        };
+        key_module.insert(key, mi);
+    }
+
+    // ---- final file -> module index ------------------------------------
+    let mut by_file: HashMap<String, usize> = HashMap::new();
+    let mut module_of_file: Vec<usize> = vec![usize::MAX; n];
+    for (i, path) in files.iter().enumerate() {
+        if let Some(&mi) = key_module.get(group_key[i].as_str()) {
+            by_file.insert(path.clone(), mi);
+            module_of_file[i] = mi;
+        }
+    }
+
+    // ---- cohesion per *final module* (internal / total coupling) -------
+    let mut internal = vec![0.0f64; slug.len()];
+    let mut external = vec![0.0f64; slug.len()];
+    for &(a, b, w) in &edge_list {
+        let (ma, mb) = (module_of_file[a], module_of_file[b]);
+        if ma == usize::MAX || mb == usize::MAX {
+            continue;
+        }
+        if ma == mb {
+            internal[ma] += w;
+        } else {
+            external[ma] += w;
+            external[mb] += w;
+        }
+    }
+    let cohesion: Vec<f64> = (0..slug.len())
+        .map(|i| {
+            let total = internal[i] + external[i];
+            if total > 0.0 {
+                internal[i] / total
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    ModulePartition {
+        by_file,
+        slug,
+        name,
+        prefix,
+        cohesion,
+    }
+}
+
+/// Workspace containers whose *children* are publication units. A repo's
+/// top-level `crates/` (cargo workspace) or `packages/` (js / dart
+/// monorepos) is structure; `crates/<member>` is the boundary. Plain code
+/// roots (`src`, `lib`) are NOT containers — a single-rooted repo is one
+/// member.
+const MEMBER_CONTAINERS: &[&str] = &["crates", "packages", "apps", "modules"];
+
+/// The top-level *publication-unit* directory a path belongs to:
+/// `spring-core/src/…` → `spring-core`, `crates/foo/src/…` → `crates/foo`,
+/// `src/anything/…` → `src`. Returns `None` for root-level files.
+fn production_member(path: &str) -> Option<&str> {
+    let (first, rest) = path.split_once('/')?;
+    if MEMBER_CONTAINERS.contains(&first.to_ascii_lowercase().as_str()) {
+        if let Some((second, _)) = rest.split_once('/') {
+            return Some(&path[..first.len() + 1 + second.len()]);
+        }
+    }
+    Some(first)
+}
+
+/// Return the feature token for a path **only** when it sits under an
+/// explicit, unambiguous feature marker (`.../features/<x>/...`). Loose
+/// conventions (`lib/<x>`, first directory) deliberately return `None` —
+/// they are not trusted as business boundaries.
+fn feature_marker_token(path: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let raw: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if raw.is_empty() {
+        return None;
+    }
+    let dirs: &[&str] = if raw.last().map(|s| s.contains('.')).unwrap_or(false) {
+        &raw[..raw.len() - 1]
+    } else {
+        &raw[..]
+    };
+    for (i, seg) in dirs.iter().enumerate() {
+        if FEATURE_MARKERS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
+            return Some(dirs[i + 1].to_string());
+        }
+    }
+    None
+}
+
+/// Generic identifiers that carry no business meaning — never use one as a
+/// module name even if it is the most-referenced symbol in a cluster.
+const GENERIC_NAMES: &[&str] = &[
+    "default",
+    "load",
+    "build",
+    "get",
+    "set",
+    "init",
+    "main",
+    "run",
+    "call",
+    "create",
+    "update",
+    "delete",
+    "fromjson",
+    "tojson",
+    "copywith",
+    "tostring",
+    "of",
+    "instance",
+    "value",
+    "data",
+    "state",
+    "model",
+    "result",
+    "response",
+    "request",
+    "client",
+    "service",
+    "base",
+    "common",
+    "utils",
+    "util",
+    "helper",
+    "helpers",
+    "constants",
+    "config",
+];
+
+/// Name a module group. `feat::` groups are named directly after their
+/// feature marker; otherwise we try a dominant feature-folder token, then
+/// the most-referenced *business* symbol (preferring types), and finally
+/// the longest common directory.
+fn name_module(
+    key: &str,
+    file_idxs: &[usize],
+    files: &[String],
+    file_symbols: &HashMap<usize, Vec<&Node>>,
+    sym_indegree: &HashMap<&ArtifactId, usize>,
+) -> (String, String) {
+    // (0) explicit feature marker — authoritative. Anchor the path to a
+    //     non-test source file so a feature spanning `lib/features/<x>` and
+    //     `test/features/<x>` reports `lib/features/<x>`, not an empty
+    //     prefix (their common directory diverges at the top level).
+    if key.starts_with("feat::") {
+        if let Some(tok) = file_idxs
+            .iter()
+            .find_map(|&fi| feature_marker_token(&files[fi]))
+        {
+            let pfx = file_idxs
+                .iter()
+                .filter(|&&fi| !is_test_path(&files[fi]))
+                .find_map(|&fi| feature_key(&files[fi]).map(|k| k.prefix))
+                .or_else(|| {
+                    file_idxs
+                        .iter()
+                        .find_map(|&fi| feature_key(&files[fi]).map(|k| k.prefix))
+                })
+                .unwrap_or_default();
+            return (tok, pfx);
+        }
+    }
+
+    // path:: groups are isolated files already bucketed by their feature dir;
+    // name them after the dominant such token (skipping structural layers).
+    if key.starts_with("path::") {
+        let mut tok_count: BTreeMap<String, usize> = BTreeMap::new();
+        let mut tok_prefix: HashMap<String, String> = HashMap::new();
+        for &fi in file_idxs {
+            let (disp, pfx) = fallback_feature_token(&files[fi]);
+            *tok_count.entry(disp.clone()).or_insert(0) += 1;
+            tok_prefix.entry(disp).or_insert(pfx);
+        }
+        if let Some((disp, _)) = tok_count
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        {
+            let pfx = tok_prefix.get(disp).cloned().unwrap_or_default();
+            return (disp.clone(), pfx);
+        }
+    }
+
+    // (a) dominant feature-folder token — only from *trusted* tokens (real
+    //     markers / source-root children). The bare first-dir fallback (the
+    //     repo's own top folder) is excluded so a layer-then-feature app
+    //     (`Yolan/UI/<feature>`, `Yolan/ViewModel/…`) is named by its central
+    //     business symbol (step b), not collapsed into one "Yolan" module.
+    let mut token_count: BTreeMap<String, usize> = BTreeMap::new();
+    let mut token_prefix: HashMap<String, String> = HashMap::new();
+    for &fi in file_idxs {
+        if let Some(k) = feature_key(&files[fi]) {
+            if !k.trusted {
+                continue;
+            }
+            *token_count.entry(k.display.clone()).or_insert(0) += 1;
+            token_prefix.entry(k.display).or_insert(k.prefix);
+        }
+    }
+    let dominant = token_count
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(d, c)| (d.clone(), *c));
+    if let Some((disp, cnt)) = dominant {
+        // Majority is judged among the files that actually *voted* — test
+        // paths carry no trusted token and must not dilute the denominator
+        // (laravel: 70 test files starved "Database" of its majority and a
+        // central exception class named the module). A clear plurality
+        // (≥2× the runner-up) also counts; near-ties (cross-component
+        // families like Bus+Queue) fall through to the central symbol.
+        // Either way the voters must cover a meaningful share of the
+        // community's production files, so a handful of stray tokens can
+        // never name a large community.
+        let voters: usize = token_count.values().sum();
+        let runner_up = token_count
+            .values()
+            .copied()
+            .filter(|&c| c < cnt)
+            .max()
+            .unwrap_or(0);
+        let eligible = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .count();
+        let covers = voters * 3 >= eligible;
+        let majority = cnt * 2 >= voters;
+        let plurality = cnt >= 3 && runner_up > 0 && cnt >= runner_up * 2;
+        if token_count.len() == 1 || (covers && (majority || plurality)) {
+            let pfx = token_prefix.get(&disp).cloned().unwrap_or_default();
+            return (disp, pfx);
+        }
+    }
+
+    // (a15) unique production member. When token votes tie in (a) and the
+    //     community sits entirely inside ONE top-level subproject of a
+    //     multi-member repo, that directory is the author's own boundary
+    //     and name for the code (spring-core's util/convert/codec family
+    //     is "spring-core", never a hash-map class or its busiest file).
+    //     Single-member repos skip this — the lone member carries no
+    //     information and the deeper rules differentiate communities.
+    {
+        // The member's display segment is the path's last component
+        // (`crates/groundgraph-core` → `groundgraph-core`).
+        fn leaf(m: &str) -> &str {
+            m.rsplit('/').next().unwrap_or(m)
+        }
+        let member_ok = |m: &str| {
+            let l = leaf(m).to_ascii_lowercase();
+            !SOURCE_ROOTS.contains(&l.as_str())
+                && !LAYER_DIRS.contains(&l.as_str())
+                && !NON_BUSINESS_BUCKETS.contains(&slugify(&l).as_str())
+        };
+        let community: BTreeSet<&str> = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .filter_map(|&fi| production_member(&files[fi]))
+            .collect();
+        if community.len() == 1 {
+            let member = *community.iter().next().expect("len checked");
+            if member_ok(member) {
+                let repo_members: BTreeSet<&str> = files
+                    .iter()
+                    .filter(|p| !is_test_path(p))
+                    .filter_map(|p| production_member(p))
+                    .filter(|m| member_ok(m))
+                    .collect();
+                if repo_members.len() >= 2 {
+                    // Members of a family share a brand prefix
+                    // (`spring-core` / `spring-web`, `okhttp-tls` /
+                    // `okhttp`, `crates/groundgraph-core` / `-engine`): the
+                    // tail is the author's module name and matches what
+                    // token-named sibling communities produce (`web`), so
+                    // the two merge instead of coexisting as "web" +
+                    // "spring_web".
+                    let name = leaf(member);
+                    let display = name
+                        .split_once('-')
+                        .filter(|(head, tail)| {
+                            !tail.is_empty()
+                                && repo_members.iter().any(|m| {
+                                    let m = leaf(m);
+                                    m != name
+                                        && (m == *head
+                                            || m.strip_prefix(head)
+                                                .is_some_and(|r| r.starts_with('-')))
+                                })
+                        })
+                        .map(|(_, tail)| tail.to_string())
+                        .unwrap_or_else(|| name.to_string());
+                    return (display, member.to_string());
+                }
+            }
+        }
+    }
+
+    // (a2) dominant file. In a flat layout (Redis's `src/`, any C project)
+    //     there are no feature directories at all, and the central-symbol
+    //     rule below surfaces whichever internal struct happens to be most
+    //     referenced (`AutoMemEntry`). But the *file* concentration of
+    //     inbound references is a stronger author signal: `dict.c` IS the
+    //     module named "dict". Only fires when one file clearly dominates
+    //     (≥2× the runner-up and a minimum absolute weight), so feature-
+    //     shaped communities with evenly spread references fall through.
+    {
+        // Test scaffolding can never be the author's module name — shared
+        // test helpers attract huge in-degree (every test case calls them)
+        // and would otherwise name the module "binding_test" (gin dogfood).
+        // Dunder files (`__init__.py` re-export hubs) likewise attract the
+        // most references while being pure package plumbing (django dogfood).
+        let mut scores: Vec<(usize, usize)> = file_idxs
+            .iter()
+            .filter(|&&fi| !is_test_path(&files[fi]))
+            .filter(|&&fi| {
+                let stem = files[fi]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.split('.').next())
+                    .unwrap_or_default();
+                !(stem.starts_with("__") && stem.ends_with("__"))
+            })
+            .map(|&fi| {
+                let s = file_symbols
+                    .get(&fi)
+                    .map(|syms| {
+                        syms.iter()
+                            .map(|s| sym_indegree.get(&s.id).copied().unwrap_or(0))
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+                (fi, s)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.cmp(&a.1).then(files[a.0].cmp(&files[b.0])));
+        if let Some(&(top_fi, top)) = scores.first() {
+            let second = scores.get(1).map(|&(_, s)| s).unwrap_or(0);
+            // Large communities (>15 files) can never be honestly named by
+            // one struct, so the top file's stem wins outright; smaller ones
+            // need clear dominance before overriding the symbol rule.
+            let dominant = if file_idxs.len() > 15 {
+                top >= 8
+            } else {
+                top >= 8 && top >= second * 2
+            };
+            if file_idxs.len() > 1 && dominant {
+                let stem = files[top_fi]
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.split('.').next())
+                    .unwrap_or_default();
+                // Only GENERIC_NAMES filters here. LAYER_DIRS describes
+                // *directory* layers (`lib/networking/` files things by
+                // kind); a file STEM like `networking.c` is the author's
+                // own module name and must survive.
+                if !stem.is_empty() && !GENERIC_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+                {
+                    return (stem.to_string(), production_dir_prefix(file_idxs, files));
+                }
+            }
+        }
+    }
+
+    // (b) central business symbol. A *type* (class/struct/enum) names a
+    //     module far better than a method, so any referenced type outranks
+    //     every callable regardless of degree — otherwise a ubiquitous method
+    //     (`updateThemeSubviews`, `endEditing`) would name the feature.
+    //     Within the same type-ness, higher in-degree wins; ties break by
+    //     name. Generic names are skipped so we never surface "load"/"state".
+    let mut best: Option<(bool, usize, String)> = None; // (is_type, indegree, name)
+    for &fi in file_idxs {
+        if is_test_path(&files[fi]) {
+            continue;
+        }
+        if let Some(syms) = file_symbols.get(&fi) {
+            for s in syms {
+                let Some(nm) = s.name.as_deref() else {
+                    continue;
+                };
+                if nm.is_empty() || GENERIC_NAMES.contains(&nm.to_ascii_lowercase().as_str()) {
+                    continue;
+                }
+                let deg = sym_indegree.get(&s.id).copied().unwrap_or(0);
+                let is_ty = language_traits::is_type(s.kind);
+                let cand = (is_ty, deg, nm.to_string());
+                let better = match &best {
+                    Some((bt, bd, bn)) => {
+                        (is_ty && !*bt)
+                            || (is_ty == *bt && deg > *bd)
+                            || (is_ty == *bt && deg == *bd && nm < bn.as_str())
+                    }
+                    None => true,
+                };
+                if better {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    if let Some((is_ty, _deg, nm)) = best {
+        // Only a *type* may name a module. A callable (method / function /
+        // constructor), however highly referenced, title-cases into a
+        // pseudo-type (`findNodeById` → "FindNodeById") that masquerades as a
+        // business concept; such clusters — extension files, lone test files —
+        // are named by their directory in step (c) instead.
+        if is_ty {
+            return (
+                strip_role_suffix(&nm),
+                production_dir_prefix(file_idxs, files),
+            );
+        }
+    }
+
+    // (c) fallback: deepest *non-layer* segment of the common directory prefix
+    //     (a structural layer like `viewmodel`/`ui` names *how* code is filed,
+    //     not the feature). Fall back to the last segment if all are layers.
+    let pfx = production_dir_prefix(file_idxs, files);
+    let disp = pfx
+        .rsplit('/')
+        .find(|s| !s.is_empty() && !LAYER_DIRS.contains(&s.to_ascii_lowercase().as_str()))
+        .or_else(|| pfx.rsplit('/').find(|s| !s.is_empty()))
+        .unwrap_or("module")
+        .to_string();
+    (disp, pfx)
+}
+
+/// Strip a single trailing architectural-role word so a community
+/// centred on `CheckoutController` is named "Checkout", not "Checkout
+/// Controller". Only one suffix is removed and never the whole name.
+fn strip_role_suffix(name: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        "Controller",
+        "Repository",
+        "UseCase",
+        "Usecase",
+        "Service",
+        "Provider",
+        "Notifier",
+        "Manager",
+        "Handler",
+        "Bloc",
+        "Cubit",
+        "ViewModel",
+        "Screen",
+        "Widget",
+        "Page",
+        "View",
+        "Model",
+        "State",
+        "Store",
+        "Client",
+        "Impl",
+        "Error",
+        "Exception",
+    ];
+    for suf in SUFFIXES {
+        if name.len() > suf.len() && name.ends_with(suf) {
+            return name[..name.len() - suf.len()].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Common directory prefix anchored to PRODUCTION files. A community that
+/// spans `django/forms/**` and `tests/forms_tests/**` has an empty plain
+/// common prefix; the production subset ("where the feature lives") is the
+/// useful answer. Falls back to all files when everything is tests.
+fn production_dir_prefix(file_idxs: &[usize], files: &[String]) -> String {
+    let prod: Vec<usize> = file_idxs
+        .iter()
+        .copied()
+        .filter(|&fi| !is_test_path(&files[fi]))
+        .collect();
+    let pfx = if prod.is_empty() {
+        String::new()
+    } else {
+        common_dir_prefix(&prod, files)
+    };
+    if pfx.is_empty() {
+        common_dir_prefix(file_idxs, files)
+    } else {
+        pfx
+    }
+}
+
+/// Longest common directory prefix (filename dropped) across files.
+fn common_dir_prefix(file_idxs: &[usize], files: &[String]) -> String {
+    let mut split: Vec<Vec<String>> = Vec::new();
+    for &fi in file_idxs {
+        let norm = files[fi].replace('\\', "/");
+        let mut parts: Vec<String> = norm
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if parts.last().map(|s| s.contains('.')).unwrap_or(false) {
+            parts.pop();
+        }
+        if !parts.is_empty() {
+            split.push(parts);
+        }
+    }
+    if split.is_empty() {
+        return String::new();
+    }
+    let mut prefix = split[0].clone();
+    for s in &split[1..] {
+        let mut i = 0;
+        while i < prefix.len() && i < s.len() && prefix[i] == s[i] {
+            i += 1;
+        }
+        prefix.truncate(i);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.join("/")
+}
+
+// ---------------------------------------------------------------------------
+// Feature-key segmentation (pure, testable)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeatureKey {
+    slug: String,
+    display: String,
+    prefix: String,
+    /// `true` when the token came from an explicit feature marker
+    /// (`features/<x>`) or a recognised source root (`lib/<x>`, `src/<x>`);
+    /// `false` for the bare first-directory fallback (e.g. the repo's own
+    /// top folder `Yolan/`). Loose first-dir tokens must never *name* a graph
+    /// community, or every community collapses into one "repo-name" module.
+    trusted: bool,
+}
+
+/// Structural / architectural-layer directory names that say *how* code is
+/// filed, not *which feature* it serves. The path-only fallback skips these
+/// so an isolated `Yolan/UI/BuyAndAfter/Cell/Foo.swift` buckets under the
+/// feature `BuyAndAfter`, not the repo root or the `UI` / `Cell` layer.
+const LAYER_DIRS: &[&str] = &[
+    "ui",
+    "view",
+    "views",
+    "viewmodel",
+    "viewmodels",
+    "viewcontroller",
+    "viewcontrollers",
+    "controller",
+    "controllers",
+    "cell",
+    "cells",
+    "model",
+    "models",
+    "entity",
+    "entities",
+    "common",
+    "base",
+    "core",
+    "util",
+    "utils",
+    "helper",
+    "helpers",
+    "extension",
+    "extensions",
+    "category",
+    "categories",
+    "component",
+    "components",
+    "widget",
+    "widgets",
+    "class",
+    "classes",
+    "resource",
+    "resources",
+    "network",
+    "networking",
+    "service",
+    "services",
+    "manager",
+    "managers",
+    "tool",
+    "tools",
+    "protocol",
+    "protocols",
+    "config",
+    "configs",
+    "constant",
+    "constants",
+    "vendor",
+    "third",
+    "thirdparty",
+    "library",
+    "libraries",
+    "support",
+    "shared",
+    "general",
+    "custom",
+];
+
+/// Path-only fallback for an **isolated** file (no graph coupling): pick the
+/// most specific *feature* directory by dropping the repo-root segment and any
+/// structural [`LAYER_DIRS`]. Returns `(display, prefix)` where `prefix` is the
+/// path up to and including the chosen segment. Honest last resort — used only
+/// where the code graph offers no signal at all.
+fn fallback_feature_token(path: &str) -> (String, String) {
+    let norm = path.replace('\\', "/");
+    let raw: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    let dirs: &[&str] = if raw.last().map(|s| s.contains('.')).unwrap_or(false) {
+        &raw[..raw.len() - 1]
+    } else {
+        &raw[..]
+    };
+    if dirs.is_empty() {
+        return ("misc".to_string(), String::new());
+    }
+    if dirs.len() == 1 {
+        return (dirs[0].to_string(), dirs[0].to_string());
+    }
+    // Drop the repo-root segment, then take the first non-layer segment.
+    for (i, seg) in dirs.iter().enumerate().skip(1) {
+        if !LAYER_DIRS.contains(&seg.to_ascii_lowercase().as_str()) {
+            // A source root inside a multi-module repo (`extras/src/...`,
+            // `pkg/lib/src/...`): pierce the structural chain so the bucket
+            // is named by the business package, never "src" / "main".
+            if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) {
+                if let Some((k, end)) = business_segment_after_source_root(dirs, i) {
+                    return (dirs[k].to_string(), dirs[..end].join("/"));
+                }
+            }
+            return (seg.to_string(), dirs[..=i].join("/"));
+        }
+    }
+    // Everything after the root is a structural layer (`Yolan/ViewModel/*`,
+    // `Yolan/UI/Foo.swift`): there is no feature signal at all, so group under
+    // the app/source root rather than leaking a layer name (`UI`, `ViewModel`)
+    // as if it were a feature.
+    (dirs[0].to_string(), dirs[0].to_string())
+}
+
+/// First index at or after `start` that is not itself a source root.
+/// Pierces consecutive structural chains like Dart/Flutter's `lib/src`
+/// (`packages/foo/lib/src/x.dart`) so `src` is never a business token.
+fn skip_source_chain(dirs: &[&str], start: usize) -> usize {
+    let mut j = start;
+    while j < dirs.len() && SOURCE_ROOTS.contains(&dirs[j].to_ascii_lowercase().as_str()) {
+        j += 1;
+    }
+    j
+}
+
+/// Resolve the business segment for a path whose segment `i` is a source
+/// root: pierce the JVM source-set chain first, then any consecutive
+/// source-root chain (`lib/src`). When the chain swallows the whole tail —
+/// the file sits directly inside `lib/src/` — the business segment is the
+/// one *before* the root (the Dart/SwiftPM package directory), provided it
+/// is not itself structural. Returns `(index, prefix_end)` where `prefix`
+/// is `dirs[..prefix_end]`.
+fn business_segment_after_source_root(dirs: &[&str], i: usize) -> Option<(usize, usize)> {
+    if let Some(j) = pierce_jvm_layout(dirs, i) {
+        if j < dirs.len() {
+            return Some((j, j + 1));
+        }
+        // A recognised JVM source-set chain with no package dirs at all
+        // (`build-logic/src/main/kotlin/Foo.kt`): the module directory in
+        // front of `src` is the business segment — "main" never is.
+        if i > 0 && !LAYER_DIRS.contains(&dirs[i - 1].to_ascii_lowercase().as_str()) {
+            return Some((i - 1, i));
+        }
+        return None;
+    }
+    let j = skip_source_chain(dirs, i + 1);
+    if j < dirs.len() {
+        let k = pierce_pascal_namespace(dirs, j);
+        return Some((k, k + 1));
+    }
+    if i > 0 && !LAYER_DIRS.contains(&dirs[i - 1].to_ascii_lowercase().as_str()) {
+        return Some((i - 1, i));
+    }
+    None
+}
+
+/// `src/<Vendor>/<Package>/…` (PSR-4 and other single-namespace-root
+/// layouts): a PascalCase vendor segment directly after the source chain is
+/// structural when a PascalCase package directory follows — `Illuminate` in
+/// laravel/framework names the *namespace* shared by every file, the
+/// component directory names the module. Pierce exactly one level. Dotted
+/// .NET project dirs (`Microsoft.Extensions.Logging`) and layer dirs
+/// (`Models`, `Controllers` in an app skeleton) are real module anchors and
+/// are never pierced into.
+fn pierce_pascal_namespace(dirs: &[&str], j: usize) -> usize {
+    let pascal = |s: &str| {
+        s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && s.chars().all(|c| c.is_ascii_alphanumeric())
+    };
+    let Some(next) = dirs.get(j + 1) else {
+        return j;
+    };
+    if pascal(dirs[j]) && pascal(next) && !LAYER_DIRS.contains(&next.to_ascii_lowercase().as_str())
+    {
+        j + 1
+    } else {
+        j
+    }
+}
+
+/// Given `dirs` and the index of a matched source root (`src`), return the
+/// index of the first *business* segment after piercing the Maven/Gradle
+/// source-set chain (`src/{main,test,commonMain,…}/{java,kotlin,…}`) and the
+/// JVM reverse-domain package prefix (`com/google/gson` → its sub-package,
+/// or the product segment for package-root files). Returns `None` when this
+/// is not a JVM source-set layout at all; `Some(dirs.len())` when the chain
+/// matched but swallowed every remaining segment (caller anchors at the
+/// module directory).
+fn pierce_jvm_layout(dirs: &[&str], src_idx: usize) -> Option<usize> {
+    const JVM_LANGS: &[&str] = &["java", "kotlin", "scala", "groovy"];
+    const TLDS: &[&str] = &["com", "org", "net", "io", "dev", "me", "co", "edu", "gov"];
+    let set_raw = dirs.get(src_idx + 1)?;
+    let set = set_raw.to_ascii_lowercase();
+    let lang_idx = src_idx + 2;
+    let lang_follows = dirs
+        .get(lang_idx)
+        .is_some_and(|s| JVM_LANGS.contains(&s.to_ascii_lowercase().as_str()));
+    // Standard Maven/Gradle sets end in main/test; KMP repos also declare
+    // custom camelCase sets (`src/commonJvmAndroid/kotlin/...`). A camelCase
+    // segment is a set only when a JVM language dir follows — an all-lower
+    // business dir over a stray `java/` subdir is never pierced.
+    let is_source_set = set.ends_with("main")
+        || set.ends_with("test")
+        || set == "androidtest"
+        || (lang_follows && set_raw.chars().any(|c| c.is_ascii_uppercase()));
+    if !is_source_set || !lang_follows {
+        return None;
+    }
+    // Package segments after the language dir. Letters-only comparison
+    // absorbs version suffixes (`okhttp3`) and separators (`spring-jdbc`).
+    let letters = |s: &str| -> String {
+        s.chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let module_dir = if src_idx > 0 {
+        letters(dirs[src_idx - 1])
+    } else {
+        String::new()
+    };
+    let mut i = lang_idx + 1;
+    // Reverse-domain prefix: TLD + organisation.
+    if dirs.len() - i >= 2 && TLDS.contains(&dirs[i].to_ascii_lowercase().as_str()) {
+        i += 2;
+        // Product segment: skipped when a deeper sub-package exists
+        // (`com/google/gson/stream` → stream; `com/google/gson` → gson) —
+        // unless the subproject directory is *named after* it
+        // (`spring-jdbc` ↔ `…springframework/jdbc`): a product-named
+        // subproject makes the product segment the business identity, and
+        // its sub-packages (`core`, `support`) mere structure.
+        if dirs.len() - i >= 2 {
+            let pkg = letters(dirs[i]);
+            let product_named_subproject =
+                !pkg.is_empty() && module_dir != pkg && module_dir.ends_with(&pkg);
+            if !product_named_subproject {
+                i += 1;
+            }
+        }
+    } else if dirs.len() - i >= 2 {
+        // Non-reverse-domain package root that *names the product*: Kotlin
+        // repos commonly root the package at the module's own name
+        // (`okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/…` —
+        // okhttp3 ≈ okhttp). Strip it like the TLD product segment, and only
+        // when a deeper sub-package exists.
+        let pkg = letters(dirs[i]);
+        if !pkg.is_empty() && pkg == module_dir {
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+/// Derive the business module a code/test path belongs to. Returns `None`
+/// for paths with no usable directory segment.
+fn feature_key(path: &str) -> Option<FeatureKey> {
+    let norm = path.replace('\\', "/");
+    let raw: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if raw.is_empty() {
+        return None;
+    }
+    // Directory segments only: drop a trailing filename (has an extension).
+    let dirs: Vec<&str> = if raw.last().map(|s| s.contains('.')).unwrap_or(false) {
+        raw[..raw.len() - 1].to_vec()
+    } else {
+        raw.clone()
+    };
+    if dirs.is_empty() {
+        return None;
+    }
+
+    // 1) explicit feature markers win.
+    for (i, seg) in dirs.iter().enumerate() {
+        if FEATURE_MARKERS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
+            return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
+        }
+    }
+    // 2) segment after a source root. Maven/Gradle structural chains
+    //    (`src/main/java`, `src/test/kotlin`, KMP's `src/commonMain/kotlin`)
+    //    and the JVM reverse-domain package prefix (`com/google/gson`) are
+    //    pierced first — "main" / "com" are never business tokens.
+    for (i, seg) in dirs.iter().enumerate() {
+        if SOURCE_ROOTS.contains(&seg.to_ascii_lowercase().as_str()) && i + 1 < dirs.len() {
+            if let Some((k, end)) = business_segment_after_source_root(&dirs, i) {
+                return Some(make_key(dirs[k], &dirs[..end], true));
+            }
+            return Some(make_key(dirs[i + 1], &dirs[..=i + 1], true));
+        }
+    }
+    // 3) fallback: first directory segment (untrusted — only a path anchor).
+    Some(make_key(dirs[0], &dirs[..1], false))
+}
+
+fn make_key(name: &str, prefix_segments: &[&str], trusted: bool) -> FeatureKey {
+    FeatureKey {
+        slug: slugify(name),
+        display: name.to_string(),
+        prefix: prefix_segments.join("/"),
+        trusted,
+    }
+}
+
+/// Match a doc path to one of the known module slugs by normalised
+/// segment equality (so `docs/feature-docs/customer-edit/…` matches the
+/// `customer_edit` module). Returns the longest matching slug.
+fn match_doc_to_module(path: &str, known: &BTreeSet<String>) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let segments: Vec<String> = norm
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(normalise_token)
+        .collect();
+    let mut best: Option<&String> = None;
+    for slug in known {
+        let target = normalise_token(slug);
+        if target.is_empty() {
+            continue;
+        }
+        if segments.iter().any(|seg| seg == &target) {
+            match best {
+                Some(b) if b.len() >= slug.len() => {}
+                _ => best = Some(slug),
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Lower-case and strip separators so `customer-edit` == `customer_edit`.
+fn normalise_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Distinctive identifier token from a symbol name, or `None` when it
+/// carries no identity (too short, generic verb, etc.). Length ≥ 4: 3-char
+/// names (`map`, `get`, `run`) collide with everyday prose words in
+/// headings.
+fn identifier_token(name: &str) -> Option<String> {
+    let norm = normalise_token(name);
+    if norm.len() < 4 || GENERIC_NAMES.contains(&norm.as_str()) {
+        return None;
+    }
+    Some(norm)
+}
+
+/// Code identifiers cited by a doc heading. Two sources, both precise:
+/// backtick spans (`` `Registration` ``) and bare CamelCase words with ≥2
+/// uppercase letters (`ScheduledIo`). Plain capitalised prose (`Overview`,
+/// `Goals`) matches neither, so ordinary headings cast no votes.
+fn heading_identifier_tokens(heading: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = heading;
+    while let Some(start) = rest.find('`') {
+        let Some(len) = rest[start + 1..].find('`') else {
+            break;
+        };
+        let span = &rest[start + 1..start + 1 + len];
+        // `a::b` / `a.b` paths cite the leaf identifier.
+        for part in span.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if part.chars().any(|c| c.is_ascii_alphabetic()) {
+                if let Some(token) = identifier_token(part) {
+                    out.push(token);
+                }
+            }
+        }
+        rest = &rest[start + 1 + len + 1..];
+    }
+    for word in heading.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        let uppers = word.chars().filter(|c| c.is_ascii_uppercase()).count();
+        let has_lower = word.chars().any(|c| c.is_ascii_lowercase());
+        let is_camel = uppers >= 2 && has_lower;
+        let is_snake = word.contains('_') && word.chars().any(|c| c.is_ascii_alphabetic());
+        if is_camel || is_snake {
+            if let Some(token) = identifier_token(word) {
+                out.push(token);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Product-level document: a README/ARCHITECTURE/DESIGN anywhere in the
+/// tree, any document at the repo root, or a document at the *top level of
+/// a documentation root* (leveldb's `doc/impl.md`, flask's
+/// `docs/design.rst`). These describe the product or a whole package, and
+/// surface as pack-level `key_docs` when no module claims them.
+fn is_product_level_doc(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let stem = file.split('.').next().unwrap_or(file).to_ascii_lowercase();
+    // Process docs carry no business knowledge: changelogs, contribution
+    // guides, licensing, codes of conduct.
+    if matches!(
+        stem.as_str(),
+        "changelog" | "changes" | "contributing" | "license" | "code_of_conduct" | "security"
+    ) {
+        return false;
+    }
+    if !normalized.contains('/') {
+        return true;
+    }
+    if matches!(stem.as_str(), "readme" | "architecture" | "design") {
+        return true;
+    }
+    if let Some((dir, _)) = normalized.rsplit_once('/') {
+        if matches!(
+            dir,
+            "doc" | "docs" | "documentation" | "specs" | "spec" | "adr" | "rfcs" | "wiki"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the path is a prose document (by extension) rather than code.
+fn is_doc_file_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".md", ".mdx", ".markdown", ".rst", ".txt", ".adoc"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Normalised file stem usable as a doc↔source identity token, or `None`
+/// when the stem carries no identity: generic names (`index`, `main`),
+/// dunder plumbing (`__init__`), or too short to be distinctive.
+fn source_stem_token(path: &str) -> Option<String> {
+    let file = path.replace('\\', "/");
+    let file = file.rsplit('/').next()?;
+    let stem = file.split('.').next()?;
+    if stem.starts_with("__") && stem.ends_with("__") {
+        return None;
+    }
+    let norm = normalise_token(stem);
+    if norm.len() < 3 || GENERIC_NAMES.contains(&norm.as_str()) {
+        return None;
+    }
+    Some(norm)
+}
+
+/// Turn an arbitrary directory name into a valid business-candidate slug
+/// (`^[a-z0-9][a-z0-9_-]*$`).
+fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        return "module".to_string();
+    }
+    // Must start with alnum (after trimming `_`, a non-empty slug always does;
+    // `starts_with` keeps this panic-free even if the trim logic changes).
+    if trimmed.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        trimmed
+    } else {
+        format!("m_{trimmed}")
+    }
+}
+
+/// Prettify a folder name for display: `customer_edit` -> `Customer Edit`.
+fn prettify(name: &str) -> String {
+    let words: Vec<String> = name
+        .split(['_', '-', ' '])
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        name.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+
+fn framework_family(node: &Node) -> Option<String> {
+    let meta = node.metadata_json.as_deref()?;
+    let role: crate::python_frameworks::FrameworkRole = serde_json::from_str(meta).ok()?;
+    Some(role.family().to_string())
+}
+
+fn display_label(node: &Node) -> String {
+    node.name
+        .clone()
+        .or_else(|| node.stable_key.clone())
+        .unwrap_or_else(|| node.id.to_string())
+}
+
+fn line_range(node: &Node) -> Option<(u32, u32)> {
+    match (node.start_line, node.end_line) {
+        (Some(s), Some(e)) => Some((s, e)),
+        _ => None,
+    }
+}
+
+/// Collapse fine-grained nodes (doc *sections*, test *cases*) to one
+/// [`EvidenceRef`] per source file, in stable path order. For a business
+/// pack we want the *files* that describe/verify a module, not every
+/// heading or assertion. The representative id is the first node of the
+/// file (a real node id, so it still grounds the evidence list), and the
+/// name is the file name.
+fn dedup_refs_by_path(nodes: &[&Node]) -> Vec<EvidenceRef> {
+    let mut sorted: Vec<&&Node> = nodes.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+    });
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<EvidenceRef> = Vec::new();
+    for node in sorted {
+        let path = node.path.clone().unwrap_or_default();
+        if path.is_empty() || !seen.insert(path.clone()) {
+            continue;
+        }
+        let name = path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| display_label(node));
+        out.push(EvidenceRef {
+            id: node.id.to_string(),
+            path,
+            name,
+        });
+    }
+    out
+}
+
+/// Heuristic: does this path live in test/spec scaffolding? Used to keep
+/// test doubles (mocks/fakes) out of the *business* entry-point ranking.
+fn is_test_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    let in_test_dir = p.split('/').any(|seg| {
+        matches!(
+            seg,
+            "test"
+                | "tests"
+                | "testing"
+                | "integration_test"
+                | "test_driver"
+                | "__tests__"
+                | "spec"
+                | "specs"
+        )
+    });
+    in_test_dir
+        || p.ends_with("_test.dart")
+        || p.contains("_test.")
+        || p.contains(".test.")
+        || p.contains(".spec.")
+        || p.contains("_spec.")
+}
+
+/// Heuristic: is this a generated / codegen file? Such symbols (freezed
+/// copyWith impls, json_serializable `.g.dart`, protobuf, mockito mocks)
+/// are machine-written plumbing, never a business entry point.
+fn is_generated_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    const GENERATED_SUFFIXES: &[&str] = &[
+        ".freezed.dart",
+        ".g.dart",
+        ".gr.dart",
+        ".config.dart",
+        ".mocks.dart",
+        ".pb.dart",
+        ".pbenum.dart",
+        ".pbjson.dart",
+        ".pbserver.dart",
+        ".gen.dart",
+    ];
+    GENERATED_SUFFIXES.iter().any(|suf| p.ends_with(suf))
+        || p.ends_with(".generated.ts")
+        || p.ends_with(".g.ts")
+}
+
+fn capped_sorted(set: &BTreeSet<String>, limit: usize) -> Vec<String> {
+    set.iter().take(limit).cloned().collect()
+}
+
+/// Curate the node-id evidence list an AI should ground a candidate in:
+/// the entry-point symbols, then docs, then a couple of tests.
+fn build_evidence_list(
+    entry_points: &[EvidenceSymbol],
+    docs: &[EvidenceRef],
+    tests: &[EvidenceRef],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ep in entry_points {
+        out.push(ep.id.clone());
+    }
+    for d in docs.iter().take(3) {
+        out.push(d.id.clone());
+    }
+    for t in tests.iter().take(3) {
+        out.push(t.id.clone());
+    }
+    out.dedup();
+    out
+}
+
+fn prompt_text() -> String {
+    r#"你是 GroundGraph 的业务逻辑提炼器。下面的 `modules` 是按业务模块（feature）聚合的**代码事实证据**（入口符号、路由、Provider、存储、测试、文档、模块依赖）。
+
+请基于这些证据，为每个值得记录的业务模块写出**中文业务逻辑候选**，输出 `business_logic.yaml`，schema 如下：
+
+```yaml
+schema_version: 1
+candidates:
+  - id: <模块 id，与 modules[].id 一致，^[a-z0-9][a-z0-9_-]*$>
+    name: "<一句话中文业务标题>"
+    description: |
+      <1-3 句中文业务逻辑描述：这个模块在产品里负责什么、关键流程、对外契约边界>
+    evidence:        # 只能引用证据包里出现过的 id（modules[].evidence / entry_points[].id / docs[].id / tests[].id）
+      - <node id>
+    confidence: 0.0..1.0   # 证据越充分（有入口+测试+文档+语义边）越高
+    open_questions:        # 代码无法证明的问题（外部配置、服务端行为、设备能力等）
+      - "<问题>"
+    risks:                 # 看起来脆弱/缺测试/边界不清的风险
+      - "<风险>"
+    recommendation: "<给审阅人的一句话建议，如 建议接受 / 建议补测试后再确认>"
+    status: proposed
+```
+
+硬约束：
+1. 只能引用证据包里**真实出现过的 id / 路径**，严禁臆造任何 path / name / id。
+2. 信息不足时，写入 `open_questions` 或调低 `confidence`，不要编造高置信描述。
+3. 描述聚焦"业务做什么、为什么"，不是"代码怎么写"；用产品/领域语言。
+4. 所有候选 `status: proposed`；是否确认由人工 `groundgraph candidate review` 决定，绝不冒充人工确认。
+5. 把生成结果写入 `.groundgraph/candidates/business_logic.yaml`。"#
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// config helpers (mirrors connect.rs to keep the module self-contained)
+// ---------------------------------------------------------------------------
+
+fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+    crate::config::load_config(repo_root)
+}
+
+fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
+    crate::config::resolve_storage_path(repo_root, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use groundgraph_core::{EdgeCertainty, EdgeSource, EdgeStatus};
+    use tempfile::TempDir;
+
+    fn empty_store() -> (Store, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        (store, dir)
+    }
+
+    fn distinct(labels: &[usize]) -> usize {
+        labels.iter().copied().collect::<BTreeSet<usize>>().len()
+    }
+
+    #[test]
+    fn refine_oversized_splits_a_blob_but_keeps_a_monolith() {
+        // Two triangles bridged, initially fused into one community (label 0).
+        // With a cap of 2 the community is oversized, so it is re-clustered on
+        // its induced subgraph and separates into the two triangles.
+        let edges = vec![
+            (0, 1, 1.0),
+            (1, 2, 1.0),
+            (0, 2, 1.0),
+            (3, 4, 1.0),
+            (4, 5, 1.0),
+            (3, 5, 1.0),
+            (2, 3, 1.0), // bridge
+        ];
+        let placed = vec![true; 6];
+        let mut labels = vec![0usize; 6];
+        let mut next = 1;
+        refine_oversized(&mut labels, &edges, &placed, 2, &mut next);
+        assert_eq!(
+            distinct(&labels),
+            2,
+            "an oversized two-triangle blob must split: {labels:?}"
+        );
+        assert_eq!(labels[0], labels[1], "triangle A stays together");
+        assert_eq!(labels[3], labels[5], "triangle B stays together");
+        assert_ne!(labels[0], labels[3], "the two triangles separate");
+
+        // A genuine clique cannot be split and must be left whole even when it
+        // exceeds the cap (no infinite recursion).
+        let mut kedges = Vec::new();
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                kedges.push((i, j, 1.0));
+            }
+        }
+        let mut klabels = vec![0usize; 5];
+        let mut knext = 1;
+        refine_oversized(&mut klabels, &kedges, &[true; 5], 2, &mut knext);
+        assert_eq!(distinct(&klabels), 1, "a clique is a monolith: {klabels:?}");
+    }
+
+    #[test]
+    fn fallback_feature_token_skips_layers_and_root() {
+        // Isolated file under repo-root + UI/Cell layers → the feature dir.
+        let (disp, pfx) = fallback_feature_token("Yolan/UI/BuyAndAfter/Cell/Foo.swift");
+        assert_eq!(disp, "BuyAndAfter");
+        assert_eq!(pfx, "Yolan/UI/BuyAndAfter");
+        // A flat layer-only path has no feature signal: a structural layer
+        // (`ui`, `viewmodel`) says *how* code is filed, not *which* feature, so
+        // we group under the app/source root, never the leaked layer name.
+        let (disp2, pfx2) = fallback_feature_token("Yolan/ViewModel/OrderVM.swift");
+        assert_eq!(disp2, "Yolan");
+        assert_eq!(pfx2, "Yolan");
+        // Files sitting directly in the `UI` layer likewise group under the
+        // app root, not a "UI" pseudo-feature.
+        let (disp3, _) = fallback_feature_token("Yolan/UI/Splash.swift");
+        assert_eq!(disp3, "Yolan");
+    }
+
+    #[test]
+    fn name_module_prefers_dominant_file_stem_in_flat_layout() {
+        // Regression (Redis): a flat `src/` C codebase has no feature
+        // directories, so naming fell through to the highest-indegree
+        // *struct* — an internal data carrier like `AutoMemEntry` — which
+        // reads as noise. When one file in the community dominates the
+        // inbound references, its stem (`dict.c` → "dict") IS the module
+        // name the authors chose; prefer it over any symbol.
+        let files = vec!["src/dict.c".to_string(), "src/adlist.c".to_string()];
+        let n_core = node("c1", NodeKind::CFunction, &files[0], "dictAdd");
+        let n_core2 = node("c2", NodeKind::CFunction, &files[0], "dictCreate");
+        let n_struct = node("c3", NodeKind::CStruct, &files[1], "AutoMemEntry");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_core, &n_core2]);
+        file_symbols.insert(1, vec![&n_struct]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_core.id, 30);
+        indeg.insert(&n_core2.id, 12);
+        indeg.insert(&n_struct.id, 6);
+        let (disp, _pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "dict",
+            "dominant file stem must outrank an internal struct name: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_never_names_after_test_files_or_test_symbols() {
+        // Regression (gin): communities containing both production and test
+        // files got named "binding_test" / "teststruct" — the test file had
+        // the highest inbound-reference concentration (shared helpers), and
+        // its stem leaked into the business module name. Test scaffolding can
+        // never be the author's module name: prefer the busiest NON-test file
+        // (and never a struct that only lives in tests).
+        let files = vec![
+            "binding/binding_test.go".to_string(),
+            "binding/binding.go".to_string(),
+        ];
+        let n_helper = node("g1", NodeKind::GoFunction, &files[0], "createTestForm");
+        let n_struct = node("g2", NodeKind::GoStruct, &files[0], "TestStruct");
+        let n_core = node("g3", NodeKind::GoInterface, &files[1], "Binding");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_helper, &n_struct]);
+        file_symbols.insert(1, vec![&n_core]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        // Test helpers are referenced from dozens of test cases — far more
+        // than the production interface.
+        indeg.insert(&n_helper.id, 40);
+        indeg.insert(&n_struct.id, 25);
+        indeg.insert(&n_core.id, 9);
+        let (disp, _pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("binding"),
+            "module name must come from production code (binding.go / Binding), \
+             not test scaffolding: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_skips_python_dunder_files() {
+        // Regression (django): `django/forms/__init__.py` style re-export
+        // hubs attract the highest inbound-reference concentration in the
+        // community, so the dominant-file rule named a 2900-symbol module
+        // "Init". A dunder file is package plumbing, never the author's
+        // module name — the busiest real file must win instead.
+        let files = vec![
+            "django/forms/__init__.py".to_string(),
+            "django/forms/fields.py".to_string(),
+        ];
+        let n_hub = node("p1", NodeKind::PythonFunction, &files[0], "lazy_import");
+        let n_field = node("p2", NodeKind::PythonClass, &files[1], "CharField");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_hub]);
+        file_symbols.insert(1, vec![&n_field]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_hub.id, 50);
+        indeg.insert(&n_field.id, 20);
+        let (disp, pfx) = name_module("comm::1", &[0, 1], &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("fields") || disp.eq_ignore_ascii_case("charfield"),
+            "dunder file must never name a module: got {disp}"
+        );
+        assert_eq!(pfx, "django/forms");
+    }
+
+    #[test]
+    fn feature_key_pierces_maven_layout_and_jvm_package_prefix() {
+        // Regression (gson): `gson/src/main/java/com/google/gson/stream/…`
+        // hit the SOURCE_ROOTS rule at `src` and took the next segment —
+        // "main" — as a trusted business token, naming a 728-symbol module
+        // "Main". The Maven/Gradle structural chain (`src/<set>/<lang>`) and
+        // the JVM reverse-domain package prefix must both be pierced.
+        let k = feature_key("gson/src/main/java/com/google/gson/stream/JsonReader.java")
+            .expect("feature key");
+        assert_eq!(k.display, "stream", "got {k:?}");
+        // Package-root files anchor to the product segment.
+        let k2 = feature_key("gson/src/main/java/com/google/gson/Gson.java").expect("feature key");
+        assert_eq!(k2.display, "gson", "got {k2:?}");
+        // Test sets pierce the same way.
+        let k3 = feature_key("gson/src/test/java/com/google/gson/functional/MapTest.java")
+            .expect("feature key");
+        assert_eq!(k3.display, "functional", "got {k3:?}");
+        // Non-JVM layouts keep the existing behaviour.
+        let k4 = feature_key("src/network/http.c").expect("feature key");
+        assert_eq!(k4.display, "network");
+        // The isolated-file fallback pierces the same way: a multi-module
+        // Maven repo (`extras/src/main/java/...`) must not name its bucket
+        // "src".
+        let (disp, _pfx) = fallback_feature_token(
+            "extras/src/main/java/com/google/gson/interceptors/Intercept.java",
+        );
+        assert_eq!(disp, "interceptors");
+    }
+
+    #[test]
+    fn feature_key_pierces_dart_lib_src_chain_to_the_package_segment() {
+        // Regression (bloc): `examples/github_search/common_github_search/
+        // lib/src/*.dart` hit the SOURCE_ROOTS rule at `lib` and took the
+        // next segment — `src`, itself a source root — as a trusted business
+        // token, naming a 61-symbol module "Src". Consecutive structural
+        // segments must be pierced; when nothing remains after the chain the
+        // business segment is the one *before* it (Dart package layout).
+        let k = feature_key("examples/github_search/common_github_search/lib/src/models.dart")
+            .expect("feature key");
+        assert_eq!(k.display, "common_github_search", "got {k:?}");
+        // A feature dir after the chain still wins (src-layout Python).
+        let k2 = feature_key("src/flask/app.py").expect("feature key");
+        assert_eq!(k2.display, "flask", "got {k2:?}");
+        // Monorepo package roots keep their package name.
+        let k3 = feature_key("packages/bloc/lib/src/bloc.dart").expect("feature key");
+        assert_eq!(k3.display, "bloc", "got {k3:?}");
+        // Isolated-file fallback: the first non-layer segment after the
+        // repo root is the app dir itself — never "src".
+        let (disp, _pfx) =
+            fallback_feature_token("examples/flutter_todos/lib/src/widgets/card.dart");
+        assert_eq!(disp, "flutter_todos");
+        let (disp2, _pfx2) = fallback_feature_token("common_github_search/lib/src/models.dart");
+        assert_eq!(disp2, "common_github_search");
+    }
+
+    #[test]
+    fn feature_key_pierces_psr4_vendor_namespace() {
+        // Regression (laravel): `src/Illuminate/Auth/AuthManager.php` hit the
+        // SOURCE_ROOTS rule at `src` and took "Illuminate" — the PSR-4 vendor
+        // namespace shared by *all* 2700 files — as the business token, so
+        // every graph community named itself "illuminate" and the slug-merge
+        // collapsed the whole framework into one module. A PascalCase vendor
+        // segment directly under a source root is structural when another
+        // PascalCase package segment follows; pierce exactly one level.
+        let k = feature_key("src/Illuminate/Auth/AuthManager.php").expect("feature key");
+        assert_eq!(k.display, "Auth", "got {k:?}");
+        let k2 = feature_key("src/Illuminate/Database/Eloquent/Model.php").expect("feature key");
+        assert_eq!(k2.display, "Database", "got {k2:?}");
+        // Lowercase python/dart packages keep their package name.
+        let k3 = feature_key("src/flask/app.py").expect("feature key");
+        assert_eq!(k3.display, "flask", "got {k3:?}");
+        // A dotted .NET project dir is a real module name, never pierced.
+        let k4 = feature_key("src/Microsoft.Extensions.Logging/Logger.cs").expect("feature key");
+        assert_eq!(k4.display, "Microsoft.Extensions.Logging", "got {k4:?}");
+        // Single Pascal segment with only files below stays (it IS the module).
+        let k5 = feature_key("src/Core/engine.cs").expect("feature key");
+        assert_eq!(k5.display, "Core", "got {k5:?}");
+        // Layer dirs are never promoted to module names: an app skeleton's
+        // `src/Acme/Models/User.php` anchors at the vendor, not `Models`.
+        let k6 = feature_key("src/Acme/Models/User.php").expect("feature key");
+        assert_eq!(k6.display, "Acme", "got {k6:?}");
+    }
+
+    #[test]
+    fn partition_respects_top_level_member_boundaries() {
+        // Regression (rails): `Object#with` (activesupport core_ext) is called
+        // from actionpack/activerecord/railties alike, so one graph community
+        // spanned four gems and the dominant-file rule named the 61-file blob
+        // "with". Top-level directories of a monorepo are publication units
+        // (gems / workspace members / gradle projects): a community must never
+        // merge production files across them. Test-tree files (their own
+        // top-level dir) follow the community's dominant production member.
+        let files = [
+            "activesupport/lib/active_support/core_ext/object/with.rb",
+            "actionpack/lib/action_controller/metal.rb",
+            "activerecord/lib/active_record/base.rb",
+            "tests/object_with_test.rb",
+        ];
+        let n0 = node("s0", NodeKind::RubyMethod, files[0], "with");
+        let n1 = node("s1", NodeKind::RubyMethod, files[1], "metal_dispatch");
+        let n2 = node("s2", NodeKind::RubyMethod, files[2], "save");
+        let n3 = node("s3", NodeKind::RubyMethod, files[3], "test_with");
+        let f0 = node("f0", NodeKind::File, files[0], "with.rb");
+        let f1 = node("f1", NodeKind::File, files[1], "metal.rb");
+        let f2 = node("f2", NodeKind::File, files[2], "base.rb");
+        let f3 = node("f3", NodeKind::File, files[3], "object_with_test.rb");
+        let nodes = vec![n0, n1, n2, n3, f0, f1, f2, f3];
+        // Everyone calls `with` — one tight community in graph terms.
+        let edges = vec![
+            edge("s1", "s0", EdgeKind::Calls),
+            edge("s2", "s0", EdgeKind::Calls),
+            edge("s3", "s0", EdgeKind::Calls),
+            edge("s3", "s0", EdgeKind::References),
+        ];
+        let p = partition_modules(&nodes, &edges);
+        let mi = |path: &str| *p.by_file.get(path).expect(path);
+        assert_ne!(
+            mi(files[0]),
+            mi(files[1]),
+            "activesupport and actionpack must stay separate modules: {:?}",
+            p.slug
+        );
+        assert_ne!(
+            mi(files[1]),
+            mi(files[2]),
+            "actionpack and activerecord must stay separate modules: {:?}",
+            p.slug
+        );
+        // The test file follows the dominant production member of its
+        // community (all three call into activesupport's `with`).
+        assert_eq!(
+            mi(files[3]),
+            mi(files[0]),
+            "test file must follow the community's production member: {:?}",
+            p.slug
+        );
+    }
+
+    #[test]
+    fn feature_key_pierces_kmp_custom_source_sets() {
+        // Regression (okhttp): Kotlin Multiplatform repos declare custom
+        // source sets (`src/commonJvmAndroid/kotlin/...`) that don't end in
+        // "main"/"test", so the JVM pierce fell through and named a
+        // 140-file module "commonJvmAndroid". A camelCase set segment whose
+        // next segment is a JVM language dir is structural all the same.
+        let k = feature_key("okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/Util.kt")
+            .expect("feature key");
+        assert_eq!(k.display, "internal", "got {k:?}");
+        let k2 =
+            feature_key("okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt").expect("feature key");
+        assert_eq!(k2.display, "okhttp3", "got {k2:?}");
+        // An all-lowercase business dir that happens to sit over a `java/`
+        // subdir is NOT a source set — never pierced.
+        let k3 = feature_key("src/banking/java/Ledger.java").expect("feature key");
+        assert_eq!(k3.display, "banking", "got {k3:?}");
+        // A JVM source-set chain with no package dirs at all (Gradle
+        // build-logic conventions) anchors at the module directory —
+        // "main" / "kotlin" are never business tokens.
+        let k4 = feature_key("build-logic/src/main/kotlin/BndBuildAction.kt").expect("feature key");
+        assert_eq!(k4.display, "build-logic", "got {k4:?}");
+    }
+
+    #[test]
+    fn name_module_majority_is_among_voters_not_diluted_by_tests() {
+        // Regression (laravel): a 147-file community held ~60 production
+        // files under `src/Illuminate/Database/**` plus ~70 `tests/**` files.
+        // Test paths produce no *trusted* feature token, yet they sat in the
+        // dominance denominator (`cnt*2 >= file_idxs.len()`), so "Database"
+        // never reached 50% and the module got named after the central
+        // symbol ("uniqueconstraintviolation"). Majority must be judged
+        // among the files that actually voted; clear pluralities (≥2× the
+        // runner-up) count too.
+        let mut files: Vec<String> = Vec::new();
+        for i in 0..6 {
+            files.push(format!("src/Illuminate/Database/Query/F{i}.php"));
+        }
+        files.push("src/Illuminate/Pagination/Paginator.php".to_string());
+        files.push("src/Illuminate/Support/Arr2.php".to_string());
+        for i in 0..10 {
+            files.push(format!("tests/Database/DatabaseQueryF{i}Test.php"));
+        }
+        let idxs: Vec<usize> = (0..files.len()).collect();
+        // Central symbol with huge in-degree sits in pagination — the wrong
+        // name unless directory consensus wins.
+        let n_central = node(
+            "x1",
+            NodeKind::PhpClass,
+            "src/Illuminate/Pagination/Paginator.php",
+            "Paginator",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(6, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 80);
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("database"),
+            "directory consensus among voters must outrank the central symbol: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_near_tie_communities_keep_central_symbol_naming() {
+        // Counter-case: a genuinely cross-component community (laravel's
+        // Bus+Queue+Broadcasting event family) has no dominant directory —
+        // votes split ~evenly. Forcing the slim plurality winner would be
+        // dishonest; the central-symbol rule stays in charge.
+        let files = vec![
+            "src/Illuminate/Bus/Batch.php".to_string(),
+            "src/Illuminate/Bus/PendingBatch.php".to_string(),
+            "src/Illuminate/Queue/Worker.php".to_string(),
+            "src/Illuminate/Queue/Job.php".to_string(),
+            "src/Illuminate/Broadcasting/Channel.php".to_string(),
+        ];
+        let idxs: Vec<usize> = (0..files.len()).collect();
+        let n_central = node(
+            "x2",
+            NodeKind::PhpClass,
+            "src/Illuminate/Bus/PendingBatch.php",
+            "PendingBatch",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(1, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 40);
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            !disp.eq_ignore_ascii_case("bus"),
+            "a 2-vs-2-vs-1 split must not crown 'Bus' by plurality: got {disp}"
+        );
+    }
+
+    #[test]
+    fn merged_slug_prefers_production_prefix_over_shorter_test_prefix() {
+        // Regression (laravel): the `tests/Database/**` files are isolated
+        // (no resolved edges into production) and bucket by their fallback
+        // token "Database" with prefix `tests/Database`; the production
+        // community names itself "Database" too. The slug merge kept the
+        // *shorter* anchor — `tests/Database` — and the test-tree retain
+        // then deleted the whole 548-file module from the report. A
+        // production anchor must always outrank a test anchor, regardless
+        // of length.
+        let files = [
+            "src/Illuminate/Database/Eloquent/Builder.php",
+            "src/Illuminate/Database/Eloquent/Model.php",
+            "tests/Database/DatabaseEloquentBuilderTest.php",
+            "tests/Database/DatabaseEloquentModelTest.php",
+        ];
+        let s0 = node("s0", NodeKind::PhpClass, files[0], "Builder");
+        let s1 = node("s1", NodeKind::PhpClass, files[1], "Model");
+        let t0 = node("t0", NodeKind::TestCase, files[2], "testWhere");
+        let t1 = node("t1", NodeKind::TestCase, files[3], "testSave");
+        let f: Vec<Node> = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| node(&format!("f{i}"), NodeKind::File, p, "f"))
+            .collect();
+        let mut nodes = vec![s0, s1, t0, t1];
+        nodes.extend(f);
+        // Production files couple to each other; tests stay isolated (the
+        // real failure mode: unresolved dynamic calls in the test tree).
+        let edges = vec![edge("s0", "s1", EdgeKind::Calls)];
+        let p = partition_modules(&nodes, &edges);
+        let mi = *p.by_file.get(files[0]).expect("production file placed");
+        assert_eq!(p.slug[mi], "database", "slugs: {:?}", p.slug);
+        assert!(
+            p.prefix[mi].starts_with("src/"),
+            "merged module must anchor at the production tree, got {}",
+            p.prefix[mi]
+        );
+    }
+
+    #[test]
+    fn partition_splits_workspace_member_containers() {
+        // Regression (groundgraph dogfood): `crates/groundgraph-core` symbols are
+        // referenced by every other crate, so one community spanned
+        // engine+core+store and the report showed 3 modules for a 5-crate
+        // workspace. `crates/<member>` / `packages/<member>` are publication
+        // units exactly like top-level subprojects — the member boundary is
+        // the *child* of the container, not the container itself.
+        let files = [
+            "crates/groundgraph-engine/src/index.rs",
+            "crates/groundgraph-core/src/node.rs",
+            "crates/groundgraph-store/src/lib.rs",
+        ];
+        let n0 = node("s0", NodeKind::RustFunction, files[0], "index_repository");
+        let n1 = node("s1", NodeKind::RustStruct, files[1], "Node");
+        let n2 = node("s2", NodeKind::RustStruct, files[2], "Store");
+        let f: Vec<Node> = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| node(&format!("f{i}"), NodeKind::File, p, "f"))
+            .collect();
+        let mut nodes = vec![n0, n1, n2];
+        nodes.extend(f);
+        // Engine references core and store heavily — one graph community.
+        let edges = vec![
+            edge("s0", "s1", EdgeKind::References),
+            edge("s0", "s2", EdgeKind::Calls),
+        ];
+        let p = partition_modules(&nodes, &edges);
+        let mi = |path: &str| *p.by_file.get(path).expect(path);
+        assert_ne!(
+            mi(files[0]),
+            mi(files[1]),
+            "engine and core are separate workspace members: {:?}",
+            p.slug
+        );
+        assert_ne!(
+            mi(files[0]),
+            mi(files[2]),
+            "engine and store are separate workspace members: {:?}",
+            p.slug
+        );
+    }
+
+    #[test]
+    fn name_module_unique_member_outranks_central_symbol_in_multimember_repos() {
+        // Regression (spring): spring-core's util/convert/codec packages form
+        // one community; package tokens tie (no majority, no 2× plurality),
+        // so the central symbol named a 285-file module
+        // "concurrentreferencehashmap". When the whole community lives in ONE
+        // top-level subproject of a multi-member repo, that directory is the
+        // author's own name for it — use it before falling back to a symbol.
+        let files = vec![
+            "spring-core/src/main/java/org/springframework/core/SpringVersion.java".to_string(),
+            "spring-core/src/main/java/org/springframework/core/convert/Converter.java".to_string(),
+            "spring-core/src/main/java/org/springframework/util/ConcurrentReferenceHashMap.java"
+                .to_string(),
+            "spring-core/src/main/java/org/springframework/util/StringUtils.java".to_string(),
+            "spring-core/src/main/java/org/springframework/codec/Codec.java".to_string(),
+            // other members exist in the repo (multi-member), but not in this
+            // community:
+            "spring-web/src/main/java/org/springframework/web/WebUtils.java".to_string(),
+        ];
+        let idxs: Vec<usize> = (0..5).collect();
+        let n_central = node(
+            "x3",
+            NodeKind::JavaClass,
+            "spring-core/src/main/java/org/springframework/util/ConcurrentReferenceHashMap.java",
+            "ConcurrentReferenceHashMap",
+        );
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(2, vec![&n_central]);
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_central.id, 90);
+        let (disp, pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert!(
+            disp.eq_ignore_ascii_case("core"),
+            "unique member dir (brand prefix stripped) must outrank the central symbol: got {disp}"
+        );
+        assert_eq!(pfx, "spring-core");
+    }
+
+    #[test]
+    fn feature_key_keeps_product_segment_in_product_named_subprojects() {
+        // Regression (spring): `spring-jdbc/src/main/java/org/springframework/
+        // jdbc/core/JdbcTemplate.java` pierced past the product segment to
+        // the structural sub-package (`core`, `support`), so token votes
+        // scattered and 221-file modules got named after a central symbol
+        // ("jdbctemplate"). When the subproject directory is *named after*
+        // the package (`spring-jdbc` ↔ `…jdbc`), the product segment IS the
+        // business identity — keep it.
+        let k = feature_key(
+            "spring-jdbc/src/main/java/org/springframework/jdbc/core/JdbcTemplate.java",
+        )
+        .expect("feature key");
+        assert_eq!(k.display, "jdbc", "got {k:?}");
+        // Single-namespace repos still pierce to the sub-package: gson's
+        // main module documents its features by sub-package…
+        let k2 = feature_key("gson/src/main/java/com/google/gson/stream/JsonReader.java")
+            .expect("feature key");
+        assert_eq!(k2.display, "stream", "got {k2:?}");
+        // …and its `extras` module shares the `com.google.gson` namespace —
+        // the sub-package is the only distinguishing feature token.
+        let k3 = feature_key("extras/src/main/java/com/google/gson/interceptors/Intercept.java")
+            .expect("feature key");
+        assert_eq!(k3.display, "interceptors", "got {k3:?}");
+    }
+
+    #[test]
+    fn test_tree_buckets_are_never_business_modules() {
+        // Regression (jellyfin): `tests/Jellyfin.Api.Tests/**` files have no
+        // resolved edges into production code, so they bucket by path and
+        // outscored every production module in the report (tests dominate
+        // their signal). A module whose path anchor lives in a test tree is
+        // scaffolding, never a business module.
+        let nodes = vec![
+            node(
+                "p1",
+                NodeKind::CSharpClass,
+                "Jellyfin.Api/Controllers/UserController.cs",
+                "UserController",
+            ),
+            node(
+                "f1",
+                NodeKind::File,
+                "Jellyfin.Api/Controllers/UserController.cs",
+                "UserController.cs",
+            ),
+            node(
+                "h1",
+                NodeKind::CSharpClass,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpers.cs",
+                "RequestHelpers",
+            ),
+            node(
+                "t1",
+                NodeKind::TestCase,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpersTests.cs",
+                "GetOrderBy_Success",
+            ),
+            node(
+                "f2",
+                NodeKind::File,
+                "tests/Jellyfin.Api.Tests/Helpers/RequestHelpers.cs",
+                "RequestHelpers.cs",
+            ),
+        ];
+        let edges = Vec::new(); // no resolved coupling, exactly the failure mode
+        let pack = build_pack(&nodes, &edges, &BusinessPackOptions::default());
+        for m in &pack.modules {
+            assert!(
+                !m.path_prefix.starts_with("tests/"),
+                "test-tree bucket reported as business module: {} ({})",
+                m.id,
+                m.path_prefix
+            );
+        }
+        assert!(
+            pack.modules.iter().any(|m| m.symbol_count > 0),
+            "the production module must survive: {:?}",
+            pack.modules.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn production_dir_prefix_ignores_test_trees() {
+        // django: a community spanning `django/forms/**` and
+        // `tests/forms_tests/**` must report `django/forms`, not "".
+        let files = vec![
+            "django/forms/fields.py".to_string(),
+            "django/forms/widgets.py".to_string(),
+            "tests/forms_tests/test_fields.py".to_string(),
+        ];
+        assert_eq!(production_dir_prefix(&[0, 1, 2], &files), "django/forms");
+        // All-tests community still gets its honest common prefix.
+        let only_tests = vec![
+            "tests/forms_tests/test_a.py".to_string(),
+            "tests/forms_tests/test_b.py".to_string(),
+        ];
+        assert_eq!(
+            production_dir_prefix(&[0, 1], &only_tests),
+            "tests/forms_tests"
+        );
+    }
+
+    #[test]
+    fn name_module_large_community_uses_top_file_even_without_clear_dominance() {
+        // Redis's core community spans 40 files / 1789 symbols; references
+        // are spread out, so no file is 2× the runner-up. One struct
+        // (`AutoMemEntry`) still must not name 40 files — the busiest file
+        // (`server.c`) is the honest anchor.
+        let files: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 0 {
+                    "src/server.c".to_string()
+                } else {
+                    format!("src/f{i}.c")
+                }
+            })
+            .collect();
+        let nodes_owned: Vec<Node> = (0..20)
+            .map(|i| {
+                if i == 0 {
+                    node("s0", NodeKind::CFunction, &files[0], "initServer")
+                } else {
+                    node(
+                        &format!("s{i}"),
+                        if i == 1 {
+                            NodeKind::CStruct
+                        } else {
+                            NodeKind::CFunction
+                        },
+                        &files[i],
+                        if i == 1 { "AutoMemEntry" } else { "fn" },
+                    )
+                }
+            })
+            .collect();
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        for (i, n) in nodes_owned.iter().enumerate() {
+            file_symbols.insert(i, vec![n]);
+        }
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&nodes_owned[0].id, 10);
+        indeg.insert(&nodes_owned[1].id, 9); // struct close behind: no 2× dominance
+        let idxs: Vec<usize> = (0..20).collect();
+        let (disp, _pfx) = name_module("comm::1", &idxs, &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "server",
+            "large community must take top file stem: got {disp}"
+        );
+    }
+
+    #[test]
+    fn name_module_never_names_a_module_after_a_callable() {
+        // Regression (tailorx `FindNodeById`): a community whose only symbols are
+        // callables — a Dart extension file's methods, or a lone test file's
+        // helpers — must be named after its directory, never after a method like
+        // `findNodeById`, which title-cases into "FindNodeById" and masquerades
+        // as a business type. Only a *type* may name a module via the central
+        // symbol; otherwise we fall through to the path.
+        let files = vec!["test/core/render_schema/render_schema_compile_test.dart".to_string()];
+        let n_method = node("s1", NodeKind::DartMethod, &files[0], "findNodeById");
+        let n_fn = node("s2", NodeKind::DartFunction, &files[0], "buildDemoSchema");
+        let mut file_symbols: std::collections::HashMap<usize, Vec<&Node>> =
+            std::collections::HashMap::new();
+        file_symbols.insert(0, vec![&n_method, &n_fn]);
+        // Even with a very high in-degree the method must not win.
+        let mut indeg: std::collections::HashMap<&ArtifactId, usize> =
+            std::collections::HashMap::new();
+        indeg.insert(&n_method.id, 30);
+        let (disp, _pfx) = name_module("comm::1", &[0], &files, &file_symbols, &indeg);
+        assert_eq!(
+            disp, "render_schema",
+            "a callable must not name a module: got {disp}"
+        );
+    }
+
+    fn node(id: &str, kind: NodeKind, path: &str, name: &str) -> Node {
+        Node {
+            id: ArtifactId::new(id.to_string()),
+            kind,
+            path: Some(path.to_string()),
+            name: Some(name.to_string()),
+            start_line: Some(1),
+            end_line: Some(9),
+            content_hash: None,
+            stable_key: None,
+            source_file: Some(path.to_string()),
+            source_hash: None,
+            indexer: Some("test".into()),
+            index_generation: None,
+            metadata_json: None,
+        }
+    }
+
+    fn edge(from: &str, to: &str, kind: EdgeKind) -> EdgeAssertion {
+        EdgeAssertion {
+            id: ArtifactId::new(format!("{}::{from}->{to}", kind.as_str())),
+            from_id: ArtifactId::new(from.to_string()),
+            to_id: ArtifactId::new(to.to_string()),
+            kind,
+            source: EdgeSource::LanguageAdapter,
+            certainty: EdgeCertainty::Fact,
+            status: EdgeStatus::Confirmed,
+            confidence: 1.0,
+            evidence_json: None,
+            source_file: None,
+            source_hash: None,
+            indexer: Some("test".into()),
+            index_generation: None,
+            metadata_json: None,
+        }
+    }
+
+    #[test]
+    fn feature_key_uses_marker_segment() {
+        let k = feature_key("lib/features/auth/data/auth_repository.dart").unwrap();
+        assert_eq!(k.slug, "auth");
+        assert_eq!(k.prefix, "lib/features/auth");
+    }
+
+    #[test]
+    fn feature_key_falls_back_to_source_root_child() {
+        let k = feature_key("lib/core/settings/pro_provider.dart").unwrap();
+        assert_eq!(k.slug, "core");
+        assert_eq!(k.prefix, "lib/core");
+
+        let k2 = feature_key("src/billing/checkout.ts").unwrap();
+        assert_eq!(k2.slug, "billing");
+    }
+
+    #[test]
+    fn feature_key_first_dir_when_no_known_root() {
+        let k = feature_key("server/payments/handler.go").unwrap();
+        assert_eq!(k.slug, "server");
+    }
+
+    #[test]
+    fn slugify_sanitises_to_candidate_id() {
+        assert_eq!(slugify("Customer Edit"), "customer_edit");
+        assert_eq!(slugify("ai-tryon"), "ai_tryon");
+        assert_eq!(slugify("123abc"), "123abc");
+        assert_eq!(slugify("!!!"), "module");
+        // Empty / all-underscore inputs hit the `trimmed.is_empty()` guard that
+        // protects the leading-char inspection (#206) — no panic, "module".
+        assert_eq!(slugify(""), "module");
+        assert_eq!(slugify("___"), "module");
+    }
+
+    #[test]
+    fn strip_role_suffix_drops_error_and_exception() {
+        // A widely-thrown error enum has sky-high in-degree, but the business
+        // concept is the prefix, not the `Error` role.
+        assert_eq!(strip_role_suffix("PhotoCleanerError"), "PhotoCleaner");
+        assert_eq!(strip_role_suffix("AuthException"), "Auth");
+        // A type literally named `Error` keeps its name (length guard).
+        assert_eq!(strip_role_suffix("Error"), "Error");
+    }
+
+    #[test]
+    fn match_doc_to_module_handles_hyphen_underscore_drift() {
+        let mut known = BTreeSet::new();
+        known.insert("customer_edit".to_string());
+        known.insert("auth".to_string());
+        assert_eq!(
+            match_doc_to_module("docs/feature-docs/customer-edit/index.md", &known).as_deref(),
+            Some("customer_edit")
+        );
+        assert_eq!(
+            match_doc_to_module("docs/feature-docs/auth/index.md", &known).as_deref(),
+            Some("auth")
+        );
+        assert_eq!(
+            match_doc_to_module("docs/architecture/overview.md", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn build_pack_groups_modules_and_rolls_up_signals() {
+        let (mut store, _dir) = empty_store();
+        // ---- auth module: bloc + repository + service (densely coupled),
+        //      plus a test that exercises the bloc and a doc. The modules
+        //      are detected from the call graph, so each feature needs real
+        //      intra-feature coupling (mirroring how a real feature reads).
+        let ab = "dart_class::lib/features/auth/presentation/auth_bloc.dart#AuthBloc";
+        let ar = "dart_class::lib/features/auth/data/auth_repository.dart#AuthRepository";
+        let as_ = "dart_class::lib/features/auth/domain/auth_service.dart#AuthService";
+        let auth_test = "test_case::test/features/auth/auth_bloc_test.dart#login works";
+        store
+            .upsert_node(&node(
+                ab,
+                NodeKind::DartClass,
+                "lib/features/auth/presentation/auth_bloc.dart",
+                "AuthBloc",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                ar,
+                NodeKind::DartClass,
+                "lib/features/auth/data/auth_repository.dart",
+                "AuthRepository",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                as_,
+                NodeKind::DartClass,
+                "lib/features/auth/domain/auth_service.dart",
+                "AuthService",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                auth_test,
+                NodeKind::TestCase,
+                "test/features/auth/auth_bloc_test.dart",
+                "login works",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::docs/feature-docs/auth/index.md#Auth",
+                NodeKind::DocSection,
+                "docs/feature-docs/auth/index.md",
+                "Auth",
+            ))
+            .unwrap();
+        // ---- products module: screen + repository (coupled), navigates to
+        //      a route and reads a provider.
+        let ps = "dart_class::lib/features/products/products_screen.dart#ProductsScreen";
+        let pr =
+            "dart_class::lib/features/products/data/products_repository.dart#ProductsRepository";
+        store
+            .upsert_node(&node(
+                ps,
+                NodeKind::DartClass,
+                "lib/features/products/products_screen.dart",
+                "ProductsScreen",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                pr,
+                NodeKind::DartClass,
+                "lib/features/products/data/products_repository.dart",
+                "ProductsRepository",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "route::/design",
+                NodeKind::Route,
+                "route::/design",
+                "/design",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "dart_provider::lib/core/cart_provider.dart#cartProvider",
+                NodeKind::DartProvider,
+                "lib/core/cart_provider.dart",
+                "cartProvider",
+            ))
+            .unwrap();
+
+        // intra-auth coupling (clique) + the test exercising the bloc
+        for (f, t) in [(ab, ar), (ab, as_), (as_, ar), (auth_test, ab)] {
+            store.upsert_edge(&edge(f, t, EdgeKind::Calls)).unwrap();
+        }
+        // intra-products coupling
+        store.upsert_edge(&edge(ps, pr, EdgeKind::Calls)).unwrap();
+        // semantic signals on the products screen
+        store
+            .upsert_edge(&edge(ps, "route::/design", EdgeKind::NavigatesTo))
+            .unwrap();
+        store
+            .upsert_edge(&edge(
+                ps,
+                "dart_provider::lib/core/cart_provider.dart#cartProvider",
+                EdgeKind::ReadsProvider,
+            ))
+            .unwrap();
+        // single cross-module dependency: products -> auth
+        store.upsert_edge(&edge(ps, ar, EdgeKind::Calls)).unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+
+        let auth = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "auth")
+            .expect("auth module");
+        assert_eq!(auth.name, "Auth");
+        assert_eq!(auth.test_count, 1);
+        assert_eq!(auth.docs.len(), 1, "doc associated by normalised segment");
+        assert!(auth.entry_points.iter().any(|e| e.name == "AuthBloc"));
+
+        let products = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "products")
+            .expect("products module");
+        assert_eq!(products.routes, vec!["/design".to_string()]);
+        assert_eq!(products.providers, vec!["cartProvider".to_string()]);
+        assert_eq!(
+            products.depends_on,
+            vec!["auth".to_string()],
+            "cross-module call recorded as dependency"
+        );
+
+        // module dependency graph carries the products->auth edge
+        assert!(pack
+            .module_dependencies
+            .iter()
+            .any(|d| d.from == "products" && d.to == "auth"));
+
+        // cohesion is reported and bounded; auth (a clique) is highly
+        // self-contained, so its cohesion beats the leaky products module.
+        let auth_coh = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "auth")
+            .unwrap()
+            .cohesion;
+        assert!(
+            auth_coh > 0.5,
+            "auth is a clique -> high cohesion, got {auth_coh}"
+        );
+        for m in &pack.modules {
+            assert!((0.0..=1.0).contains(&m.cohesion));
+        }
+
+        // evidence list references only real node ids
+        for m in &pack.modules {
+            for ev in &m.evidence {
+                assert!(
+                    store
+                        .find_node(&ArtifactId::new(ev.clone()))
+                        .unwrap()
+                        .is_some(),
+                    "evidence id {ev} must resolve to a real node"
+                );
+            }
+        }
+
+        // prompt is Chinese + mentions the target file
+        assert!(pack.prompt.contains("business_logic.yaml"));
+        assert!(pack.prompt.contains("业务逻辑"));
+    }
+
+    #[test]
+    fn layer_organised_repo_still_aggregates_by_business_feature() {
+        // The repo is organised by *layer* (`lib/models`, `lib/services`,
+        // `lib/widgets`), not by feature — exactly the "messy"/conventional
+        // case the user warned about. A naive path split would report
+        // "Models / Services / Widgets" (architecture, not business). The
+        // call graph, however, couples each feature across the layers, so
+        // graph-driven detection must recover the *business* modules
+        // ("User", "Order") and name them after their central symbol.
+        let (mut store, _dir) = empty_store();
+        let nodes = [
+            (
+                "dart_class::lib/models/user.dart#User",
+                "lib/models/user.dart",
+                "User",
+            ),
+            (
+                "dart_class::lib/services/user_service.dart#UserService",
+                "lib/services/user_service.dart",
+                "UserService",
+            ),
+            (
+                "dart_class::lib/widgets/user_page.dart#UserPage",
+                "lib/widgets/user_page.dart",
+                "UserPage",
+            ),
+            (
+                "dart_class::lib/models/order.dart#Order",
+                "lib/models/order.dart",
+                "Order",
+            ),
+            (
+                "dart_class::lib/services/order_service.dart#OrderService",
+                "lib/services/order_service.dart",
+                "OrderService",
+            ),
+            (
+                "dart_class::lib/widgets/order_page.dart#OrderPage",
+                "lib/widgets/order_page.dart",
+                "OrderPage",
+            ),
+        ];
+        for (id, path, name) in nodes {
+            store
+                .upsert_node(&node(id, NodeKind::DartClass, path, name))
+                .unwrap();
+        }
+        let user = "dart_class::lib/models/user.dart#User";
+        let user_svc = "dart_class::lib/services/user_service.dart#UserService";
+        let user_page = "dart_class::lib/widgets/user_page.dart#UserPage";
+        let order = "dart_class::lib/models/order.dart#Order";
+        let order_svc = "dart_class::lib/services/order_service.dart#OrderService";
+        let order_page = "dart_class::lib/widgets/order_page.dart#OrderPage";
+        // each feature is a triangle across the three layers
+        for (f, t) in [
+            (user_page, user_svc),
+            (user_svc, user),
+            (user_page, user),
+            (order_page, order_svc),
+            (order_svc, order),
+            (order_page, order),
+        ] {
+            store.upsert_edge(&edge(f, t, EdgeKind::Calls)).unwrap();
+        }
+        // single weak cross-feature link: order references user
+        store
+            .upsert_edge(&edge(order_svc, user, EdgeKind::Calls))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+
+        // Exactly two business modules, by *feature*, not by layer.
+        let ids: BTreeSet<&str> = pack.modules.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.contains("models") && !ids.contains("services") && !ids.contains("widgets"),
+            "must not segment by architectural layer, got {ids:?}"
+        );
+        assert!(
+            ids.contains("user"),
+            "expected a graph-derived `user` module, got {ids:?}"
+        );
+        assert!(
+            ids.contains("order"),
+            "expected a graph-derived `order` module, got {ids:?}"
+        );
+
+        // the user module pulled in all three layer files (proof it
+        // followed the graph, not the directory): its 3 symbols live under
+        // models/, services/ and widgets/ respectively.
+        let user_mod = pack.modules.iter().find(|m| m.id == "user").unwrap();
+        assert_eq!(
+            user_mod.symbol_count, 3,
+            "user feature spans models+services+widgets"
+        );
+        let dirs: BTreeSet<String> = user_mod
+            .entry_points
+            .iter()
+            .filter_map(|e| e.path.rsplit_once('/').map(|(d, _)| d.to_string()))
+            .collect();
+        assert!(
+            dirs.contains("lib/models")
+                && dirs.contains("lib/services")
+                && dirs.contains("lib/widgets"),
+            "user module entry points should span all three layers, got {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn docs_dedup_by_file_and_scaffolding_buckets_excluded() {
+        let (mut store, _dir) = empty_store();
+        // a real business module
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/billing/billing_bloc.dart#BillingBloc",
+                NodeKind::DartClass,
+                "lib/features/billing/billing_bloc.dart",
+                "BillingBloc",
+            ))
+            .unwrap();
+        // one doc FILE split into three sections — must collapse to 1 doc
+        for heading in ["Overview", "Pricing", "Refunds"] {
+            store
+                .upsert_node(&node(
+                    &format!("doc_section::docs/feature-docs/billing/guide.md#{heading}"),
+                    NodeKind::DocSection,
+                    "docs/feature-docs/billing/guide.md",
+                    heading,
+                ))
+                .unwrap();
+        }
+        // scaffolding buckets that must NOT become business modules
+        store
+            .upsert_node(&node(
+                "dart_class::test/support/test_harness.dart#TestHarness",
+                NodeKind::DartClass,
+                "test/support/test_harness.dart",
+                "TestHarness",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "dart_function::tool/codegen/run.dart#main",
+                NodeKind::DartFunction,
+                "tool/codegen/run.dart",
+                "runCodegen",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+
+        let billing = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "billing")
+            .expect("billing module");
+        assert_eq!(
+            billing.docs.len(),
+            1,
+            "three sections of one doc file collapse to a single doc evidence"
+        );
+        assert_eq!(billing.docs[0].path, "docs/feature-docs/billing/guide.md");
+
+        assert!(
+            pack.modules.iter().all(|m| m.id != "test"),
+            "`test` scaffolding bucket must not be a business module"
+        );
+        assert!(
+            pack.modules.iter().all(|m| m.id != "tool"),
+            "`tool` scaffolding bucket must not be a business module"
+        );
+    }
+
+    #[test]
+    fn entry_points_prefer_production_over_test_symbols() {
+        let (mut store, _dir) = empty_store();
+        // production bloc
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/checkout/presentation/checkout_bloc.dart#CheckoutBloc",
+                NodeKind::DartClass,
+                "lib/features/checkout/presentation/checkout_bloc.dart",
+                "CheckoutBloc",
+            ))
+            .unwrap();
+        // test-only mock that *looks* like an entry point (matches `repository`)
+        store
+            .upsert_node(&node(
+                "dart_class::test/features/checkout/checkout_bloc_test.dart#_MockCheckoutRepository",
+                NodeKind::DartClass,
+                "test/features/checkout/checkout_bloc_test.dart",
+                "_MockCheckoutRepository",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let checkout = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "checkout")
+            .expect("checkout module");
+        assert!(
+            checkout
+                .entry_points
+                .iter()
+                .any(|e| e.name == "CheckoutBloc"),
+            "production bloc is an entry point"
+        );
+        assert!(
+            checkout
+                .entry_points
+                .iter()
+                .all(|e| e.name != "_MockCheckoutRepository"),
+            "test-file mock must not be a business entry point"
+        );
+    }
+
+    #[test]
+    fn generated_codegen_symbols_are_not_entry_points() {
+        let (mut store, _dir) = empty_store();
+        // hand-written model
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/cart/data/models/my_cart_item_dto.dart#MyCartPageDto",
+                NodeKind::DartClass,
+                "lib/features/cart/data/models/my_cart_item_dto.dart",
+                "MyCartPageDto",
+            ))
+            .unwrap();
+        // freezed-generated copyWith noise (same module, .freezed.dart file)
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/cart/data/models/my_cart_item_dto.freezed.dart#_$MyCartPageDtoCopyWithImpl",
+                NodeKind::DartClass,
+                "lib/features/cart/data/models/my_cart_item_dto.freezed.dart",
+                "_$MyCartPageDtoCopyWithImpl",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let cart = pack.modules.iter().find(|m| m.id == "cart").expect("cart");
+        assert!(
+            cart.entry_points.iter().any(|e| e.name == "MyCartPageDto"),
+            "hand-written model is an entry point"
+        );
+        assert!(
+            cart.entry_points
+                .iter()
+                .all(|e| !e.name.contains("CopyWith")),
+            "freezed-generated copyWith classes must not be entry points"
+        );
+    }
+
+    /// flask/tokio dogfood: `docs/tutorial/`, `docs/deploying/` form isolated
+    /// path-buckets whose slug ("tutorial") dodges the NON_BUSINESS_BUCKETS
+    /// denylist (only the repo-root "docs" segment is on it). A community with
+    /// zero code symbols is a manual chapter, not a business module — its
+    /// content only matters where it attaches to a code module as evidence.
+    #[test]
+    fn doc_only_communities_are_never_business_modules() {
+        let (mut store, _dir) = empty_store();
+        // Real code module.
+        let a = "python_class::src/flask/app.py#Flask";
+        let b = "python_function::src/flask/blueprints.py#Blueprint";
+        store
+            .upsert_node(&node(a, NodeKind::PythonClass, "src/flask/app.py", "Flask"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::PythonFunction,
+                "src/flask/blueprints.py",
+                "Blueprint",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        // Doc-only tree: File + DocSection nodes, no code symbols.
+        for f in ["docs/tutorial/install.rst", "docs/tutorial/layout.rst"] {
+            store
+                .upsert_node(&node(
+                    &format!("file::{f}"),
+                    NodeKind::File,
+                    f,
+                    f.rsplit('/').next().unwrap(),
+                ))
+                .unwrap();
+            store
+                .upsert_node(&node(
+                    &format!("doc_section::{f}#Top"),
+                    NodeKind::DocSection,
+                    f,
+                    "Top",
+                ))
+                .unwrap();
+        }
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.modules.iter().all(|m| m.id != "tutorial"),
+            "a docs-only community must not be reported as a business module; got {:?}",
+            pack.modules.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert!(
+            pack.modules.iter().any(|m| m.symbol_count > 0),
+            "the real code module survives"
+        );
+    }
+
+    /// flask dogfood: the docs tree mirrors source files by *name* —
+    /// `docs/blueprints.rst` documents `src/flask/blueprints.py` — but shares
+    /// no path segment with the module slug, so segment matching alone left
+    /// every code module with `docs: []`. A doc file whose stem equals the
+    /// stem of a source file inside exactly one module is that module's
+    /// documentation. Generic stems (`index`, `init`) stay unmatched.
+    #[test]
+    fn doc_named_after_a_source_file_attaches_to_that_modules_docs() {
+        let (mut store, _dir) = empty_store();
+        let a = "python_class::src/flask/app.py#Flask";
+        let b = "python_class::src/flask/blueprints.py#Blueprint";
+        store
+            .upsert_node(&node(a, NodeKind::PythonClass, "src/flask/app.py", "Flask"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::PythonClass,
+                "src/flask/blueprints.py",
+                "Blueprint",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::docs/blueprints.rst#Modular Applications",
+                NodeKind::DocSection,
+                "docs/blueprints.rst",
+                "Modular Applications",
+            ))
+            .unwrap();
+        // The docs indexer also emits a File node per doc — these form a
+        // `docs` path-bucket whose slug must never capture the association
+        // (real flask bug: every stem-matched doc landed in the scaffolding
+        // bucket because `docs` was a known slug).
+        store
+            .upsert_node(&node(
+                "file::docs/blueprints.rst",
+                NodeKind::File,
+                "docs/blueprints.rst",
+                "blueprints.rst",
+            ))
+            .unwrap();
+        // Generic stem must NOT attach (would false-link half the docs tree).
+        store
+            .upsert_node(&node(
+                "doc_section::docs/index.rst#Welcome",
+                NodeKind::DocSection,
+                "docs/index.rst",
+                "Welcome",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let module = pack
+            .modules
+            .iter()
+            .find(|m| m.symbol_count > 0)
+            .expect("code module");
+        assert!(
+            module.docs.iter().any(|d| d.path == "docs/blueprints.rst"),
+            "stem-matched doc must attach to the module owning blueprints.py; docs={:?}",
+            module.docs
+        );
+        assert!(
+            module.docs.iter().all(|d| d.path != "docs/index.rst"),
+            "generic-stem docs must not attach"
+        );
+    }
+
+    /// tokio dogfood: design docs live in a *names-free* location
+    /// (`tokio/docs/reactor-refactor.md`) — no path segment and no file stem
+    /// bridges to any module. But their headings cite code identifiers
+    /// (`Registration`, `ScheduledIo`); each identifier owned by exactly one
+    /// module is a vote, and a file whose votes pick a single clear winner
+    /// (≥2 votes, strictly ahead) attaches there. One stray mention must NOT
+    /// attach — a README citing one type from every module would otherwise
+    /// glue itself to an arbitrary module.
+    #[test]
+    fn doc_heading_symbol_mentions_attach_doc_to_owning_module() {
+        let (mut store, _dir) = empty_store();
+        let reg = "rust_struct::tokio/src/io/registration.rs#Registration";
+        let sched = "rust_struct::tokio/src/io/scheduled_io.rs#ScheduledIo";
+        let tcp = "rust_struct::tokio/src/net/tcp.rs#TcpStream";
+        let udp = "rust_struct::tokio/src/net/udp.rs#UdpSocket";
+        store
+            .upsert_node(&node(
+                reg,
+                NodeKind::RustStruct,
+                "tokio/src/io/registration.rs",
+                "Registration",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                sched,
+                NodeKind::RustStruct,
+                "tokio/src/io/scheduled_io.rs",
+                "ScheduledIo",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                tcp,
+                NodeKind::RustStruct,
+                "tokio/src/net/tcp.rs",
+                "TcpStream",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                udp,
+                NodeKind::RustStruct,
+                "tokio/src/net/udp.rs",
+                "UdpSocket",
+            ))
+            .unwrap();
+        store
+            .upsert_edge(&edge(reg, sched, EdgeKind::Calls))
+            .unwrap();
+        store.upsert_edge(&edge(tcp, udp, EdgeKind::Calls)).unwrap();
+
+        // Two votes for the io module via backtick-quoted identifiers.
+        for (id, name) in [
+            (
+                "doc_section::tokio/docs/reactor-refactor.md#Reworking the `Registration` type",
+                "Reworking the `Registration` type",
+            ),
+            (
+                "doc_section::tokio/docs/reactor-refactor.md#Reworking the `ScheduledIo` type",
+                "Reworking the `ScheduledIo` type",
+            ),
+        ] {
+            store
+                .upsert_node(&node(
+                    id,
+                    NodeKind::DocSection,
+                    "tokio/docs/reactor-refactor.md",
+                    name,
+                ))
+                .unwrap();
+        }
+        // A single mention: must stay unattached.
+        store
+            .upsert_node(&node(
+                "doc_section::tokio/docs/random.md#About `TcpStream`",
+                NodeKind::DocSection,
+                "tokio/docs/random.md",
+                "About `TcpStream`",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let io_module = pack
+            .modules
+            .iter()
+            .find(|m| {
+                m.entry_points
+                    .iter()
+                    .any(|e| e.name.contains("Registration"))
+                    || m.path_prefix.contains("io")
+            })
+            .expect("io module exists");
+        assert!(
+            io_module
+                .docs
+                .iter()
+                .any(|d| d.path == "tokio/docs/reactor-refactor.md"),
+            "doc citing two io-owned identifiers must attach to the io module; docs={:?}",
+            io_module.docs
+        );
+        for m in &pack.modules {
+            assert!(
+                m.docs.iter().all(|d| d.path != "tokio/docs/random.md"),
+                "single-mention doc must not attach anywhere; module {} got it",
+                m.id
+            );
+        }
+    }
+
+    /// A design doc spanning two subsystems (tokio's reactor-refactor doc
+    /// cites both `Registration`/`ScheduledIo` of runtime-io and
+    /// `AsyncRead`/`AsyncWrite` of io) ties the vote. A tie at ≥2 votes
+    /// means the doc genuinely describes all tied modules — attach to each,
+    /// rather than dropping the doc.
+    #[test]
+    fn tied_heading_votes_attach_doc_to_all_tied_modules() {
+        let (mut store, _dir) = empty_store();
+        let r1 = "rust_struct::a/src/registration.rs#Registration";
+        let r2 = "rust_struct::a/src/scheduled.rs#ScheduledIo";
+        let i1 = "rust_struct::b/src/async_read.rs#AsyncRead";
+        let i2 = "rust_struct::b/src/async_write.rs#AsyncWrite";
+        for (id, path, name) in [
+            (r1, "a/src/registration.rs", "Registration"),
+            (r2, "a/src/scheduled.rs", "ScheduledIo"),
+            (i1, "b/src/async_read.rs", "AsyncRead"),
+            (i2, "b/src/async_write.rs", "AsyncWrite"),
+        ] {
+            store
+                .upsert_node(&node(id, NodeKind::RustStruct, path, name))
+                .unwrap();
+        }
+        store.upsert_edge(&edge(r1, r2, EdgeKind::Calls)).unwrap();
+        store.upsert_edge(&edge(i1, i2, EdgeKind::Calls)).unwrap();
+        for (id, name) in [
+            (
+                "doc_section::docs/refactor.md#`Registration` and `ScheduledIo`",
+                "`Registration` and `ScheduledIo`",
+            ),
+            (
+                "doc_section::docs/refactor.md#`AsyncRead` / `AsyncWrite`",
+                "`AsyncRead` / `AsyncWrite`",
+            ),
+        ] {
+            store
+                .upsert_node(&node(id, NodeKind::DocSection, "docs/refactor.md", name))
+                .unwrap();
+        }
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let holders: Vec<&str> = pack
+            .modules
+            .iter()
+            .filter(|m| m.docs.iter().any(|d| d.path == "docs/refactor.md"))
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(
+            holders.len(),
+            2,
+            "a 2-2 tied design doc must attach to both modules; holders={holders:?}"
+        );
+    }
+
+    /// tokio dogfood, second bug: `tokio/README.md` segment-matched the
+    /// symbol-less `tokio` path-bucket (File nodes only), which pass-4
+    /// filtering then discarded — the README vanished entirely instead of
+    /// reaching `key_docs`. Docs may only attach to modules that *hold
+    /// code*; matches into symbol-less buckets must fall through.
+    #[test]
+    fn docs_never_attach_to_symbolless_file_buckets() {
+        let (mut store, _dir) = empty_store();
+        let a = "rust_fn::core/src/engine.rs#start_engine";
+        let b = "rust_fn::core/src/engine_util.rs#stop_engine";
+        store
+            .upsert_node(&node(
+                a,
+                NodeKind::RustFunction,
+                "core/src/engine.rs",
+                "start_engine",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::RustFunction,
+                "core/src/engine_util.rs",
+                "stop_engine",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        // A symbol-less bucket: only File nodes under `web/`.
+        store
+            .upsert_node(&node(
+                "file::web/app.js",
+                NodeKind::File,
+                "web/app.js",
+                "app.js",
+            ))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::web/README.md#Web frontend",
+                NodeKind::DocSection,
+                "web/README.md",
+                "Web frontend",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "web/README.md"),
+            "README matching a symbol-less bucket must fall through to key_docs; got {:?}",
+            pack.key_docs
+        );
+    }
+
+    /// Package READMEs (`tokio-stream/README.md`) and the repo README often
+    /// describe a *whole product*, not one module — forcing them onto a
+    /// single module would mislead. They must surface at the pack level as
+    /// `key_docs` so the AI still receives them as global context.
+    #[test]
+    fn unattached_readmes_surface_as_pack_key_docs() {
+        let (mut store, _dir) = empty_store();
+        let a = "rust_fn::src/stream/map.rs#map";
+        let b = "rust_fn::src/stream/filter.rs#filter";
+        store
+            .upsert_node(&node(a, NodeKind::RustFunction, "src/stream/map.rs", "map"))
+            .unwrap();
+        store
+            .upsert_node(&node(
+                b,
+                NodeKind::RustFunction,
+                "src/stream/filter.rs",
+                "filter",
+            ))
+            .unwrap();
+        store.upsert_edge(&edge(a, b, EdgeKind::Calls)).unwrap();
+        store
+            .upsert_node(&node(
+                "doc_section::README.md#Overview",
+                NodeKind::DocSection,
+                "README.md",
+                "Overview",
+            ))
+            .unwrap();
+        // leveldb pattern: implementation notes at the top level of the doc
+        // root (`doc/impl.md`) — product-level documentation even though the
+        // stem is not "readme".
+        store
+            .upsert_node(&node(
+                "doc_section::doc/impl.md#Files",
+                NodeKind::DocSection,
+                "doc/impl.md",
+                "Files",
+            ))
+            .unwrap();
+        // Deep non-well-known doc must NOT become a key doc.
+        store
+            .upsert_node(&node(
+                "doc_section::docs/contributing/style.md#Style",
+                NodeKind::DocSection,
+                "docs/contributing/style.md",
+                "Style",
+            ))
+            .unwrap();
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "README.md"),
+            "unattached README must appear in pack-level key_docs; got {:?}",
+            pack.key_docs
+        );
+        assert!(
+            pack.key_docs.iter().any(|d| d.path == "doc/impl.md"),
+            "top-level docs under a doc root are product-level; got {:?}",
+            pack.key_docs
+        );
+        assert!(
+            pack.key_docs
+                .iter()
+                .all(|d| d.path != "docs/contributing/style.md"),
+            "nested non-well-known docs must stay out of key_docs"
+        );
+    }
+
+    #[test]
+    fn tests_dedup_by_file_keeps_true_count() {
+        let (mut store, _dir) = empty_store();
+        store
+            .upsert_node(&node(
+                "dart_class::lib/features/wallet/wallet_bloc.dart#WalletBloc",
+                NodeKind::DartClass,
+                "lib/features/wallet/wallet_bloc.dart",
+                "WalletBloc",
+            ))
+            .unwrap();
+        // one test file, three test cases
+        for case in ["loads balance", "tops up", "handles error"] {
+            store
+                .upsert_node(&node(
+                    &format!("test_case::test/features/wallet/wallet_bloc_test.dart#{case}"),
+                    NodeKind::TestCase,
+                    "test/features/wallet/wallet_bloc_test.dart",
+                    case,
+                ))
+                .unwrap();
+        }
+
+        let pack =
+            propose_business_pack_with_store(&store, &BusinessPackOptions::default()).unwrap();
+        let wallet = pack
+            .modules
+            .iter()
+            .find(|m| m.id == "wallet")
+            .expect("wallet module");
+        assert_eq!(wallet.test_count, 3, "true test-node count preserved");
+        assert_eq!(
+            wallet.tests.len(),
+            1,
+            "displayed test list collapses to one entry per file"
+        );
+        assert_eq!(
+            wallet.tests[0].path,
+            "test/features/wallet/wallet_bloc_test.dart"
+        );
+    }
+
+    #[test]
+    fn noise_methods_are_not_entry_points() {
+        let acc = ModuleAcc {
+            slug: "x".into(),
+            name: "X".into(),
+            ..Default::default()
+        };
+        let build = node(
+            "dart_method::lib/features/x/widget.dart#X.build",
+            NodeKind::DartMethod,
+            "lib/features/x/widget.dart",
+            "X.build",
+        );
+        assert_eq!(acc.entry_point_score(&build), 0);
+        let bloc = node(
+            "dart_class::lib/features/x/x_bloc.dart#XBloc",
+            NodeKind::DartClass,
+            "lib/features/x/x_bloc.dart",
+            "XBloc",
+        );
+        assert!(acc.entry_point_score(&bloc) > 0);
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "groundgraph-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GroundGraph MCP (Model Context Protocol) stdio server."
+
+[[bin]]
+name = "groundgraph-mcp"
+path = "src/bin/groundgraph-mcp.rs"
+
+[lib]
+name = "groundgraph_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+groundgraph-core = { path = "../groundgraph-core" }
+groundgraph-store = { path = "../groundgraph-store" }
+groundgraph-engine = { path = "../groundgraph-engine" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

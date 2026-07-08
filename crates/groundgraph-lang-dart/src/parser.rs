@@ -1,0 +1,1607 @@
+#![allow(clippy::too_many_arguments)]
+//! Lightweight Dart parser. Line-based, brace-aware, no resolved AST.
+//!
+//! Goals:
+//! - Be cheap and predictable. Dart's full grammar is out of scope.
+//! - Produce stable artifact IDs and line ranges good enough for PR Impact.
+//! - Ignore comments completely. GroundGraph is non-invasive and must not
+//!   depend on tool-specific annotations in business code.
+//!
+//! Non-goals: typedef, mixins, enums, extension methods, type parameters,
+//! async modifiers — they are accepted but not modelled as separate kinds.
+
+use groundgraph_core::artifact_id::{
+    dart_class_id, dart_constructor_id, dart_function_id, dart_group_id, dart_method_id,
+    dart_test_id, file_id, slugify,
+};
+use groundgraph_core::language_batch::{
+    AdapterDiagnostic, FileArtifact, ImportEdge, SymbolArtifact, SymbolRange, TestArtifact,
+};
+use groundgraph_core::{ArtifactId, NodeKind};
+
+pub struct ParseResult {
+    pub file: FileArtifact,
+    pub symbols: Vec<SymbolArtifact>,
+    pub tests: Vec<TestArtifact>,
+    pub imports: Vec<ImportEdge>,
+    pub ranges: Vec<SymbolRange>,
+    pub diagnostics: Vec<AdapterDiagnostic>,
+    /// Per-class field-name → type-name mapping discovered by the
+    /// lightweight parser. Used downstream by [`references`] to resolve
+    /// `field.member` access into a reference to the field's class.
+    /// Intentionally local: never persisted in `LanguageIndexBatch`.
+    pub field_types:
+        std::collections::BTreeMap<ArtifactId, std::collections::BTreeMap<String, String>>,
+}
+
+struct ClassFrame {
+    id: ArtifactId,
+    name: String,
+    depth: usize,
+}
+
+struct PendingSymbol {
+    id: ArtifactId,
+    start_line: u32,
+}
+
+pub fn parse_dart(path: &str, source: &str, content_hash: &str) -> ParseResult {
+    let mut symbols = Vec::new();
+    let mut tests = Vec::new();
+    let mut imports = Vec::new();
+    let mut ranges = Vec::new();
+    let diagnostics = Vec::new();
+    let mut field_types: std::collections::BTreeMap<
+        ArtifactId,
+        std::collections::BTreeMap<String, String>,
+    > = std::collections::BTreeMap::new();
+
+    let file_artifact = FileArtifact {
+        id: file_id(path),
+        path: path.to_string(),
+        language: "dart".into(),
+        content_hash: content_hash.to_string(),
+    };
+
+    let mut class_stack: Vec<ClassFrame> = Vec::new();
+    let mut open_symbol_starts: Vec<(ArtifactId, u32, usize)> = Vec::new();
+    let mut pending_symbol: Option<PendingSymbol> = None;
+    let mut depth = 0usize;
+    let mut total_lines = 0u32;
+    let mut scan = ScanState::default();
+
+    for (idx, raw_line) in source.lines().enumerate() {
+        let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
+        total_lines = line_no;
+        let line = strip_inline_string_braces(raw_line);
+        let trimmed = line.trim_start();
+
+        // Lines that *start* inside a multi-line `'''`/`"""` literal are
+        // string content, not code: only depth bookkeeping may see them,
+        // or template text like `class Fake {` would register as real
+        // symbols (issues2.md #37).
+        if scan.in_multiline_string() {
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        if let Some(pending) = pending_symbol.take() {
+            let depth_before = depth;
+            update_depth(&line, &mut depth, &mut scan);
+            if depth > depth_before {
+                open_symbol_starts.push((pending.id, pending.start_line, depth));
+            } else if declaration_finished_without_open_body(&line) {
+                finalize_symbol(
+                    &pending.id,
+                    pending.start_line,
+                    line_no,
+                    path,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    &class_stack,
+                );
+            } else {
+                pending_symbol = Some(pending);
+            }
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        // Ignore comments completely. Links are declared outside business
+        // source files in `.groundgraph/links.yaml`.
+        if trimmed.starts_with("///") {
+            continue;
+        }
+        // Skip blank lines without clearing doc buffer.
+        if trimmed.is_empty() {
+            // Update depth and continue.
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        // Import directives.
+        if let Some(target) = parse_import(trimmed) {
+            imports.push(ImportEdge {
+                from_file: file_artifact.id.clone(),
+                to_path: target,
+            });
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        let current_class = class_stack
+            .last()
+            .map(|c| (c.id.clone(), c.name.clone(), c.depth));
+
+        // Class declarations.
+        if let Some(class_name) = parse_class_header(trimmed) {
+            let class_id = dart_class_id(path, &class_name);
+            let sym = SymbolArtifact {
+                id: class_id.clone(),
+                kind: NodeKind::DartClass,
+                path: path.to_string(),
+                name: class_name.clone(),
+                qualified_name: class_name.clone(),
+                start_line: line_no,
+                end_line: line_no,
+                parent_symbol_id: None,
+                metadata_json: None,
+            };
+            symbols.push(sym);
+            let opens_brace = line.contains('{');
+            update_depth(&line, &mut depth, &mut scan);
+            if opens_brace {
+                class_stack.push(ClassFrame {
+                    id: class_id.clone(),
+                    name: class_name.clone(),
+                    depth,
+                });
+                open_symbol_starts.push((class_id, line_no, depth));
+            }
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        // test() / group() calls.
+        if let Some(name) = parse_test_call(trimmed) {
+            let slug = slugify(&name);
+            let id = dart_test_id(path, &slug);
+            tests.push(TestArtifact {
+                id: id.clone(),
+                kind: NodeKind::TestCase,
+                path: path.to_string(),
+                name: name.clone(),
+                start_line: line_no,
+                end_line: line_no,
+                parent_symbol_id: current_class.as_ref().map(|c| c.0.clone()),
+            });
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+        if let Some(name) = parse_group_call(trimmed) {
+            let slug = slugify(&name);
+            let id = dart_group_id(path, &slug);
+            tests.push(TestArtifact {
+                id: id.clone(),
+                kind: NodeKind::TestGroup,
+                path: path.to_string(),
+                name,
+                start_line: line_no,
+                end_line: line_no,
+                parent_symbol_id: current_class.as_ref().map(|c| c.0.clone()),
+            });
+            update_depth(&line, &mut depth, &mut scan);
+            close_symbols(
+                &mut open_symbol_starts,
+                &mut class_stack,
+                &mut ranges,
+                &mut symbols,
+                &mut tests,
+                depth,
+                line_no,
+                path,
+            );
+            continue;
+        }
+
+        // Constructor and method/function declarations.
+        // Only parse declarations at the class's *direct* child layer.
+        // Anything deeper (`depth > class_depth`) is inside a method body
+        // and must not be re-parsed — otherwise expressions like
+        // `candidates.sort(...)` get misidentified as method declarations.
+        let class_for_decl = current_class
+            .as_ref()
+            .filter(|(_, _, class_depth)| depth == *class_depth);
+
+        if let Some(class) = class_for_decl {
+            if let Some(ctor_name) = parse_constructor(trimmed, &class.1) {
+                let id = dart_constructor_id(path, &class.1, &ctor_name);
+                let qname = if ctor_name.is_empty() {
+                    class.1.clone()
+                } else {
+                    format!("{}.{}", class.1, ctor_name)
+                };
+                symbols.push(SymbolArtifact {
+                    id: id.clone(),
+                    kind: NodeKind::DartConstructor,
+                    path: path.to_string(),
+                    name: ctor_name.clone(),
+                    qualified_name: qname,
+                    start_line: line_no,
+                    end_line: line_no,
+                    parent_symbol_id: Some(class.0.clone()),
+                    metadata_json: None,
+                });
+                let depth_before = depth;
+                update_depth(&line, &mut depth, &mut scan);
+                if depth > depth_before {
+                    open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
+                } else {
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
+                }
+                close_symbols(
+                    &mut open_symbol_starts,
+                    &mut class_stack,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    depth,
+                    line_no,
+                    path,
+                );
+                continue;
+            }
+            if let Some((field_name, type_name)) = parse_field(trimmed) {
+                field_types
+                    .entry(class.0.clone())
+                    .or_default()
+                    .insert(field_name, type_name);
+                update_depth(&line, &mut depth, &mut scan);
+                close_symbols(
+                    &mut open_symbol_starts,
+                    &mut class_stack,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    depth,
+                    line_no,
+                    path,
+                );
+                continue;
+            }
+            if let Some(method_name) = parse_method(trimmed) {
+                let id = dart_method_id(path, &class.1, &method_name);
+                symbols.push(SymbolArtifact {
+                    id: id.clone(),
+                    kind: NodeKind::DartMethod,
+                    path: path.to_string(),
+                    name: method_name.clone(),
+                    qualified_name: format!("{}.{}", class.1, method_name),
+                    start_line: line_no,
+                    end_line: line_no,
+                    parent_symbol_id: Some(class.0.clone()),
+                    metadata_json: None,
+                });
+                let depth_before = depth;
+                update_depth(&line, &mut depth, &mut scan);
+                if depth > depth_before {
+                    open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
+                } else {
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
+                }
+                close_symbols(
+                    &mut open_symbol_starts,
+                    &mut class_stack,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    depth,
+                    line_no,
+                    path,
+                );
+                continue;
+            }
+        } else if depth == 0 {
+            if let Some(name) = parse_top_level_function(trimmed) {
+                let id = dart_function_id(path, &name);
+                symbols.push(SymbolArtifact {
+                    id: id.clone(),
+                    kind: NodeKind::DartFunction,
+                    path: path.to_string(),
+                    name: name.clone(),
+                    qualified_name: name.clone(),
+                    start_line: line_no,
+                    end_line: line_no,
+                    parent_symbol_id: None,
+                    metadata_json: None,
+                });
+                let depth_before = depth;
+                update_depth(&line, &mut depth, &mut scan);
+                if depth > depth_before {
+                    open_symbol_starts.push((id, line_no, depth));
+                } else if declaration_finished_without_open_body(&line) {
+                    finalize_symbol(
+                        &id,
+                        line_no,
+                        line_no,
+                        path,
+                        &mut ranges,
+                        &mut symbols,
+                        &mut tests,
+                        &class_stack,
+                    );
+                } else {
+                    pending_symbol = Some(PendingSymbol {
+                        id,
+                        start_line: line_no,
+                    });
+                }
+                close_symbols(
+                    &mut open_symbol_starts,
+                    &mut class_stack,
+                    &mut ranges,
+                    &mut symbols,
+                    &mut tests,
+                    depth,
+                    line_no,
+                    path,
+                );
+                continue;
+            }
+        }
+
+        // Default: just update brace depth.
+        update_depth(&line, &mut depth, &mut scan);
+        close_symbols(
+            &mut open_symbol_starts,
+            &mut class_stack,
+            &mut ranges,
+            &mut symbols,
+            &mut tests,
+            depth,
+            line_no,
+            path,
+        );
+    }
+
+    if let Some(pending) = pending_symbol.take() {
+        finalize_symbol(
+            &pending.id,
+            pending.start_line,
+            total_lines,
+            path,
+            &mut ranges,
+            &mut symbols,
+            &mut tests,
+            &class_stack,
+        );
+    }
+
+    // Anything still open closes at EOF.
+    while let Some((id, start, _depth)) = open_symbol_starts.pop() {
+        finalize_symbol(
+            &id,
+            start,
+            total_lines,
+            path,
+            &mut ranges,
+            &mut symbols,
+            &mut tests,
+            &class_stack,
+        );
+    }
+
+    disambiguate_duplicate_test_ids(&mut tests);
+
+    ParseResult {
+        file: file_artifact,
+        symbols,
+        tests,
+        imports,
+        ranges,
+        diagnostics,
+        field_types,
+    }
+}
+
+/// Detect simple Dart class field declarations.
+///
+/// Recognised shapes (all single-line):
+///   `Type name;`
+///   `Type name = expr;`
+///   `final Type name = expr;`
+///   `late final Type name;`
+///   `static const Type name = expr;`
+///
+/// Generic types are accepted; the recorded `type_name` is the *first*
+/// identifier of the type expression (e.g. `List<String>` ⇒ `List`,
+/// `Future<void>` ⇒ `Future`). This is intentionally coarse; downstream
+/// reference resolution only needs to match a *class name* the symbol
+/// index already knows about.
+///
+/// Returns `(field_name, type_name)` or `None` if the line does not look
+/// like a field declaration.
+fn parse_field(line: &str) -> Option<(String, String)> {
+    if line.starts_with("//") || line.starts_with("///") {
+        return None;
+    }
+    // Method or constructor declarations always contain `(` before any `=`
+    // or `;`. Field initialisers may contain `(` *after* `=`, so reject
+    // only when `(` appears before `=` and `;`.
+    let paren = line.find('(');
+    let eq = line.find('=');
+    let semi = line.find(';');
+    let stop = match (eq, semi) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+    let stop = stop?;
+    if let Some(p) = paren {
+        if p < stop {
+            return None;
+        }
+    }
+    let head = line[..stop].trim();
+    if head.is_empty() {
+        return None;
+    }
+
+    let mut tokens = head.split_whitespace().peekable();
+    let mut buf: Vec<&str> = Vec::new();
+    while let Some(tok) = tokens.peek().copied() {
+        if matches!(
+            tok,
+            "static" | "final" | "late" | "const" | "var" | "external" | "covariant"
+        ) {
+            tokens.next();
+            continue;
+        }
+        break;
+    }
+    for tok in tokens {
+        buf.push(tok);
+    }
+    if buf.len() < 2 {
+        return None;
+    }
+    let type_token = buf[0];
+    let name_token = buf[buf.len() - 1];
+
+    let type_name: String = type_token
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    let field_name: String = name_token
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if type_name.is_empty() || field_name.is_empty() {
+        return None;
+    }
+    // Skip statement-like patterns that would otherwise look like
+    // `Type name;` after split: `return foo;`, `await foo;`, etc.
+    if matches!(
+        type_name.as_str(),
+        "return" | "await" | "yield" | "throw" | "assert" | "if" | "for" | "while" | "switch"
+    ) {
+        return None;
+    }
+    // Type and field name cannot be Dart reserved keywords.
+    if matches!(
+        field_name.as_str(),
+        "return" | "true" | "false" | "null" | "this" | "super" | "if" | "for"
+    ) {
+        return None;
+    }
+    Some((field_name, type_name))
+}
+
+fn declaration_finished_without_open_body(line: &str) -> bool {
+    line.contains(';') || line.contains("=>") || line.contains('{')
+}
+
+fn disambiguate_duplicate_test_ids(tests: &mut [TestArtifact]) {
+    // Single counting pass instead of the old O(N²) re-slugify-everything
+    // inner loop — generated golden-test files easily hold thousands of
+    // cases (issues2.md #60).
+    let slugs: Vec<String> = tests.iter().map(|t| slugify(&t.name)).collect();
+    let mut counts: std::collections::HashMap<(NodeKind, String, String), usize> =
+        std::collections::HashMap::new();
+    for (t, slug) in tests.iter().zip(&slugs) {
+        *counts
+            .entry((t.kind, t.path.clone(), slug.clone()))
+            .or_insert(0) += 1;
+    }
+    for (idx, slug) in slugs.iter().enumerate() {
+        let key = (tests[idx].kind, tests[idx].path.clone(), slug.clone());
+        if counts.get(&key).copied().unwrap_or(0) <= 1 {
+            continue;
+        }
+        let unique_slug = format!("{slug}-line-{}", tests[idx].start_line);
+        tests[idx].id = match tests[idx].kind {
+            NodeKind::TestCase => dart_test_id(&tests[idx].path, &unique_slug),
+            NodeKind::TestGroup => dart_group_id(&tests[idx].path, &unique_slug),
+            _ => tests[idx].id.clone(),
+        };
+    }
+}
+
+fn close_symbols(
+    open_symbols: &mut Vec<(ArtifactId, u32, usize)>,
+    class_stack: &mut Vec<ClassFrame>,
+    ranges: &mut Vec<SymbolRange>,
+    symbols: &mut [SymbolArtifact],
+    tests: &mut [TestArtifact],
+    depth: usize,
+    line_no: u32,
+    path: &str,
+) {
+    loop {
+        match open_symbols.last() {
+            Some(&(_, _, sym_depth)) if depth < sym_depth => {}
+            _ => break,
+        }
+        let Some((id, start, _)) = open_symbols.pop() else {
+            break;
+        };
+        finalize_symbol(
+            &id,
+            start,
+            line_no,
+            path,
+            ranges,
+            symbols,
+            tests,
+            class_stack,
+        );
+    }
+    loop {
+        match class_stack.last() {
+            Some(frame) if depth < frame.depth => {}
+            _ => break,
+        }
+        // The class symbol's end_line is set when we close its corresponding
+        // open_symbol entry above. We just discard the frame here.
+        if class_stack.pop().is_none() {
+            break;
+        }
+    }
+}
+
+fn finalize_symbol(
+    id: &ArtifactId,
+    start_line: u32,
+    end_line: u32,
+    path: &str,
+    ranges: &mut Vec<SymbolRange>,
+    symbols: &mut [SymbolArtifact],
+    tests: &mut [TestArtifact],
+    class_stack: &[ClassFrame],
+) {
+    let (kind, qname, parent) = if let Some(sym) = symbols.iter_mut().find(|s| s.id == *id) {
+        sym.end_line = end_line;
+        (
+            sym.kind,
+            sym.qualified_name.clone(),
+            sym.parent_symbol_id.clone(),
+        )
+    } else if let Some(t) = tests.iter_mut().find(|t| t.id == *id) {
+        t.end_line = end_line;
+        (t.kind, t.name.clone(), t.parent_symbol_id.clone())
+    } else if let Some(frame) = class_stack.iter().find(|f| f.id == *id) {
+        (NodeKind::DartClass, frame.name.clone(), None)
+    } else {
+        return;
+    };
+
+    ranges.push(SymbolRange {
+        file_path: path.to_string(),
+        symbol_id: id.clone(),
+        start_line,
+        end_line,
+        symbol_kind: kind,
+        qualified_name: qname,
+        parent_symbol_id: parent,
+    });
+}
+
+/// Cross-line scanner state for [`update_depth`]. `triple` is `Some((quote,
+/// raw))` while the scanner is inside a multi-line `'''`/`"""` literal —
+/// per-line resets used to treat template content as code and drift the
+/// brace depth (issues2.md #37).
+#[derive(Default)]
+struct ScanState {
+    triple: Option<(char, bool)>,
+}
+
+impl ScanState {
+    fn in_multiline_string(&self) -> bool {
+        self.triple.is_some()
+    }
+}
+
+fn update_depth(line: &str, depth: &mut usize, state: &mut ScanState) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut raw_string = false;
+    let mut quote_char = '"';
+    // Escape state instead of a one-char look-back: `prev != '\\'` misread
+    // `"\\"` (escaped backslash, string *closed*) as still-open, which then
+    // mis-counted every following brace (issues.md #5).
+    let mut escaped = false;
+    let mut prev = ' ';
+    while i < chars.len() {
+        let ch = chars[i];
+        // Inside a multi-line literal: consume until the closing run.
+        // `escaped` legitimately resets at line start — a trailing `\`
+        // escapes the newline itself, not the next line's first char.
+        if let Some((q, raw)) = state.triple {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' && !raw {
+                escaped = true;
+            } else if ch == q && chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                state.triple = None;
+                prev = ' ';
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' && !raw_string {
+                escaped = true;
+            } else if !raw_string && ch == '$' && chars.get(i + 1) == Some(&'{') {
+                // String interpolation `${ expr }`: the expression can carry its
+                // own quotes and braces (`"${m["k"]}"`). Skip to the matching
+                // `}` so a nested quote does not prematurely end the string and
+                // the interpolation's braces are not counted as code blocks.
+                // (#259) (Raw strings — `r"..."` — do not interpolate.)
+                i = skip_interpolation(&chars, i + 2);
+                prev = ' ';
+                continue;
+            } else if ch == quote_char {
+                in_string = false;
+            }
+            prev = ch;
+            i += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                // Dart raw strings (`r'...'`) have no escapes at all.
+                let raw = prev == 'r';
+                if chars.get(i + 1) == Some(&ch) && chars.get(i + 2) == Some(&ch) {
+                    state.triple = Some((ch, raw));
+                    escaped = false;
+                    prev = ' ';
+                    i += 3;
+                    continue;
+                }
+                in_string = true;
+                quote_char = ch;
+                raw_string = raw;
+                escaped = false;
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => break, // line comment
+            '{' => *depth += 1,
+            '}' if *depth > 0 => {
+                *depth -= 1;
+            }
+            _ => {}
+        }
+        prev = ch;
+        i += 1;
+    }
+}
+
+/// Given `chars[start..]` positioned just *after* a `${`, return the index of
+/// the char past the `}` that closes the interpolation. Counts nested braces
+/// and skips nested string literals (which may themselves interpolate), so the
+/// interpolation's own braces are never mistaken for code blocks. Single-line:
+/// an unterminated interpolation returns `chars.len()`. (#259)
+fn skip_interpolation(chars: &[char], start: usize) -> usize {
+    let mut i = start;
+    let mut brace = 1usize;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => brace += 1,
+            '}' => {
+                brace -= 1;
+                if brace == 0 {
+                    return i + 1;
+                }
+            }
+            c @ ('\'' | '"') => {
+                let raw = i > 0 && chars[i - 1] == 'r';
+                i = skip_inline_string(chars, i, c, raw);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Skip a single-line string literal whose opening quote is at `chars[open]`.
+/// Returns the index past the closing quote. Honors `\`-escapes (non-raw) and
+/// recurses into `${...}` interpolations so a brace inside a nested string is
+/// not counted. (#259)
+fn skip_inline_string(chars: &[char], open: usize, quote: char, raw: bool) -> usize {
+    let mut i = open + 1;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && !raw {
+            escaped = true;
+        } else if !raw && ch == '$' && chars.get(i + 1) == Some(&'{') {
+            i = skip_interpolation(chars, i + 2);
+            continue;
+        } else if ch == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Byte index of the first unescaped `quote` in `s`, honouring `\\` pairs.
+fn find_unescaped(s: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == quote {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn strip_inline_string_braces(line: &str) -> String {
+    // Conservative pass: keep the line as-is; `update_depth` already skips
+    // braces inside string literals.
+    line.to_string()
+}
+
+fn parse_class_header(line: &str) -> Option<String> {
+    let stripped = line
+        .trim_start_matches("abstract ")
+        .trim_start_matches("base ")
+        .trim_start_matches("final ")
+        .trim_start_matches("sealed ")
+        .trim_start_matches("interface ")
+        .trim_start_matches("class ")
+        .trim_start();
+    if line.trim_start().starts_with("class ")
+        || line.trim_start().starts_with("abstract class ")
+        || line.trim_start().starts_with("sealed class ")
+        || line.trim_start().starts_with("final class ")
+        || line.trim_start().starts_with("base class ")
+        || line.trim_start().starts_with("interface class ")
+    {
+        let name: String = stripped
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn parse_import(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("import ")?;
+    let rest = rest.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let end = find_unescaped(&rest[1..], quote)?;
+    Some(rest[1..1 + end].to_string())
+}
+
+fn parse_test_call(line: &str) -> Option<String> {
+    extract_call_arg(line, "test(")
+}
+
+fn parse_group_call(line: &str) -> Option<String> {
+    extract_call_arg(line, "group(")
+}
+
+fn extract_call_arg(line: &str, prefix: &str) -> Option<String> {
+    let pos = line.find(prefix)?;
+    // Must be at start or preceded by non-identifier char.
+    if pos > 0 {
+        let prev = line.as_bytes()[pos - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
+    }
+    let after = &line[pos + prefix.len()..];
+    let after = after.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let inside = &after[1..];
+    let end = find_unescaped(inside, quote)?;
+    Some(inside[..end].to_string())
+}
+
+fn parse_method(line: &str) -> Option<String> {
+    // <return-type>? <name>(args). We skip lines starting with reserved
+    // statements (`if`, `for`, `while`, etc).
+    if line.starts_with("//") || line.starts_with("///") {
+        return None;
+    }
+    for kw in [
+        "if(", "if ", "for(", "for ", "while(", "while ", "switch", "return ", "return;",
+        // A `factory` is always a constructor; when the class name does
+        // not match (so `parse_constructor` passed), modelling it as a
+        // method would collapse names at the `.` (issues2.md #36).
+        "factory ",
+    ] {
+        if line.starts_with(kw) {
+            return None;
+        }
+    }
+    let paren = line.find('(')?;
+    let head = &line[..paren];
+    let head_trim = head.trim_end();
+    // Reject field initializers like `ProNotifier pro = ProNotifier();`.
+    // A method head never contains `=` between the return type and the
+    // opening `(`; only an assignment / default-value expression would.
+    if head_trim.contains('=') {
+        return None;
+    }
+    let name_part = head_trim.split_whitespace().last()?;
+    let cleaned: String = name_part
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Filter out `test`/`group` callsites (already detected separately).
+    if matches!(cleaned.as_str(), "test" | "group") {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn parse_top_level_function(line: &str) -> Option<String> {
+    // Same heuristic as method, but at depth 0.
+    parse_method(line)
+}
+
+fn parse_constructor(line: &str, class_name: &str) -> Option<String> {
+    // `factory` (and `const factory`) constructors must keep their own
+    // names: falling through to `parse_method` collapsed every factory in
+    // a class onto one method id (issues2.md #36).
+    let trimmed = line
+        .trim_start_matches("const ")
+        .trim_start()
+        .trim_start_matches("factory ")
+        .trim_start()
+        .trim_start_matches("const ")
+        .trim_start();
+    if !trimmed.starts_with(class_name) {
+        return None;
+    }
+    let after = &trimmed[class_name.len()..];
+    let mut chars = after.chars();
+    match chars.next() {
+        Some('(') => Some(String::new()),
+        Some('.') => {
+            let name: String = chars
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // Must be followed by `(`.
+            let after_name = &after[1 + name.len()..];
+            if after_name.starts_with('(') {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> ParseResult {
+        parse_dart("lib/a.dart", src, "hash")
+    }
+
+    #[test]
+    fn one_line_bodyless_method_does_not_swallow_following_methods() {
+        // Regression: a method whose `{}` are on the same line (e.g.
+        // `Future<void> foo(...) async {}`) used to leave its range
+        // open and absorb every following method body, producing false
+        // calls/references edges. The range must stay on its own line.
+        let src =
+            "class C {\n  Future<void> foo(int x) async {}\n  void bar() {\n    foo(1);\n  }\n}\n";
+        let r = parse(src);
+        let foo_range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "C.foo")
+            .expect("foo should produce a range");
+        assert_eq!(foo_range.start_line, foo_range.end_line);
+        assert_eq!(foo_range.start_line, 2, "foo must stay on line 2");
+        let bar_range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "C.bar")
+            .expect("bar should produce a range");
+        assert_eq!(bar_range.start_line, 3);
+        assert!(bar_range.end_line >= 5);
+    }
+
+    #[test]
+    fn multiline_method_signature_keeps_body_range() {
+        // Pixcraft's `_listenToPurchaseUpdates` signature spans multiple
+        // lines. The parser used to finalise it on the first line, so the
+        // reference scanner never saw the body and missed
+        // `notifier.applyPurchase(...)`.
+        let src = "class Paywall {\n  void listen(\n    List<String> purchases,\n  ) async {\n    notifier.applyPurchase(purchases.first);\n  }\n}\n";
+        let r = parse(src);
+        let range = r
+            .ranges
+            .iter()
+            .find(|range| range.qualified_name == "Paywall.listen")
+            .expect("listen should produce a range");
+        assert_eq!(range.start_line, 2);
+        assert!(
+            range.end_line >= 5,
+            "multi-line method must include its body, got {range:?}"
+        );
+    }
+
+    #[test]
+    fn class_field_emits_field_type_entry() {
+        // The lightweight parser must record class-level fields so
+        // references resolution can later map `pro.state` ⇒ ProNotifier.
+        let src = "class E {\n  ProNotifier pro = ProNotifier();\n  bool flag = false;\n}\n";
+        let r = parse(src);
+        let class_id = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartClass)
+            .map(|s| s.id.clone())
+            .unwrap();
+        let fields = r
+            .field_types
+            .get(&class_id)
+            .expect("class field map must exist");
+        assert_eq!(fields.get("pro").map(String::as_str), Some("ProNotifier"));
+        assert_eq!(fields.get("flag").map(String::as_str), Some("bool"));
+    }
+
+    #[test]
+    fn extracts_class_and_methods_ignoring_comments() {
+        let src = "/// Ordinary API docs\nclass Foo {\n  Foo();\n  void bar() {}\n}\n";
+        let r = parse(src);
+        assert_eq!(r.symbols.len(), 3, "class + ctor + method");
+        let class = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartClass)
+            .unwrap();
+        assert_eq!(class.name, "Foo");
+        let method = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartMethod)
+            .unwrap();
+        assert_eq!(method.name, "bar");
+        assert_eq!(method.parent_symbol_id.as_ref().unwrap(), &class.id);
+    }
+
+    #[test]
+    fn extracts_top_level_function() {
+        let src = "void main() {}\n";
+        let r = parse(src);
+        assert!(r
+            .symbols
+            .iter()
+            .any(|s| s.kind == NodeKind::DartFunction && s.name == "main"));
+    }
+
+    #[test]
+    fn extracts_named_constructor() {
+        let src = "class Foo {\n  Foo.named();\n}\n";
+        let r = parse(src);
+        let ctor = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartConstructor)
+            .unwrap();
+        assert_eq!(ctor.name, "named");
+    }
+
+    #[test]
+    fn extracts_test_and_group_ignoring_comments() {
+        let src = "void main() {\n  group('Outer', () {\n    /// Ordinary test docs\n    test('inside', () {});\n  });\n}\n";
+        let r = parse(src);
+        let test = r
+            .tests
+            .iter()
+            .find(|t| t.kind == NodeKind::TestCase)
+            .unwrap();
+        assert_eq!(test.name, "inside");
+        let group = r
+            .tests
+            .iter()
+            .find(|t| t.kind == NodeKind::TestGroup)
+            .unwrap();
+        assert_eq!(group.name, "Outer");
+    }
+
+    #[test]
+    fn duplicate_test_names_get_distinct_artifact_ids() {
+        let src = "void main() {\n  test('same name', () {});\n  test('same name', () {});\n}\n";
+        let r = parse(src);
+        let tests: Vec<_> = r
+            .tests
+            .iter()
+            .filter(|t| t.kind == NodeKind::TestCase)
+            .collect();
+        assert_eq!(tests.len(), 2);
+        assert_ne!(
+            tests[0].id, tests[1].id,
+            "same path + same test name must not collapse into one graph node"
+        );
+    }
+
+    #[test]
+    fn extracts_imports() {
+        let src = "import 'package:foo/bar.dart';\nimport \"package:baz/qux.dart\";\n";
+        let r = parse(src);
+        assert_eq!(r.imports.len(), 2);
+        assert_eq!(r.imports[0].to_path, "package:foo/bar.dart");
+        assert_eq!(r.imports[1].to_path, "package:baz/qux.dart");
+    }
+
+    #[test]
+    fn symbol_ranges_cover_method_and_class() {
+        let src = "class Foo {\n  void bar() {\n    return;\n  }\n}\n";
+        let r = parse(src);
+        let class_range = r
+            .ranges
+            .iter()
+            .find(|rg| rg.symbol_kind == NodeKind::DartClass)
+            .unwrap();
+        assert_eq!(class_range.start_line, 1);
+        assert!(class_range.end_line >= 4);
+        let method_range = r
+            .ranges
+            .iter()
+            .find(|rg| rg.symbol_kind == NodeKind::DartMethod)
+            .unwrap();
+        assert_eq!(method_range.start_line, 2);
+        assert!(method_range.end_line >= 3);
+        assert_eq!(
+            method_range.parent_symbol_id.as_ref().unwrap(),
+            &class_range.symbol_id
+        );
+    }
+
+    #[test]
+    fn parse_class_header_recognises_modifiers() {
+        assert_eq!(parse_class_header("class Foo {").as_deref(), Some("Foo"));
+        assert_eq!(
+            parse_class_header("abstract class Bar {").as_deref(),
+            Some("Bar")
+        );
+        assert_eq!(
+            parse_class_header("sealed class Baz {").as_deref(),
+            Some("Baz")
+        );
+        assert_eq!(parse_class_header("not a class"), None);
+    }
+
+    #[test]
+    fn parse_import_handles_both_quote_styles() {
+        assert_eq!(parse_import("import 'a.dart';").as_deref(), Some("a.dart"));
+        assert_eq!(
+            parse_import("import \"b.dart\";").as_deref(),
+            Some("b.dart")
+        );
+        assert_eq!(parse_import("not import"), None);
+    }
+
+    #[test]
+    fn extract_call_arg_ignores_substring_matches() {
+        assert!(parse_test_call("xtest('foo', ...)").is_none());
+        assert_eq!(parse_test_call("test('foo', ...)").as_deref(), Some("foo"));
+        assert_eq!(parse_group_call("  group('g', ...)").as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn unterminated_quote_in_test_call_is_ignored() {
+        assert!(parse_test_call("test('foo, ...)").is_none());
+    }
+
+    #[test]
+    fn constructor_requires_class_name_match() {
+        assert_eq!(parse_constructor("Foo();", "Foo").as_deref(), Some(""));
+        assert_eq!(
+            parse_constructor("Foo.named();", "Foo").as_deref(),
+            Some("named")
+        );
+        assert!(parse_constructor("Foo.weird", "Foo").is_none());
+        assert!(parse_constructor("Other()", "Foo").is_none());
+    }
+
+    #[test]
+    fn method_filter_skips_control_flow_keywords() {
+        assert!(parse_method("if (x) {").is_none());
+        assert!(parse_method("return foo();").is_none());
+        assert!(parse_method("while(true) {").is_none());
+        assert!(parse_method("// comment").is_none());
+    }
+
+    #[test]
+    fn imports_inside_strings_are_not_extracted() {
+        let r = parse("import 'a.dart';\nvoid main() { var s = 'import not-a-file'; }\n");
+        assert_eq!(r.imports.len(), 1);
+        assert_eq!(r.imports[0].to_path, "a.dart");
+    }
+
+    #[test]
+    fn class_without_brace_is_recorded_without_body_range() {
+        let r = parse("abstract class Foo;\n");
+        let class = r
+            .symbols
+            .iter()
+            .find(|s| s.kind == NodeKind::DartClass)
+            .unwrap();
+        assert_eq!(class.name, "Foo");
+        // No body so we should not emit a range for the class.
+        assert!(r
+            .ranges
+            .iter()
+            .all(|rg| rg.symbol_kind != NodeKind::DartClass));
+    }
+
+    #[test]
+    fn empty_source_returns_only_file_artifact() {
+        let r = parse("");
+        assert!(r.symbols.is_empty());
+        assert!(r.tests.is_empty());
+        assert!(r.imports.is_empty());
+        assert!(r.ranges.is_empty());
+        assert_eq!(r.file.path, "lib/a.dart");
+    }
+
+    #[test]
+    fn method_body_calls_are_not_misdetected_as_method_declarations() {
+        // Regression: `depth >= class_depth` used to let `candidates.sort(...)`
+        // inside a method body be parsed as a sibling method of the enclosing
+        // class. The only legitimate method declarations live at the class's
+        // *direct* child layer (depth == class_depth).
+        let src = "class AutoPlacementService {\n  AutoPlacementService();\n\n  PlacementCandidate placeWatermark(List<PlacementCandidate> candidates) {\n    candidates.sort((a, b) => b.score.compareTo(a.score));\n    return candidates.first;\n  }\n\n  double scoreCandidate(PlacementCandidate candidate) {\n    return candidate.score;\n  }\n}\n";
+        let r = parse(src);
+        let method_names: Vec<_> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartMethod)
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(
+            method_names,
+            vec!["placeWatermark".to_string(), "scoreCandidate".to_string()],
+            "no body-call noise allowed, got {method_names:?}"
+        );
+    }
+
+    #[test]
+    fn nested_blocks_do_not_emit_phantom_methods() {
+        // `if (...) { ... }` inside a method body must not introduce a new
+        // method symbol just because the outer brace depth increased.
+        let src =
+            "class Box {\n  void open() {\n    if (locked) {\n      throw 'no';\n    }\n  }\n}\n";
+        let r = parse(src);
+        let methods: Vec<_> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartMethod)
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(methods, vec!["open".to_string()]);
+    }
+
+    fn depth_of(lines: &[&str]) -> usize {
+        let mut d = 0usize;
+        let mut scan = ScanState::default();
+        for line in lines {
+            update_depth(line, &mut d, &mut scan);
+        }
+        d
+    }
+
+    #[test]
+    fn update_depth_skips_braces_inside_strings_and_line_comments() {
+        assert_eq!(depth_of(&["var x = '{{{'; // }"]), 0);
+        assert_eq!(depth_of(&["class X {"]), 1);
+        assert_eq!(depth_of(&["class X {", "}"]), 0);
+        // Underflow safety.
+        assert_eq!(depth_of(&["}"]), 0);
+    }
+
+    #[test]
+    fn update_depth_handles_escaped_backslash_before_closing_quote() {
+        // `"\\"` is a complete string literal (escaped backslash). The old
+        // `prev != '\\'` check saw the backslash and kept the scanner "inside
+        // a string", so the following `{` was swallowed (issues.md #5).
+        assert_eq!(
+            depth_of(&[r#"var s = "\\"; if (x) {"#]),
+            1,
+            "the trailing `{{` must be counted"
+        );
+
+        // An escaped quote really does stay inside the string.
+        assert_eq!(
+            depth_of(&[r#"var s = "a\"b{"; "#]),
+            0,
+            "braces inside the string must not count"
+        );
+
+        // Even-length backslash runs end the escape: `"a\\\\"` closes too.
+        assert_eq!(depth_of(&[r#"var s = "a\\\\"; {"#]), 1);
+    }
+
+    #[test]
+    fn update_depth_handles_string_interpolation_with_nested_quotes() {
+        // `"${a["{"]}"` — the `{` lives inside the *nested* string of an
+        // interpolation expression. The nested `"` must not end the outer
+        // string, and the `{` must not be counted as a code block. Only the
+        // trailing real `{` counts. (#259)
+        assert_eq!(
+            depth_of(&[r#"var s = "${a["{"]}"; if (c) {"#]),
+            1,
+            "nested quote/brace inside ${{...}} must not corrupt depth"
+        );
+        // A collection literal inside an interpolation is not a code block.
+        assert_eq!(depth_of(&[r#"var s = "a ${ {1: 2} } b";"#]), 0);
+        // Raw strings do not interpolate: `$`, `{`, `}` are literal content.
+        assert_eq!(depth_of(&[r#"var s = r"${not[an]i}"; {"#]), 1);
+    }
+
+    #[test]
+    fn update_depth_tracks_triple_quotes_across_lines() {
+        // Braces inside a multi-line literal must not count…
+        assert_eq!(depth_of(&["var s = '''", "{ {", "''';", "{"]), 1);
+        // …and a triple-quoted literal that opens and closes on one line
+        // leaves no dangling state.
+        assert_eq!(depth_of(&["var s = '''{ x }''';", "{"]), 1);
+        // Quotes inside the literal don't close it.
+        assert_eq!(
+            depth_of(&["var s = \"\"\"", "it's 'quoted' {", "\"\"\";"]),
+            0
+        );
+    }
+
+    /// issues2.md #36: `factory Foo.x(...)` used to fall through
+    /// `parse_constructor` (the `factory ` prefix broke the class-name
+    /// match) into `parse_method`, where `take_while` stopped at `.` —
+    /// every factory in a class collapsed onto one method named like the
+    /// class, colliding on a single symbol id.
+    #[test]
+    fn factory_constructors_register_as_distinct_constructors() {
+        let src = "class Foo {\n  factory Foo.fromJson(Map j) { return Foo._(); }\n  factory Foo.fromYaml(String y) { return Foo._(); }\n  Foo._();\n}\n";
+        let r = parse(src);
+        let ctors: Vec<&str> = r
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::DartConstructor)
+            .map(|s| s.qualified_name.as_str())
+            .collect();
+        assert!(
+            ctors.contains(&"Foo.fromJson") && ctors.contains(&"Foo.fromYaml"),
+            "factories must become distinct constructors, got {ctors:?}"
+        );
+        assert!(
+            !r.symbols
+                .iter()
+                .any(|s| s.kind == NodeKind::DartMethod && s.name == "Foo"),
+            "no collapsed method named after the class may appear"
+        );
+    }
+
+    /// issues2.md #37: `update_depth` reset its string state on every
+    /// line, so a multi-line `'''...'''` template containing `{` drifted
+    /// the depth counter and dragged enclosing symbol ranges to EOF.
+    #[test]
+    fn triple_quoted_strings_do_not_corrupt_brace_depth() {
+        let src = "class C {\n  void f() {\n    var s = '''\n{ \"json\": \"template\",\n''';\n  }\n  void g() {}\n}\n";
+        let r = parse(src);
+        let f = r
+            .ranges
+            .iter()
+            .find(|x| x.qualified_name == "C.f")
+            .expect("f range");
+        assert_eq!(f.end_line, 6, "f must close right after the literal");
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "C.g"),
+            "g must still be discovered after the template"
+        );
+    }
+
+    /// Declaration-looking text inside a multi-line string must not be
+    /// parsed as real symbols (issues2.md #37).
+    #[test]
+    fn declarations_inside_triple_quoted_strings_are_ignored() {
+        let src = "void real() {\n  var tpl = '''\nclass Fake {\n  void phantom() {}\n}\n''';\n}\n";
+        let r = parse(src);
+        assert!(
+            !r.symbols.iter().any(|s| s.name == "Fake"),
+            "class text inside a string literal must not register"
+        );
+        assert!(
+            !r.symbols.iter().any(|s| s.name == "phantom"),
+            "method text inside a string literal must not register"
+        );
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "real"),
+            "the real function must survive"
+        );
+    }
+
+    /// Raw triple-quoted strings (`r'''`) have no escapes at all.
+    #[test]
+    fn raw_triple_quoted_strings_close_without_escape_handling() {
+        let src = "void f() {\n  var s = r'''\n{ \\\n''';\n}\nvoid g() {}\n";
+        let r = parse(src);
+        assert!(
+            r.ranges.iter().any(|x| x.qualified_name == "g"),
+            "g must be discovered after the raw template"
+        );
+        let f = r
+            .ranges
+            .iter()
+            .find(|x| x.qualified_name == "f")
+            .expect("f range");
+        assert_eq!(f.end_line, 5);
+    }
+
+    #[test]
+    fn parse_import_and_call_args_handle_escaped_quotes() {
+        // Escaped quote inside the literal must not terminate it (#6).
+        assert_eq!(
+            parse_import(r"import 'it\'s.dart';").as_deref(),
+            Some(r"it\'s.dart")
+        );
+        assert_eq!(
+            parse_test_call(r"test('it\'s working', () {});").as_deref(),
+            Some(r"it\'s working")
+        );
+        assert_eq!(
+            parse_group_call(r#"group("say \"hi\"", () {});"#).as_deref(),
+            Some(r#"say \"hi\""#)
+        );
+        // A literal ending in an escaped backslash still terminates.
+        assert_eq!(
+            parse_test_call(r#"test("ends with backslash\\", () {});"#).as_deref(),
+            Some(r#"ends with backslash\\"#)
+        );
+    }
+
+    #[test]
+    fn parse_field_recognises_modifier_combinations() {
+        // Field with all combinations of static / final / late / const /
+        // covariant / external. `var name = expr;` (no explicit type) is
+        // intentionally NOT recognised because the field-type tracker has
+        // nothing to map back to a class.
+        for src in [
+            "Type name;",
+            "final Type name;",
+            "late Type name;",
+            "late final Type name;",
+            "static const Type name = expr;",
+            "covariant Type name;",
+            "external Type name;",
+        ] {
+            let parsed = parse_field(src);
+            assert!(
+                parsed.is_some(),
+                "expected `{src}` to be recognised as a field, got None"
+            );
+        }
+        // `var name = expr;` is currently rejected by design.
+        assert!(parse_field("var name = expr;").is_none());
+    }
+
+    #[test]
+    fn parse_field_rejects_method_signature_and_statements() {
+        // Statements should not look like fields.
+        assert!(parse_field("return foo();").is_none());
+        assert!(parse_field("await something;").is_none());
+        assert!(parse_field("if (x) {").is_none());
+        // Method head: `( ` before `=` / `;` ⇒ not a field.
+        assert!(parse_field("Future<void> foo() async {").is_none());
+        // No identifiers at all.
+        assert!(parse_field(";").is_none());
+        // Reserved field-name keywords.
+        assert!(parse_field("Type this = 1;").is_none());
+        // Comment-only.
+        assert!(parse_field("/// docs only").is_none());
+        assert!(parse_field("// inline").is_none());
+        // Single token with `;` only ⇒ not enough tokens for type+name.
+        assert!(parse_field("name;").is_none());
+    }
+
+    #[test]
+    fn parse_class_header_modifiers_cover_all_branches() {
+        // base, final, interface modifiers.
+        assert_eq!(parse_class_header("base class B {").as_deref(), Some("B"));
+        assert_eq!(parse_class_header("final class F {").as_deref(), Some("F"));
+        assert_eq!(
+            parse_class_header("interface class I {").as_deref(),
+            Some("I")
+        );
+    }
+
+    #[test]
+    fn parse_method_rejects_field_initialiser_with_constructor_call() {
+        // Field initialisers like `ProNotifier pro = ProNotifier();` used to
+        // be mis-recognised as a method whose head was `ProNotifier pro =
+        // ProNotifier`. The head-has-`=` reject must bite.
+        assert!(parse_method("ProNotifier pro = ProNotifier();").is_none());
+        // But a regular method head must still be recognised.
+        assert_eq!(parse_method("void foo() {").as_deref(), Some("foo"));
+        // `test(...)` is reserved for test-call detection.
+        assert!(parse_method("test('x', () {});").is_none());
+    }
+
+    #[test]
+    fn empty_doc_only_file_is_ignored() {
+        let r = parse("/// just docs\n/// more docs\n");
+        assert!(
+            r.symbols.is_empty(),
+            "doc-only file must not produce symbols: {:?}",
+            r.symbols
+        );
+    }
+
+    #[test]
+    fn parse_handles_import_with_unterminated_quote() {
+        // Best-effort: if the import quote is unterminated, skip cleanly.
+        let r = parse("import 'oops\n");
+        assert!(r.imports.is_empty(), "broken import must be dropped");
+    }
+
+    #[test]
+    fn class_declared_on_same_line_as_brace_close_is_recorded() {
+        // `class X {}` on one line should produce a class symbol.
+        let r = parse("class X {}\n");
+        assert!(r.symbols.iter().any(|s| s.kind == NodeKind::DartClass));
+    }
+
+    #[test]
+    fn comment_inside_method_body_is_not_a_test_call() {
+        // `/// test('x', ...)` is a doc comment, never a test artefact.
+        let r = parse("class C {\n  void m() {\n    /// test('inside doc', () {});\n  }\n}\n");
+        assert!(
+            r.tests.iter().all(|t| t.name != "inside doc"),
+            "doc-comment test() must not produce an artefact"
+        );
+    }
+
+    #[test]
+    fn imports_outside_class_body_are_attached_to_file_id() {
+        // Imports do not depend on which class they appear before / after.
+        let r = parse("import 'a.dart';\nclass C {}\nimport 'b.dart';\n");
+        assert_eq!(r.imports.len(), 2);
+        // Both originate from the same file artefact id.
+        assert_eq!(r.imports[0].from_file, r.imports[1].from_file);
+    }
+}

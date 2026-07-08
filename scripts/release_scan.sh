@@ -4,10 +4,10 @@
 # 策略：
 # 1. 用 rsync 把目标仓的源码同步到 release-scans/_scratch/<name>/，
 #    丢弃 node_modules / target / build / .dart_tool / .git / dist 等
-#    本地工具产物。这样目标仓自始至终保持 0 副作用 —— 连 .specslice/
+#    本地工具产物。这样目标仓自始至终保持 0 副作用 —— 连 .groundgraph/
 #    都不会创建在用户的代码库里。
-# 2. 在 scratch 仓里写一份 .specslice.yaml（开启目标语言的 adapter），
-#    跑 `specslice init` + `specslice index` + `specslice check`。
+# 2. 在 scratch 仓里写一份 .groundgraph.yaml（开启目标语言的 adapter），
+#    跑 `groundgraph init` + `groundgraph index` + `groundgraph check`。
 # 3. 把摘要写入 reports/release/<name>/{report.md, index.txt, check.txt}，
 #    并把图导出（graph.json）也存进去（HTML 太大且 gitignored）。
 # 4. graph.db / HTML / scratch 副本全部留在本仓库内部，不会污染目标仓。
@@ -24,7 +24,7 @@ LANG="${3:?need language: dart|typescript|python|java}"
 
 # issues.md #83: NAME becomes a directory under release-scans/_scratch and is
 # the target of `rsync --delete`. A traversal value like "../../crates" would
-# make rsync wipe the specslice tree. Restrict NAME to a safe slug; reject any
+# make rsync wipe the groundgraph tree. Restrict NAME to a safe slug; reject any
 # slash, leading dot, or `..` component before we touch the filesystem.
 case "$NAME" in
   "" | . | .. | */* | *..* | .*)
@@ -57,7 +57,7 @@ SECRET_EXCLUDES=(
 )
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPECSLICE="$ROOT/target/release/specslice"
+GROUNDGRAPH="$ROOT/target/release/groundgraph"
 SCRATCH_BASE="$ROOT/release-scans/_scratch"
 REPORTS_BASE="$ROOT/reports/release"
 
@@ -70,7 +70,7 @@ case "$LANG" in
   dart)
     rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude '.dart_tool/' --exclude 'build/' \
-      --exclude '.idea/' --exclude '.vscode/' --exclude '.specslice/' \
+      --exclude '.idea/' --exclude '.vscode/' --exclude '.groundgraph/' \
       --exclude '**/node_modules/' --exclude 'macos/Pods/' --exclude 'ios/Pods/' \
       --exclude '**/.cxx/' --exclude '**/Carthage/' --exclude '**/.gradle/' \
       --exclude '**/build/' --exclude '**/.symbols/' --exclude '**/*.lock' \
@@ -79,7 +79,7 @@ case "$LANG" in
       --exclude 'ohos/' --exclude 'huawei/' \
       --exclude '*.pbxproj' --exclude 'screenshots/' --exclude 'assets/' \
       "$SRC"/ "$SCRATCH"/
-    cat > "$SCRATCH/.specslice.yaml" <<'YAML'
+    cat > "$SCRATCH/.groundgraph.yaml" <<'YAML'
 docs:
   paths: [docs, README.md]
 code:
@@ -90,10 +90,10 @@ YAML
     rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude 'node_modules/' --exclude 'dist/' \
       --exclude '.next/' --exclude '.turbo/' --exclude 'coverage/' \
-      --exclude '.specslice/' --exclude '*.lock' --exclude 'package-lock.json' \
+      --exclude '.groundgraph/' --exclude '*.lock' --exclude 'package-lock.json' \
       --exclude '.cache/' --exclude '*.log' \
       "$SRC"/ "$SCRATCH"/
-    cat > "$SCRATCH/.specslice.yaml" <<'YAML'
+    cat > "$SCRATCH/.groundgraph.yaml" <<'YAML'
 docs:
   paths: [README.md, docs]
 typescript:
@@ -105,13 +105,13 @@ YAML
     rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude '.venv/' --exclude 'venv/' --exclude '__pycache__/' \
       --exclude '.pytest_cache/' --exclude '.ruff_cache/' --exclude '.mypy_cache/' \
-      --exclude '.specslice/' --exclude 'node_modules/' --exclude 'dist/' \
+      --exclude '.groundgraph/' --exclude 'node_modules/' --exclude 'dist/' \
       --exclude 'build/' --exclude '*.egg-info' --exclude '.tox/' \
       --exclude 'coverage/' --exclude '.coverage*' --exclude '*.log' \
       --exclude 'frontend/node_modules/' --exclude 'frontend/dist/' --exclude 'frontend/.next/' \
       --exclude 'frontend/coverage/' --exclude '**/__pycache__/' \
       "$SRC"/ "$SCRATCH"/
-    cat > "$SCRATCH/.specslice.yaml" <<'YAML'
+    cat > "$SCRATCH/.groundgraph.yaml" <<'YAML'
 docs:
   paths: [docs, README.md, AGENTS.md]
 python:
@@ -123,10 +123,10 @@ YAML
     rsync -a --delete "${SECRET_EXCLUDES[@]}" \
       --exclude '.git/' --exclude 'target/' --exclude 'build/' \
       --exclude '.idea/' --exclude '.vscode/' --exclude '.gradle/' \
-      --exclude '.specslice/' --exclude '*.class' --exclude '*.jar' \
+      --exclude '.groundgraph/' --exclude '*.class' --exclude '*.jar' \
       --exclude '*.war' --exclude '*.log' --exclude 'logs/' \
       "$SRC"/ "$SCRATCH"/
-    cat > "$SCRATCH/.specslice.yaml" <<'YAML'
+    cat > "$SCRATCH/.groundgraph.yaml" <<'YAML'
 docs:
   paths: [README.md, docs]
 java:
@@ -137,9 +137,9 @@ YAML
   *) echo "unknown language: $LANG" >&2; exit 1;;
 esac
 
-# Some scratched trees may still ship a `.specslice.yaml` from the
+# Some scratched trees may still ship a `.groundgraph.yaml` from the
 # source repo (none of the targets do today, but be defensive).
-rm -rf "$SCRATCH/.specslice"
+rm -rf "$SCRATCH/.groundgraph"
 
 # issues.md #81 belt-and-braces: delete any secret files that slipped past the
 # rsync excludes (unusual names) before anything reads the scratch copy. Keep
@@ -151,25 +151,25 @@ find "$SCRATCH" -type f \( \
   ! -name '*.example' -delete 2>/dev/null || true
 
 echo "==> [$NAME] init"
-"$SPECSLICE" --repo-root "$SCRATCH" init >"$REPORT/init.txt" 2>&1 || \
+"$GROUNDGRAPH" --repo-root "$SCRATCH" init >"$REPORT/init.txt" 2>&1 || \
   { tail -20 "$REPORT/init.txt"; exit 1; }
 
 echo "==> [$NAME] index"
-"$SPECSLICE" --repo-root "$SCRATCH" index >"$REPORT/index.txt" 2>&1
+"$GROUNDGRAPH" --repo-root "$SCRATCH" index >"$REPORT/index.txt" 2>&1
 
 echo "==> [$NAME] check (best-effort, allowed to surface findings)"
-"$SPECSLICE" --repo-root "$SCRATCH" check >"$REPORT/check.txt" 2>&1 || true
+"$GROUNDGRAPH" --repo-root "$SCRATCH" check >"$REPORT/check.txt" 2>&1 || true
 
 echo "==> [$NAME] graph code view (JSON)"
-"$SPECSLICE" --repo-root "$SCRATCH" graph \
+"$GROUNDGRAPH" --repo-root "$SCRATCH" graph \
   --format json --view code >"$REPORT/graph-code.json" 2>>"$REPORT/check.txt" || true
 
 echo "==> [$NAME] graph business view (JSON)"
-"$SPECSLICE" --repo-root "$SCRATCH" graph \
+"$GROUNDGRAPH" --repo-root "$SCRATCH" graph \
   --format json --view business >"$REPORT/graph-business.json" 2>>"$REPORT/check.txt" || true
 
 echo "==> [$NAME] dead-code (best-effort)"
-"$SPECSLICE" --repo-root "$SCRATCH" dead-code \
+"$GROUNDGRAPH" --repo-root "$SCRATCH" dead-code \
   --json --min-confidence high >"$REPORT/dead-code-high.json" 2>>"$REPORT/check.txt" || true
 
 # Snapshot quick summary of files / nodes so the report Markdown can
@@ -193,19 +193,19 @@ EDGE_COUNT=$(count_json_array "$REPORT/graph-code.json" edges)
 
 echo "==> [$NAME] writing report"
 {
-  echo "## $NAME ($LANG) — specslice 0.2.0 真实扫描"
+  echo "## $NAME ($LANG) — groundgraph 0.2.0 真实扫描"
   echo
   echo "- 源仓: \`$SRC\`"
   echo "- scratch 副本: \`release-scans/_scratch/$NAME/\`（已 gitignore）"
-  echo "- 目标仓副作用: 无 — 没有任何 \`.specslice/\` / \`graph.db\` / export 文件落到源仓内。"
+  echo "- 目标仓副作用: 无 — 没有任何 \`.groundgraph/\` / \`graph.db\` / export 文件落到源仓内。"
   echo
-  echo "### \`specslice index\` 输出"
+  echo "### \`groundgraph index\` 输出"
   echo
   echo '```'
   cat "$REPORT/index.txt"
   echo '```'
   echo
-  echo "### \`specslice check\` 摘要（前 60 行）"
+  echo "### \`groundgraph check\` 摘要（前 60 行）"
   echo
   echo '```'
   head -60 "$REPORT/check.txt"

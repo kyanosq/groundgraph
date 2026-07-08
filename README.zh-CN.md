@@ -1,12 +1,12 @@
 <div align="center">
 
-# SpecSlice
+# GroundGraph
 
 **面向 AI 编程的非侵入式「意图层」。**
 
-SpecSlice 为代码库构建一张**带证据**的图——把需求、文档、测试与代码连起来——让 AI（和人）拿到**有依据**的上下文，而不是靠猜。它从不改动你的源码：所有状态都只写在 `.specslice/` 下。
+GroundGraph 为代码库构建一张**带证据**的图——把需求、文档、测试与代码连起来——让 AI（和人）拿到**有依据**的上下文，而不是靠猜。它从不改动你的源码：所有状态都只写在 GroundGraph 工作区目录 `.groundgraph/` 下。
 
-[![CI](https://github.com/specslice/specslice/actions/workflows/ci.yml/badge.svg)](https://github.com/specslice/specslice/actions/workflows/ci.yml)
+[![CI](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![Rust](https://img.shields.io/badge/rust-1.96-orange.svg)](rust-toolchain.toml)
 
@@ -16,18 +16,18 @@ SpecSlice 为代码库构建一张**带证据**的图——把需求、文档、
 
 ---
 
-## SpecSlice 是什么？
+## GroundGraph 是什么？
 
-大多数「代码智能」工具回答的是*「这个符号在哪」*。SpecSlice 还回答*「这段代码是**为了什么**、有什么能证明它」*。
+大多数「代码智能」工具回答的是*「这个符号在哪」*。GroundGraph 还回答*「这段代码是**为了什么**、有什么能证明它」*。
 
 它把仓库索引成一张 SQLite 图：**节点**（符号、文件、文档、需求、测试、路由、数据库表……）和**边**（调用、引用、实现、验证、持久化……），且每条边都带**证据**。在这张图之上，提供代码检索、影响分析、死代码检测、行为事实抽取，以及一套「AI 提候选 → 人确认」的业务逻辑沉淀流程。
 
-- **非侵入（零写回）。** SpecSlice 绝不编辑、注解或提交你的代码。所有状态都是可重建的缓存，只在 `.specslice/` 下。
+- **非侵入（零写回）。** GroundGraph 绝不编辑、注解或提交你的代码。所有状态都是可重建的缓存，只在 `.groundgraph/` 下。
 - **证据优先于断言。** 边由具体事实支撑（一个调用点、一处文档链接、一条测试引用），并带置信度——不是黑盒启发式。
 - **AI 提候选，人确认。** 业务逻辑候选由代码/文档/测试事实生成，必须经人工审阅后才成为权威。
 - **分层、多语言。** 进程内 tree-sitter 后端覆盖广度（Rust、TypeScript、Python、Go、Java、C、C++、Swift、C#、Ruby、PHP、Kotlin）外加 Dart 分析器 sidecar；**可选**的 SCIP/LSP 叠加层在你需要的地方补上精确的调用/引用边。
 
-> SpecSlice **不是**更快的 grep。它是检索之上的一层：意图对齐、可追溯、文档/代码漂移。它能自举——SpecSlice 索引自己的 Rust 源码。
+> GroundGraph **不是**更快的 grep。它是检索之上的一层：意图对齐、可追溯、文档/代码漂移。它能自举——GroundGraph 索引自己的 Rust 源码。
 
 ## 核心能力
 
@@ -46,16 +46,16 @@ SpecSlice 为代码库构建一张**带证据**的图——把需求、文档、
 
 ## 安装
 
-SpecSlice 是一个 Rust workspace。从源码构建（`rust-toolchain.toml` 已钉死工具链版本）：
+GroundGraph 是一个 Rust workspace。从源码构建（`rust-toolchain.toml` 已钉死工具链版本）：
 
 ```bash
-git clone https://github.com/specslice/specslice.git
-cd specslice
+git clone https://github.com/groundgraph/groundgraph.git
+cd groundgraph
 
-# 安装 CLI（`specslice`）与 MCP 服务（`specslice-mcp`）。
+# 安装 CLI（`groundgraph`）与 MCP 服务（`groundgraph-mcp`）。
 # `--locked` 会遵循已提交的 Cargo.lock，使构建可复现。
-cargo install --locked --path crates/specslice-cli
-cargo install --locked --path crates/specslice-mcp   # 可选，供 AI 智能体使用
+cargo install --locked --path crates/groundgraph-cli
+cargo install --locked --path crates/groundgraph-mcp   # 可选，供 AI 智能体使用
 
 # …或直接把二进制构建到 target/release/
 cargo build --release
@@ -66,21 +66,21 @@ cargo build --release
 ```bash
 cd /path/to/your/repo
 
-specslice init                      # 生成 .specslice.yaml + .specslice/graph.db
-specslice index                     # 把文档 + 代码索引进图
+groundgraph init                    # 生成 .groundgraph.yaml + .groundgraph/graph.db
+groundgraph index                   # 把文档 + 代码索引进图
 
-specslice search "parse sql tables" # 带证据的命中排序
-specslice dead-code                 # 不可达符号 + 理由
-specslice trace UserController      # 某端点的完整下游链路
-specslice propose                   # AI 业务逻辑证据包（+ 中文提示词）
-specslice dashboard                 # 单文件离线 HTML 管理面板
+groundgraph search "parse sql tables" # 带证据的命中排序
+groundgraph dead-code                 # 不可达符号 + 理由
+groundgraph trace UserController      # 某端点的完整下游链路
+groundgraph propose                   # AI 业务逻辑证据包（+ 中文提示词）
+groundgraph dashboard                 # 单文件离线 HTML 管理面板
 ```
 
-所有产物都只在 `.specslice/` 下。删掉该目录即可从头开始——你的源码永不被改动。若不想提交缓存，把 `.specslice/` 加进 `.gitignore`。
+GroundGraph 的所有产物都只写在 `.groundgraph/` 下。删掉该目录即可从头开始——你的源码永不被改动。
 
 ## 命令速查
 
-完整且权威的列表请运行 `specslice --help`（或 `specslice <命令> --help`）。最常用的：
+完整且权威的列表请运行 `groundgraph --help`（或 `groundgraph <命令> --help`）。最常用的：
 
 | 分类 | 命令 | 作用 |
 | --- | --- | --- |
@@ -103,11 +103,11 @@ specslice dashboard                 # 单文件离线 HTML 管理面板
 | Dart | 内置**分析器 sidecar**（领域感知：Riverpod / Hive / 导航 / 内购） | Dart |
 | 文档 | Markdown / RST / AsciiDoc / 需求 / ADR | `.md`、`.mdx`、`.rst`、`.adoc` |
 
-在 `.specslice.yaml` 的统一 `languages:` 选择器里选语言，再跑 `specslice index`。
+在 `.groundgraph.yaml` 的统一 `languages:` 选择器里选语言，再跑 `groundgraph index`。
 
 ### 可选精确层（SCIP）
 
-为得到精确的 `Calls`/`References` 边，`index` 时 SpecSlice 会按语言自动调用已安装的 SCIP indexer 并摄取结果。这是**可选**的——没有它你仍得到完整的结构图。
+为得到精确的 `Calls`/`References` 边，`index` 时 GroundGraph 会按语言自动调用已安装的 SCIP indexer 并摄取结果。这是**可选**的——没有它你仍得到完整的结构图。
 
 | 语言 | indexer | 安装 |
 | --- | --- | --- |
@@ -116,19 +116,19 @@ specslice dashboard                 # 单文件离线 HTML 管理面板
 | TypeScript | `scip-typescript` | `npm i -g @sourcegraph/scip-typescript` |
 | Python | `scip-python` | `npm i -g @sourcegraph/scip-python` |
 
-indexer 缺失或失败时只是一条清晰、非致命的「仅结构图」提示——绝不报错。可用 `SPECSLICE_SCIP_<LANG>_BIN`（如 `SPECSLICE_SCIP_RUST_BIN`）指定具体二进制。
+indexer 缺失或失败时只是一条清晰、非致命的「仅结构图」提示——绝不报错。可用 `GROUNDGRAPH_SCIP_<LANG>_BIN`（如 `GROUNDGRAPH_SCIP_RUST_BIN`）指定具体二进制。
 
-> **对钉了工具链的 Rust 仓库的提示：** `rust-analyzer` 的 rustup 代理会按仓库的 `rust-toolchain.toml` 解析；若该工具链没有该组件，运行 `rustup component add rust-analyzer`（针对该工具链）或设置 `SPECSLICE_SCIP_RUST_BIN`。
+> **对钉了工具链的 Rust 仓库的提示：** `rust-analyzer` 的 rustup 代理会按仓库的 `rust-toolchain.toml` 解析；若该工具链没有该组件，运行 `rustup component add rust-analyzer`（针对该工具链）或设置 `GROUNDGRAPH_SCIP_RUST_BIN`。
 
 ## MCP 集成
 
-`specslice-mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务，把图（search、subgraph、dead-code……）暴露给 AI 智能体。让支持 MCP 的客户端指向该二进制：
+`groundgraph-mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务，把图（search、subgraph、dead-code……）暴露给 AI 智能体。让支持 MCP 的客户端指向该二进制：
 
 ```jsonc
 {
   "mcpServers": {
-    "specslice": {
-      "command": "specslice-mcp",
+    "groundgraph": {
+      "command": "groundgraph-mcp",
       "args": ["--repo-root", "/path/to/your/repo"]
     }
   }
@@ -137,11 +137,11 @@ indexer 缺失或失败时只是一条清晰、非致命的「仅结构图」提
 
 ## 配置
 
-`specslice init` 会写出可编辑的 `.specslice.yaml`，关键段：
+`groundgraph init` 会写出可编辑的 `.groundgraph.yaml`，关键段：
 
 ```yaml
 storage:
-  path: .specslice/graph.db   # 图缓存（可重建）
+  path: .groundgraph/graph.db   # 图缓存（可重建）
 docs:
   paths: [docs, specs, adr]   # 文档/需求所在目录
   include: ["**/*.md", "**/*.mdx", "**/*.rst", "**/*.adoc"]
@@ -161,12 +161,12 @@ enrichment:
 
 ```
 crates/
-├── specslice-core      # 图领域模型：节点、边、证据、id
-├── specslice-store     # SQLite 存储 + 迁移（.specslice/graph.db）
-├── specslice-engine    # 索引器、扫描器、检索、分析（大脑）
-├── specslice-lang-dart # Dart 语言支持
-├── specslice-cli       # `specslice` 二进制
-└── specslice-mcp       # `specslice-mcp` MCP 服务
+├── groundgraph-core      # 图领域模型：节点、边、证据、id
+├── groundgraph-store     # SQLite 存储 + 迁移（.groundgraph/graph.db）
+├── groundgraph-engine    # 索引器、扫描器、检索、分析（大脑）
+├── groundgraph-lang-dart # Dart 语言支持
+├── groundgraph-cli       # `groundgraph` CLI
+└── groundgraph-mcp      # `groundgraph-mcp` 服务
 ```
 
 `index` 先跑结构化 pass（tree-sitter / Dart），再由可选的 SCIP 叠加层把精确边绑定到已存在的符号上。读命令打开存储后查询图——开库时会幂等地兜底建好性能索引，因此即便刚升级完二进制，查询依然很快。

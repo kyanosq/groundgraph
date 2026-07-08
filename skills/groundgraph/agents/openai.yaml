@@ -1,0 +1,6 @@
+interface:
+  display_name: "GroundGraph"
+  short_description: "Non-invasive repo graph, code search, porting & logic analysis"
+  default_prompt: "Use $groundgraph to index this repository, search code via the graph instead of grep, and (for rewrites/ports) compare source vs target with port-coverage and graph-equiv."
+policy:
+  allow_implicit_invocation: true

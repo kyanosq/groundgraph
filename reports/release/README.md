@@ -1,19 +1,19 @@
-# specslice 0.2.0 — 真实仓库扫描验收报告
+# groundgraph 0.2.0 — 真实仓库扫描验收报告
 
-本目录记录 `specslice 0.2.0` 在四个真实仓库上的扫描结果，作为 P20（TypeScript / Java + 多语言一致性）正式收口的发布证据。
+本目录记录 `groundgraph 0.2.0` 在四个真实仓库上的扫描结果，作为 P20（TypeScript / Java + 多语言一致性）正式收口的发布证据。
 
 ## 非侵入性约定
 
 为了让目标仓库保持 0 副作用（连 `graph.db` 都不能写到用户的代码库里），所有扫描走 **shadow scratch** 模式：
 
 1. `scripts/release_scan.sh` 用 `rsync` 把源仓的源码同步到 `release-scans/_scratch/<name>/`，自动剔除 `.git / node_modules / .venv / target / build / .dart_tool / dist / Pods` 等本地工具产物；
-2. 在 scratch 副本里生成 `.specslice.yaml`（开启对应语言的 adapter），跑 `specslice init / index / check / graph / dead-code`；
+2. 在 scratch 副本里生成 `.groundgraph.yaml`（开启对应语言的 adapter），跑 `groundgraph init / index / check / graph / dead-code`；
 3. 摘要写到 `reports/release/<name>/report.md`，二进制图 / HTML 留在仓库内部并 gitignore；
-4. **目标仓库自始至终没有任何文件被创建、修改或删除**。本目录的所有副作用都发生在 specslice 自己的工作区里。
+4. **目标仓库自始至终没有任何文件被创建、修改或删除**。本目录的所有副作用都发生在 groundgraph 自己的工作区里。
 
-证据：扫描完成后 `ls -la <target>/.specslice` 全部命中本次扫描之前的旧时间戳（或目录根本不存在）；`pixcraft-landing` 与 `vub` 的目标仓 **当前** 仍没有 `.specslice/` 子目录。
+证据：扫描完成后 `ls -la <target>/.groundgraph` 全部命中本次扫描之前的旧时间戳（或目录根本不存在）；`pixcraft-landing` 与 `vub` 的目标仓 **当前** 仍没有 `.groundgraph/` 子目录。
 
-## 扫描总览（specslice 0.2.0）
+## 扫描总览（groundgraph 0.2.0）
 
 | 仓库 | 语言 | 文件 | 符号 | 测试 | Imports | 节点 | 边 | Resolver |
 |------|------|------|------|------|---------|------|----|----------|
@@ -42,7 +42,7 @@ vub: java_method(11423) file(3112) java_class(2452) java_interface(635) java_con
 ## 复现方式
 
 ```bash
-cargo build -p specslice-cli --release
+cargo build -p groundgraph-cli --release
 bash scripts/release_scan.sh pixcraft-app    /Users/qjs/Code/My/bean/pixcraft-app     dart
 bash scripts/release_scan.sh pixcraft-landing /Users/qjs/Code/My/bean/pixcraft-landing typescript
 bash scripts/release_scan.sh atagent          /Users/qjs/Code/Projects/atagent          python
@@ -50,9 +50,9 @@ bash scripts/release_scan.sh vub              /Users/qjs/Code/Demo/vub          
 ```
 
 每个 `report.md` 自带：
-- 完整的 `specslice index` 输出（含 LSP / AST resolver 信息）
-- `specslice check` 摘要
+- 完整的 `groundgraph index` 输出（含 LSP / AST resolver 信息）
+- `groundgraph check` 摘要
 - Graph code-view 规模
 - `dead-code --json --min-confidence high` 的前 30 行
 
-具体的 JSON / SQLite 产物（`graph-code.json` / `graph-business.json` / `dead-code-high.json` / 中间态 `.specslice/graph.db`）保留在本目录里供二次分析，但都已 gitignore，不会进入 release tarball。
+具体的 JSON / SQLite 产物（`graph-code.json` / `graph-business.json` / `dead-code-high.json` / 中间态 `.groundgraph/graph.db`）保留在本目录里供二次分析，但都已 gitignore，不会进入 release tarball。

@@ -1,4 +1,4 @@
-"""pytest cases used by the SpecSlice Python AST fixture."""
+"""pytest cases used by the GroundGraph Python AST fixture."""
 
 import pytest
 

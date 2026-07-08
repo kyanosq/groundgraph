@@ -1,4 +1,4 @@
-"""Example package used for SpecSlice Python indexing tests."""
+"""Example package used for GroundGraph Python indexing tests."""
 
 from .greeter import Greeter
 

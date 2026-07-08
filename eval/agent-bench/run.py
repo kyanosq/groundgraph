@@ -8,7 +8,7 @@ tool call) to `runs/<task>__<arm>__s<seed>.jsonl`. Scoring is a separate step
 
 The two arms differ ONLY by a one-paragraph constraint appended to the shared
 task prompt (see tasks.json): the `grep` arm is told to use ripgrep/grep, the
-`specslice` arm is told it has the specslice CLI. Same model, same workspace,
+`groundgraph` arm is told it has the groundgraph CLI. Same model, same workspace,
 same task text — so any delta is attributable to the available tooling (and the
 recorded tool calls let us verify each arm actually stayed in its lane).
 """
@@ -73,7 +73,7 @@ def run_one(
     status = "ok"
     # start_new_session so a timeout can SIGKILL the whole process group — the
     # headless agent forks children of its own, and an orphaned one would keep
-    # holding the index lock (the very failure specslice's proc.rs guards against).
+    # holding the index lock (the very failure GroundGraph's proc.rs guards against).
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", default=None)
     ap.add_argument(
         "--arms",
-        default="grep,specslice",
+        default="grep,groundgraph",
         help="comma-separated subset of arms defined in tasks.json",
     )
     ap.add_argument("--seeds", type=int, default=1)

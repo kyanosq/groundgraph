@@ -1,6 +1,6 @@
 package com.example.hello;
 
-/** Tiny greeter type used by the SpecSlice Java indexer fixture. */
+/** Tiny greeter type used by the GroundGraph Java indexer fixture. */
 public class Greeter {
 
     private final String name;

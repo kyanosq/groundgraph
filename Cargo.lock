@@ -369,6 +369,113 @@ dependencies = [
 ]
 
 [[package]]
+name = "groundgraph-cli"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "assert_fs",
+ "clap",
+ "groundgraph-core",
+ "groundgraph-engine",
+ "groundgraph-lang-dart",
+ "groundgraph-store",
+ "predicates",
+ "serde",
+ "serde_json",
+ "sigpipe",
+ "tempfile",
+]
+
+[[package]]
+name = "groundgraph-core"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "groundgraph-engine"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "globset",
+ "groundgraph-core",
+ "groundgraph-lang-dart",
+ "groundgraph-store",
+ "ignore",
+ "proptest",
+ "protobuf",
+ "rayon",
+ "rusqlite",
+ "scip",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha2",
+ "shlex",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-dart",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+ "walkdir",
+]
+
+[[package]]
+name = "groundgraph-lang-dart"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "groundgraph-core",
+ "sha2",
+ "walkdir",
+]
+
+[[package]]
+name = "groundgraph-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "groundgraph-core",
+ "groundgraph-engine",
+ "groundgraph-store",
+ "predicates",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+]
+
+[[package]]
+name = "groundgraph-store"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "groundgraph-core",
+ "proptest",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -905,113 +1012,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "specslice-cli"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "assert_fs",
- "clap",
- "predicates",
- "serde",
- "serde_json",
- "sigpipe",
- "specslice-core",
- "specslice-engine",
- "specslice-lang-dart",
- "specslice-store",
- "tempfile",
-]
-
-[[package]]
-name = "specslice-core"
-version = "0.2.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "specslice-engine"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "globset",
- "ignore",
- "proptest",
- "protobuf",
- "rayon",
- "rusqlite",
- "scip",
- "serde",
- "serde_json",
- "serde_yml",
- "sha2",
- "shlex",
- "specslice-core",
- "specslice-lang-dart",
- "specslice-store",
- "tempfile",
- "thiserror",
- "time",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-dart",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-kotlin-ng",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-swift",
- "tree-sitter-typescript",
- "walkdir",
-]
-
-[[package]]
-name = "specslice-lang-dart"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "sha2",
- "specslice-core",
- "walkdir",
-]
-
-[[package]]
-name = "specslice-mcp"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "predicates",
- "serde",
- "serde_json",
- "serde_yml",
- "specslice-core",
- "specslice-engine",
- "specslice-store",
- "tempfile",
-]
-
-[[package]]
-name = "specslice-store"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "proptest",
- "rusqlite",
- "serde",
- "specslice-core",
- "tempfile",
- "thiserror",
-]
 
 [[package]]
 name = "streaming-iterator"

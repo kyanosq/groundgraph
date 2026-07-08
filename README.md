@@ -1,12 +1,12 @@
 <div align="center">
 
-# SpecSlice
+# GroundGraph
 
 **A non-invasive *intent layer* for AI-assisted coding.**
 
-SpecSlice builds an evidence-linked graph of your codebase — connecting requirements, docs, tests and code — so AI agents (and humans) get *grounded* context instead of guesses. It never touches your source: everything lives under `.specslice/`.
+GroundGraph builds an evidence-linked graph of your codebase — connecting requirements, docs, tests and code — so AI agents (and humans) get *grounded* context instead of guesses. It never touches your source: everything lives under the GroundGraph workspace directory `.groundgraph/`.
 
-[![CI](https://github.com/specslice/specslice/actions/workflows/ci.yml/badge.svg)](https://github.com/specslice/specslice/actions/workflows/ci.yml)
+[![CI](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.96-orange.svg)](rust-toolchain.toml)
 
@@ -16,18 +16,18 @@ SpecSlice builds an evidence-linked graph of your codebase — connecting requir
 
 ---
 
-## What is SpecSlice?
+## What is GroundGraph?
 
-Most "code intelligence" tools answer *"where is this symbol?"*. SpecSlice also answers *"what is this code **for**, and what proves it?"*
+Most "code intelligence" tools answer *"where is this symbol?"*. GroundGraph also answers *"what is this code **for**, and what proves it?"*
 
 It indexes your repository into a SQLite graph of **nodes** (symbols, files, docs, requirements, tests, routes, DB tables…) and **edges** (calls, references, implements, verifies, persists…), where every edge carries **evidence**. On top of that graph it offers code search, impact analysis, dead-code detection, behavioral-fact extraction, and an AI **propose → human confirm** workflow for capturing business logic.
 
-- **Non-invasive (zero write-back).** SpecSlice never edits, annotates, or commits to your code. All state is a rebuildable cache under `.specslice/`.
+- **Non-invasive (zero write-back).** GroundGraph never edits, annotates, or commits to your code. All state is a rebuildable cache under `.groundgraph/`.
 - **Evidence over assertion.** Edges are backed by concrete facts (a call site, a doc link, a test reference), each with a confidence level — not opaque heuristics.
 - **AI proposes, humans confirm.** Business-logic candidates are generated from code/doc/test facts and only become authoritative after a human review step.
 - **Tiered, multi-language.** A fast in-process tree-sitter backend covers breadth (Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin) plus a Dart analyzer sidecar; an *optional* SCIP/LSP overlay adds precise call/reference edges where you want them.
 
-> SpecSlice is **not** a faster grep. It is the layer above retrieval: intent alignment, traceability, and doc/code drift. It self-hosts — SpecSlice indexes its own Rust source.
+> GroundGraph is **not** a faster grep. It is the layer above retrieval: intent alignment, traceability, and doc/code drift. It self-hosts — GroundGraph indexes its own Rust source.
 
 ## Highlights
 
@@ -46,16 +46,16 @@ Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexe
 
 ## Install
 
-SpecSlice is a Rust workspace. Build from source (a `rust-toolchain.toml` pins the exact toolchain):
+GroundGraph is a Rust workspace. Build from source (a `rust-toolchain.toml` pins the exact toolchain):
 
 ```bash
-git clone https://github.com/specslice/specslice.git
-cd specslice
+git clone https://github.com/groundgraph/groundgraph.git
+cd groundgraph
 
-# Install the CLI (`specslice`) and the MCP server (`specslice-mcp`).
+# Install the CLI (`groundgraph`) and the MCP server (`groundgraph-mcp`).
 # `--locked` honours the committed Cargo.lock so the build is reproducible.
-cargo install --locked --path crates/specslice-cli
-cargo install --locked --path crates/specslice-mcp   # optional, for AI agents
+cargo install --locked --path crates/groundgraph-cli
+cargo install --locked --path crates/groundgraph-mcp   # optional, for AI agents
 
 # …or just build the binaries into target/release/
 cargo build --release
@@ -66,21 +66,21 @@ cargo build --release
 ```bash
 cd /path/to/your/repo
 
-specslice init                      # create .specslice.yaml + .specslice/graph.db
-specslice index                     # index docs + code into the graph
+groundgraph init                    # create .groundgraph.yaml + .groundgraph/graph.db
+groundgraph index                   # index docs + code into the graph
 
-specslice search "parse sql tables" # ranked, evidence-backed hits
-specslice dead-code                 # unreachable symbols, with reasons
-specslice trace UserController      # full downstream chain of an endpoint
-specslice propose                   # AI business-logic evidence pack (+ prompt)
-specslice dashboard                 # one-file offline HTML management panel
+groundgraph search "parse sql tables" # ranked, evidence-backed hits
+groundgraph dead-code                 # unreachable symbols, with reasons
+groundgraph trace UserController      # full downstream chain of an endpoint
+groundgraph propose                   # AI business-logic evidence pack (+ prompt)
+groundgraph dashboard                 # one-file offline HTML management panel
 ```
 
-Everything written stays under `.specslice/`. Delete that directory to start clean — your source is never modified. Add `.specslice/` to your `.gitignore` if you don't want to commit the cache.
+Everything written by GroundGraph stays under `.groundgraph/`. Delete that directory to start clean — your source is never modified.
 
 ## Command reference
 
-Run `specslice --help` (or `specslice <command> --help`) for the full, authoritative list. The most-used commands:
+Run `groundgraph --help` (or `groundgraph <command> --help`) for the full, authoritative list. The most-used commands:
 
 | Area | Command | What it does |
 | --- | --- | --- |
@@ -103,11 +103,11 @@ Run `specslice --help` (or `specslice <command> --help`) for the full, authorita
 | Dart | Bundled **analyzer sidecar** (domain-aware: Riverpod / Hive / navigation / IAP) | Dart |
 | Docs | Markdown / RST / AsciiDoc / requirements / ADR | `.md`, `.mdx`, `.rst`, `.adoc` |
 
-Select languages in `.specslice.yaml` (the unified `languages:` selector) and re-run `specslice index`.
+Select languages in `.groundgraph.yaml` (the unified `languages:` selector) and re-run `groundgraph index`.
 
 ### Optional precision overlay (SCIP)
 
-For precise `Calls`/`References` edges, SpecSlice will auto-invoke an installed SCIP indexer per language during `index` and ingest the result. This is **optional** — without it you still get the full structural graph.
+For precise `Calls`/`References` edges, GroundGraph will auto-invoke an installed SCIP indexer per language during `index` and ingest the result. This is **optional** — without it you still get the full structural graph.
 
 | Language | Indexer | Install |
 | --- | --- | --- |
@@ -116,19 +116,19 @@ For precise `Calls`/`References` edges, SpecSlice will auto-invoke an installed 
 | TypeScript | `scip-typescript` | `npm i -g @sourcegraph/scip-typescript` |
 | Python | `scip-python` | `npm i -g @sourcegraph/scip-python` |
 
-A missing or failing indexer is a clear, non-fatal "structure-only" note — never an error. Point SpecSlice at a specific binary with `SPECSLICE_SCIP_<LANG>_BIN` (e.g. `SPECSLICE_SCIP_RUST_BIN`).
+A missing or failing indexer is a clear, non-fatal "structure-only" note — never an error. Point GroundGraph at a specific binary with `GROUNDGRAPH_SCIP_<LANG>_BIN` (e.g. `GROUNDGRAPH_SCIP_RUST_BIN`).
 
-> **Note for Rust repos with a pinned toolchain:** the `rust-analyzer` rustup proxy resolves against your repo's `rust-toolchain.toml`. If that toolchain lacks the component, run `rustup component add rust-analyzer` (for that toolchain) or set `SPECSLICE_SCIP_RUST_BIN`.
+> **Note for Rust repos with a pinned toolchain:** the `rust-analyzer` rustup proxy resolves against your repo's `rust-toolchain.toml`. If that toolchain lacks the component, run `rustup component add rust-analyzer` (for that toolchain) or set `GROUNDGRAPH_SCIP_RUST_BIN`.
 
 ## MCP integration
 
-`specslice-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, dead-code, …) to AI agents. It speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP), so point any stdio-capable MCP client at the binary:
+`groundgraph-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, dead-code, …) to AI agents. It speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP), so point any stdio-capable MCP client at the binary:
 
 ```jsonc
 {
   "mcpServers": {
-    "specslice": {
-      "command": "specslice-mcp",
+    "groundgraph": {
+      "command": "groundgraph-mcp",
       "args": ["--repo-root", "/path/to/your/repo"]
     }
   }
@@ -137,11 +137,11 @@ A missing or failing indexer is a clear, non-fatal "structure-only" note — nev
 
 ## Configuration
 
-`specslice init` writes a `.specslice.yaml` you can edit. Key sections:
+`groundgraph init` writes a `.groundgraph.yaml` you can edit. Key sections:
 
 ```yaml
 storage:
-  path: .specslice/graph.db   # the graph cache (rebuildable)
+  path: .groundgraph/graph.db   # the graph cache (rebuildable)
 docs:
   paths: [docs, specs, adr]   # where to find docs/requirements
   include: ["**/*.md", "**/*.mdx", "**/*.rst", "**/*.adoc"]
@@ -162,12 +162,12 @@ enrichment:
 
 ```
 crates/
-├── specslice-core      # graph domain model: nodes, edges, evidence, ids
-├── specslice-store     # SQLite store + migrations (the .specslice/graph.db)
-├── specslice-engine    # indexers, scanners, search, analyses (the brains)
-├── specslice-lang-dart # Dart language support
-├── specslice-cli       # the `specslice` binary
-└── specslice-mcp       # the `specslice-mcp` MCP server
+├── groundgraph-core      # graph domain model: nodes, edges, evidence, ids
+├── groundgraph-store     # SQLite store + migrations (the .groundgraph/graph.db)
+├── groundgraph-engine    # indexers, scanners, search, analyses (the brains)
+├── groundgraph-lang-dart # Dart language support
+├── groundgraph-cli       # the `groundgraph` CLI
+└── groundgraph-mcp      # the `groundgraph-mcp` server
 ```
 
 `index` runs structural passes (tree-sitter / Dart) first, then an optional SCIP overlay binds precise edges onto the symbols that already exist. Read commands open the store and query the graph — they idempotently ensure performance indexes on open, so queries stay fast even right after a binary upgrade.

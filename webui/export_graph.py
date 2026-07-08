@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a SpecSlice graph.db into a network JSON for the WebGL viewer.
+"""Export a GroundGraph graph.db into a network JSON for the WebGL viewer.
 
 Usage:
     python3 export_graph.py <graph.db> <out.json> [--keep-isolated]
@@ -57,7 +57,7 @@ def export(db_path: str, out_path: str, keep_isolated: bool = False) -> None:
     else:
         out_nodes = [n for nid, n in nodes.items() if deg.get(nid, 0) > 0]
 
-    repo = db_path.split("/.specslice")[0].rstrip("/").split("/")[-1]
+    repo = db_path.split("/.groundgraph")[0].rstrip("/").split("/")[-1]
     payload = {
         "meta": {
             "repo": repo,

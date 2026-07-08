@@ -3,9 +3,9 @@
 > **注意**：本报告包含本机私有项目信息，仅供操作者本人使用，**请勿提交到开源仓库**。
 >
 > 扫描方式：将 `~/Code/My`、`~/Code/Features` 下的仓库 rsync 到 `/tmp/scan/<name>`
-> （排除 build 产物与数据目录），依次运行 `specslice init → index → check →
+> （排除 build 产物与数据目录），依次运行 `groundgraph init → index → check →
 > dead-code → similar`。所有发现都已在**原仓库**中逐条核实（文件存在性 / 符号
-> grep），非真实的项目均已作为 SpecSlice 误报修复（见文末）。
+> grep），非真实的项目均已作为 GroundGraph 误报修复（见文末）。
 
 ## 扫描范围
 
@@ -59,7 +59,7 @@ check / dead-code / similar` 均 exit 0，无 panic、无超时。
   ViewModels|Protocols/...`（102 个文件路径），而仓库实际结构已重组为
   `MarkIt/App|Features|DesignSystem|Models|Redaction|Services/...`。
   历史评审文档整体过期。建议二选一：
-  1. 在 MarkIt 配置 `.specslice.yaml → checks.doc_drift_ignore:
+  1. 在 MarkIt 配置 `.groundgraph.yaml → checks.doc_drift_ignore:
      ["docs/exec-plans/**"]`（按历史档案豁免）；
   2. 或为文档补一行“目录结构系当时快照”的免责说明。
 
@@ -72,7 +72,7 @@ check / dead-code / similar` 均 exit 0，无 panic、无超时。
   符合研究型仓库特征；其中 `_econ_*` 系列 API 包装函数完全无调用方，可作清理
   起点）。
 - 另：`docs/references/rqalpha-source/`（第三方框架源码副本）此前会被当成
-  第一方代码索引，本次已在 SpecSlice 侧修复（探测排除 vendored 目录）。
+  第一方代码索引，本次已在 GroundGraph 侧修复（探测排除 vendored 目录）。
 
 ### nest（8）
 - `references/spike.md`、`references/critical-overrides.md`、
@@ -93,7 +93,7 @@ check / dead-code / similar` 均 exit 0，无 panic、无超时。
 - Swift 仓库的候选集中在 View 扩展与运算符重载（外部消费者可能使用，故仅
   medium）；MetaQuant 的候选集中在研究性因子函数。
 
-## 本次扫描反向驱动的 SpecSlice 修复（已全部落地 + 测试）
+## 本次扫描反向驱动的 GroundGraph 修复（已全部落地 + 测试）
 
 | 来源仓库 | 暴露问题 | 修复 |
 |---|---|---|
@@ -108,4 +108,4 @@ check / dead-code / similar` 均 exit 0，无 panic、无超时。
 | （路线图） | agent 无法直接取用漂移检查 | 新增 MCP 工具 `check_drift`（第 7 个工具） |
 
 修复后全部 16 仓复扫：剩余告警均为上文列出的**已核实真实漂移**；
-SpecSlice 自身仓库 `check` 保持 0 findings（灵敏度对照实验确认检查未失灵）。
+GroundGraph 自身仓库 `check` 保持 0 findings（灵敏度对照实验确认检查未失灵）。

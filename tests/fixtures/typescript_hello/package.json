@@ -1,9 +1,9 @@
 {
-  "name": "specslice-typescript-hello",
+  "name": "groundgraph-typescript-hello",
   "private": true,
   "version": "0.0.1",
   "type": "module",
-  "description": "Tiny TypeScript fixture used by SpecSlice's TS indexer tests.",
+  "description": "Tiny TypeScript fixture used by GroundGraph's TS indexer tests.",
   "scripts": {
     "test": "vitest run"
   },
