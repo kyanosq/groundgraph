@@ -32,6 +32,21 @@ const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// tools cannot silently blow a client's response-size limit.
 const TOOLS_PAGE_SIZE: usize = 100;
 
+const AGENT_INSTRUCTIONS: &str = "\
+GroundGraph MCP gives agents structured access to the GroundGraph code graph. \
+Before relying on tools, ensure the target repo has been prepared with \
+`groundgraph init` and `groundgraph index`; if a tool reports no GroundGraph \
+workspace, ask the operator to run those commands. Prefer graph tools for \
+discovery: use `search_graph` first for symbols/concepts, then \
+`explain_symbol` or `get_subgraph` for drill-down, and `context_pack` when you \
+need an agent-ready bundle for a requirement, candidate, or symbol. Use \
+`check_drift` for doc/code consistency, `dead_code` only as a candidate report, \
+and `impact` with `worktree: true` when reviewing uncommitted changes. Do not \
+fall back to grep or broad file scans to re-prove results already returned by \
+GroundGraph; read source files only when the graph result is stale, truncated, \
+or missing the body you need. Every tool accepts `repo_root` to override the \
+server default.";
+
 /// MCP server state.
 #[derive(Debug, Clone)]
 pub struct Server {
@@ -185,10 +200,7 @@ impl Server {
                     "listChanged": false,
                 }
             },
-            "instructions": "GroundGraph MCP — agent tools for the GroundGraph code graph. \
-                Default repo root is the working directory; every tool accepts a \
-                `repo_root` field to override. Tools return structured JSON payloads \
-                in a single text content block.",
+            "instructions": AGENT_INSTRUCTIONS,
         })
     }
 

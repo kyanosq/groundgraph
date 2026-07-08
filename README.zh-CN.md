@@ -163,7 +163,7 @@ indexer 缺失或失败时只是一条清晰、非致命的「仅结构图」提
 
 ## MCP 集成
 
-`groundgraph-mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务，把图（search、subgraph、dead-code……）暴露给 AI 智能体。让支持 MCP 的客户端指向该二进制：
+`groundgraph-mcp` 是一个 [Model Context Protocol](https://modelcontextprotocol.io) 服务，把图（search、subgraph、impact、context pack、dead-code……）暴露给 AI 智能体。它使用 **stdio MCP**（标准本地传输，不是 SSE/HTTP）。让支持 MCP 的客户端指向该二进制：
 
 ```jsonc
 {
@@ -175,6 +175,17 @@ indexer 缺失或失败时只是一条清晰、非致命的「仅结构图」提
   }
 }
 ```
+
+先准备目标仓库：
+
+```bash
+groundgraph --repo-root /path/to/your/repo init
+groundgraph --repo-root /path/to/your/repo index
+```
+
+服务会暴露 7 个工具：`search_graph`、`get_subgraph`、`explain_symbol`、`impact`、`dead_code`、`context_pack`、`check_drift`。agent 审查当前未提交的 tracked 改动时，调用 `impact` 并传 `worktree: true`，语义与 `groundgraph impact --worktree` 一致。
+
+更完整的客户端配置、工具选择策略和 agent 使用规则见 [GroundGraph for agents and MCP clients](docs/agent-mcp.md)。
 
 ## 配置
 

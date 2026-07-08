@@ -11,6 +11,7 @@
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
 use groundgraph_mcp::server::Server;
@@ -63,6 +64,25 @@ fn bootstrap_fixture(tmp_root: &Path) {
         .success();
 }
 
+fn run_git(repo: &Path, args: &[&str]) {
+    let status = StdCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .expect("invoke git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn init_git_repo(tmp_root: &Path) {
+    run_git(tmp_root, &["init", "-q", "-b", "main"]);
+    run_git(tmp_root, &["config", "user.email", "test@example.com"]);
+    run_git(tmp_root, &["config", "user.name", "Test"]);
+    std::fs::write(tmp_root.join(".gitignore"), ".groundgraph/\n").unwrap();
+    run_git(tmp_root, &["add", "."]);
+    run_git(tmp_root, &["commit", "-q", "-m", "baseline"]);
+}
+
 #[test]
 fn dispatcher_initialize_reports_server_info() {
     let server = Server::new(PathBuf::from("."));
@@ -75,6 +95,32 @@ fn dispatcher_initialize_reports_server_info() {
     assert_eq!(result["protocolVersion"], "2024-11-05");
     assert_eq!(result["serverInfo"]["name"], "groundgraph-mcp");
     assert!(result["capabilities"]["tools"].is_object());
+}
+
+#[test]
+fn dispatcher_initialize_instructions_guide_agent_tool_use() {
+    let server = Server::new(PathBuf::from("."));
+    let raw = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let response_line = server.dispatch(raw).expect("response expected");
+    let value: Value = serde_json::from_str(&response_line).unwrap();
+    let instructions = value["result"]["instructions"]
+        .as_str()
+        .expect("initialize must include agent instructions");
+
+    for needle in [
+        "groundgraph init",
+        "groundgraph index",
+        "search_graph",
+        "context_pack",
+        "check_drift",
+        "worktree",
+        "Do not fall back to grep",
+    ] {
+        assert!(
+            instructions.contains(needle),
+            "initialize instructions must mention `{needle}`; got:\n{instructions}"
+        );
+    }
 }
 
 #[test]
@@ -144,6 +190,18 @@ fn packaged_skill_matches_mcp_launch_and_tool_contract() {
     assert!(
         skill.contains(".groundgraph.yaml"),
         "Skill must point Swift/Go users at the root .groundgraph.yaml config"
+    );
+    assert!(
+        skill.contains("worktree: true"),
+        "Skill must document the MCP impact worktree mode for agent reviews"
+    );
+    assert!(
+        skill.contains("Do not fall back to grep"),
+        "Skill must guide agents to prefer graph results over grep re-checking"
+    );
+    assert!(
+        skill.contains("docs/agent-mcp.md"),
+        "Skill must point to the agent/MCP guide"
     );
     assert!(
         !skill.contains(".groundgraph/config.yaml"),
@@ -420,5 +478,56 @@ fn tools_call_round_trips_explain_context_drift_and_impact() {
     assert_eq!(
         im["result"]["content"][0]["type"], "text",
         "impact must return a well-formed text tool result: {im}"
+    );
+}
+
+#[test]
+fn mcp_impact_supports_worktree_diff_for_agent_reviews() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_fixture(tmp.path());
+    init_git_repo(tmp.path());
+
+    let impl_path = tmp
+        .path()
+        .join("lib/domain/watermark/auto_placement_service.dart");
+    let original = std::fs::read_to_string(&impl_path).unwrap();
+    let edited = original.replace(
+        "candidates.sort((a, b) => b.score.compareTo(a.score));",
+        "candidates.sort((a, b) => b.score.compareTo(a.score) * -1 * -1);",
+    );
+    assert_ne!(original, edited, "fixture anchor for the edit not found");
+    std::fs::write(&impl_path, edited).unwrap();
+
+    let server = Server::new(tmp.path().to_path_buf());
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 77,
+        "method": "tools/call",
+        "params": {
+            "name": "impact",
+            "arguments": {
+                "base": "HEAD",
+                "worktree": true,
+                "reindex": false
+            }
+        }
+    });
+    let response: Value =
+        serde_json::from_str(&server.dispatch(&req.to_string()).expect("response")).unwrap();
+    assert_eq!(response["id"], 77);
+    assert_eq!(
+        response["result"]["isError"].as_bool(),
+        Some(false),
+        "MCP impact must support worktree diffs without requiring a throwaway commit: {response}"
+    );
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let changed = payload["changed_files"].as_array().unwrap();
+    assert!(
+        changed.iter().any(|f| f
+            .as_str()
+            .map(|p| p.ends_with("auto_placement_service.dart"))
+            .unwrap_or(false)),
+        "worktree impact must report the uncommitted file, got {payload:#}"
     );
 }

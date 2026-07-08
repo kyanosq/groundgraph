@@ -200,6 +200,16 @@ Or point any stdio-capable MCP client (Cursor, Claude Desktop, …) at that comm
 
 It advertises these tools, each with a JSON-Schema `inputSchema`: `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack`, `check_drift`. Business-logic candidates are exposed through `context_pack` / `explain_symbol` (there are no separate candidate tools), matching the CLI's evidence-then-confirm model.
 
+Agent policy:
+
+- Make sure the target repo has run `groundgraph init` and `groundgraph index` before relying on MCP results.
+- Start with `search_graph` for symbols, concepts, and snippets; then use `explain_symbol`, `get_subgraph`, or `context_pack` for deeper context.
+- For current uncommitted tracked changes, call `impact` with `worktree: true` instead of requiring a throwaway commit.
+- Use `check_drift` after docs, requirements, tests, or public API changes.
+- Do not fall back to grep or broad file scans to re-prove results already returned by GroundGraph; read source only when the graph result is stale, truncated, or missing a body needed for an edit.
+
+More copyable client configuration and tool-selection guidance lives in `docs/agent-mcp.md`.
+
 ## Dead-Code Candidate Workflow
 
 Use `dead-code` only as a candidate report. It is not an automatic deletion tool and must not be presented as proof that a symbol is removable.

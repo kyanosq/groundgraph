@@ -269,7 +269,7 @@ groundgraph propose        代码/文档/测试事实  → 业务模块证据包
 | 代码事实边 | `contains` / `imports` / `calls` / `references` |
 | 语义边 | `reads_provider` / `navigates_to` / `persists_to` / `subscribes_stream`（Flutter/Riverpod 专项）；Python 框架装饰器（FastAPI/Flask/Celery/Click/Pydantic）识别 |
 | CLI 命令面 | `init/index/slice/impact/check/context/connect/export/graph/candidate/logic/`**`propose`**`/`**`business-doc`**`/search/dead-code/similar/select-tests/features/graph-diff/questions`（`propose`+`business-doc` 为业务文档流水线两端） |
-| MCP 工具 | 6 个：`search_graph` / `context_pack` / `explain_symbol` / `get_subgraph` / `impact` / `dead_code`（独立 `groundgraph-mcp` 二进制） |
+| MCP 工具 | 7 个：`search_graph` / `context_pack` / `explain_symbol` / `get_subgraph` / `impact` / `dead_code` / `check_drift`（独立 `groundgraph-mcp` 二进制） |
 | 可视化 | 自包含、离线、零 CDN 的 HTML 代码图浏览器（Documents / Business / Code / Tests / Risks 五泳道，fact/confirmed/candidate/risk 四图层） |
 | 成熟度 | v0.2.0 已收口发版，v0.3.0-A（置信度贯通）+ P21/P22（tree-sitter 广度后端）+ P23（9 语言启发式调用解析全覆盖）+ P24（业务文档流水线 `propose`/`business-doc`，**模块划分以代码图为准**：Louvain 社区 + 显式 feature 边界优先）已落地未发版；workspace 全绿（engine lib **411 测试** + CLI bin **42 测试**，含逐语言属性测试 + 9 语言调用解析 scan 测试 + 业务证据包/文档导出测试 + Louvain 社区发现测试） |
 

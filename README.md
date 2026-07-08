@@ -165,7 +165,7 @@ A missing or failing indexer is a clear, non-fatal "structure-only" note — nev
 
 ## MCP integration
 
-`groundgraph-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, dead-code, …) to AI agents. It speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP), so point any stdio-capable MCP client at the binary:
+`groundgraph-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the graph (search, subgraph, impact, context packs, dead-code, …) to AI agents. It speaks **MCP over stdio** (the standard local-server transport — not SSE/HTTP), so point any stdio-capable MCP client at the binary:
 
 ```jsonc
 {
@@ -177,6 +177,17 @@ A missing or failing indexer is a clear, non-fatal "structure-only" note — nev
   }
 }
 ```
+
+Prepare the repository first:
+
+```bash
+groundgraph --repo-root /path/to/your/repo init
+groundgraph --repo-root /path/to/your/repo index
+```
+
+The server advertises seven tools: `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack`, and `check_drift`. For agent reviews of uncommitted tracked changes, call `impact` with `worktree: true` so the MCP path matches `groundgraph impact --worktree`.
+
+See [GroundGraph for agents and MCP clients](docs/agent-mcp.md) for copyable client config, tool-selection guidance, and recommended agent policy.
 
 ## Configuration
 

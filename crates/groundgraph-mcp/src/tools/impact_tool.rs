@@ -28,6 +28,11 @@ pub fn descriptor() -> ToolDescriptor {
                     "default": "HEAD",
                     "description": "Head git ref."
                 },
+                "worktree": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Diff `base` against the current working tree instead of a committed head. Use this when an agent is reviewing uncommitted changes."
+                },
                 "reindex": {
                     "type": "boolean",
                     "default": true,
@@ -54,6 +59,10 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .unwrap_or("HEAD")
         .to_string();
+    let worktree = args
+        .get("worktree")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let reindex = args
         .get("reindex")
         .and_then(|v| v.as_bool())
@@ -62,7 +71,7 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
     let options = ImpactOptions {
         repo_root,
         base_ref: base,
-        head_ref: head,
+        head_ref: if worktree { String::new() } else { head },
         reindex,
     };
     let report = run_impact(options).context("computing impact")?;

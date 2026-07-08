@@ -18,7 +18,7 @@
 
 Generated to `<repo>/.groundgraph/export/search-<slug>.html` by default; pass `--output` to override. Same self-containment contract as `graph --format html` (no remote URLs, no CDN, one HTML file).
 
-**Agent surface (P0a, `groundgraph-mcp`):** the same engine surface is exposed to AI agents through an MCP stdio server so they do not have to parse CLI text. Six structured tools are advertised in `tools/list` — `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack` — each returning a single `text` content block whose body is the engine response serialized as pretty JSON. Tool errors land as `isError: true` content; only protocol-level failures (unknown method / tool) use JSON-RPC error envelopes. Launch with `groundgraph-mcp --repo-root <repo>` (or `GROUNDGRAPH_REPO_ROOT=...`); tool calls may override `repo_root` per-call.
+**Agent surface (P0a, `groundgraph-mcp`):** the same engine surface is exposed to AI agents through an MCP stdio server so they do not have to parse CLI text. Seven structured tools are advertised in `tools/list` — `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack`, `check_drift` — each returning a single `text` content block whose body is the engine response serialized as pretty JSON. Tool errors land as `isError: true` content; only protocol-level failures (unknown method / tool) use JSON-RPC error envelopes. Launch with `groundgraph-mcp --repo-root <repo>` (or `GROUNDGRAPH_REPO_ROOT=...`); tool calls may override `repo_root` per-call.
 
 **Tech Stack:** Rust engine/CLI, `serde` data contracts, self-contained HTML/CSS/vanilla JS, optional Mermaid text export.
 
