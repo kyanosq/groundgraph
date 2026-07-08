@@ -2038,7 +2038,7 @@ fn trailing_ident(s: &str) -> Option<String> {
 
 /// Recover HTTP routes from an Express / Hono server — the TS/JS analogue of
 /// [`parse_gin_routes`]. Matches `<router>.<verb>("/path", …handler)` where the
-/// receiver is a known app/router (see [`collect_express_routers`]) and the verb
+/// receiver is a known app/router (see `collect_express_routers`) and the verb
 /// is an HTTP method. Inline arrow / `function` handlers leave the handler empty
 /// (the path is still indexed, like a Gin closure); a bare-identifier handler is
 /// kept as the method name so the linker can resolve it. Comments are stripped

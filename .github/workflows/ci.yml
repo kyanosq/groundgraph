@@ -42,6 +42,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Rustdoc (deny warnings)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+      - name: Package core crate
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo package -p groundgraph-core --locked
+
       # `--locked` makes CI fail if Cargo.lock is stale, pinning the dependency
       # graph for deterministic, reproducible indexing (issues.md #226 / #240).
       - name: Test

@@ -1,7 +1,7 @@
 //! Dart indexing orchestrator (P23.6 — consolidated on tree-sitter).
 //!
 //! Two tiers feed one [`LanguageIndexBatch`]:
-//! - **Tier-2 (structure, authoritative):** [`build_dart_structure`] runs the
+//! - **Tier-2 (structure, authoritative):** `build_dart_structure` runs the
 //!   generic tree-sitter driver ([`crate::dart_treesitter`]) over every
 //!   `.dart` file and produces the file / class / method / function /
 //!   constructor / test nodes, `contains` hierarchy, resolved `imports`
@@ -12,7 +12,7 @@
 //!   contributes `Calls` / `References` / framework edges, the synthetic
 //!   `route` / `storage` nodes, and the framework-semantic `DartProvider`
 //!   symbols. Its *plain* structural output is discarded in favour of the
-//!   tree-sitter tier; [`backfill_referenced_symbols`] re-homes any symbol an
+//!   tree-sitter tier; `backfill_referenced_symbols` re-homes any symbol an
 //!   overlay edge references but the structural pass did not emit, so no
 //!   semantic edge dangles.
 //!
@@ -51,7 +51,7 @@ pub struct DartIndexOptions {
     /// Optional `glob`-style patterns to filter out paths that are technically
     /// inside a `code_roots` entry but should be skipped (generated files,
     /// build output, etc.). Patterns use the simple matcher in
-    /// [`crate::dart_indexer::path_matches_glob`] — only `**`, `*`, `?`, `.`
+    /// `path_matches_glob` — only `**`, `*`, `?`, `.`
     /// and `/` are honoured.
     pub exclude_globs: Vec<String>,
     /// P23.7 — when `true`, skip the Dart analyzer (Tier-3 semantic) overlay
@@ -698,7 +698,7 @@ fn ingest(
 }
 
 /// Language-agnostic ingestion helper used by the P11 LSP adapters
-/// (Swift / Go). Mirrors the structural subset of [`ingest`] without
+/// (Swift / Go). Mirrors the structural subset of `ingest` without
 /// the Dart-specific bookkeeping (analyzer-vs-lightweight resolver
 /// tags, `declared_implementations` counts, etc.). The caller passes
 /// its own indexer label so per-language facts can be cleared

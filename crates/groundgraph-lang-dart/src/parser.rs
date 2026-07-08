@@ -27,7 +27,7 @@ pub struct ParseResult {
     pub ranges: Vec<SymbolRange>,
     pub diagnostics: Vec<AdapterDiagnostic>,
     /// Per-class field-name → type-name mapping discovered by the
-    /// lightweight parser. Used downstream by [`references`] to resolve
+    /// lightweight parser. Used downstream by `references` to resolve
     /// `field.member` access into a reference to the field's class.
     /// Intentionally local: never persisted in `LanguageIndexBatch`.
     pub field_types:

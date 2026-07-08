@@ -12,7 +12,7 @@
 //! semantic `Calls` / `References` edges, overlaid onto the existing
 //! tree-sitter symbol ids — the LSP id scheme `swift::<file>::<qualified>`
 //! is identical to the tree-sitter one by construction (see
-//! [`swift_qualify`]). LSP edges are tagged `indexer = swift_lsp`. When no
+//! `swift_qualify`). LSP edges are tagged `indexer = swift_lsp`. When no
 //! `sourcekit-lsp` is available the structural graph is already complete.
 
 use std::path::PathBuf;

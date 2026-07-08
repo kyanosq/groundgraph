@@ -9,7 +9,7 @@
 //! slightly different questions for the same kind.
 //!
 //! This module is the single source of truth. New languages add their
-//! `NodeKind` variants to [`node::NodeKind`] and an arm here; every
+//! `NodeKind` variants to [`crate::node::NodeKind`] and an arm here; every
 //! consumer keeps working.
 //!
 //! Design rules:

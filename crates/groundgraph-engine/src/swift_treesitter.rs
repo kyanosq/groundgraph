@@ -16,11 +16,11 @@
 //!   `class_declaration`. They are told apart by the leading keyword token
 //!   (a direct child). `enum` additionally carries an `enum_class_body`.
 //! - An `extension`'s name is a `user_type` (vs a `type_identifier` for the
-//!   others); it is handled like a Rust `impl` block via [`swift_extension_type`]
+//!   others); it is handled like a Rust `impl` block via `swift_extension_type`
 //!   so its members nest under the extended type without emitting a
 //!   duplicate type node.
 //! - `init` / `deinit` declarations have no `name` field; their names are
-//!   the literals `init` / `deinit` ([`swift_name_of`]).
+//!   the literals `init` / `deinit` (`swift_name_of`).
 //! - `@Test` / `@Suite` (swift-testing) live under `modifiers → attribute`;
 //!   `XCTest` cases are `test*` methods with no parameters.
 

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "SQLite-backed graph store for GroundGraph."
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.2.0" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }

@@ -63,7 +63,7 @@ fn ensure_safe_ref(label: &str, value: &str) -> Result<()> {
 }
 
 /// Run `git diff --unified=0` for the given refs inside `repo_root` and return
-/// raw text. See [`diff_args`] for the committed-range vs working-tree modes.
+/// raw text. See `diff_args` for the committed-range vs working-tree modes.
 pub fn git_diff(repo_root: &std::path::Path, base: &str, head: &str) -> Result<String> {
     ensure_safe_ref("base", base)?;
     ensure_safe_ref("head", head)?;

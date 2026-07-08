@@ -48,7 +48,7 @@ use serde_json::{json, Value};
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// LSP `SymbolKind` enum values per the spec (1..=26). We only
-/// enumerate the kinds we actually map to a GroundGraph [`crate::NodeKind`]
+/// enumerate the kinds we actually map to a GroundGraph [`groundgraph_core::NodeKind`]
 /// in any language profile — everything else gets discarded by the
 /// indexer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,7 +97,7 @@ impl LspSymbolKind {
     }
 }
 
-/// One node in a [`textDocument/documentSymbol`] hierarchy after we have
+/// One node in a `textDocument/documentSymbol` hierarchy after we have
 /// normalised the protocol's old `SymbolInformation[]` shape and the
 /// new `DocumentSymbol[]` shape into the same nested form.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +173,7 @@ type ReaderMessage = Result<Value>;
 /// Spawned LSP server we can talk to synchronously. Stdout is drained
 /// by a background thread so that [`Self::set_response_timeout`] can
 /// fire even when the server holds stdin open without writing — the
-/// blocking [`BufRead::read_line`] used by [`read_message`] would
+/// blocking [`BufRead::read_line`] used by `read_message` would
 /// otherwise sit on a futex forever and trump the deadline check.
 pub struct LspClient {
     child: Option<Child>,

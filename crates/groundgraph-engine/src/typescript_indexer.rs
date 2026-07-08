@@ -1,8 +1,8 @@
 //! P20/P23.2 — TypeScript language adapter (structure + heuristic).
 //!
 //! The in-process tree-sitter driver ([`crate::typescript_treesitter`]) is the
-//! **sole source of truth** for `.ts` / `.mts` / `.cts` ([`TYPESCRIPT_SPEC`])
-//! and `.tsx` / `.js` / `.jsx` / `.vue` ([`TSX_SPEC`]). It owns classes /
+//! **sole source of truth** for `.ts` / `.mts` / `.cts` (`TYPESCRIPT_SPEC`)
+//! and `.tsx` / `.js` / `.jsx` / `.vue` (`TSX_SPEC`). It owns classes /
 //! functions / methods, jest / vitest tests, ESM imports resolved to
 //! repo-relative file ids (including cross-extension `.ts` ↔ `.tsx`), and the
 //! medium-confidence heuristic `Calls` / `References` edges resolved across the

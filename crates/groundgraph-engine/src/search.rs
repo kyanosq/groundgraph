@@ -87,8 +87,8 @@ pub const DEFAULT_LIMIT: usize = 25;
 pub const DEFAULT_DEPTH: usize = 1;
 
 /// Maximum total score a single hit can earn from the post-scoring boost
-/// passes ([`apply_evidence_boost`] = [`SCORE_EDGE_EVIDENCE`],
-/// [`apply_neighbor_boost`] = [`SCORE_NEIGHBOR`]). Used to reason about how
+/// passes (`apply_evidence_boost` = [`SCORE_EDGE_EVIDENCE`],
+/// `apply_neighbor_boost` = [`SCORE_NEIGHBOR`]). Used to reason about how
 /// wide the candidate window must be so a dropped node can't overtake a
 /// kept one after boosting.
 pub const MAX_POST_SCORE_BOOST: i32 = SCORE_EDGE_EVIDENCE + SCORE_NEIGHBOR;

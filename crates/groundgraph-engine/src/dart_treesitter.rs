@@ -30,9 +30,9 @@
 //!   `declaration` → a *bare* `function_signature` / `getter_signature` /
 //!   `setter_signature`; these are emitted as methods too.
 //! - `extension … on T` is handled like a Rust `impl` block via
-//!   [`dart_extension_type`] so its members attach to `T`.
+//!   `dart_extension_type` so its members attach to `T`.
 //! - `test` / `group` are call-based; the driver descends into the
-//!   conventional `void main() { … }` harness because [`DART_SPEC`] sets
+//!   conventional `void main() { … }` harness because `DART_SPEC` sets
 //!   `recurse_callables = true`.
 
 use std::collections::BTreeMap;
@@ -497,7 +497,7 @@ pub(crate) static DART_SPEC: LangSpec = LangSpec {
 /// Structural facts extracted from one Dart file, addressed with the legacy
 /// `dart_*::` id scheme so the analyzer/lightweight semantic overlays bind
 /// without translation. `raw_imports` are unresolved targets — the caller
-/// resolves them against the full repo file set via [`dart_resolve_import`].
+/// resolves them against the full repo file set via `dart_resolve_import`.
 #[derive(Debug, Clone, Default)]
 pub struct DartFileStructure {
     pub symbols: Vec<SymbolArtifact>,

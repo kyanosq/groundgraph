@@ -4,14 +4,14 @@
 //!
 //! Go-specific irregularities isolated here:
 //! - A Go type is a `type_spec` whose *value* (`struct_type` /
-//!   `interface_type`) decides its kind, so [`go_container_of`] inspects
+//!   `interface_type`) decides its kind, so `go_container_of` inspects
 //!   the `type` field rather than the node kind alone.
 //! - A method is not lexically nested in its type; the owner comes from
 //!   the receiver (`func (r *Repo) M()`), surfaced via
-//!   [`go_receiver_type`] so the generic driver nests it under `Repo`.
+//!   `go_receiver_type` so the generic driver nests it under `Repo`.
 //! - `go test` collects free functions by name + signature
-//!   ([`go_test_of`]), and import *paths* map to package *directories*
-//!   ([`go_resolve_import`]).
+//!   (`go_test_of`), and import *paths* map to package *directories*
+//!   (`go_resolve_import`).
 
 use crate::treesitter::{
     body_from_field, keep_callable_kind, name_from_field, no_call_test, no_src_roots, no_text,

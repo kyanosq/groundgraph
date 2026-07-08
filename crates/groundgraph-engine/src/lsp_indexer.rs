@@ -56,12 +56,12 @@ pub struct LspProfile {
     /// engine config carries the operator-level `exclude_globs`.
     pub skip_suffixes: &'static [&'static str],
     /// Command to spawn the LSP server. May be overridden via
-    /// environment variable (see [`override_command`]).
+    /// environment variable (see `override_command`).
     pub default_command: &'static str,
     /// Args passed to the LSP server on spawn.
     pub default_args: &'static [&'static str],
     /// Environment variable that operators can set to override
-    /// [`default_command`]. We document it next to the profile.
+    /// `default_command`. We document it next to the profile.
     pub command_env_var: &'static str,
     /// Map an LSP [`LspSymbolKind`] to a GroundGraph [`NodeKind`].
     /// Return `None` to silently drop the symbol — e.g. Go's

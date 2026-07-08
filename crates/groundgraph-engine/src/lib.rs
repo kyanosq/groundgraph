@@ -1,8 +1,14 @@
-//! GroundGraph engine.
+//! Embeddable GroundGraph engine.
 //!
-//! MVP-0 surface area:
-//! - [`EngineConfig`] — workspace-level config persisted to `.groundgraph.yaml`.
-//! - [`init_repository`] — generate the config file and graph database.
+//! This crate contains the library surface behind the `groundgraph` CLI and
+//! the `groundgraph-mcp` server. External applications should start with
+//! [`prelude`], which re-exports the stable high-level workflow functions
+//! (`init`, `index`, `search`, `check`, `impact`, context packs) plus the core
+//! graph model and store handle.
+//!
+//! The lower-level modules remain public for advanced integrations and for the
+//! first-party binaries, but during the `0.x` series the recommended external
+//! API is the curated [`prelude`] facade.
 
 pub(crate) mod atomic_write;
 pub mod business_candidates;
@@ -204,3 +210,39 @@ pub use swift_indexer::{
 pub use typescript_indexer::{
     index_typescript, TypescriptIndexOptions, TypescriptIndexResult, TYPESCRIPT_LANGUAGE_ID,
 };
+
+/// Recommended imports for applications embedding GroundGraph.
+///
+/// Prefer this module over importing lower-level adapter modules directly. It
+/// keeps caller code focused on the supported workflows while still exposing
+/// the shared graph model (`Node`, `EdgeAssertion`, `NodeKind`, …) and the
+/// SQLite [`groundgraph_store::Store`] for advanced read-only integrations.
+pub mod prelude {
+    pub use groundgraph_core::{
+        AdapterDiagnostic, ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource,
+        EdgeStatus, Evidence, EvidenceKind, FileArtifact, ImportEdge, Language, LanguageIndexBatch,
+        Node, NodeKind, ReferenceEdge, SymbolArtifact, SymbolFamily, SymbolRange, TestArtifact,
+    };
+    pub use groundgraph_store::{Store, StoreError, StoreResult};
+
+    pub use crate::{
+        analyze_constants, analyze_data_contract, analyze_dead_code, analyze_feature_map,
+        analyze_port_coverage, analyze_questions, analyze_similarity, analyze_symbol_facts,
+        analyze_test_suggestions, build_context, build_feature_pack, compute_checks,
+        compute_impact, default_search_kinds, index_repository, init_repository, run_checks,
+        run_impact, run_logic_confidence, run_search, run_search_with_store, select_tests,
+        slice_requirement, BusinessCandidate, CheckFinding, CheckOptions, CheckReport,
+        CheckSeverity, CodeSnippet, ConstantEntry, ConstantsOptions, ConstantsReport,
+        ContextOptions, ContextPack, DataContractOptions, DataContractReport, DeadCodeCandidate,
+        DeadCodeConfidence, DeadCodeOptions, DeadCodeReport, DocSnippet, EdgeSummary, EngineConfig,
+        FeatureCluster, FeatureMap, FeatureMapOptions, FeaturePack, FeaturePackOptions,
+        FeaturePackSelector, FeatureSlice, ImpactOptions, ImpactReport, IndexOptions, IndexResult,
+        InitOptions, InitOutcome, LogicConfidenceOptions, LogicConfidenceReport,
+        PortCoverageOptions, PortCoverageReport, Question, QuestionsOptions, QuestionsReport,
+        SearchEdge, SearchMatch, SearchNode, SearchOptions, SearchQuery, SearchResult,
+        SearchSubgraph, SelectedTest, SimilarityCluster, SimilarityMode, SimilarityOptions,
+        SimilarityReport, SliceItem, SliceOptions, SymbolFact, SymbolFactsOptions,
+        SymbolFactsReport, TestSelection, TestSelectionOptions, TestSuggestionsOptions,
+        TestSuggestionsReport, TreeSitterLangResult,
+    };
+}

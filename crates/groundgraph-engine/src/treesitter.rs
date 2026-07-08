@@ -341,7 +341,7 @@ pub struct LangSpec {
     pub recurse_callables: bool,
     /// Pair with `recurse_callables`: when descending into a callable body,
     /// only emit a *nested* callable that carries framework metadata
-    /// ([`metadata_of`] returns `Some`). Off by default, so Dart keeps
+    /// (`metadata_of` returns `Some`). Off by default, so Dart keeps
     /// emitting every nested declaration. Python turns this on so a FastAPI
     /// handler defined inside an app factory (`def create_app(): @app.get(…)
     /// def handler(): …`) becomes a real symbol while plain local closures
@@ -1302,7 +1302,7 @@ pub struct TsIndexResult {
     /// fixture/corpus files) and were skipped. Surfaced as a CLI warning.
     #[serde(default)]
     pub parse_timeouts: usize,
-    /// Files skipped because they exceeded [`crate::source_text::MAX_INDEX_FILE_BYTES`]
+    /// Files skipped because they exceeded `crate::source_text::MAX_INDEX_FILE_BYTES`
     /// — a capacity gate (read before the time gate) bounding peak memory.
     #[serde(default)]
     pub skipped_oversized: usize,

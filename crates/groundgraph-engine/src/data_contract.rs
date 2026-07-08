@@ -12,7 +12,7 @@
 //!    `data.get(...)` encode the wire format; getting a key name or a default
 //!    wrong silently corrupts data on the new platform.
 //!
-//! The keymap scan uses [`strip_noise`](crate::source_text::strip_noise) as
+//! The keymap scan uses [`strip_noise`] as
 //! a *mask*: a code-level subscript shows up in the masked text as
 //! `ident[" "]` (delimiters kept, key blanked), which lets us tell a real
 //! `map['k']` access apart from a `['a','b']` array literal or a `['k']`

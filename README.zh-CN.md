@@ -78,6 +78,47 @@ groundgraph dashboard                 # 单文件离线 HTML 管理面板
 
 GroundGraph 的所有产物都只写在 `.groundgraph/` 下。删掉该目录即可从头开始——你的源码永不被改动。
 
+## 作为 Rust 库使用
+
+GroundGraph 也可以作为 Rust 库嵌入到你的应用里。外部应用建议依赖
+`groundgraph-engine` 并导入整理过的 `prelude`；底层模块仍然公开，供高级集成使用，
+但 `0.x` 阶段推荐把 `prelude` 作为主要外部 API。
+
+```toml
+[dependencies]
+anyhow = "1"
+
+# crates.io 首发前可先用 git 依赖：
+groundgraph-engine = { git = "https://github.com/groundgraph/groundgraph", package = "groundgraph-engine" }
+
+# 发布到 crates.io 后：
+# groundgraph-engine = "0.2"
+```
+
+```rust
+use groundgraph_engine::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let repo_root = std::env::current_dir()?;
+
+    init_repository(InitOptions::new(&repo_root))?;
+    index_repository(IndexOptions::all(&repo_root))?;
+
+    let result = run_search(SearchOptions::keywords(&repo_root, "auth session"))?;
+    for hit in result.matches.iter().take(5) {
+        println!("{} {}", hit.score, hit.id);
+    }
+
+    Ok(())
+}
+```
+
+crate 分层：
+
+- `groundgraph-core`：图模型、证据、语言批次类型。
+- `groundgraph-store`：SQLite 图存储。
+- `groundgraph-engine`：初始化、索引、检索、检查、影响分析、上下文包和分析报告等高层工作流。
+
 ## 命令速查
 
 完整且权威的列表请运行 `groundgraph --help`（或 `groundgraph <命令> --help`）。最常用的：
@@ -177,12 +218,14 @@ crates/
 cargo fmt --all                                          # 格式化
 cargo clippy --workspace --all-targets -- -D warnings    # 静态检查（零警告策略）
 cargo test --workspace                                   # 1000+ 测试
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-- 工具链钉在 [`rust-toolchain.toml`](rust-toolchain.toml)；CI（`.github/workflows/ci.yml`）在每次 push 上强制 fmt + clippy（`-D warnings`）+ 测试。
+- 工具链钉在 [`rust-toolchain.toml`](rust-toolchain.toml)；CI（`.github/workflows/ci.yml`）在每次 push 上强制 fmt + clippy（`-D warnings`）+ 测试 + rustdoc。
 - **测试驱动：** 新行为先写失败测试，再写让它通过的最小实现。
 - 手写扫描器由 `proptest` 全域性测试守护（任意 UTF-8 → 不 panic、确定性）。
 - 验收以**真实命令输出**为准，不以口头结论替代。
+- 发布与 crates.io 检查见 [`docs/publishing.md`](docs/publishing.md)。
 
 ## 贡献
 

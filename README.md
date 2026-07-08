@@ -78,6 +78,49 @@ groundgraph dashboard                 # one-file offline HTML management panel
 
 Everything written by GroundGraph stays under `.groundgraph/`. Delete that directory to start clean — your source is never modified.
 
+## Use as a Rust library
+
+GroundGraph can also be embedded from Rust. Applications should depend on the
+engine crate and import the curated `prelude`; lower-level modules are public
+for advanced integrations, but `prelude` is the recommended external surface
+during the `0.x` series.
+
+```toml
+[dependencies]
+anyhow = "1"
+
+# Git dependency before the first crates.io release:
+groundgraph-engine = { git = "https://github.com/groundgraph/groundgraph", package = "groundgraph-engine" }
+
+# After crates.io publication:
+# groundgraph-engine = "0.2"
+```
+
+```rust
+use groundgraph_engine::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let repo_root = std::env::current_dir()?;
+
+    init_repository(InitOptions::new(&repo_root))?;
+    index_repository(IndexOptions::all(&repo_root))?;
+
+    let result = run_search(SearchOptions::keywords(&repo_root, "auth session"))?;
+    for hit in result.matches.iter().take(5) {
+        println!("{} {}", hit.score, hit.id);
+    }
+
+    Ok(())
+}
+```
+
+Crate layering:
+
+- `groundgraph-core` — graph model, evidence and language batch types.
+- `groundgraph-store` — SQLite-backed graph store.
+- `groundgraph-engine` — high-level workflows for init, index, search, checks,
+  impact, context packs and analysis reports.
+
 ## Command reference
 
 Run `groundgraph --help` (or `groundgraph <command> --help`) for the full, authoritative list. The most-used commands:
@@ -178,12 +221,14 @@ crates/
 cargo fmt --all                                   # format
 cargo clippy --workspace --all-targets -- -D warnings   # lint (zero-warning policy)
 cargo test --workspace                            # ~1000+ tests
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-- The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); CI (`.github/workflows/ci.yml`) enforces fmt + clippy (`-D warnings`) + tests on every push.
+- The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); CI (`.github/workflows/ci.yml`) enforces fmt + clippy (`-D warnings`) + tests + rustdoc on every push.
 - **Test-driven:** new behavior starts with a failing test, then the minimal code to pass it.
 - Hand-rolled scanners are guarded by `proptest` totality tests (arbitrary UTF-8 → no panic, deterministic).
 - Acceptance is judged by **real command output**, not prose.
+- Release and crates.io checks are documented in [`docs/publishing.md`](docs/publishing.md).
 
 ## Contributing
 

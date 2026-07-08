@@ -1,7 +1,7 @@
 //! P22/P23.2 — TypeScript language spec for the generic tree-sitter driver.
 //!
 //! Since the P23 收敛 this is the **sole structural backend** for TypeScript:
-//! [`TYPESCRIPT_SPEC`] owns `.ts` / `.mts` / `.cts` and [`TSX_SPEC`] owns
+//! `TYPESCRIPT_SPEC` owns `.ts` / `.mts` / `.cts` and `TSX_SPEC` owns
 //! `.tsx` (same grammar crate, JSX-aware dialect). Both share one
 //! `language_id` (`typescript`) so symbols, ids, and the `typescript_treesitter`
 //! indexer name are uniform across the two passes. The hooks recover:

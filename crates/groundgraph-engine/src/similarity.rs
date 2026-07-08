@@ -29,7 +29,7 @@
 //!   preserved while identifiers collapse to `ID`.
 //!
 //! Every language whose function/method nodes are emitted by an
-//! indexer is mapped in [`node_language`]; adding a new one is a
+//! indexer is mapped in `node_language`; adding a new one is a
 //! `Language` arm plus a keyword set — the lexer is shared.
 
 use std::collections::{BTreeMap, HashSet};
@@ -1144,7 +1144,7 @@ fn fingerprint_tokens(tokens: &[String]) -> u64 {
 /// bodies with similar shingles produce SimHashes with small
 /// Hamming distance even if a few tokens were added, removed, or
 /// renamed. We use FNV-1a per shingle (same hash family as
-/// [`fingerprint_tokens`]) for cross-platform determinism.
+/// `fingerprint_tokens`) for cross-platform determinism.
 pub fn simhash_tokens(tokens: &[String], k: usize) -> u64 {
     if tokens.is_empty() {
         return 0;
