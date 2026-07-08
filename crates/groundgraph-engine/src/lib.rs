@@ -84,6 +84,7 @@ pub mod trace;
 pub mod treesitter;
 pub mod typescript_indexer;
 pub mod typescript_treesitter;
+pub mod watch;
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,

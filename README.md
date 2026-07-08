@@ -41,6 +41,7 @@ It indexes your repository into a SQLite graph of **nodes** (symbols, files, doc
 - 🔁 **`port-coverage` / `graph-equiv`** — track and prove a rewrite/port against the source graph.
 - 📊 **`dashboard`** — a single self-contained offline HTML panel aggregating overview, business modules, feature clusters, checks, dead code, open questions and purity. No server, no CDN — open it from `file://`.
 - 🔌 **MCP server** — expose the graph to AI agents via the Model Context Protocol.
+- 🧩 **`install` / `watch`** — configure Cursor, Claude Code and Codex for MCP, then keep the graph refreshed during agent work.
 
 Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexes in ~11s, the TypeScript compiler repo (20k+ files) in ~28s (parallel parsing + a per-file parse budget that survives fixture corpora with intentional syntax errors), Django (Python), gin (Go) and gson (Java/Maven) validated end-to-end. SCIP enrichment is incremental — unchanged sources reuse the previous `.scip` instead of re-running the type-checker — and search ranking demotes tests/tools/examples so issue-style queries hit production code first (validated against real Redis issues).
 
@@ -68,6 +69,8 @@ cd /path/to/your/repo
 
 groundgraph init                    # create .groundgraph.yaml + .groundgraph/graph.db
 groundgraph index                   # index docs + code into the graph
+groundgraph install --agent cursor,claude # write local MCP config for agents
+groundgraph watch                   # re-index when repository files change
 
 groundgraph search "parse sql tables" # ranked, evidence-backed hits
 groundgraph dead-code                 # unreachable symbols, with reasons
@@ -76,7 +79,7 @@ groundgraph propose                   # AI business-logic evidence pack (+ promp
 groundgraph dashboard                 # one-file offline HTML management panel
 ```
 
-Everything written by GroundGraph stays under `.groundgraph/`. Delete that directory to start clean — your source is never modified.
+GroundGraph's graph cache stays under `.groundgraph/`. Delete that directory to start clean. `groundgraph install` may write agent configuration files such as `.cursor/mcp.json` or `.mcp.json`, but GroundGraph never annotates or rewrites your source files.
 
 ## Use as a Rust library
 
@@ -127,7 +130,7 @@ Run `groundgraph --help` (or `groundgraph <command> --help`) for the full, autho
 
 | Area | Command | What it does |
 | --- | --- | --- |
-| **Setup** | `init`, `index` | Create the workspace; index docs + code into the graph |
+| **Setup** | `init`, `index`, `install`, `watch` | Create the workspace; index docs + code; configure agents; refresh the graph during edits |
 | **Navigate** | `search`, `trace`, `graph`, `context`, `slice` | Find code, follow chains, render the graph, build context packs |
 | **Overview** | `dashboard`, `features`, `stats` | Offline HTML management panel; functional-area clusters; command ledger |
 | **Change impact** | `impact`, `graph-diff`, `select-tests` | What a diff affects; compare graph snapshots; which tests to run |
@@ -171,6 +174,7 @@ A missing or failing indexer is a clear, non-fatal "structure-only" note — nev
 {
   "mcpServers": {
     "groundgraph": {
+      "type": "stdio",
       "command": "groundgraph-mcp",
       "args": ["--repo-root", "/path/to/your/repo"]
     }
@@ -184,6 +188,18 @@ Prepare the repository first:
 groundgraph --repo-root /path/to/your/repo init
 groundgraph --repo-root /path/to/your/repo index
 ```
+
+Or let GroundGraph write supported agent config for you:
+
+```bash
+# Project-local MCP config for Cursor and Claude Code.
+groundgraph --repo-root /path/to/your/repo install --agent cursor,claude
+
+# Codex CLI has no project-local MCP config; install it globally.
+groundgraph --repo-root /path/to/your/repo install --location global --agent codex
+```
+
+Run `groundgraph --repo-root /path/to/your/repo watch` during active work to poll repository files and re-run `index` after debounced changes. Generated/cache directories such as `.groundgraph/`, `.git/`, `target/`, `node_modules/`, `build/` and `dist/` are ignored.
 
 The server advertises seven tools: `search_graph`, `get_subgraph`, `explain_symbol`, `impact`, `dead_code`, `context_pack`, and `check_drift`. For agent reviews of uncommitted tracked changes, call `impact` with `worktree: true` so the MCP path matches `groundgraph impact --worktree`.
 

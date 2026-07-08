@@ -450,8 +450,9 @@ CodeGraph 是「更快地找到代码」；GroundGraph 是「确保 AI 改对了
 
 ### Phase A：生存线 —— 让人能用起来、用得新鲜（1–2 个迭代）
 - [ ] 跨平台 release：Linux/Windows/macOS × x64/arm64 静态二进制 + 一行安装脚本。
-- [ ] `groundgraph install`：自动探测并配置 Cursor / Claude Code / Codex / opencode 的 MCP（参考 CodeGraph installer 契约测试）。
-- [ ] MCP `serve` 加**文件监听 auto-sync + staleness banner + 连接时 catch-up**。
+- [x] `groundgraph install`：配置 Cursor / Claude Code / Codex 的 MCP（本地 Cursor/Claude，Codex 全局；保留既有 sibling MCP server）。
+- [x] `groundgraph watch`：跨平台 polling watcher，忽略生成/缓存目录，变更 debounce 后重跑 `index`。
+- [ ] MCP `serve` 内嵌**文件监听 auto-sync + staleness banner + 连接时 catch-up**。
 - [ ] MCP `initialize` instructions 升级为单一真相源（按 intent 选工具、直接信任结果、漂移时提示 Read）。
 
 ### Phase B：检索充分性 —— 把 agent 体验拉到 CodeGraph 水平（2–3 个迭代）

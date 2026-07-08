@@ -28,8 +28,12 @@ struct Cli {
 enum Commands {
     /// Initialise a GroundGraph workspace: create `.groundgraph.yaml` and `.groundgraph/graph.db`.
     Init,
+    /// Install GroundGraph MCP config for local or global AI agents.
+    Install(InstallArgs),
     /// Index docs and code into the graph store.
     Index(IndexArgs),
+    /// Watch repository files and re-index when the graph may be stale.
+    Watch(WatchArgs),
     /// Resolve a requirement into docs, implementation and tests.
     Slice(SliceArgs),
     /// Report which requirements, docs and tests are affected by a git diff.
@@ -996,6 +1000,78 @@ struct IndexArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct InstallArgs {
+    /// Agent target(s) to configure. Repeat or use comma-separated values.
+    #[arg(
+        long = "agent",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "cursor,claude,codex"
+    )]
+    agents: Vec<InstallAgentArg>,
+    /// Config location. Local is project scoped; global writes under HOME.
+    #[arg(long, value_enum, default_value_t = InstallLocationArg::Local)]
+    location: InstallLocationArg,
+    /// Print the planned writes without touching files.
+    #[arg(long)]
+    dry_run: bool,
+    /// Add Claude Code auto-allow permissions for GroundGraph MCP tools.
+    #[arg(long)]
+    auto_allow: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum InstallAgentArg {
+    Cursor,
+    Claude,
+    Codex,
+}
+
+impl From<InstallAgentArg> for commands::install::AgentTarget {
+    fn from(value: InstallAgentArg) -> Self {
+        match value {
+            InstallAgentArg::Cursor => commands::install::AgentTarget::Cursor,
+            InstallAgentArg::Claude => commands::install::AgentTarget::Claude,
+            InstallAgentArg::Codex => commands::install::AgentTarget::Codex,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum InstallLocationArg {
+    Local,
+    Global,
+}
+
+impl From<InstallLocationArg> for commands::install::InstallLocation {
+    fn from(value: InstallLocationArg) -> Self {
+        match value {
+            InstallLocationArg::Local => commands::install::InstallLocation::Local,
+            InstallLocationArg::Global => commands::install::InstallLocation::Global,
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+struct WatchArgs {
+    /// Only index documentation when the watcher triggers.
+    #[arg(long)]
+    docs_only: bool,
+    /// Do not run an initial `groundgraph index` before entering watch mode.
+    #[arg(long)]
+    no_initial_index: bool,
+    /// Collect one snapshot and exit. Useful for CI smoke tests.
+    #[arg(long)]
+    once: bool,
+    /// Poll interval in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 2000)]
+    interval_ms: u64,
+    /// Debounce delay after a detected change before re-indexing.
+    #[arg(long, value_name = "MS", default_value_t = 500)]
+    debounce_ms: u64,
+}
+
+#[derive(Debug, clap::Args)]
 struct ExportArgs {
     /// Output format. MVP-0 only supports `jsonl`.
     #[arg(long, value_enum, default_value_t = ExportFormatArg::Jsonl)]
@@ -1077,7 +1153,9 @@ fn exit_code(exit: i32) -> u8 {
 fn command_name(command: &Commands) -> &'static str {
     match command {
         Commands::Init => "init",
+        Commands::Install(_) => "install",
         Commands::Index(_) => "index",
+        Commands::Watch(_) => "watch",
         Commands::Slice(_) => "slice",
         Commands::Impact(_) => "impact",
         Commands::Check(_) => "check",
@@ -1125,7 +1203,28 @@ fn command_name(command: &Commands) -> &'static str {
 fn dispatch(cli: Cli) -> Result<u8> {
     match cli.command {
         Commands::Init => commands::init::run(&cli.repo_root).map(|()| 0),
+        Commands::Install(args) => commands::install::run(
+            &cli.repo_root,
+            commands::install::InstallRunArgs {
+                agents: args.agents.into_iter().map(Into::into).collect(),
+                location: args.location.into(),
+                dry_run: args.dry_run,
+                auto_allow: args.auto_allow,
+            },
+        )
+        .map(|()| 0),
         Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only).map(|()| 0),
+        Commands::Watch(args) => commands::watch::run(
+            &cli.repo_root,
+            commands::watch::WatchRunArgs {
+                interval: std::time::Duration::from_millis(args.interval_ms),
+                debounce: std::time::Duration::from_millis(args.debounce_ms),
+                once: args.once,
+                initial_index: !args.no_initial_index,
+                docs_only: args.docs_only,
+            },
+        )
+        .map(|()| 0),
         Commands::Slice(args) => commands::slice::run(
             &cli.repo_root,
             &args.requirement,

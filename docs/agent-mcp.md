@@ -18,6 +18,46 @@ groundgraph --repo-root /path/to/repo check
 `index` populates `.groundgraph/graph.db`. GroundGraph never annotates or edits
 source files.
 
+## Auto-configure agents
+
+GroundGraph can write MCP config for supported local agents:
+
+```bash
+# Project-local configs:
+# - Cursor: .cursor/mcp.json
+# - Claude Code: .mcp.json
+groundgraph --repo-root /path/to/repo install --agent cursor,claude
+
+# Codex CLI has no project-local MCP config, so it is global only:
+# - Codex: ~/.codex/config.toml
+groundgraph --repo-root /path/to/repo install --location global --agent codex
+```
+
+Use `--dry-run` to inspect the planned writes. Use `--auto-allow` with Claude
+Code if you want the installer to add allow-list entries for GroundGraph MCP
+tools.
+
+## Keep the graph fresh
+
+During active agent work, run the watcher in the repository:
+
+```bash
+groundgraph --repo-root /path/to/repo watch
+```
+
+The watcher runs an initial `index`, then polls repository files and re-indexes
+after debounced changes. It ignores generated/cache directories including
+`.groundgraph/`, `.git/`, `target/`, `node_modules/`, `build/`, `dist/`,
+`.dart_tool/` and `.gradle/`.
+
+Useful flags:
+
+```bash
+groundgraph watch --no-initial-index
+groundgraph watch --interval-ms 1000 --debounce-ms 750
+groundgraph watch --once --no-initial-index
+```
+
 ## Start the MCP server
 
 ```bash
@@ -35,6 +75,7 @@ Desktop, Claude Code, Codex, Continue, or similar agent runtimes:
 {
   "mcpServers": {
     "groundgraph": {
+      "type": "stdio",
       "command": "groundgraph-mcp",
       "args": ["--repo-root", "/path/to/repo"]
     }
