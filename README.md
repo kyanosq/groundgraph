@@ -6,7 +6,7 @@
 
 GroundGraph builds an evidence-linked graph of your codebase — connecting requirements, docs, tests and code — so AI agents (and humans) get *grounded* context instead of guesses. It never touches your source: everything lives under the GroundGraph workspace directory `.groundgraph/`.
 
-[![CI](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/groundgraph/groundgraph/actions/workflows/ci.yml)
+[![CI](https://github.com/kyanosq/groundgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/kyanosq/groundgraph/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.96-orange.svg)](rust-toolchain.toml)
 
@@ -50,7 +50,7 @@ Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexe
 GroundGraph is a Rust workspace. Build from source (a `rust-toolchain.toml` pins the exact toolchain):
 
 ```bash
-git clone https://github.com/groundgraph/groundgraph.git
+git clone https://github.com/kyanosq/groundgraph.git
 cd groundgraph
 
 # Install the CLI (`groundgraph`) and the MCP server (`groundgraph-mcp`).
@@ -93,7 +93,7 @@ during the `0.x` series.
 anyhow = "1"
 
 # Git dependency before the first crates.io release:
-groundgraph-engine = { git = "https://github.com/groundgraph/groundgraph", package = "groundgraph-engine" }
+groundgraph-engine = { git = "https://github.com/kyanosq/groundgraph", package = "groundgraph-engine" }
 
 # After crates.io publication:
 # groundgraph-engine = "0.2"

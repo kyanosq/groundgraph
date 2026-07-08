@@ -15,7 +15,7 @@ edition = "2021"
 # 1.89 for `File::lock` (concurrent stats append, issues2.md #35).
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/groundgraph/groundgraph"
+repository = "https://github.com/kyanosq/groundgraph"
 
 [workspace.lints.rust]
 # GroundGraph is a non-invasive, deterministic indexer. There is no scenario in
