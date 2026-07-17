@@ -20,7 +20,7 @@
 
 use crate::treesitter::{
     body_from_field, name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws,
-    simple_type_name, LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    simple_type_name, CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -196,50 +196,42 @@ fn csharp_resolve_import(
 /// - `new Greeter(…)` → `Reference` to the constructed type.
 fn csharp_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_csharp_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, CSHARP_CALL_KINDS);
     out
 }
 
-fn collect_csharp_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "invocation_expression" => {
-                if let Some(f) = child.child_by_field_name("function") {
-                    let name = match f.kind() {
-                        "identifier" => node_text(f, src).map(str::to_string),
-                        "member_access_expression" => f
-                            .child_by_field_name("name")
-                            .and_then(|n| node_text(n, src))
-                            .map(str::to_string),
-                        _ => None,
-                    };
-                    if let Some(name) = name {
-                        out.push((name, RefKind::Call));
-                    }
-                }
-            }
-            "object_creation_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("type")
-                    .and_then(|t| simple_type_name(t, src))
-                {
-                    out.push((name, RefKind::Reference));
-                }
-            }
-            _ => {}
-        }
-        collect_csharp_calls(child, src, out, depth + 1);
-    }
+/// `invocation_expression` whose `function` field is a bare `identifier` or
+/// a `member_access_expression` (`obj.Method`) → the invoked method name.
+fn csharp_invoke_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    let f = node.child_by_field_name("function")?;
+    let name = match f.kind() {
+        "identifier" => node_text(f, src).map(str::to_string),
+        "member_access_expression" => f
+            .child_by_field_name("name")
+            .and_then(|n| node_text(n, src))
+            .map(str::to_string),
+        _ => None,
+    };
+    name.map(|n| (n, RefKind::Call))
 }
+
+/// `new Greeter(…)` → reference to the constructed type's bare name.
+fn csharp_new_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("type")
+        .and_then(|t| simple_type_name(t, src))
+        .map(|name| (name, RefKind::Reference))
+}
+
+static CSHARP_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "invocation_expression",
+        extract: csharp_invoke_extract,
+    },
+    CallKind {
+        kind: "object_creation_expression",
+        extract: csharp_new_extract,
+    },
+];
 
 pub(crate) static CSHARP_SPEC: LangSpec = LangSpec {
     language_id: "csharp",
@@ -278,6 +270,10 @@ pub(crate) static CSHARP_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    // `partial class Foo` split across files is one logical type: merge the
+    // halves so a method in one file resolves a peer in another
+    // (issues.md #125).
+    partial_class_merge: true,
 };
 
 #[cfg(test)]
@@ -453,7 +449,7 @@ public class Greeter
         let refs: Vec<(String, String, RefKind)> = s
             .references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect();
         assert!(
             refs.contains(&("App.Run".into(), "Greeter".into(), RefKind::Reference)),
@@ -466,6 +462,37 @@ public class Greeter
         assert!(
             refs.contains(&("App.Run".into(), "Helper".into(), RefKind::Call)),
             "bare invocation: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn linq_query_expression_calls_are_captured() {
+        // issues.md #125(1): a LINQ `select helper(x)` call lives inside a
+        // `query_expression` node. `collect_calls` recurses unconditionally,
+        // so the `invocation_expression` inside the select clause is captured
+        // without a dedicated query_expression branch — this pins that
+        // behaviour so a future "only top-level invocations" regression turns
+        // it red.
+        let src = r#"
+public class Q
+{
+    public void Run(int[] xs)
+    {
+        var q = from x in xs where x > 0 select helper(x);
+    }
+    void helper(int z) { }
+}
+"#;
+        let s = scan(src);
+        let from_run: Vec<&str> = s
+            .references
+            .iter()
+            .filter(|r| r.from_qualified.as_ref() == "Q.Run" && r.kind == RefKind::Call)
+            .map(|r| r.to_name.as_str())
+            .collect();
+        assert!(
+            from_run.contains(&"helper"),
+            "LINQ `select helper(x)` must be captured as a call: {from_run:?}"
         );
     }
 

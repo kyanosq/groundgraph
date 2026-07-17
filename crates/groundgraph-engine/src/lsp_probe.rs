@@ -176,7 +176,11 @@ fn broken_stub_marker(stderr: &str) -> Option<&'static str> {
     MARKERS.iter().copied().find(|m| lower.contains(m))
 }
 
-#[cfg(test)]
+// Every case in this module spawns a unix script stub (`true`, shebang
+// wrappers) and relies on `PermissionsExt` to chmod them — none of that
+// compiles or runs on Windows. Gated so `cargo test` builds there (the
+// release pipeline's Windows CI job depends on it).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

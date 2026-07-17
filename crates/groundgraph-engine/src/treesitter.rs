@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use groundgraph_core::artifact_id::{file_id, ArtifactId};
 use groundgraph_core::language_batch::{
@@ -148,7 +150,7 @@ impl RefKind {
 /// every other language's scan output is byte-for-byte unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedRef {
-    pub from_qualified: String,
+    pub from_qualified: Arc<str>,
     pub to_name: String,
     pub kind: RefKind,
 }
@@ -382,12 +384,86 @@ pub struct LangSpec {
     /// look like C++, C++ claims it only when it does — so exactly one parser
     /// owns each header and nothing is double-indexed.
     pub claims_path: Option<PathClaimFn>,
+    /// Merge `partial class` / `partial struct` halves across files
+    /// (issues.md #125). When on, a bare name that resolves neither same-file
+    /// nor via an imported file falls back to a module-wide lookup whose
+    /// target shares the caller's owning-type prefix — the same-named partial
+    /// class half in a companion file. C# turns this on; every other language
+    /// leaves it off so unrelated same-named methods across files never link.
+    pub partial_class_merge: bool,
 }
 
 /// Default [`LangSpec::call_idents_of`]: capture nothing. Languages that
 /// have not built a body identifier extractor stay structural-only.
 pub fn no_call_idents(_body: tree_sitter::Node<'_>, _source: &[u8]) -> Vec<(String, RefKind)> {
     Vec::new()
+}
+
+/// Extract one outbound `(callee_name, ref_kind)` pair from a single call /
+/// constructor / reference site, or `None` to skip it. The node passed in is
+/// the grammar-specific call site itself (`call_expression`,
+/// `method_invocation`, `new_expression`, …), so each language reads whatever
+/// field / child its grammar spells the callee with — see [`CallKind`].
+pub(crate) type CallExtractFn =
+    for<'a, 'b> fn(tree_sitter::Node<'a>, &'b [u8]) -> Option<(String, RefKind)>;
+
+/// One shape of call site a tree-sitter adapter collects from a body: the
+/// tree-sitter node kind, paired with the function that pulls the callee
+/// name (and whether it is a [`RefKind::Call`] or [`RefKind::Reference`])
+/// out of a node of that kind.
+///
+/// A language hands the shared [`collect_calls`] walker a `&[CallKind]`
+/// slice; the recursion, the [`MAX_NESTING_DEPTH`] cap, and the unconditional
+/// "always descend into every child" semantics live in that walker, written
+/// and tested once. Adding a new call shape (a language's `new` form, a
+/// type-position reference, …) is one more slice entry — not a fresh
+/// hand-written recursion per adapter (issues.md #130).
+#[derive(Clone, Copy)]
+pub(crate) struct CallKind {
+    /// The tree-sitter node kind this entry matches (e.g. `"call_expression"`).
+    pub kind: &'static str,
+    /// Pull `(name, ref_kind)` out of a node of [`CallKind::kind`], or `None`.
+    pub extract: CallExtractFn,
+}
+
+/// Generic call / reference collector shared by every tree-sitter adapter's
+/// [`LangSpec::call_idents_of`] hook (issues.md #130).
+///
+/// Walks `node`'s named children; for each child whose kind matches a
+/// registered [`CallKind`] it runs that kind's extractor and pushes the
+/// result, then **always** recurses into the child (`depth + 1`) so calls
+/// nested in arguments / blocks / closures are still found. A hard
+/// [`MAX_NESTING_DEPTH`] cap stops a pathologically deep input from blowing
+/// the stack. Behaviour is byte-for-byte identical to the former per-language
+/// `collect_<lang>_calls` recursions: the only thing that varied across them
+/// was *which* kinds match and *how* the callee name is read — now expressed
+/// as the `call_kinds` slice.
+pub(crate) fn collect_calls(
+    node: tree_sitter::Node<'_>,
+    src: &[u8],
+    out: &mut Vec<(String, RefKind)>,
+    depth: usize,
+    call_kinds: &[CallKind],
+) {
+    if depth > MAX_NESTING_DEPTH {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let kind = child.kind();
+        // A node matches at most one call kind: the kinds in a language's
+        // slice are mutually exclusive grammar categories, so the first hit
+        // is the only hit (mirrors the prior `match child.kind()` arms).
+        for ck in call_kinds {
+            if kind == ck.kind {
+                if let Some((name, ref_kind)) = (ck.extract)(child, src) {
+                    out.push((name, ref_kind));
+                }
+                break;
+            }
+        }
+        collect_calls(child, src, out, depth + 1, call_kinds);
+    }
 }
 
 /// Per-file parse budget. Clean source parses in single-digit milliseconds —
@@ -764,10 +840,14 @@ fn walk(
                     // reachability into the code it exercises. No-op (empty) for
                     // languages that have not opted in via `call_idents_of`.
                     if let Some(body) = (spec.body_of)(child) {
+                        // Share one Arc<str> per callable (#160): every
+                        // body-level call ident used to deep-clone the
+                        // qualified String; an Arc clone is allocation-free.
+                        let from_qualified = Arc::<str>::from(qualified.as_str());
                         for (to_name, ref_kind) in (spec.call_idents_of)(body, source) {
                             if !to_name.is_empty() {
                                 scan.references.push(ScannedRef {
-                                    from_qualified: qualified.clone(),
+                                    from_qualified: Arc::clone(&from_qualified),
                                     to_name,
                                     kind: ref_kind,
                                 });
@@ -881,7 +961,7 @@ fn walk(
         for (to_name, ref_kind) in (spec.call_idents_of)(child, source) {
             if !to_name.is_empty() {
                 scan.references.push(ScannedRef {
-                    from_qualified: parent_qualified.unwrap_or_default().to_string(),
+                    from_qualified: Arc::from(parent_qualified.unwrap_or_default()),
                     to_name,
                     kind: ref_kind,
                 });
@@ -1699,15 +1779,16 @@ pub(crate) fn resolve_heuristic_refs(
     // same-file / imported-file resolution fails *and* the name maps to a
     // single file, so unique types/constructors link across files while
     // ubiquitous method names stay local.
-    let module_index: HashMap<&str, Vec<(&str, &str)>> = if spec.module_scoped_resolution {
-        let mut idx: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-        for (path, name, qualified) in symbols {
-            idx.entry(name).or_default().push((path, qualified));
-        }
-        idx
-    } else {
-        HashMap::new()
-    };
+    let module_index: HashMap<&str, Vec<(&str, &str)>> =
+        if spec.module_scoped_resolution || spec.partial_class_merge {
+            let mut idx: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            for (path, name, qualified) in symbols {
+                idx.entry(name).or_default().push((path, qualified));
+            }
+            idx
+        } else {
+            HashMap::new()
+        };
     // Pre-pass: names whose module-wide fan-in (distinct referencing files)
     // exceeds the cap are infrastructure hubs and excluded from module-wide
     // resolution (see [`MODULE_HUB_FANIN_CAP`]).
@@ -1742,7 +1823,7 @@ pub(crate) fn resolve_heuristic_refs(
         let from_id = if r.from_qualified.is_empty() {
             file_id(file)
         } else {
-            symbol_id(spec, file, &r.from_qualified)
+            symbol_id(spec, file, &r.from_qualified[..])
         };
         // (target_file, target_qualified, edge_kind)
         let mut targets: Vec<(&str, String, EdgeKind)> = Vec::new();
@@ -1789,7 +1870,7 @@ pub(crate) fn resolve_heuristic_refs(
                     // shares the method's name. Pushing the self target here would
                     // wrongly suppress the import-target fallback below and lose
                     // the real cross-package edge.
-                    if *qn == r.from_qualified.as_str() {
+                    if *qn == &r.from_qualified[..] {
                         continue;
                     }
                     targets.push((file.as_str(), (*qn).to_string(), r.kind.edge_kind()));
@@ -1830,6 +1911,24 @@ pub(crate) fn resolve_heuristic_refs(
                         if tf != file.as_str() {
                             for (_, qn) in defs {
                                 targets.push((tf, (*qn).to_string(), r.kind.edge_kind()));
+                            }
+                        }
+                    }
+                }
+            }
+            // C# partial-class merge (issues.md #125): a bare name unresolved
+            // same-file / via `using` falls back to the partial companion — a
+            // same-named class half in another file. Gate on the owning-type
+            // prefix matching the caller's, so unrelated same-named methods in
+            // different classes never link (only a partial peer qualifies).
+            if targets.is_empty() && spec.partial_class_merge {
+                let from_owner = r.from_qualified.split(sep).next().unwrap_or("");
+                if !from_owner.is_empty() {
+                    if let Some(defs) = module_index.get(name) {
+                        for (tf, qn) in defs {
+                            let target_owner = qn.split(sep).next().unwrap_or("");
+                            if target_owner == from_owner && *tf != file.as_str() {
+                                targets.push((*tf, (*qn).to_string(), r.kind.edge_kind()));
                             }
                         }
                     }
@@ -2093,6 +2192,83 @@ fn is_skip_dir(entry: &walkdir::DirEntry, skip_dirs: &[&str]) -> bool {
 #[cfg(test)]
 mod driver_capability_tests {
     use super::*;
+
+    #[test]
+    fn collect_calls_walks_registered_kinds_and_always_descends() {
+        // The generic call walker (issues.md #130) must, for every named
+        // child: run the extractor of the first registered CallKind whose
+        // `kind` matches, push its result, and *always* recurse so a call
+        // nested in another call's arguments is still found. We drive it
+        // against the Rust grammar with a throwaway CallKind so the test
+        // stays independent of any per-adapter migration.
+        fn extract_call(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+            node.child_by_field_name("function")
+                .and_then(|f| node_text(f, src))
+                .map(|n| (n.to_string(), RefKind::Call))
+        }
+        let kinds = &[CallKind {
+            kind: "call_expression",
+            extract: extract_call,
+        }];
+        let src = "fn body() { foo(bar()); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let body = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("body")
+            .unwrap();
+        let mut out = Vec::new();
+        collect_calls(body, src.as_bytes(), &mut out, 0, kinds);
+        let names: Vec<String> = out.iter().map(|(n, _)| n.clone()).collect();
+        // `bar()` nests inside `foo()`'s argument list — finding both proves
+        // the walker descends unconditionally rather than stopping at the
+        // outer call.
+        assert!(
+            names.contains(&"foo".to_string()) && names.contains(&"bar".to_string()),
+            "expected foo + bar (always-descend), got {names:?}"
+        );
+        // Past the nesting cap the walker must be a no-op: the first thing it
+        // does is bail when `depth > MAX_NESTING_DEPTH`.
+        let mut capped = Vec::new();
+        collect_calls(
+            body,
+            src.as_bytes(),
+            &mut capped,
+            MAX_NESTING_DEPTH + 1,
+            kinds,
+        );
+        assert!(
+            capped.is_empty(),
+            "depth > MAX_NESTING_DEPTH must stop the walk immediately"
+        );
+    }
+
+    #[test]
+    fn collect_calls_with_empty_kinds_is_a_clean_noop() {
+        // A brand-new language wires no call kinds yet: the walker still runs
+        // (and recurses), but with no extractor to fire it collects nothing —
+        // the safe default that keeps an unwired language silent.
+        let src = "fn body() { foo(bar()); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let body = tree
+            .root_node()
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("body")
+            .unwrap();
+        let mut out = Vec::new();
+        collect_calls(body, src.as_bytes(), &mut out, 0, &[]);
+        assert!(out.is_empty(), "no registered kinds ⇒ no captures");
+    }
 
     #[test]
     fn oversized_source_files_are_skipped() {
@@ -2920,7 +3096,7 @@ describe('outer', () => {
         vec![(
             "ui/builder.swift".to_string(),
             ScannedRef {
-                from_qualified: from.to_string(),
+                from_qualified: Arc::from(from),
                 to_name: to.to_string(),
                 kind: RefKind::Call,
             },
@@ -3005,7 +3181,7 @@ describe('outer', () => {
         let pending = vec![(
             "c/StyleInfoController.java".to_string(),
             ScannedRef {
-                from_qualified: "StyleInfoController.selectMeasuresInfo".to_string(),
+                from_qualified: Arc::from("StyleInfoController.selectMeasuresInfo"),
                 to_name: "selectMeasuresInfo".to_string(),
                 kind: RefKind::Call,
             },
@@ -3063,7 +3239,7 @@ describe('outer', () => {
             pending.push((
                 f,
                 ScannedRef {
-                    from_qualified: name.to_string(),
+                    from_qualified: Arc::from(name),
                     to_name: "Theme".to_string(),
                     kind: RefKind::Call,
                 },
@@ -3095,7 +3271,7 @@ describe('outer', () => {
             &[(
                 "ui/builder.rs".to_string(),
                 ScannedRef {
-                    from_qualified: "Builder::build".to_string(),
+                    from_qualified: Arc::from("Builder::build"),
                     to_name: "OrderViewModel".to_string(),
                     kind: RefKind::Call,
                 },

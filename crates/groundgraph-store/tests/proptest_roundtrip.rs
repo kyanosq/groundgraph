@@ -33,14 +33,21 @@ proptest! {
         kind in proptest::sample::select(NodeKind::ALL.to_vec()),
         path in proptest::option::of(SAFE_TEXT),
         name in proptest::option::of(SAFE_TEXT),
-        start_line in proptest::option::of(any::<u32>()),
-        end_line in proptest::option::of(any::<u32>()),
+        // Valid line ranges only: `Node::validate` (#168) rejects an inverted
+        // `start > end` at the store boundary, so swap any inverted pair the
+        // arbitrary u32s produce rather than generating illegal nodes.
+        (start_line, end_line) in (
+            proptest::option::of(any::<u32>()),
+            proptest::option::of(any::<u32>()),
+        )
+            .prop_map(|(s, e)| match (s, e) {
+                (Some(a), Some(b)) if a > b => (Some(b), Some(a)),
+                other => other,
+            }),
         content_hash in proptest::option::of(SAFE_TEXT),
         stable_key in proptest::option::of(SAFE_TEXT),
         source_file in proptest::option::of(SAFE_TEXT),
-        source_hash in proptest::option::of(SAFE_TEXT),
         indexer in proptest::option::of(SAFE_TEXT),
-        index_generation in proptest::option::of(any::<i64>()),
         metadata_json in proptest::option::of(SAFE_TEXT),
     ) {
         let (_tmp, mut store) = open_store();
@@ -54,9 +61,7 @@ proptest! {
             content_hash,
             stable_key,
             source_file,
-            source_hash,
             indexer,
-            index_generation,
             metadata_json,
         };
         store.upsert_node(&node).unwrap();
@@ -74,12 +79,13 @@ proptest! {
     fn arbitrary_edge_round_trips_and_upsert_is_idempotent(
         from in SAFE_ID,
         to in SAFE_ID,
-        confidence in 0.0f32..=1.0f32,
+        // Arbitrary f32 — including NaN/±∞/out-of-range: `Confidence::new`
+        // sanitises at construction, and the row must round-trip equal to the
+        // sanitised value (#168).
+        confidence in any::<f32>(),
         evidence_json in proptest::option::of(SAFE_TEXT),
         source_file in proptest::option::of(SAFE_TEXT),
-        source_hash in proptest::option::of(SAFE_TEXT),
         indexer in proptest::option::of(SAFE_TEXT),
-        index_generation in proptest::option::of(any::<i64>()),
         metadata_json in proptest::option::of(SAFE_TEXT),
     ) {
         let (_tmp, mut store) = open_store();
@@ -89,12 +95,10 @@ proptest! {
             EdgeKind::Calls,
             EdgeSource::ExternalManifest,
         );
-        edge.confidence = confidence;
+        edge.confidence = groundgraph_core::Confidence::new(confidence);
         edge.evidence_json = evidence_json;
         edge.source_file = source_file;
-        edge.source_hash = source_hash;
         edge.indexer = indexer;
-        edge.index_generation = index_generation;
         edge.metadata_json = metadata_json;
 
         store.upsert_edge(&edge).unwrap();

@@ -63,6 +63,11 @@ pub enum StoreError {
     #[error("disk is full while writing the database: {0}")]
     DiskFull(#[source] rusqlite::Error),
 
+    /// A caller handed the store a node that violates its invariants
+    /// (`start_line > end_line`, #168). Rejected before any write.
+    #[error("invalid node: {0}")]
+    InvalidNode(#[source] groundgraph_core::LineRangeError),
+
     // Catch-all. `{0}` inlines the rusqlite detail on purpose: decode failures
     // wrap a *meaningful* message (e.g. "unknown edge kind X") in a rusqlite
     // error, and bare `{}` formatting must surface it (see repositories

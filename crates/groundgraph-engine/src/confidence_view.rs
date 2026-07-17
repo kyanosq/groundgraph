@@ -483,9 +483,7 @@ mod tests {
             end_line: Some(2),
             content_hash: None,
             source_file: Some("lib/foo.dart".into()),
-            source_hash: None,
             indexer: Some("test".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_node(&node).unwrap();

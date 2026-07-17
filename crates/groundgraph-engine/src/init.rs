@@ -9,6 +9,7 @@ use crate::config::{
     config_path_for_repo, resolve_links_path, resolve_storage_path, EngineConfig,
     LanguageSelection, CONFIG_SCHEMA_VERSION, DEFAULT_STORAGE_DIR,
 };
+use crate::error::EngineResult;
 use crate::requirements_md_indexer::DEFAULT_REQUIREMENTS_DIR;
 
 #[derive(Debug, Clone)]
@@ -75,7 +76,7 @@ const SAMPLE_REQUIREMENT_MD: &str = "# GroundGraph 需求映射（Markdown）\n\
 ///   file is created if it is missing.
 /// - Ensure the external links manifest exists. This is the only place where
 ///   users declare requirement-to-code/test relationships.
-pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
+pub fn init_repository(options: InitOptions) -> EngineResult<InitOutcome> {
     let repo_root = options.repo_root;
     let config_path = config_path_for_repo(&repo_root);
     let config_already_existed = config_path.exists();
@@ -84,13 +85,13 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
         load_existing_config(&config_path)?
     } else {
         let cfg = default_config_for(&repo_root);
-        let yaml = serde_yml::to_string(&cfg).context("serialising default config to YAML")?;
+        let yaml = serde_norway::to_string(&cfg).context("serialising default config to YAML")?;
         std::fs::write(&config_path, yaml)
             .with_context(|| format!("writing default config to {}", config_path.display()))?;
         cfg
     };
 
-    let storage_dir = resolve_storage_path(&repo_root, &config)
+    let storage_dir = resolve_storage_path(&repo_root, &config)?
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo_root.join(DEFAULT_STORAGE_DIR));
@@ -123,14 +124,11 @@ pub fn init_repository(options: InitOptions) -> Result<InitOutcome> {
             .with_context(|| format!("writing requirements README {}", sample.display()))?;
     }
 
-    let graph_db_path = resolve_storage_path(&repo_root, &config);
+    let graph_db_path = resolve_storage_path(&repo_root, &config)?;
     let graph_db_already_existed = graph_db_path.exists();
 
-    let mut store = groundgraph_store::Store::open(&graph_db_path)
-        .with_context(|| format!("opening SQLite database at {}", graph_db_path.display()))?;
-    store
-        .migrate()
-        .with_context(|| format!("running migrations on {}", graph_db_path.display()))?;
+    let mut store = groundgraph_store::Store::open(&graph_db_path)?;
+    store.migrate()?;
     drop(store);
 
     Ok(InitOutcome {
@@ -432,7 +430,7 @@ pub(crate) fn detect_language_selections(repo_root: &Path) -> Vec<LanguageSelect
 fn load_existing_config(path: &Path) -> Result<EngineConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading existing config {}", path.display()))?;
-    let config = serde_yml::from_str::<EngineConfig>(&contents)
+    let config = serde_norway::from_str::<EngineConfig>(&contents)
         .with_context(|| format!("parsing existing config {}", path.display()))?;
     Ok(config)
 }

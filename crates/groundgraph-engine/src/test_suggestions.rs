@@ -15,13 +15,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use groundgraph_core::language_traits::{is_callable, is_type};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
 use crate::constants::{scan_literals, LiteralKind};
+use crate::error::EngineResult;
 use crate::source_text::read_node_source;
 use crate::symbol_facts::{build_fact, Purity, SymbolFact};
 
@@ -132,18 +132,19 @@ impl Default for TestSuggestionsOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_test_suggestions(options: TestSuggestionsOptions) -> Result<TestSuggestionsReport> {
+pub fn analyze_test_suggestions(
+    options: TestSuggestionsOptions,
+) -> EngineResult<TestSuggestionsReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     analyze_test_suggestions_with_store(&store, &options)
 }
 
 pub fn analyze_test_suggestions_with_store(
     store: &Store,
     options: &TestSuggestionsOptions,
-) -> Result<TestSuggestionsReport> {
+) -> EngineResult<TestSuggestionsReport> {
     let mut items: Vec<SymbolSuggestions> = Vec::new();
     let mut stats = TestSuggestionsStats::default();
 
@@ -326,12 +327,8 @@ fn derive_suggestions(f: &SymbolFact, boundaries: &[String]) -> Vec<Suggestion> 
 // Workspace helpers
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

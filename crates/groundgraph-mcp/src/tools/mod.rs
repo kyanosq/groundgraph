@@ -117,7 +117,10 @@ pub(crate) fn resolve_repo_root(server: &Server, args: &Value) -> Result<PathBuf
 
 pub(crate) fn open_store(repo_root: &Path) -> Result<Store> {
     let config = load_engine_config(repo_root)?;
-    let db_path = resolve_db_path(repo_root, &config)?;
+    // Storage-path resolution — including the #242 `..` confinement — lives
+    // in the single shared engine resolver (#145/#263); there is no separate
+    // MCP-side copy to drift.
+    let db_path = resolve_storage_path(repo_root, &config)?;
     Store::open(&db_path)
         .with_context(|| format!("opening SQLite database at {}", db_path.display()))
 }
@@ -129,32 +132,6 @@ pub(crate) fn load_engine_config(repo_root: &Path) -> Result<EngineConfig> {
             repo_root.display()
         )
     })
-}
-
-pub(crate) fn resolve_db_path(repo_root: &Path, config: &EngineConfig) -> Result<PathBuf> {
-    let raw = config.storage.path.clone();
-    if raw.is_empty() {
-        return Ok(resolve_storage_path(repo_root, &EngineConfig::default()));
-    }
-    let candidate = PathBuf::from(&raw);
-    // Absolute is an explicit operator override (parity with engine
-    // `resolve_storage_path` and #108 repo_root).
-    if candidate.is_absolute() {
-        return Ok(candidate);
-    }
-    // Confine a *relative* `storage.path`: a `..` escape would let a poisoned
-    // `.groundgraph.yaml` make the MCP server read/write a SQLite db outside the
-    // analysed repo (#242, mirrors #199 for `links.path` / #108 for repo_root).
-    if candidate
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        bail!(
-            "config `storage.path` ({raw}) must not contain `..`; use an absolute path \
-             to place the database outside the workspace"
-        );
-    }
-    Ok(resolve_storage_path(repo_root, config))
 }
 
 pub(crate) fn parse_node_kinds(values: &Value) -> Result<Vec<NodeKind>> {
@@ -311,38 +288,41 @@ mod tests {
     }
 
     #[test]
-    fn resolve_db_path_confines_relative_storage_path() {
+    fn open_store_rejects_a_storage_path_escaping_the_repo() {
         // #242: a poisoned `.groundgraph.yaml` must not relocate the SQLite db
         // outside the analysed repo via a `..`-escaping relative `storage.path`.
-        let repo = Path::new("/work/repo");
-        let mut cfg = EngineConfig::default();
+        // The guard now lives in the shared engine resolver (#145/#263); this
+        // pins it through the MCP entry point.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join(".groundgraph.yaml"),
+            "storage:\n  path: ../../evil.db\n",
+        )
+        .unwrap();
+        let err = open_store(repo)
+            .err()
+            .expect("a `..` storage.path must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("storage.path"), "{msg}");
+        assert!(msg.contains(".."), "{msg}");
+    }
 
-        // Default (empty) → repo-local db.
-        cfg.storage.path = String::new();
-        assert_eq!(
-            resolve_db_path(repo, &cfg).unwrap(),
-            repo.join(".groundgraph/graph.db")
-        );
-
-        // Plain relative → joined under the repo.
-        cfg.storage.path = ".groundgraph/graph.db".into();
-        assert_eq!(
-            resolve_db_path(repo, &cfg).unwrap(),
-            repo.join(".groundgraph/graph.db")
-        );
-
-        // `..` escape → refused (mirrors #108 for repo_root, #199 for links).
-        cfg.storage.path = "../../etc/evil.db".into();
-        assert!(resolve_db_path(repo, &cfg).is_err());
-        cfg.storage.path = ".groundgraph/../../escape.db".into();
-        assert!(resolve_db_path(repo, &cfg).is_err());
-
+    #[test]
+    fn open_store_honours_an_absolute_storage_path() {
         // Absolute remains allowed — an explicit operator override, consistent
-        // with engine `resolve_storage_path` (tested) and #108 repo_root.
-        cfg.storage.path = "/var/lib/groundgraph/graph.db".into();
-        assert_eq!(
-            resolve_db_path(repo, &cfg).unwrap(),
-            PathBuf::from("/var/lib/groundgraph/graph.db")
-        );
+        // with the engine resolver and #108 repo_root.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let db = tmp.path().join("elsewhere/graph.db");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(
+            repo.join(".groundgraph.yaml"),
+            format!("storage:\n  path: {}\n", db.display()),
+        )
+        .unwrap();
+        open_store(&repo).unwrap();
+        assert!(db.exists());
     }
 }

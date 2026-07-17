@@ -28,6 +28,7 @@ use groundgraph_core::Node;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineResult;
 use crate::path_class::{is_generated_path, is_test_path};
 
 pub const PORT_COVERAGE_SCHEMA_VERSION: u32 = 1;
@@ -208,10 +209,10 @@ pub struct PortMapFile {
 }
 
 /// Load and parse a YAML port-map file.
-pub fn load_port_map(path: &std::path::Path) -> Result<PortMapFile> {
+pub fn load_port_map(path: &std::path::Path) -> EngineResult<PortMapFile> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading port-map {}", path.display()))?;
-    let parsed: PortMapFile = serde_yml::from_str(&text)
+    let parsed: PortMapFile = serde_norway::from_str(&text)
         .with_context(|| format!("parsing port-map {}", path.display()))?;
     Ok(parsed)
 }
@@ -220,11 +221,9 @@ pub fn load_port_map(path: &std::path::Path) -> Result<PortMapFile> {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_port_coverage(options: PortCoverageOptions) -> Result<PortCoverageReport> {
-    let source = Store::open(&options.source_db)
-        .with_context(|| format!("opening source graph at {}", options.source_db.display()))?;
-    let target = Store::open(&options.target_db)
-        .with_context(|| format!("opening target graph at {}", options.target_db.display()))?;
+pub fn analyze_port_coverage(options: PortCoverageOptions) -> EngineResult<PortCoverageReport> {
+    let source = Store::open(&options.source_db)?;
+    let target = Store::open(&options.target_db)?;
     analyze_port_coverage_with_stores(&source, &target, &options)
 }
 
@@ -232,7 +231,7 @@ pub fn analyze_port_coverage_with_stores(
     source: &Store,
     target: &Store,
     options: &PortCoverageOptions,
-) -> Result<PortCoverageReport> {
+) -> EngineResult<PortCoverageReport> {
     let user_globs =
         build_globset(&options.exclude).context("compiling port-coverage exclude globs")?;
     let source_include_globs = build_globset(&options.source_include)

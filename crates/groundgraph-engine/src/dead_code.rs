@@ -31,7 +31,7 @@
 //!      ignore.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -39,7 +39,8 @@ use groundgraph_core::{EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DeadCodeConfig, EngineConfig};
+use crate::config::{resolve_storage_path, DeadCodeConfig, EngineConfig};
+use crate::error::EngineResult;
 
 pub const DEAD_CODE_SCHEMA_VERSION: u32 = 1;
 
@@ -129,28 +130,23 @@ pub struct DeadCodeCandidate {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn analyze_dead_code(opts: DeadCodeOptions) -> Result<DeadCodeReport> {
+pub fn analyze_dead_code(opts: DeadCodeOptions) -> EngineResult<DeadCodeReport> {
     let config = load_workspace_config(&opts.repo_root)?;
-    let db_path = resolve_storage_path(&opts.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&opts.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     let dead_cfg = config.dead_code.clone();
     analyze_dead_code_with_store(&store, opts, &dead_cfg)
 }
 
-fn load_workspace_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_workspace_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 pub fn analyze_dead_code_with_store(
     store: &Store,
     opts: DeadCodeOptions,
     config: &DeadCodeConfig,
-) -> Result<DeadCodeReport> {
+) -> EngineResult<DeadCodeReport> {
     let ignore_set = build_globset(&config.ignore).context("compiling dead_code.ignore globs")?;
     let public_set = build_globset(&config.public_api_roots)
         .context("compiling dead_code.public_api_roots globs")?;
@@ -1233,7 +1229,8 @@ pub fn group_by_confidence(
 mod tests {
     use super::*;
     use groundgraph_core::{
-        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus, Node, NodeKind,
+        ArtifactId, Confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+        Node, NodeKind,
     };
     use groundgraph_store::Store;
     use tempfile::TempDir;
@@ -1258,9 +1255,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1280,9 +1275,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1299,12 +1292,10 @@ mod tests {
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1330,9 +1321,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("rust_treesitter".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1357,9 +1346,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("swift_treesitter".into()),
-                index_generation: None,
                 metadata_json: metadata_json.map(String::from),
             })
             .unwrap();
@@ -1375,12 +1362,10 @@ mod tests {
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some("rust_treesitter".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1895,9 +1880,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some("lib/widget.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -1946,9 +1929,7 @@ mod tests {
                 content_hash: None,
                 stable_key: Some("_LabColor._LabColor".into()),
                 source_file: Some("lib/color.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2003,9 +1984,7 @@ mod tests {
                 content_hash: None,
                 stable_key: Some("_Delegate".into()),
                 source_file: Some("lib/l10n.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2021,9 +2000,7 @@ mod tests {
                 content_hash: None,
                 stable_key: Some("_Delegate.<default>".into()),
                 source_file: Some("lib/l10n.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2185,9 +2162,7 @@ mod tests {
                 content_hash: None,
                 stable_key: Some("_LabColor._distance".into()),
                 source_file: Some("lib/color.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2279,9 +2254,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some("test/foo_test.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2294,12 +2267,10 @@ mod tests {
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2358,9 +2329,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some("test/foo_test.dart".into()),
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2468,9 +2437,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("swift_lsp".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2490,9 +2457,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("swift_lsp".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2509,12 +2474,10 @@ mod tests {
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some(indexer.into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2584,9 +2547,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("python_ast".into()),
-                index_generation: None,
                 metadata_json: metadata_json.map(str::to_string),
             })
             .unwrap();
@@ -2674,12 +2635,10 @@ mod tests {
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some(indexer.into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2744,12 +2703,10 @@ mod tests {
             source: EdgeSource::GitDiff,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some("git_diff".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_edge(&e_ab).unwrap();

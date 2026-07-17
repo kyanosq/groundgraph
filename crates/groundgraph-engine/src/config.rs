@@ -11,8 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{EngineError, EngineResult};
 
 pub const DEFAULT_CONFIG_FILE_NAME: &str = ".groundgraph.yaml";
 pub const DEFAULT_STORAGE_DIR: &str = ".groundgraph";
@@ -430,41 +431,56 @@ pub fn has_config_file(repo_root: &Path) -> bool {
     repo_root.join(DEFAULT_CONFIG_FILE_NAME).is_file()
 }
 
-pub fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+pub fn load_config(repo_root: &Path) -> EngineResult<EngineConfig> {
     let path = config_path_for_repo(repo_root);
     if !path.exists() {
-        anyhow::bail!(
-            "no GroundGraph workspace at {}: run `groundgraph init` first",
-            repo_root.display()
-        );
+        // A missing workspace file is a *user* error (run `init`), not an
+        // internal/store failure — surface it as such so callers can hint the
+        // fix instead of reporting a generic failure (#166).
+        return Err(EngineError::NoWorkspace {
+            repo_root: repo_root.to_path_buf(),
+        });
     }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-    let cfg: EngineConfig = serde_yml::from_str(&contents)
-        .with_context(|| format!("parsing config {}", path.display()))?;
+    let contents = std::fs::read_to_string(&path).map_err(|source| EngineError::Io {
+        context: "reading config",
+        path: path.clone(),
+        source,
+    })?;
+    let cfg: EngineConfig = serde_norway::from_str(&contents).map_err(|e| EngineError::Config {
+        message: format!("parsing config {}: {e}", path.display()),
+        path: Some(path),
+    })?;
     if let Some(notice) = cfg.schema_version_notice() {
-        eprintln!("groundgraph: {notice}");
+        tracing::warn!("{notice}");
     }
     Ok(cfg.normalized())
 }
 
-pub fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
+/// Resolve `storage.path` against the repo root — the single storage-path
+/// resolution point for CLI and MCP alike (#145/#242/#263).
+///
+/// Empty / whitespace-only falls back to `.groundgraph/graph.db`. Everything
+/// else delegates to the shared confinement policy
+/// ([`groundgraph_core::confine_under_root`]): absolute paths are honoured
+/// verbatim (explicit operator override), relative paths join under the repo
+/// root, and a `..` escape from a poisoned `.groundgraph.yaml` is refused
+/// (surfaced as a `Config` error — the file is malformed, not absent).
+pub fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> EngineResult<PathBuf> {
     let default_path = format!("{DEFAULT_STORAGE_DIR}/{DEFAULT_DB_FILENAME}");
     let raw = if config.storage.path.trim().is_empty() {
-        Path::new(&default_path)
+        default_path.as_str()
     } else {
-        Path::new(&config.storage.path)
+        config.storage.path.as_str()
     };
-    if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        repo_root.join(raw)
-    }
+    groundgraph_core::confine_under_root(repo_root, raw).map_err(|e| EngineError::Config {
+        message: format!("resolving config `storage.path` ({raw}): {e}"),
+        path: None,
+    })
 }
 
-pub fn storage_path_for_repo(repo_root: &Path) -> Result<PathBuf> {
+pub fn storage_path_for_repo(repo_root: &Path) -> EngineResult<PathBuf> {
     let config = load_config(repo_root)?;
-    Ok(resolve_storage_path(repo_root, &config))
+    resolve_storage_path(repo_root, &config)
 }
 
 pub fn resolve_links_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
@@ -478,8 +494,11 @@ pub fn resolve_links_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 
 pub fn workspace_dir_for_repo(repo_root: &Path) -> PathBuf {
     if let Ok(config) = load_config(repo_root) {
-        if let Some(parent) = resolve_storage_path(repo_root, &config).parent() {
-            return parent.to_path_buf();
+        if let Some(parent) = resolve_storage_path(repo_root, &config)
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            return parent;
         }
     }
     repo_root.join(DEFAULT_STORAGE_DIR)
@@ -786,6 +805,68 @@ impl LanguageAdapterConfig {
             fallback.iter().map(|s| (*s).to_string()).collect()
         } else {
             self.paths.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_storage(path: &str) -> EngineConfig {
+        EngineConfig {
+            storage: StorageConfig { path: path.into() },
+            ..EngineConfig::default()
+        }
+    }
+
+    /// The storage-path contract every CLI/MCP entry point shares
+    /// (#145/#242/#263). The generic confinement policy itself is pinned by
+    /// table-driven tests in `groundgraph_core::paths`; these cases pin the
+    /// storage-specific wrapper (empty fallback + error context).
+    #[test]
+    fn resolve_storage_path_contract() {
+        let root = Path::new("/work/repo");
+        let ok_cases: &[(&str, &str)] = &[
+            // Empty and whitespace-only fall back to the default db location.
+            ("", "/work/repo/.groundgraph/graph.db"),
+            ("   ", "/work/repo/.groundgraph/graph.db"),
+            // Plain relative paths join under the repo root.
+            ("graph.db", "/work/repo/graph.db"),
+            (".groundgraph/graph.db", "/work/repo/.groundgraph/graph.db"),
+            ("./graph.db", "/work/repo/graph.db"),
+            // Absolute paths are honoured verbatim (operator override).
+            (
+                "/var/lib/groundgraph/graph.db",
+                "/var/lib/groundgraph/graph.db",
+            ),
+            ("/tmp/abs/graph.db", "/tmp/abs/graph.db"),
+        ];
+        for (configured, expected) in ok_cases {
+            assert_eq!(
+                resolve_storage_path(root, &cfg_with_storage(configured)).unwrap(),
+                PathBuf::from(expected),
+                "storage.path={configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_storage_path_rejects_parent_dir_escape() {
+        let root = Path::new("/work/repo");
+        // #242: a poisoned `.groundgraph.yaml` must not relocate the SQLite
+        // db outside the analysed repo — on the engine side too, not only
+        // behind the MCP boundary.
+        for configured in [
+            "../evil.db",
+            "../../etc/evil.db",
+            ".groundgraph/../../escape.db",
+        ] {
+            let err = resolve_storage_path(root, &cfg_with_storage(configured))
+                .expect_err("a `..` escape must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("storage.path"), "{msg}");
+            assert!(msg.contains(".."), "{msg}");
         }
     }
 }

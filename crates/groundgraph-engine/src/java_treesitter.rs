@@ -24,7 +24,7 @@
 
 use crate::treesitter::{
     body_from_field, name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws,
-    simple_type_name, LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    simple_type_name, CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -192,43 +192,34 @@ fn java_resolve_import(
 /// the noise floor bounded.
 fn java_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_java_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, JAVA_CALL_KINDS);
     out
 }
 
-fn collect_java_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "method_invocation" => {
-                if let Some(name) = child
-                    .child_by_field_name("name")
-                    .and_then(|n| node_text(n, src))
-                {
-                    out.push((name.to_string(), RefKind::Call));
-                }
-            }
-            "object_creation_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("type")
-                    .and_then(|t| simple_type_name(t, src))
-                {
-                    out.push((name, RefKind::Reference));
-                }
-            }
-            _ => {}
-        }
-        collect_java_calls(child, src, out, depth + 1);
-    }
+/// `method_invocation` whose `name` field is the invoked method.
+fn java_method_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("name")
+        .and_then(|n| node_text(n, src))
+        .map(|name| (name.to_string(), RefKind::Call))
 }
+
+/// `new Greeter(…)` → reference to the constructed type's bare name.
+fn java_new_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("type")
+        .and_then(|t| simple_type_name(t, src))
+        .map(|name| (name, RefKind::Reference))
+}
+
+static JAVA_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "method_invocation",
+        extract: java_method_extract,
+    },
+    CallKind {
+        kind: "object_creation_expression",
+        extract: java_new_extract,
+    },
+];
 
 pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     language_id: "java",
@@ -268,6 +259,7 @@ pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -288,7 +280,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

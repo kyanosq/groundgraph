@@ -19,12 +19,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use groundgraph_core::language_traits::{is_callable, is_type, lex_syntax, Language};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::source_text::read_node_source;
 
 pub const CONSTANTS_SCHEMA_VERSION: u32 = 1;
@@ -122,18 +122,17 @@ impl Default for ConstantsOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_constants(options: ConstantsOptions) -> Result<ConstantsReport> {
+pub fn analyze_constants(options: ConstantsOptions) -> EngineResult<ConstantsReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     analyze_constants_with_store(&store, &options)
 }
 
 pub fn analyze_constants_with_store(
     store: &Store,
     options: &ConstantsOptions,
-) -> Result<ConstantsReport> {
+) -> EngineResult<ConstantsReport> {
     // group key: (kind, value) -> ConstantEntry-in-progress
     let mut grouped: BTreeMap<(LiteralKind, String), ConstantEntry> = BTreeMap::new();
     let mut stats = ConstantsStats::default();
@@ -537,12 +536,8 @@ fn is_trivial(kind: LiteralKind, value: &str) -> bool {
 // Workspace helpers
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

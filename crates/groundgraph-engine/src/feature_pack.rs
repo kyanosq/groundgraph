@@ -23,11 +23,12 @@ use groundgraph_core::EdgeKind;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
 use crate::constants::{analyze_constants_with_store, ConstantEntry, ConstantsOptions};
 use crate::data_contract::{
     analyze_data_contract_with_store, DataContractOptions, JsonKey, TableSchema,
 };
+use crate::error::EngineResult;
 use crate::slice::slice_from_store;
 use crate::source_text::read_node_source;
 use crate::symbol_facts::{build_fact, SymbolFact};
@@ -104,18 +105,17 @@ const WIDE_CAP: usize = 100_000;
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn build_feature_pack(options: FeaturePackOptions) -> Result<FeaturePack> {
+pub fn build_feature_pack(options: FeaturePackOptions) -> EngineResult<FeaturePack> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     build_feature_pack_with_store(&store, &options)
 }
 
 pub fn build_feature_pack_with_store(
     store: &Store,
     options: &FeaturePackOptions,
-) -> Result<FeaturePack> {
+) -> EngineResult<FeaturePack> {
     let (focus, scope_files) = resolve_scope(store, &options.selector)?;
 
     // In-scope symbols + their facts.
@@ -378,12 +378,8 @@ fn scoped_suggestions(
 // Workspace helpers
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

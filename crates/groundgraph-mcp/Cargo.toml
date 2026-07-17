@@ -16,13 +16,17 @@ name = "groundgraph_mcp"
 path = "src/lib.rs"
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core", version = "0.2.0" }
-groundgraph-store = { path = "../groundgraph-store", version = "0.2.0" }
-groundgraph-engine = { path = "../groundgraph-engine", version = "0.2.0" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.3.0" }
+groundgraph-store = { path = "../groundgraph-store", version = "0.3.0" }
+groundgraph-engine = { path = "../groundgraph-engine", version = "0.3.0" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
+# issues.md #230 — mcp server diagnostics route through tracing (stderr).
+# The server installs its own subscriber; stdout is reserved for JSON-RPC.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

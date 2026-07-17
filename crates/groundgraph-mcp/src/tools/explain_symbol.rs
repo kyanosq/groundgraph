@@ -2,10 +2,11 @@
 //! candidates that reference one symbol id. Designed so an agent can
 //! answer "what is this symbol?" in one tool call.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
 use groundgraph_core::ArtifactId;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::protocol::ToolDescriptor;
@@ -20,6 +21,22 @@ use super::{object_schema, open_store, resolve_repo_root};
 /// flag `truncated` so the agent drills down with `get_subgraph` — the same
 /// defence `get_subgraph` got in issues.md #9, here for `explain_symbol` (#87).
 const MAX_EXPLAIN_EDGES: usize = 500;
+
+/// One row of the upstream/downstream edge listing — a typed mirror of the
+/// `json!({...})` value `explain_symbol` used to build per edge (issues.md
+/// #162). Field order is alphabetical to match the prior `serde_json::Map`
+/// output (built without `preserve_order` ⇒ BTreeMap key order), so the
+/// serialised shape — and thus the MCP contract — is byte-identical.
+#[derive(Serialize, Clone)]
+struct ExplainEdgeRow {
+    edge_id: String,
+    edge_kind: &'static str,
+    neighbor_id: String,
+    neighbor_kind: Option<&'static str>,
+    neighbor_label: String,
+    neighbor_path: Option<String>,
+    source_file: Option<String>,
+}
 
 pub fn descriptor() -> ToolDescriptor {
     ToolDescriptor {
@@ -61,10 +78,20 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
         .with_context(|| format!("loading node `{symbol_id}`"))?
         .ok_or_else(|| anyhow!("node `{symbol_id}` not found in graph store"))?;
 
-    let mut upstream: Vec<Value> = Vec::new();
-    let mut downstream: Vec<Value> = Vec::new();
+    let mut upstream: Vec<ExplainEdgeRow> = Vec::new();
+    let mut downstream: Vec<ExplainEdgeRow> = Vec::new();
     let mut tests: Vec<Value> = Vec::new();
     let mut neighbour_ids: HashSet<String> = HashSet::new();
+    // Bucket edges by kind while iterating (#162): previously every edge was
+    // built as a `serde_json::Value` (a `Map<String, Value>` + its strings),
+    // pushed into `upstream`/`downstream`, then a second pass `.clone()`-d
+    // each `Value` into the grouped map. A typed `ExplainEdgeRow` serialised
+    // straight to the MCP shape, plus a single iteration that fills both the
+    // flat list and the buckets, drops the per-edge `Map` allocation and the
+    // clone loop. `BTreeMap` keeps the prior alphabetised key order (serde_json
+    // is built without `preserve_order`).
+    let mut grouped_up: BTreeMap<&'static str, Vec<ExplainEdgeRow>> = BTreeMap::new();
+    let mut grouped_down: BTreeMap<&'static str, Vec<ExplainEdgeRow>> = BTreeMap::new();
 
     let from_edges = store.list_edges_from(&aid)?;
     let to_edges = store.list_edges_to(&aid)?;
@@ -95,57 +122,45 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
                 }
             }
         }
-        upstream.push(json!({
-            "edge_id": edge.id.to_string(),
-            "edge_kind": edge.kind.as_str(),
-            "neighbor_id": edge.from_id.to_string(),
-            "neighbor_kind": neighbor.as_ref().map(|n| n.kind.as_str()),
-            "neighbor_label": neighbor.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| edge.from_id.to_string()),
-            "neighbor_path": neighbor.as_ref().and_then(|n| n.path.clone()),
-            "source_file": edge.source_file.clone(),
-        }));
+        let row = ExplainEdgeRow {
+            edge_id: edge.id.to_string(),
+            edge_kind: edge.kind.as_str(),
+            neighbor_id: edge.from_id.to_string(),
+            neighbor_kind: neighbor.as_ref().map(|n| n.kind.as_str()),
+            neighbor_label: neighbor
+                .as_ref()
+                .and_then(|n| n.name.clone())
+                .unwrap_or_else(|| edge.from_id.to_string()),
+            neighbor_path: neighbor.as_ref().and_then(|n| n.path.clone()),
+            source_file: edge.source_file.clone(),
+        };
+        grouped_up
+            .entry(edge.kind.as_str())
+            .or_default()
+            .push(row.clone());
+        upstream.push(row);
     }
     let down_budget = MAX_EXPLAIN_EDGES.saturating_sub(up_taken);
     for edge in from_edges.iter().take(down_budget) {
         neighbour_ids.insert(edge.to_id.to_string());
         let neighbor = store.find_node(&edge.to_id)?;
-        downstream.push(json!({
-            "edge_id": edge.id.to_string(),
-            "edge_kind": edge.kind.as_str(),
-            "neighbor_id": edge.to_id.to_string(),
-            "neighbor_kind": neighbor.as_ref().map(|n| n.kind.as_str()),
-            "neighbor_label": neighbor.as_ref().and_then(|n| n.name.clone()).unwrap_or_else(|| edge.to_id.to_string()),
-            "neighbor_path": neighbor.as_ref().and_then(|n| n.path.clone()),
-            "source_file": edge.source_file.clone(),
-        }));
-    }
-
-    // Group edges by kind for the inspector view.
-    let mut grouped_up: serde_json::Map<String, Value> = serde_json::Map::new();
-    let mut grouped_down: serde_json::Map<String, Value> = serde_json::Map::new();
-    for row in &upstream {
-        if let Some(k) = row.get("edge_kind").and_then(|v| v.as_str()) {
-            // The entry is only ever inserted here as an Array, so `else` is
-            // unreachable — but match instead of `expect` so a future change to
-            // how this map is populated degrades to dropping one row, not a
-            // panic that fails the whole MCP tool call (#191).
-            if let Value::Array(arr) = grouped_up
-                .entry(k.to_string())
-                .or_insert_with(|| Value::Array(Vec::new()))
-            {
-                arr.push(row.clone());
-            }
-        }
-    }
-    for row in &downstream {
-        if let Some(k) = row.get("edge_kind").and_then(|v| v.as_str()) {
-            if let Value::Array(arr) = grouped_down
-                .entry(k.to_string())
-                .or_insert_with(|| Value::Array(Vec::new()))
-            {
-                arr.push(row.clone());
-            }
-        }
+        let row = ExplainEdgeRow {
+            edge_id: edge.id.to_string(),
+            edge_kind: edge.kind.as_str(),
+            neighbor_id: edge.to_id.to_string(),
+            neighbor_kind: neighbor.as_ref().map(|n| n.kind.as_str()),
+            neighbor_label: neighbor
+                .as_ref()
+                .and_then(|n| n.name.clone())
+                .unwrap_or_else(|| edge.to_id.to_string()),
+            neighbor_path: neighbor.as_ref().and_then(|n| n.path.clone()),
+            source_file: edge.source_file.clone(),
+        };
+        grouped_down
+            .entry(edge.kind.as_str())
+            .or_default()
+            .push(row.clone());
+        downstream.push(row);
     }
 
     // Look for business candidates whose evidence cites this symbol.
@@ -282,5 +297,141 @@ mod tests {
             1,
             "the declares_verification test must survive truncation (upstream first)"
         );
+    }
+
+    /// A hub with one upstream edge of each evidence kind (plus a downstream
+    /// Calls + References), used to pin the full `explain_symbol` JSON shape.
+    fn diverse_store() -> (tempfile::TempDir, ArtifactId) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".groundgraph")).unwrap();
+        std::fs::write(dir.path().join(".groundgraph.yaml"), "{}\n").unwrap();
+        let mut store =
+            groundgraph_store::Store::open(dir.path().join(".groundgraph/graph.db")).unwrap();
+        store.migrate().unwrap();
+
+        let hub = ArtifactId::new("java::Hub.java#Hub.work".to_string());
+        let mut hn = Node::new(hub.clone(), NodeKind::JavaMethod);
+        hn.name = Some("work".into());
+        hn.path = Some("Hub.java".into());
+        store.upsert_node(&hn).unwrap();
+
+        // mk_node borrows `store` mutably; scope it so that borrow ends before
+        // `edge` (which also needs &mut store) is defined.
+        let (doc, imp, tst, callee, reft) = {
+            let mut mk_node = |id: &str, kind: NodeKind, name: &str, path: &str| -> ArtifactId {
+                let aid = ArtifactId::new(id.to_string());
+                let mut n = Node::new(aid.clone(), kind);
+                n.name = Some(name.into());
+                n.path = Some(path.into());
+                store.upsert_node(&n).unwrap();
+                aid
+            };
+            (
+                mk_node("doc::a", NodeKind::DocSection, "Spec", "spec.md"),
+                mk_node("py::a", NodeKind::PythonFunction, "do", "a.py"),
+                mk_node("test::a", NodeKind::TestCase, "test_work", "a_test.py"),
+                mk_node("java::b", NodeKind::JavaMethod, "helper", "B.java"),
+                mk_node("java::c", NodeKind::JavaClass, "field", "C.java"),
+            )
+        };
+
+        let mut edge = |id: &str, from: ArtifactId, to: ArtifactId, kind: EdgeKind| {
+            let mut e = EdgeAssertion::fact(from, to, kind, EdgeSource::LanguageAdapter);
+            e.id = ArtifactId::new(id.to_string());
+            store.upsert_edge(&e).unwrap();
+        };
+        edge("e::doc", doc, hub.clone(), EdgeKind::Documents);
+        edge(
+            "e::impl",
+            imp,
+            hub.clone(),
+            EdgeKind::DeclaresImplementation,
+        );
+        edge("e::verif", tst, hub.clone(), EdgeKind::DeclaresVerification);
+        edge("e::call", hub.clone(), callee, EdgeKind::Calls);
+        edge("e::ref", hub.clone(), reft, EdgeKind::References);
+        (dir, hub)
+    }
+
+    /// issues.md #162: the `explain_symbol` JSON is an MCP output contract.
+    /// Pin its key set, key order, row shape and counts so the typed-struct +
+    /// bucket-while-iterating refactor cannot drift what clients see. Keys are
+    /// alphabetised because `serde_json` is built without `preserve_order`
+    /// (Map == BTreeMap semantics).
+    #[test]
+    fn explain_symbol_json_shape_pins_the_mcp_contract() {
+        let (dir, hub) = diverse_store();
+        let server = Server::new(dir.path().to_path_buf());
+        let out = call(&server, &json!({ "symbol_id": hub.to_string() })).unwrap();
+        let obj = out.as_object().expect("top-level is an object");
+
+        // Top-level key set + (alphabetised) order.
+        let top: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            top,
+            vec![
+                "candidates_referencing",
+                "downstream",
+                "downstream_by_kind",
+                "node",
+                "stats",
+                "tests",
+                "truncated",
+                "truncation_hint",
+                "upstream",
+                "upstream_by_kind",
+            ]
+        );
+
+        // grouped-by-kind keys are alphabetised.
+        let up: Vec<&str> = out["upstream_by_kind"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            up,
+            vec![
+                "declares_implementation",
+                "declares_verification",
+                "documents"
+            ]
+        );
+        let down: Vec<&str> = out["downstream_by_kind"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(down, vec!["calls", "references"]);
+
+        // Each edge row exposes exactly this key set, in this order.
+        let row: Vec<&str> = out["upstream"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            row,
+            vec![
+                "edge_id",
+                "edge_kind",
+                "neighbor_id",
+                "neighbor_kind",
+                "neighbor_label",
+                "neighbor_path",
+                "source_file",
+            ]
+        );
+
+        // declares_verification + TestCase neighbour → captured into `tests`.
+        assert_eq!(out["tests"].as_array().unwrap().len(), 1);
+        assert_eq!(out["stats"]["upstream_count"], json!(3));
+        assert_eq!(out["stats"]["downstream_count"], json!(2));
+        assert_eq!(out["stats"]["test_count"], json!(1));
+        assert_eq!(out["truncated"], json!(false));
+        assert_eq!(out["truncation_hint"], json!(null));
     }
 }

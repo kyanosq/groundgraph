@@ -1,0 +1,215 @@
+name: Release
+
+# Build precompiled binaries for every platform when a `v*` tag is pushed and
+# attach them to a GitHub Release. A `workflow_dispatch` run is a dry run: it
+# exercises all four builds and uploads workflow artifacts for inspection, but
+# skips the `release` job (which only runs on a real tag push).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Build jobs stay read-only; only the `release` aggregate job needs write scope
+# to create the GitHub Release.
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins 1.96.0; `rustup show` installs + selects it.
+      # The release script adds the two Apple targets and builds both arches.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Signing/notarisation env is optional — when unset the script ships an
+      # ad-hoc/unsigned binary and warns (issues.md #82). A release machine that
+      # exports a Developer ID identity gets a Gatekeeper-passable binary.
+      - name: Build + package (universal, cli + mcp)
+        env:
+          GROUNDGRAPH_SIGN_IDENTITY: ${{ secrets.GROUNDGRAPH_SIGN_IDENTITY }}
+          GROUNDGRAPH_NOTARY_PROFILE: ${{ secrets.GROUNDGRAPH_NOTARY_PROFILE }}
+          GROUNDGRAPH_ENTITLEMENTS: ${{ secrets.GROUNDGRAPH_ENTITLEMENTS }}
+        run: scripts/release_macos_universal.sh
+
+      - name: Validate package
+        run: |
+          archive="$(ls dist/groundgraph-*-macos-universal.tar.gz)"
+          scripts/validate_macos_package.sh "$archive"
+
+      - name: Verify checksum
+        run: |
+          set -e
+          cd dist
+          archive="$(ls groundgraph-*-macos-universal.tar.gz)"
+          shasum -a 256 -c "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/groundgraph-*-macos-universal.tar.gz*
+
+  build-linux:
+    name: Linux ${{ matrix.arch }} (musl)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64: build natively with the musl cross toolchain on the runner.
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            builder: cargo
+          # aarch64: cross-compile via `cross` (Docker image ships the gcc).
+          # If musl ever hits a C-toolchain wall, switch this target to
+          # aarch64-unknown-linux-gnu; the product name below stays linux-aarch64.
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            builder: cross
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Install musl tools (x86_64 only)
+        if: matrix.arch == 'x86_64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64 only)
+        if: matrix.arch == 'aarch64'
+        run: cargo install --locked cross
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.target }}
+
+      - name: Build + package
+        env:
+          BUILDER: ${{ matrix.builder }}
+          # musl-tools provides `musl-gcc`; point cc-rs at it for the C deps
+          # (rusqlite bundled + 13 tree-sitter grammar crates). Harmless for the
+          # aarch64 job, which builds inside `cross`'s Docker image.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: scripts/release_linux.sh --target ${{ matrix.target }}
+
+      - name: Smoke test (archive safety + ELF architecture + contents)
+        run: |
+          set -euo pipefail
+          cd dist
+          archive="$(ls groundgraph-*-linux-${{ matrix.arch }}.tar.gz)"
+          # 1) refuse absolute/parent-relative members
+          if tar -tzf "$archive" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
+            echo "error: archive contains unsafe member paths" >&2
+            exit 1
+          fi
+          # 2) extract and assert expected layout
+          tmp="$(mktemp -d)"
+          tar -xzf "$archive" -C "$tmp"
+          pkg="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          test -x "$pkg/bin/groundgraph"
+          test -x "$pkg/bin/groundgraph-mcp"
+          test -x "$pkg/libexec/groundgraph"
+          test -x "$pkg/libexec/groundgraph-mcp"
+          test -f "$pkg/tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart"
+          # 3) the staged ELF matches the matrix arch (can't exec aarch64 on x86)
+          case "${{ matrix.arch }}" in
+            x86_64) file "$pkg/libexec/groundgraph" | grep -q 'x86-64' ;;
+            aarch64) file "$pkg/libexec/groundgraph" | grep -q 'aarch64' ;;
+          esac
+          # 4) on a native arch, also confirm the binary actually runs
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            "$pkg/bin/groundgraph" --help >/dev/null
+          fi
+
+      - name: Verify checksum
+        run: |
+          set -e
+          cd dist
+          archive="$(ls groundgraph-*-linux-${{ matrix.arch }}.tar.gz)"
+          sha256sum -c "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/groundgraph-*-linux-${{ matrix.arch }}.tar.gz*
+
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build + package (cli + mcp)
+        shell: pwsh
+        run: ./scripts/release_windows.ps1
+
+      - name: Smoke test (--help)
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem dist -Directory |
+            Where-Object Name -like 'groundgraph-*-windows-*' | Select-Object -First 1
+          & "$($pkg.FullName)\bin\groundgraph.exe" --help | Out-Null
+          & "$($pkg.FullName)\bin\groundgraph-mcp.exe" --help | Out-Null
+
+      - name: Verify checksum
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist -Filter 'groundgraph-*-windows-*.zip' | Select-Object -First 1
+          $expected = ((Get-Content "$($zip.FullName).sha256" -First 1) -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) {
+            throw "checksum mismatch: expected $expected, got $actual"
+          }
+          Write-Host "checksum OK: $actual"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/groundgraph-*-windows-*.zip*
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-macos, build-linux, build-windows]
+    # Only a real tag push creates a Release; workflow_dispatch is a dry run.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # merge-multiple flattens all four artifact sets into the workspace; each
+      # artifact preserves its `dist/` prefix, so the files land under ./dist/.
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          gh release create "${{ github.ref_name }}" \
+            dist/*.tar.gz dist/*.zip dist/*.sha256 \
+            --generate-notes \
+            --title "GroundGraph ${{ github.ref_name }}"

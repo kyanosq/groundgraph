@@ -41,7 +41,7 @@ fn run_git(repo: &std::path::Path, args: &[&str]) {
 fn minimal_config_still_parses() {
     let yaml =
         "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .groundgraph/graph.db\n";
-    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(yaml).unwrap();
     assert_eq!(cfg.repo.root, ".");
     assert_eq!(cfg.storage.path, ".groundgraph/graph.db");
     // Sections that were not provided fall back to defaults.
@@ -119,7 +119,7 @@ checks:
   missing_linked_test_level: warning
   orphan_requirement_level: warning
 "#;
-    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(yaml).unwrap();
     assert_eq!(cfg.docs.paths.len(), 3);
     assert_eq!(cfg.code.paths.len(), 2);
     assert_eq!(cfg.code.exclude.len(), 5);
@@ -355,9 +355,9 @@ fn run_impact_honours_configured_doc_and_warning_levels() {
 #[test]
 fn default_config_serialises_with_new_sections_for_round_trip() {
     let cfg = EngineConfig::default();
-    let yaml = serde_yml::to_string(&cfg).unwrap();
+    let yaml = serde_norway::to_string(&cfg).unwrap();
     // Forward-compatibility: round-trip without losing the optional sections.
-    let round_trip: EngineConfig = serde_yml::from_str(&yaml).unwrap();
+    let round_trip: EngineConfig = serde_norway::from_str(&yaml).unwrap();
     assert_eq!(round_trip, cfg);
 }
 
@@ -394,7 +394,7 @@ fn config_schema_notice_warns_only_on_newer_than_supported() {
 fn legacy_config_without_schema_version_loads_and_is_silent() {
     let yaml =
         "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .groundgraph/graph.db\n";
-    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(yaml).unwrap();
     assert_eq!(cfg.schema_version, None);
     assert!(cfg.schema_version_notice().is_none());
 }
@@ -414,7 +414,7 @@ fn init_stamps_config_schema_version() {
         repo_root: dart.path().into(),
     })
     .unwrap();
-    let cfg: EngineConfig = serde_yml::from_str(
+    let cfg: EngineConfig = serde_norway::from_str(
         &std::fs::read_to_string(dart.path().join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
     )
     .unwrap();
@@ -440,7 +440,7 @@ fn init_stamps_config_schema_version() {
         repo_root: poly.path().into(),
     })
     .unwrap();
-    let cfg: EngineConfig = serde_yml::from_str(
+    let cfg: EngineConfig = serde_norway::from_str(
         &std::fs::read_to_string(poly.path().join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
     )
     .unwrap();
@@ -522,7 +522,7 @@ go:
   exclude:
     - "**/vendor/**"
 "#;
-    let cfg: EngineConfig = serde_yml::from_str(yaml).unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(yaml).unwrap();
     assert!(cfg.swift.enabled, "swift.enabled must round-trip");
     assert_eq!(cfg.swift.paths_or(&["Sources"]), vec!["Sources", "Tests"]);
     assert_eq!(
@@ -533,7 +533,7 @@ go:
     assert_eq!(cfg.go.paths_or(&["."]), vec![".", "cmd"]);
     assert_eq!(cfg.go.exclude, vec!["**/vendor/**".to_string()]);
     // Sections default to disabled when omitted.
-    let minimal: EngineConfig = serde_yml::from_str(
+    let minimal: EngineConfig = serde_norway::from_str(
         "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .groundgraph/graph.db\n",
     )
     .unwrap();
@@ -560,9 +560,10 @@ fn init_autodetects_swift_repo_and_writes_treesitter_config() {
     })
     .unwrap();
 
-    let cfg: EngineConfig =
-        serde_yml::from_str(&std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap())
-            .unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(
+        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
     assert_eq!(cfg.languages.len(), 1, "exactly one detected language");
     assert_eq!(cfg.languages[0].id, "swift");
     assert!(
@@ -599,9 +600,10 @@ fn init_on_dart_repo_uses_language_selection() {
     })
     .unwrap();
 
-    let cfg: EngineConfig =
-        serde_yml::from_str(&std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap())
-            .unwrap();
+    let cfg: EngineConfig = serde_norway::from_str(
+        &std::fs::read_to_string(root.join(DEFAULT_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
     assert_eq!(cfg.languages.len(), 1);
     assert_eq!(cfg.languages[0].id, "dart");
     assert_eq!(cfg.languages[0].paths, vec!["lib".to_string()]);

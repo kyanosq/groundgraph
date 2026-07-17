@@ -20,7 +20,7 @@
 use crate::treesitter::{
     body_from_field, declarator_name, keep_callable_kind, name_from_field, no_call_test,
     no_src_roots, no_test_of, no_text, node_text, resolve_c_include, simple_type_name,
-    strip_quotes, LangSpec, RefKind, SymKind, MAX_NESTING_DEPTH,
+    strip_quotes, CallKind, LangSpec, RefKind, SymKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -152,43 +152,34 @@ fn cpp_is_transparent(kind: &str) -> bool {
 /// - `new Widget(…)` → `Reference` to the constructed type's bare name.
 fn cpp_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_cpp_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, CPP_CALL_KINDS);
     out
 }
 
-fn collect_cpp_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "call_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("function")
-                    .and_then(|f| cpp_callee_name(f, src))
-                {
-                    out.push((name, RefKind::Call));
-                }
-            }
-            "new_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("type")
-                    .and_then(|t| simple_type_name(t, src))
-                {
-                    out.push((name, RefKind::Reference));
-                }
-            }
-            _ => {}
-        }
-        collect_cpp_calls(child, src, out, depth + 1);
-    }
+/// `call_expression` whose `function` field is resolved by [`cpp_callee_name`].
+fn cpp_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|f| cpp_callee_name(f, src))
+        .map(|name| (name, RefKind::Call))
 }
+
+/// `new Widget(…)` → reference to the constructed type's bare name.
+fn cpp_new_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("type")
+        .and_then(|t| simple_type_name(t, src))
+        .map(|name| (name, RefKind::Reference))
+}
+
+static CPP_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "call_expression",
+        extract: cpp_call_extract,
+    },
+    CallKind {
+        kind: "new_expression",
+        extract: cpp_new_extract,
+    },
+];
 
 /// Best-effort *simple* callee name for a C++ call expression's `function`
 /// node — qualified paths reduce to their rightmost identifier.
@@ -246,6 +237,7 @@ pub(crate) static CPP_SPEC: LangSpec = LangSpec {
     // (`namespace` / `class` / `::` / templates / access specifiers). The
     // C++-only extensions (`.hpp`, `.cpp`, …) always read true.
     claims_path: Some(cpp_claims_path),
+    partial_class_merge: false,
 };
 
 /// [`LangSpec::claims_path`] for C++: own every C++-extension file, and own a
@@ -281,7 +273,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

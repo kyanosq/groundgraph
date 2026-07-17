@@ -22,12 +22,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use groundgraph_core::language_traits::{is_code_symbol, language_of, Language};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::source_text::strip_noise;
 
 pub const DATA_CONTRACT_SCHEMA_VERSION: u32 = 1;
@@ -108,18 +108,17 @@ impl Default for DataContractOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_data_contract(options: DataContractOptions) -> Result<DataContractReport> {
+pub fn analyze_data_contract(options: DataContractOptions) -> EngineResult<DataContractReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     analyze_data_contract_with_store(&store, &options)
 }
 
 pub fn analyze_data_contract_with_store(
     store: &Store,
     options: &DataContractOptions,
-) -> Result<DataContractReport> {
+) -> EngineResult<DataContractReport> {
     // Collect distinct code-bearing files + their language (from any code
     // node on that path). Deterministic order via BTreeMap.
     let mut files: BTreeMap<String, Language> = BTreeMap::new();
@@ -705,12 +704,8 @@ fn skip_ws_slice(chars: &[char], i: &mut usize) {
 // Workspace helpers
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

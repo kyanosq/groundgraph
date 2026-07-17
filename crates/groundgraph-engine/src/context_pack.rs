@@ -11,7 +11,8 @@ use groundgraph_core::EdgeKind;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::slice::{slice_from_store, FeatureSlice, SliceItem};
 
 #[derive(Debug, Clone)]
@@ -57,11 +58,10 @@ pub struct EdgeSummary {
     pub to: String,
 }
 
-pub fn build_context(options: ContextOptions) -> Result<ContextPack> {
+pub fn build_context(options: ContextOptions) -> EngineResult<ContextPack> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     let slice = slice_from_store(&store, &options.requirement)?;
 
     let mut docs_snippets = Vec::new();
@@ -171,17 +171,13 @@ fn read_snippet(repo_root: &Path, item: &SliceItem) -> Result<Option<String>> {
     Ok(Some(lines[start_idx..end_idx].join("\n")))
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 /// Helper: collect per-node-kind counts in the store. Useful for status-line
 /// summaries — not currently used by the CLI but kept for completeness.
-pub fn node_kind_counts(store: &Store) -> Result<BTreeMap<String, usize>> {
+pub fn node_kind_counts(store: &Store) -> EngineResult<BTreeMap<String, usize>> {
     let mut map = BTreeMap::new();
     for node in store.list_all_nodes()? {
         *map.entry(node.kind.as_str().to_string()).or_insert(0) += 1;

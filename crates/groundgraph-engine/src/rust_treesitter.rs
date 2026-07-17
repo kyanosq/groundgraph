@@ -8,7 +8,7 @@
 
 use crate::treesitter::{
     self, body_from_field, keep_callable_kind, name_from_field, no_call_test, no_text, node_text,
-    normalise_ws, simple_type_name, LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    normalise_ws, simple_type_name, CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -32,6 +32,12 @@ fn rust_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind
         "struct_item" | "union_item" => Some(SymKind::Type(NodeKind::RustStruct)),
         "enum_item" => Some(SymKind::Type(NodeKind::RustEnum)),
         "trait_item" => Some(SymKind::Type(NodeKind::RustTrait)),
+        // `macro_rules! foo { … }` — a declarative macro definition. It is
+        // neither a struct nor a callable, so it used to be dropped; emit it
+        // as a RustMacro so the name resolves both here and at `foo!()` call
+        // sites (issues.md #123). The body is opaque token tree (no `body`
+        // field), so the walker emits the node and does not descend.
+        "macro_definition" => Some(SymKind::Type(NodeKind::RustMacro)),
         "mod_item" => Some(SymKind::Module(NodeKind::RustModule)),
         _ => None,
     }
@@ -256,6 +262,7 @@ pub(crate) static RUST_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 /// Recognise `#[test]` functions (and derivatives such as `#[tokio::test]`)
@@ -316,37 +323,44 @@ fn rust_attr_is_test(attr_text: &str) -> bool {
 /// - `Type::assoc` paths keep the full `Type::assoc` string so the resolver
 ///   can verify `Type` is local before linking (drops `HashMap::new`, etc.).
 ///
-/// Macros and bare value identifiers are intentionally skipped (too noisy
-/// without a resolver); they can be added behind the same medium tier later.
+/// Macro invocations (`foo!(…)`) contribute the bare macro name so a call
+/// site links to the in-crate `macro_rules!` definition (issues.md #123);
+/// standard-library / external macros (`vec!`, `println!`, …) simply fail to
+/// resolve to an in-repo symbol and are dropped. Bare value identifiers are
+/// still skipped (too noisy without a resolver).
 fn rust_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_rust_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, RUST_CALL_KINDS);
     out
 }
 
-fn collect_rust_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(func) = child.child_by_field_name("function") {
-                if let Some(name) = rust_callee_name(func, src) {
-                    out.push((name, RefKind::Call));
-                }
-            }
-        }
-        // Always descend: calls nest inside arguments, blocks, closures,
-        // match arms, etc. Nested-fn calls fold into the enclosing callable
-        // (acceptable — nested fns are not separately indexed).
-        collect_rust_calls(child, src, out, depth + 1);
-    }
+/// The single Rust call shape: a `call_expression` whose `function` field is
+/// resolved by [`rust_callee_name`]. Recursion / depth cap / always-descend
+/// live in [`crate::treesitter::collect_calls`].
+fn rust_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|func| rust_callee_name(func, src))
+        .map(|name| (name, RefKind::Call))
+}
+
+static RUST_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "call_expression",
+        extract: rust_call_extract,
+    },
+    CallKind {
+        kind: "macro_invocation",
+        extract: rust_macro_call_extract,
+    },
+];
+
+/// `foo!(…)` → the bare macro name. Links the call site to the RustMacro
+/// definition node of the same name so a macro that is in use keeps an
+/// inbound `Calls` edge instead of reading as dead (issues.md #123).
+fn rust_macro_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("macro")
+        .and_then(|m| node_text(m, src))
+        .map(|name| (name.to_string(), RefKind::Call))
 }
 
 /// Best-effort callee name for a `call_expression`'s `function` node.
@@ -416,7 +430,7 @@ impl Greeter {
         let from_a: Vec<&str> = scan
             .references
             .iter()
-            .filter(|r| r.from_qualified == "a" && r.kind == RefKind::Call)
+            .filter(|r| r.from_qualified.as_ref() == "a" && r.kind == RefKind::Call)
             .map(|r| r.to_name.as_str())
             .collect();
         assert!(
@@ -440,7 +454,7 @@ impl Foo {
         let from_run: Vec<&str> = scan
             .references
             .iter()
-            .filter(|r| r.from_qualified == "Foo::run")
+            .filter(|r| r.from_qualified.as_ref() == "Foo::run")
             .map(|r| r.to_name.as_str())
             .collect();
         assert!(
@@ -487,7 +501,7 @@ fn only_a_helper() {}
         assert!(
             scan.references
                 .iter()
-                .any(|r| r.from_qualified == "it_adds" && r.to_name == "helper"),
+                .any(|r| r.from_qualified.as_ref() == "it_adds" && r.to_name == "helper"),
             "test body calls should be captured, got {:?}",
             scan.references
         );
@@ -796,6 +810,50 @@ impl std::fmt::Display for Widget {
             .expect("fmt method present");
         assert_eq!(fmt.kind, NodeKind::RustMethod);
         assert_eq!(fmt.parent_qualified_name.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn macro_rules_definition_emits_rust_macro_node() {
+        // `macro_rules! foo { … }` is a `macro_definition` node that is
+        // neither a container nor a callable the driver previously
+        // recognised, so it was dropped entirely — every declarative macro
+        // was an invisible black box. It now emits a RustMacro node named
+        // after the macro (issues.md #123).
+        let src = "macro_rules! greet { () => { helper(); } }\n";
+        let scan = scan(src);
+        let macros = names_of(&scan, NodeKind::RustMacro);
+        assert!(
+            macros.contains(&"greet".to_string()),
+            "macro_rules! must emit a RustMacro node, got {macros:?}"
+        );
+        // A macro body is opaque token tree — it must NOT leak nested
+        // declarations (helper() inside the arm is not a real function).
+        assert!(
+            !names_of(&scan, NodeKind::RustFunction).contains(&"helper".to_string()),
+            "macro arm body must not be walked as declarations: {:?}",
+            names_of(&scan, NodeKind::RustFunction)
+        );
+    }
+
+    #[test]
+    fn macro_invocation_emits_call_to_the_macro_name() {
+        // `foo!()` is a `macro_invocation`. Without linking it to the macro
+        // definition, every macro is zero-inbound and reads as dead. The call
+        // site must contribute a Call ref to the bare macro name so the
+        // heuristic resolver can link it to the RustMacro node in the same
+        // crate (issues.md #123).
+        let src = "macro_rules! greet { () => {} }\nfn caller() { greet!(); }\n";
+        let scan = scan(src);
+        let calls: Vec<&str> = scan
+            .references
+            .iter()
+            .filter(|r| r.from_qualified.as_ref() == "caller" && r.kind == RefKind::Call)
+            .map(|r| r.to_name.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"greet"),
+            "macro_invocation `greet!()` must yield a Call to the macro name, got {calls:?}"
+        );
     }
 
     #[test]

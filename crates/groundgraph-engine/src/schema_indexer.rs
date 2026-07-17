@@ -12,7 +12,7 @@
 //! Each table becomes a [`NodeKind::DbTable`] node whose `metadata_json`
 //! carries the columns, so `graph-equiv` can audit table/column parity.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use groundgraph_core::{ArtifactId, EdgeAssertion, EdgeKind, EdgeSource, Node, NodeKind};
@@ -20,7 +20,8 @@ use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::source_text::read_node_source;
 
 /// Build-output directories the schema walk skips *in addition* to the shared
@@ -181,24 +182,19 @@ pub const SCHEMA_INDEXER_NAME: &str = "schema";
 
 /// Open the repo's configured graph.db and add/refresh its `DbTable` nodes by
 /// scanning `.sql` + entity `.java` files. Idempotent (upsert).
-pub fn index_schema(repo_root: &Path) -> Result<SchemaIndexStats> {
+pub fn index_schema(repo_root: &Path) -> EngineResult<SchemaIndexStats> {
     let config = load_config(repo_root)?;
-    let db_path = resolve_storage_path(repo_root, &config);
-    let mut store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
-    store.migrate().context("migrating graph.db")?;
+    let db_path = resolve_storage_path(repo_root, &config)?;
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
     index_schema_into(&mut store, repo_root)
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
 }
 
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
-}
-
-pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexStats> {
+pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaIndexStats> {
     let mut stats = SchemaIndexStats::default();
     // Re-index = clean slate for this pass. Without this, upsert-only writes leave
     // orphaned nodes/edges when a route/table/mapper statement is deleted or
@@ -385,6 +381,14 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> Result<SchemaIndexSt
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
     link_inline_consumed_routes(store, &dart_consumed_calls, "dart", &mut stats)?;
     link_inline_consumed_routes(store, &ts_consumed_calls, "typescript", &mut stats)?;
+    // #137: reclaim the orphaned `evidence` / `symbol_ranges` / `node_fts` rows
+    // left by the `clear_indexer_outputs(SCHEMA_INDEXER_NAME)` above (and any
+    // from a historical crash) in a single pass. `index_schema_into` runs its
+    // own store session — the `index_repository` end-of-ingest sweep does not
+    // cover it — so each entry that clears an indexer must sweep once itself.
+    store
+        .sweep_orphans()
+        .context("sweeping orphaned rows after schema index")?;
     Ok(stats)
 }
 

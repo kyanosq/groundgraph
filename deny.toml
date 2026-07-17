@@ -11,14 +11,55 @@ all-features = false
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Real vulnerabilities and yanked crates fail the build (cargo-deny defaults).
-# issues.md #70: migrated off the unmaintained `serde_yaml` / `unsafe-libyaml`
-# onto the maintained `serde_yml` (backed by `libyml`). No advisories ignored.
+# History: issues.md #70 first migrated off the unmaintained `serde_yaml` /
+# `unsafe-libyaml` onto `serde_yml`. RUSTSEC-2025-0068 then flagged `serde_yml`
+# itself as unsound + archived, so we moved to `serde_norway` (0.9, the
+# serde_yaml fork the RustSec advisory recommends first, backed by the
+# maintained `unsafe-libyaml-norway`). `serde_yaml_ng` was rejected: it still
+# depends on the unmaintained `unsafe-libyaml`. No advisories ignored.
 ignore = []
 
 [bans]
-# issues.md #223/#224/#225: duplicate transitive versions (hashbrown,
-# wit-bindgen, getrandom, r-efi) are upstream-driven. Warn so they stay visible
-# without blocking, until the upstream upgrades land.
+# issues.md #223/#224/#225: duplicate transitive versions are upstream-driven
+# and warned (not blocked) so they stay visible while we keep trying to
+# collapse them. None of the duplicates below compile into the native release
+# binary — every one is reached only via a wasm/wasi target-only branch, a
+# build-dependency, or a dev-dependency, so they are Cargo.lock entries, not
+# shipped code.
+#
+# Convergence attempts (run 2026-07-17; every `cargo update -p … --precise …`
+# rejected with "failed to select a version" against an upstream `^` pin):
+#
+# hashbrown — three copies, all upstream-pinned away from each other:
+#   0.17.1 — hashlink (rusqlite) + indexmap (serde_json). The single version
+#            actually compiled into the native release.
+#   0.16.1 — rsqlite-vfs 0.1.1 (`^0.16.1`) → sqlite-wasm-rs → rusqlite's
+#            wasm-only cfg. Wasm-only, never shipped.
+#   0.15.5 — petgraph (`^0.15`) → prost-build, i.e. BUILD-only (runs at compile
+#            time, not linked). Introduced by the #229 SCIP→prost migration.
+# `cargo update -p hashbrown@0.15.5 --precise 0.17.1` and `…@0.16.1 …` reject.
+#
+# foldhash — 0.1.5 (hashbrown 0.15.5 → petgraph → prost-build, BUILD-only) vs
+#   0.2.0 (hashbrown 0.16.1 → rsqlite-vfs wasm-only). Both non-shipping; split
+#   follows the hashbrown 0.15/0.16 pins above. Introduced by #229 (build side).
+#
+# wit-bindgen — 0.51.0 (wasip3 → getrandom 0.4 → tempfile) vs 0.57.1
+#   (wasip2 → getrandom 0.3 → rand → proptest). `cargo update -p
+#   wit-bindgen@0.51.0 --precise 0.57.1` rejects (`^0.51.0`). wasm/wasi +
+#   dev-only; collapses when the wasi / getrandom ecosystem re-aligns.
+#
+# thiserror — CONVERGED: the workspace dep moved 1 → 2 (#224/#225) and #229
+#   removed `protobuf`/`protobuf-support`, the last thiserror-1 users, so the
+#   graph now carries a single thiserror 2.x. (No longer warned.)
+#
+# getrandom (0.3.4 vs 0.4.2) and r-efi (5.3.0 vs 6.0.0) — split by the dev-dep
+#   graph: proptest's `rand` 0.9 needs getrandom 0.3 / r-efi 5, `tempfile` 3.27
+#   needs getrandom 0.4 / r-efi 6. Dev-only; cargo-deny does not flag these as
+#   the split never reaches a build target.
+#
+# Monitoring: cargo-deny `multiple-versions = "warn"` keeps all of the above
+# visible on every CI run; the goal is to drive this list to empty as upstreams
+# re-pin, not to silence it.
 multiple-versions = "warn"
 wildcards = "allow"
 

@@ -582,10 +582,27 @@ fn execute(
     } else {
         None
     };
-    let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(cwd);
-    match run_with_capped_stderr(&mut cmd) {
-        Ok((status, _)) if status.success() => {
+    // #217: ride a one-off flake (a JVM cold-start OOM, a Node ESM resolution
+    // race, a PATH race while a tool installs) through a bounded retry before
+    // demoting the precision layer. Only transient failures retry; a missing
+    // binary, an arg error, or a timeout degrades exactly as before.
+    let policy = crate::proc::subprocess_retry_policy();
+    let mut attempts = 0u32;
+    let attempt = || -> Result<(), crate::proc::SubprocessFailure> {
+        attempts += 1;
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(cwd);
+        match run_with_capped_stderr(&mut cmd) {
+            Ok((status, _)) if status.success() => Ok(()),
+            Ok((status, stderr)) => Err(crate::proc::SubprocessFailure::Exited {
+                code: status.code(),
+                stderr,
+            }),
+            Err(e) => Err(crate::proc::SubprocessFailure::Spawn(e)),
+        }
+    };
+    match crate::proc::retry_transient_subprocess(policy, attempt) {
+        Ok(()) => {
             if writes_cwd_index {
                 let post = file_signature(&cwd_index);
                 let fresh = match (&pre, &post) {
@@ -627,11 +644,20 @@ fn execute(
                 }
             }
         }
-        Ok((status, stderr)) => {
+        Err(crate::proc::SubprocessFailure::Exited { code, stderr }) => {
             let summary = summarize_stderr(&stderr);
-            let mut msg = format!("退出码 {status}: {summary}");
+            let code_disp = code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "未知".to_string());
+            let mut msg = format!("退出码 {code_disp}: {summary}");
             if let Some(hint) = scip_failure_hint(program, &summary) {
                 msg.push_str(&format!("（{hint}）"));
+            }
+            // `attempt` has been moved into the driver by now, so `attempts`
+            // is free to read here.
+            let retries = attempts.saturating_sub(1);
+            if retries > 0 {
+                msg.push_str(&format!("（已重试 {retries} 次后仍失败）"));
             }
             ScipRunOutcome {
                 language,
@@ -639,16 +665,20 @@ fn execute(
                 output: None,
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ScipRunOutcome {
-            language,
-            // A hung indexer is non-fatal: the structural graph still indexed,
-            // only the precision overlay is missing (#77).
-            status: ScipRunStatus::Failed(format!(
-                "`{program}` 超时被终止（{e}）；可设 {SCIP_TIMEOUT_ENV} 调整预算，结构图不受影响"
-            )),
-            output: None,
-        },
-        Err(e) => ScipRunOutcome {
+        Err(crate::proc::SubprocessFailure::Spawn(e))
+            if e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            ScipRunOutcome {
+                language,
+                // A hung indexer is non-fatal: the structural graph still indexed,
+                // only the precision overlay is missing (#77).
+                status: ScipRunStatus::Failed(format!(
+                    "`{program}` 超时被终止（{e}）；可设 {SCIP_TIMEOUT_ENV} 调整预算，结构图不受影响"
+                )),
+                output: None,
+            }
+        }
+        Err(crate::proc::SubprocessFailure::Spawn(e)) => ScipRunOutcome {
             language,
             status: ScipRunStatus::Failed(format!("无法启动 `{program}`: {e}")),
             output: None,
@@ -902,6 +932,7 @@ mod tests {
         Box::new(move |_bin: &str| Some(PathBuf::from(&path)))
     }
 
+    #[cfg(unix)]
     #[test]
     fn second_run_with_unchanged_sources_is_up_to_date_and_does_not_respawn() {
         // scip-python on django costs ~4 minutes / 3.9 GB; an unchanged tree

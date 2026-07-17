@@ -7,8 +7,8 @@
 
 use crate::treesitter::{
     body_from_field, declarator_name, keep_callable_kind, name_from_field, no_call_test,
-    no_src_roots, no_test_of, no_text, node_text, resolve_c_include, strip_quotes, LangSpec,
-    RefKind, SymKind, MAX_NESTING_DEPTH,
+    no_src_roots, no_test_of, no_text, node_text, resolve_c_include, strip_quotes, CallKind,
+    LangSpec, RefKind, SymKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -121,7 +121,7 @@ pub(crate) fn c_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(Str
         }
         return out;
     }
-    collect_c_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, C_CALL_KINDS);
     out
 }
 
@@ -172,28 +172,20 @@ fn collect_macro_calls(text: &str, out: &mut Vec<(String, RefKind)>) {
     }
 }
 
-fn collect_c_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(name) = child
-                .child_by_field_name("function")
-                .and_then(|f| c_callee_name(f, src))
-            {
-                out.push((name, RefKind::Call));
-            }
-        }
-        collect_c_calls(child, src, out, depth + 1);
-    }
+/// The single C call shape: a `call_expression` whose `function` field is
+/// resolved by [`c_callee_name`]. (Macro-replacement text — `preproc_arg` —
+/// is handled textually in [`c_call_idents`] before this runs, since the
+/// preprocessor exposes no AST to walk.)
+fn c_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|f| c_callee_name(f, src))
+        .map(|name| (name, RefKind::Call))
 }
+
+static C_CALL_KINDS: &[CallKind] = &[CallKind {
+    kind: "call_expression",
+    extract: c_call_extract,
+}];
 
 /// Best-effort callee name for a C call expression's `function` node.
 pub(crate) fn c_callee_name(func: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -246,6 +238,7 @@ pub(crate) static C_SPEC: LangSpec = LangSpec {
     // `.h` is shared with C++: claim a header only when it does NOT look like
     // C++ (no `namespace` / `class` / `::`). A `.c` file always reads true.
     claims_path: Some(c_claims_path),
+    partial_class_merge: false,
 };
 
 /// [`LangSpec::claims_path`] for C: own every `.c`, and own a `.h` only when it
@@ -275,7 +268,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

@@ -25,13 +25,14 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use groundgraph_core::language_traits::{is_callable, is_type, Language};
 use groundgraph_core::EdgeKind;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::source_text::{identifier_tokens, read_node_source, strip_noise, NodeSource};
 
 pub const SYMBOL_FACTS_SCHEMA_VERSION: u32 = 1;
@@ -171,18 +172,17 @@ impl Default for SymbolFactsOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_symbol_facts(options: SymbolFactsOptions) -> Result<SymbolFactsReport> {
+pub fn analyze_symbol_facts(options: SymbolFactsOptions) -> EngineResult<SymbolFactsReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     analyze_symbol_facts_with_store(&store, &options)
 }
 
 pub fn analyze_symbol_facts_with_store(
     store: &Store,
     options: &SymbolFactsOptions,
-) -> Result<SymbolFactsReport> {
+) -> EngineResult<SymbolFactsReport> {
     let mut facts: Vec<SymbolFact> = Vec::new();
     let mut stats = SymbolFactsStats::default();
 
@@ -666,12 +666,8 @@ fn build_summary(counts: &BehaviorCounts, impurity: &[String], purity: Purity) -
 // Workspace helpers (mirrors slice.rs / context_pack.rs)
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

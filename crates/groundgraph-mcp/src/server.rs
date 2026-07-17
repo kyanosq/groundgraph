@@ -184,8 +184,8 @@ impl Server {
                 .and_then(|c| c.get("version"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("<unknown>");
-            eprintln!(
-                "groundgraph-mcp: client {name} v{version} connected (requested protocol {}, negotiated {negotiated})",
+            tracing::info!(
+                "client connected: {name} v{version} (requested protocol {}, negotiated {negotiated})",
                 requested.unwrap_or("<none>")
             );
         }

@@ -17,8 +17,8 @@
 //!   way Jest's `describe`/`it` does for TypeScript.
 
 use crate::treesitter::{
-    body_from_field, name_from_field, no_src_roots, no_text, node_text, CallTestHit, LangSpec,
-    RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    body_from_field, name_from_field, no_src_roots, no_text, node_text, CallKind, CallTestHit,
+    LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -209,42 +209,33 @@ fn ruby_resolve_import(
 ///   (Ruby's object creation).
 fn ruby_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_ruby_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, RUBY_CALL_KINDS);
     out
 }
 
-fn collect_ruby_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call" {
-            let method = child
-                .child_by_field_name("method")
-                .and_then(|m| node_text(m, src));
-            let receiver = child.child_by_field_name("receiver");
-            match (method, receiver) {
-                (Some("new"), Some(r)) if matches!(r.kind(), "constant" | "scope_resolution") => {
-                    if let Some(t) = node_text(r, src) {
-                        let bare = t.rsplit("::").next().unwrap_or(t);
-                        out.push((bare.to_string(), RefKind::Reference));
-                    }
-                }
-                (Some(m), _) if m != "new" => {
-                    out.push((m.to_string(), RefKind::Call));
-                }
-                _ => {}
-            }
+/// The single Ruby call shape (tree-sitter-ruby spells it `call`): a
+/// `Foo.new` construction is a `Reference` to the constant's bare name; any
+/// other method (`foo`, `obj.bar`) is a `Call` on the method name.
+fn ruby_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    let method = node
+        .child_by_field_name("method")
+        .and_then(|m| node_text(m, src));
+    let receiver = node.child_by_field_name("receiver");
+    match (method, receiver) {
+        (Some("new"), Some(r)) if matches!(r.kind(), "constant" | "scope_resolution") => {
+            let t = node_text(r, src)?;
+            let bare = t.rsplit("::").next().unwrap_or(t);
+            Some((bare.to_string(), RefKind::Reference))
         }
-        collect_ruby_calls(child, src, out, depth + 1);
+        (Some(m), _) if m != "new" => Some((m.to_string(), RefKind::Call)),
+        _ => None,
     }
 }
+
+static RUBY_CALL_KINDS: &[CallKind] = &[CallKind {
+    kind: "call",
+    extract: ruby_call_extract,
+}];
 
 pub(crate) static RUBY_SPEC: LangSpec = LangSpec {
     language_id: "ruby",
@@ -286,6 +277,7 @@ pub(crate) static RUBY_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -477,7 +469,7 @@ end
         let refs: Vec<(String, String, RefKind)> = s
             .references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect();
         assert!(
             refs.contains(&("App::run".into(), "Greeter".into(), RefKind::Reference)),

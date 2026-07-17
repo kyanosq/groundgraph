@@ -31,11 +31,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineResult;
 use crate::python_frameworks::FrameworkRole;
 
 pub const FEATURE_MAP_SCHEMA_VERSION: u32 = 1;
@@ -113,17 +114,16 @@ pub struct FeatureClusterMember {
     pub distance_from_seed: u32,
 }
 
-pub fn analyze_feature_map(options: FeatureMapOptions) -> Result<FeatureMap> {
+pub fn analyze_feature_map(options: FeatureMapOptions) -> EngineResult<FeatureMap> {
     let db_path = crate::config::storage_path_for_repo(&options.repo_root)?;
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening graph store at {}", db_path.display()))?;
+    let store = Store::open(&db_path)?;
     analyze_feature_map_with_store(&store, &options)
 }
 
 pub fn analyze_feature_map_with_store(
     store: &Store,
     options: &FeatureMapOptions,
-) -> Result<FeatureMap> {
+) -> EngineResult<FeatureMap> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
 

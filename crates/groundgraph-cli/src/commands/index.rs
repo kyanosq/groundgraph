@@ -1,16 +1,28 @@
 use std::fmt::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
-use groundgraph_engine::{index_repository, IndexOptions, IndexResult};
+use groundgraph_engine::progress::ProgressSink;
+use groundgraph_engine::{index_repository_with_progress, IndexOptions, IndexResult, PartialFailure};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
+pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<()> {
     let options = if docs_only {
         IndexOptions::docs_only(repo_root.to_path_buf())
     } else {
         IndexOptions::all(repo_root.to_path_buf())
     };
-    let result = index_repository(options)?;
+    // #231 — wire an `indicatif` progress sink into the indexer so a TTY
+    // shows a spinner labelled with the current phase; under CI (non-TTY) it
+    // hides entirely (indicatif convention) and never touches stdout, which
+    // carries the human-readable summary.
+    let mut progress = IndexProgress::new();
+    let result = index_repository_with_progress(options, &mut progress)?;
+    progress.finish();
+    // #232 — surface partial failures (parse timeouts, SCIP failures) so CI
+    // does not mistake an index with gaps for a fully successful one.
+    let mut partials = result.partial_failures.clone();
     print!("{}", format_result(&result));
     record_index_metrics(&result);
     // Blind-spot guard: a config written when the repo was single-language
@@ -22,14 +34,14 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
                 // `init` is non-destructive — it never rewrites an existing
                 // `.groundgraph.yaml` — so the actionable fix is editing the
                 // `languages:` list, not re-running `init` (which would no-op).
-                eprintln!(
-                    "warning: {} 门语言有源文件但未被索引: {} — 在 .groundgraph.yaml 的 `languages:` 列表中加入它们后重新 `groundgraph index`（init 仅在首次创建配置时自动检测一次，不会覆盖已有配置）",
+                tracing::warn!(
+                    "{} 门语言有源文件但未被索引: {} — 在 .groundgraph.yaml 的 `languages:` 列表中加入它们后重新 `groundgraph index`（init 仅在首次创建配置时自动检测一次，不会覆盖已有配置）",
                     langs.len(),
                     langs.join(", ")
                 );
             }
             Ok(_) => {}
-            Err(e) => eprintln!("（语言覆盖自检跳过：{e:#}）"),
+            Err(e) => tracing::warn!("语言覆盖自检跳过：{e:#}"),
         }
     }
     // P25: fold the persistence contract into the same graph. Best-effort —
@@ -87,10 +99,87 @@ pub fn run(repo_root: &Path, docs_only: bool) -> Result<()> {
                     s.inline_sql_table_edges as i64,
                 );
             }
-            Err(e) => eprintln!("Schema index skipped: {e:#}"),
+            Err(e) => {
+                tracing::warn!("Schema index skipped: {e:#}");
+                partials.push(PartialFailure {
+                    indexer: "schema".into(),
+                    reason: format!("{e:#}"),
+                });
+            }
+        }
+    }
+    if !partials.is_empty() {
+        tracing::warn!("index completed with {} partial failure(s)", partials.len());
+        for p in &partials {
+            tracing::warn!(indexer = %p.indexer, reason = %p.reason, "partial failure");
+        }
+        if fail_on_partial {
+            // #233 — a partial index is a user-correctable environment
+            // problem (install the missing SCIP tool, raise the parse budget),
+            // so it exits 2, not the internal 70.
+            return Err(crate::exit_code::UserError(format!(
+                "index completed with {} partial failure(s) — graph may have gaps (exit 2; pass --fail-on-partial=false to tolerate)",
+                partials.len()
+            ))
+            .into());
         }
     }
     Ok(())
+}
+
+/// `indicatif`-backed progress sink for `groundgraph index` (issues.md #231).
+///
+/// On a TTY it draws a spinner labelled with the current phase
+/// (`index → dart`). Under CI / when stderr is piped (non-TTY) it hides
+/// entirely so stdout — which carries the summary and any future
+/// `--format json` — stays clean. The engine knows nothing about terminals:
+/// it only calls [`ProgressSink::phase`].
+struct IndexProgress {
+    bar: ProgressBar,
+    is_tty: bool,
+}
+
+impl IndexProgress {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        let is_tty = std::io::stderr().is_terminal();
+        let draw_target = if is_tty {
+            ProgressDrawTarget::stderr()
+        } else {
+            // CI / piped: silent (indicatif hide convention, #231).
+            ProgressDrawTarget::hidden()
+        };
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        bar.set_draw_target(draw_target);
+        bar.set_message("index → starting");
+        if is_tty {
+            // Steady tick keeps the spinner animated between phase events.
+            bar.enable_steady_tick(Duration::from_millis(120));
+        }
+        Self { bar, is_tty }
+    }
+
+    fn finish(&self) {
+        if self.is_tty {
+            self.bar.finish_with_message("index → done");
+        } else {
+            // Nothing was drawn; clear any buffered state.
+            self.bar.finish_and_clear();
+        }
+    }
+}
+
+impl ProgressSink for IndexProgress {
+    fn phase(&mut self, phase: &str) {
+        self.bar.set_message(format!("index → {phase}"));
+        // inc keeps an internal counter (harmless when hidden) so a future
+        // periodic single-line mode under CI has a tick to report.
+        self.bar.inc(1);
+    }
 }
 
 /// Push aggregate index counts into the per-command stats collector so

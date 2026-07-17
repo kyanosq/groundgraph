@@ -2,8 +2,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
+
+use crate::exit_code::bail_user;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTarget {
@@ -240,7 +242,8 @@ fn read_json_object(path: &Path) -> Result<Value> {
     let value: Value = serde_json::from_str(&body)
         .with_context(|| format!("parsing JSON config {}", path.display()))?;
     if !value.is_object() {
-        bail!("JSON config {} must contain an object", path.display());
+        // exit 2: user input — config file shape is wrong; user can fix it.
+        bail_user!("JSON config {} must contain an object", path.display());
     }
     Ok(value)
 }

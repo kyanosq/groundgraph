@@ -38,9 +38,9 @@
 //!   aggregator so the UI can render "12 files" badges.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::{EdgeAssertion, EdgeCertainty, EdgeSource, EdgeStatus, Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,8 @@ use crate::business_candidates::{
     candidate_artifact_id, load_business_candidates, BusinessCandidate, ReviewStatus,
 };
 use crate::checks::{compute_checks_with_policy, CheckFinding, CheckPolicy, CheckSeverity};
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 
 /// Bump whenever the JSON shape changes in a way readers must observe.
 pub const GRAPH_SCHEMA_VERSION: u32 = 2;
@@ -252,11 +253,10 @@ impl Default for GraphOptions {
 // ---------------------------------------------------------------------------
 
 /// Build the view model from `.groundgraph/graph.db`. Read-only.
-pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> Result<GraphViewModel> {
+pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> EngineResult<GraphViewModel> {
     let config = load_config(repo_root)?;
-    let db_path = resolve_storage_path(repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(repo_root, &config)?;
+    let store = Store::open(&db_path)?;
 
     // 1. Materialise raw nodes/edges.
     let mut nodes: Vec<GraphNode> = store
@@ -632,7 +632,7 @@ fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
         kind: edge.kind.as_str().into(),
         layer,
         status,
-        confidence: Some(edge.confidence),
+        confidence: Some(edge.confidence.get()),
         source: Some(edge.source.as_str().into()),
         rationale: None,
         source_file: edge.source_file.clone(),
@@ -786,19 +786,19 @@ fn merge_business_candidate(
         Some(ReviewStatus::Accepted) => (
             GraphLayer::Fact,
             GraphStatus::Stale,
-            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            c.confidence.map_or(0.5, |v| v.get()),
             "human_confirmed",
         ),
         Some(ReviewStatus::Rejected) => (
             GraphLayer::Candidate,
             GraphStatus::Rejected,
-            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            c.confidence.map_or(0.5, |v| v.get()),
             "ai_candidate",
         ),
         Some(ReviewStatus::NeedsChanges) | Some(ReviewStatus::Pending) | None => (
             GraphLayer::Candidate,
             GraphStatus::Proposed,
-            c.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+            c.confidence.map_or(0.5, |v| v.get()),
             "ai_candidate",
         ),
     };
@@ -1445,12 +1445,8 @@ fn compute_stats(
 // Config plumbing — local to keep `graph` self-contained.
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]
@@ -1862,22 +1858,6 @@ mod tests {
         let err = load_config(tmp.path()).expect_err("missing config must error");
         let msg = format!("{err}");
         assert!(msg.contains("no GroundGraph workspace"), "{msg}");
-    }
-
-    #[test]
-    fn resolve_storage_path_prefers_absolute_path() {
-        let mut cfg = EngineConfig::default();
-        cfg.storage.path = "/tmp/abs/graph.db".into();
-        let path = resolve_storage_path(Path::new("/repo"), &cfg);
-        assert_eq!(path, PathBuf::from("/tmp/abs/graph.db"));
-    }
-
-    #[test]
-    fn resolve_storage_path_joins_relative_path_against_repo_root() {
-        let mut cfg = EngineConfig::default();
-        cfg.storage.path = "graph.db".into();
-        let path = resolve_storage_path(Path::new("/repo"), &cfg);
-        assert_eq!(path, PathBuf::from("/repo/graph.db"));
     }
 
     // -----------------------------------------------------------------

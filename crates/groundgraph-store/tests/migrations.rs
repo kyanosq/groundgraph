@@ -9,13 +9,15 @@ const EXPECTED_TABLES: &[&str] = &[
     "evidence",
     "symbol_ranges",
     "file_index",
-    "slice_cache",
     "schema_version",
     // FTS5 content layer (migration 003). It is a virtual table but still
     // surfaces in `sqlite_master` as type='table'; guarding it here means a
     // dropped/renamed full-text migration fails CI instead of silently
     // breaking search.
     "node_fts",
+    // `slice_cache` is intentionally absent: created by 001 but never read or
+    // written, it was dropped by migration 005 (#151). Its absence is asserted
+    // in `migration_creates_all_expected_tables` below.
 ];
 
 fn table_names(store: &Store) -> Vec<String> {
@@ -46,6 +48,13 @@ fn migration_creates_all_expected_tables() {
             "expected table `{expected}` to exist after migration, got: {tables:?}",
         );
     }
+    // #151: `slice_cache` was created by 001 but never read or written, so
+    // migration 005 dropped it. Asserting its absence means a future revival
+    // that re-adds the table without a migration fails CI.
+    assert!(
+        !tables.iter().any(|t| t == "slice_cache"),
+        "slice_cache must be gone after migration 005, got: {tables:?}",
+    );
 }
 
 /// The 7 adjacency / foreign-key indexes a fully-migrated DB must carry

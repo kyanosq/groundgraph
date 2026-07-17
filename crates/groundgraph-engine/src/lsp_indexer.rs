@@ -157,35 +157,70 @@ pub fn run_profile(profile: &LspProfile, options: &LspIndexOptions) -> Result<Ls
     // crash mid-handshake, etc. The only thing that still propagates is
     // logic-bug-style errors from us (e.g. file extension on PATH check
     // changed mid-call) — none of those are reachable today.
-    let mut client = match LspClient::spawn(&command, &arg_strs, &options.repo_root) {
+    let root_uri = path_to_file_uri(&options.repo_root);
+    // #217: ride a one-off LSP flake — the server exits mid-handshake on a
+    // cold first start (gopls / sourcekit-lsp crash on a cold cache), or spawn
+    // hits a transient io error — through a bounded retry before downgrading
+    // to Skipped. Only the spawn+initialize pair is retried; once the
+    // handshake succeeds the indexing loop runs exactly once.
+    let policy = crate::proc::subprocess_retry_policy();
+    let mut attempts = 0u32;
+    let attempt = || -> Result<LspClient, crate::proc::SubprocessFailure> {
+        attempts += 1;
+        let mut client = match LspClient::spawn(&command, &arg_strs, &options.repo_root) {
+            Ok(c) => c,
+            Err(err) => {
+                return Err(crate::proc::SubprocessFailure::Spawn(
+                    std::io::Error::other(flatten_error_message(&err)),
+                ));
+            }
+        };
+        if let Err(err) = client.initialize(&root_uri) {
+            // The server came up but the handshake failed — often a first-start
+            // race. Classify as a transient exit so the driver retries once,
+            // carrying the captured server stderr (plus the initialize error)
+            // into the final reason.
+            let mut combined = client.captured_stderr();
+            let detail = flatten_error_message(&err);
+            if !detail.is_empty() {
+                combined.push_str(&format!("\n[initialize: {detail}]"));
+            }
+            return Err(crate::proc::SubprocessFailure::Exited {
+                code: None,
+                stderr: combined.into_bytes(),
+            });
+        }
+        Ok(client)
+    };
+    let mut client = match crate::proc::retry_transient_subprocess(policy, attempt) {
         Ok(c) => c,
-        Err(err) => {
+        Err(crate::proc::SubprocessFailure::Spawn(err)) => {
+            let mut reason = format!("无法启动 {} LSP `{}`：{}", profile.language, command, err);
+            let retries = attempts.saturating_sub(1);
+            if retries > 0 {
+                reason.push_str(&format!("（已重试 {retries} 次后仍失败）"));
+            }
             return Ok(LspIndexOutcome::Skipped {
-                reason: format!(
-                    "无法启动 {} LSP `{}`：{}",
-                    profile.language,
-                    command,
-                    flatten_error_message(&err)
-                ),
+                reason,
+                language: profile.language,
+            });
+        }
+        Err(crate::proc::SubprocessFailure::Exited { stderr, .. }) => {
+            let stderr_str = String::from_utf8_lossy(&stderr);
+            let mut reason = with_server_stderr(
+                format!("{} LSP `{}` initialize 失败", profile.language, command),
+                &stderr_str,
+            );
+            let retries = attempts.saturating_sub(1);
+            if retries > 0 {
+                reason.push_str(&format!("（已重试 {retries} 次后仍失败）"));
+            }
+            return Ok(LspIndexOutcome::Skipped {
+                reason,
                 language: profile.language,
             });
         }
     };
-    let root_uri = path_to_file_uri(&options.repo_root);
-    if let Err(err) = client.initialize(&root_uri) {
-        return Ok(LspIndexOutcome::Skipped {
-            reason: with_server_stderr(
-                format!(
-                    "{} LSP `{}` initialize 失败：{}",
-                    profile.language,
-                    command,
-                    flatten_error_message(&err)
-                ),
-                &client.captured_stderr(),
-            ),
-            language: profile.language,
-        });
-    }
 
     let mut batch = LanguageIndexBatch {
         language: profile.language.into(),

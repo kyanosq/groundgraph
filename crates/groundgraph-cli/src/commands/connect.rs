@@ -29,17 +29,14 @@ pub fn run_apply(repo_root: &Path, candidates: PathBuf, dry_run: bool, json: boo
     } else {
         print_human(&outcome);
     }
-    Ok(
-        if outcome.rejected.is_empty() && (!outcome.accepted.is_empty() || dry_run) {
-            0
-        } else if outcome.accepted.is_empty() && !outcome.rejected.is_empty() {
-            // Nothing landed because every candidate was rejected.
-            2
-        } else {
-            // Mixed: some accepted, some rejected. Non-zero so operators notice.
-            1
-        },
-    )
+    Ok(if outcome.rejected.is_empty() && (!outcome.accepted.is_empty() || dry_run) {
+        0
+    } else {
+        // Some (or all) candidates were rejected — a user-actionable outcome.
+        // Exit 2 under the #233 contract (was a mix of 1 for partial and 2
+        // for fully-rejected; both now collapse to the single user-error code).
+        i32::from(crate::exit_code::EXIT_USER_ERROR)
+    })
 }
 
 fn serialise_evidence(pack: &EvidencePack, pretty: bool) -> Result<String> {

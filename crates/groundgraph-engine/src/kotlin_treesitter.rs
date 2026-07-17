@@ -18,8 +18,8 @@
 //!   qualified names are file-local and need no namespace handling.
 
 use crate::treesitter::{
-    name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws, LangSpec,
-    RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws, CallKind,
+    LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -203,7 +203,7 @@ fn kotlin_resolve_import(
 ///   symbol (type or function) carries the name.
 fn kotlin_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_kotlin_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, KOTLIN_CALL_KINDS);
     out
 }
 
@@ -222,37 +222,24 @@ fn navigation_call_name(callee: tree_sitter::Node<'_>, src: &[u8]) -> Option<Str
     last
 }
 
-fn collect_kotlin_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call_expression" {
-            if let Some(callee) = child.named_child(0) {
-                match callee.kind() {
-                    "identifier" => {
-                        if let Some(t) = node_text(callee, src) {
-                            out.push((t.to_string(), RefKind::Call));
-                        }
-                    }
-                    "navigation_expression" => {
-                        if let Some(name) = navigation_call_name(callee, src) {
-                            out.push((name, RefKind::Call));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+/// The single Kotlin call shape: a `call_expression` whose callee (first
+/// named child) is a bare `identifier` or a `navigation_expression`
+/// (`obj.helper`, including `?.` safe-calls).
+fn kotlin_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    let callee = node.named_child(0)?;
+    match callee.kind() {
+        "identifier" => node_text(callee, src).map(|t| (t.to_string(), RefKind::Call)),
+        "navigation_expression" => {
+            navigation_call_name(callee, src).map(|name| (name, RefKind::Call))
         }
-        collect_kotlin_calls(child, src, out, depth + 1);
+        _ => None,
     }
 }
+
+static KOTLIN_CALL_KINDS: &[CallKind] = &[CallKind {
+    kind: "call_expression",
+    extract: kotlin_call_extract,
+}];
 
 pub(crate) static KOTLIN_SPEC: LangSpec = LangSpec {
     language_id: "kotlin",
@@ -283,6 +270,7 @@ pub(crate) static KOTLIN_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -441,7 +429,7 @@ class DefaultGreeter(val n: Int) {
         let refs: Vec<(String, String, RefKind)> = s
             .references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect();
         assert!(
             refs.contains(&("App.run".into(), "DefaultGreeter".into(), RefKind::Call)),

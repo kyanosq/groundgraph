@@ -35,10 +35,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::NodeKind;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
+
+use crate::error::EngineResult;
 
 /// Schema version emitted alongside [`SimilarityReport`] so future
 /// consumers can refuse to deserialize incompatible payloads
@@ -204,14 +206,9 @@ pub struct SimilarityMember {
 
 /// Convenience entry point — opens the workspace store and runs
 /// [`analyze_similarity_with_store`].
-pub fn analyze_similarity(options: SimilarityOptions) -> Result<SimilarityReport> {
+pub fn analyze_similarity(options: SimilarityOptions) -> EngineResult<SimilarityReport> {
     let db_path = crate::config::storage_path_for_repo(&options.repo_root)?;
-    let store = Store::open(&db_path).with_context(|| {
-        format!(
-            "opening graph store at {} for similarity report",
-            db_path.display()
-        )
-    })?;
+    let store = Store::open(&db_path)?;
     analyze_similarity_with_store(&store, options)
 }
 
@@ -223,7 +220,7 @@ pub fn analyze_similarity(options: SimilarityOptions) -> Result<SimilarityReport
 pub fn analyze_similarity_with_store(
     store: &Store,
     options: SimilarityOptions,
-) -> Result<SimilarityReport> {
+) -> EngineResult<SimilarityReport> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let repo_root = options.repo_root.clone();
     let shingle_k = options.shingle_k.max(1);
@@ -1452,9 +1449,7 @@ function process(text: string): number {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some(file.into()),
-                source_hash: None,
                 indexer: Some("python_ast".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();

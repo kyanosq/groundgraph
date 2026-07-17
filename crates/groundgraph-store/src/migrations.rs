@@ -34,6 +34,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("./migrations_sql/004_edge_order_indexes.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("./migrations_sql/005_schema_cleanup.sql"),
+    },
 ];
 
 pub(crate) fn apply_all(conn: &mut Connection) -> StoreResult<()> {
@@ -206,7 +210,7 @@ mod tests {
         assert_eq!(applied_versions(&conn), vec![1]);
 
         apply_list(&mut conn, MIGRATIONS).unwrap();
-        assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4]);
+        assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
         assert!(
             table_exists(&conn, "node_fts"),
             "003 FTS table applied on resume"
@@ -214,7 +218,7 @@ mod tests {
 
         // Idempotent third pass.
         apply_list(&mut conn, MIGRATIONS).unwrap();
-        assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4]);
+        assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
     }
 
     /// #216: two processes migrating the *same fresh database* at once must not
@@ -265,7 +269,11 @@ mod tests {
             // have errored above; this confirms the full set landed exactly once
             // and the last migration's schema object exists.
             let conn = Connection::open(&db).unwrap();
-            assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4], "round {round}");
+            assert_eq!(
+                applied_versions(&conn),
+                vec![1, 2, 3, 4, 5],
+                "round {round}"
+            );
             assert!(table_exists(&conn, "node_fts"), "round {round}");
         }
     }
@@ -283,6 +291,114 @@ mod tests {
             && b.iter()
                 .enumerate()
                 .all(|(i, &c)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        // PRAGMA table_info: cid(0), name(1), type(2), … — index 1 is the name.
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        names.iter().any(|c| c == column)
+    }
+
+    /// #151/#152/#188/#190: migration 005 drops the never-written `source_hash`
+    /// / `index_generation` columns from `nodes` and `edge_assertions` (table
+    /// rebuild, since SQLite < 3.35 has no DROP COLUMN) and drops the dead
+    /// `slice_cache` table. Written TDD-first: this test fails until 005 lands.
+    #[test]
+    fn migration_005_drops_dead_columns_and_slice_cache_while_keeping_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // (1) Seed a v4-schema database: only migrations 1–4 applied, so the
+        // old `source_hash` / `index_generation` columns still exist.
+        apply_list(&mut conn, &MIGRATIONS[..4]).unwrap();
+        for (table, col) in [
+            ("nodes", "source_hash"),
+            ("nodes", "index_generation"),
+            ("edge_assertions", "source_hash"),
+            ("edge_assertions", "index_generation"),
+        ] {
+            assert!(
+                column_exists(&conn, table, col),
+                "v4 schema must still define {table}.{col}"
+            );
+        }
+        assert!(table_exists(&conn, "slice_cache"), "v4 has slice_cache");
+
+        // (2) Write real rows carrying the soon-to-be-dropped columns plus
+        // distinctive data in preserved columns, so we can prove the rebuild
+        // keeps the data and only drops the two columns.
+        conn.execute(
+            "INSERT INTO nodes (id, kind, path, name, source_hash, index_generation) \
+             VALUES ('n1', 'file', 'lib/a.dart', 'a.dart', 'node-hash', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_assertions \
+             (id, from_id, to_id, kind, source, certainty, status, confidence, \
+              source_hash, index_generation) \
+             VALUES ('e1', 'a', 'b', 'contains', 'filesystem', 'fact', 'confirmed', 1.0, \
+                     'edge-hash', 6)",
+            [],
+        )
+        .unwrap();
+
+        // (3) Apply the full migration set — this is where 005 runs.
+        apply_list(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(
+            applied_versions(&conn),
+            vec![1, 2, 3, 4, 5],
+            "005 must be recorded"
+        );
+
+        // (4) The dead columns are gone from both rebuilt tables.
+        for (table, col) in [
+            ("nodes", "source_hash"),
+            ("nodes", "index_generation"),
+            ("edge_assertions", "source_hash"),
+            ("edge_assertions", "index_generation"),
+        ] {
+            assert!(
+                !column_exists(&conn, table, col),
+                "005 must drop {table}.{col}"
+            );
+        }
+
+        // (5) Preserved data survived the rebuild (rows + their kept columns).
+        let (path, name): (String, String) = conn
+            .query_row("SELECT path, name FROM nodes WHERE id = 'n1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(path, "lib/a.dart");
+        assert_eq!(name, "a.dart");
+        let (count, conf): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), confidence FROM edge_assertions WHERE id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "edge row survived rebuild");
+        assert_eq!(conf, 1.0);
+
+        // (6) The dead `slice_cache` table is gone (#151).
+        assert!(
+            !table_exists(&conn, "slice_cache"),
+            "005 must DROP slice_cache"
+        );
+
+        // (7) Idempotent: a second full apply is a no-op (005 already recorded).
+        apply_list(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
+        assert!(!column_exists(&conn, "nodes", "source_hash"));
+        assert!(!table_exists(&conn, "slice_cache"));
     }
 
     #[test]

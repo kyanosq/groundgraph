@@ -13,7 +13,8 @@ use groundgraph_store::Store;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
-use crate::config::{EngineConfig, DEFAULT_STORAGE_DIR};
+use crate::config::{resolve_storage_path, EngineConfig, DEFAULT_STORAGE_DIR};
+use crate::error::EngineResult;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ExportFormat {
@@ -34,15 +35,12 @@ pub struct ExportOutcome {
 
 const EXPORTED_TABLES: &[&str] = &["nodes", "edge_assertions", "evidence"];
 
-pub fn export(options: ExportOptions) -> Result<ExportOutcome> {
+pub fn export(options: ExportOptions) -> EngineResult<ExportOutcome> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
 
-    let mut store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
-    store
-        .migrate()
-        .with_context(|| format!("running migrations on {}", db_path.display()))?;
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
 
     let bundle_dir = options.repo_root.join(DEFAULT_STORAGE_DIR).join("export");
     std::fs::create_dir_all(&bundle_dir)
@@ -114,10 +112,35 @@ fn sqlite_value_to_json(value: rusqlite::types::Value) -> Value {
     }
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
 }
 
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::types::Value as Sql;
+
+    #[test]
+    fn sqlite_value_to_json_maps_each_storage_type() {
+        assert_eq!(sqlite_value_to_json(Sql::Null), Value::Null);
+        assert_eq!(sqlite_value_to_json(Sql::Integer(-7)), Value::from(-7));
+        assert_eq!(
+            sqlite_value_to_json(Sql::Text("hi".into())),
+            Value::String("hi".into())
+        );
+        // Blob bytes are emitted as their unsigned numeric value.
+        assert_eq!(
+            sqlite_value_to_json(Sql::Blob(vec![0, 1, 255])),
+            Value::Array(vec![Value::from(0), Value::from(1), Value::from(255)])
+        );
+    }
+
+    #[test]
+    fn sqlite_value_to_json_collapses_non_finite_reals_to_null() {
+        // serde_json has no representation for NaN/Infinity.
+        assert_eq!(sqlite_value_to_json(Sql::Real(f64::NAN)), Value::Null);
+        assert_eq!(sqlite_value_to_json(Sql::Real(f64::INFINITY)), Value::Null);
+        assert_eq!(sqlite_value_to_json(Sql::Real(1.5)), Value::from(1.5));
+    }
 }

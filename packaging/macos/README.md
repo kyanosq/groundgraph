@@ -8,7 +8,9 @@ higher-precision Flutter/Dart indexing.
 
 ```text
 bin/groundgraph
+bin/groundgraph-mcp
 libexec/groundgraph
+libexec/groundgraph-mcp
 tool/groundgraph_dart_analyzer/
 skills/groundgraph/
 README.md
@@ -16,27 +18,29 @@ README-AI-SKILL.md
 BUILD-INFO.txt
 ```
 
-`bin/groundgraph` is the user-facing wrapper. `libexec/groundgraph` is the universal binary. The Dart
-analyzer sidecar is intentionally included as source under
-`tool/groundgraph_dart_analyzer/`.
-
-This package is CLI-focused and does not ship `groundgraph-mcp`; install the MCP
-server from source with `cargo install --locked --path crates/groundgraph-mcp`
-when an AI client needs a stdio MCP server.
+`bin/groundgraph` and `bin/groundgraph-mcp` are the user-facing wrappers;
+`libexec/groundgraph` and `libexec/groundgraph-mcp` are the universal binaries
+(arm64 + x86_64). The Dart analyzer sidecar is intentionally included as source
+under `tool/groundgraph_dart_analyzer/`. To expose the graph to AI agents over
+MCP, point a stdio MCP client at `bin/groundgraph-mcp` — no separate install
+needed.
 
 ## Install
 
 ```bash
-tar -xzf groundgraph-0.2.0-macos-universal.tar.gz
-sudo cp -R groundgraph-0.2.0-macos-universal /usr/local/groundgraph
+tar -xzf groundgraph-<VERSION>-macos-universal.tar.gz
+sudo cp -R groundgraph-<VERSION>-macos-universal /usr/local/groundgraph
 sudo ln -sf /usr/local/groundgraph/bin/groundgraph /usr/local/bin/groundgraph
+sudo ln -sf /usr/local/groundgraph/bin/groundgraph-mcp /usr/local/bin/groundgraph-mcp   # optional, for AI agents
 groundgraph --help
 ```
+
+Replace `<VERSION>` with the package version (e.g. `0.3.0`).
 
 If you do not want to use `/usr/local`, put the extracted directory anywhere
 and add its `bin` directory to PATH.
 
-## Supported languages (0.2.0)
+## Supported languages (0.3.0)
 
 GroundGraph indexes in two tiers. **Breadth** is always available (the
 tree-sitter grammars are linked into the binary — no external tool, no
@@ -163,6 +167,6 @@ GroundGraph does not require annotations in production code, tests, or docs.
 ## Uninstall
 
 ```bash
-sudo rm -f /usr/local/bin/groundgraph
+sudo rm -f /usr/local/bin/groundgraph /usr/local/bin/groundgraph-mcp
 sudo rm -rf /usr/local/groundgraph
 ```

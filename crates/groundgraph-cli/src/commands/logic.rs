@@ -39,7 +39,7 @@ pub fn run(repo_root: &Path, json: bool, only_risks: bool) -> Result<i32> {
 fn print_human(report: &LogicConfidenceReport) {
     if !report.warnings.is_empty() {
         for w in &report.warnings {
-            eprintln!("groundgraph: 警告：{w}");
+            tracing::warn!("{w}");
         }
     }
     let s = &report.summary;

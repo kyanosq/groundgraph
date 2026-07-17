@@ -15,10 +15,12 @@ pub fn run(repo_root: &Path, json: bool, fail_on_warning: bool) -> Result<i32> {
     }
     let mut exit = 0;
     if report.has_errors() {
-        exit = 1;
+        // #233 — check findings are a user-correctable data problem (broken
+        // links / missing tests), not an internal failure: exit 2.
+        exit = i32::from(crate::exit_code::EXIT_USER_ERROR);
     }
     if fail_on_warning && report.warnings() > 0 {
-        exit = 1;
+        exit = i32::from(crate::exit_code::EXIT_USER_ERROR);
     }
     Ok(exit)
 }

@@ -11,12 +11,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::{EdgeAssertion, Node};
 use groundgraph_store::Store;
 use serde::Serialize;
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 
 /// A node in the force-directed network. Field names match the JSON the viewer
 /// consumes (`webui/index.html`): `id, kind, name, path, line, deg`.
@@ -142,14 +143,11 @@ pub fn network_from_graph(
 }
 
 /// Load the graph store at `repo_root` and build the full network view.
-pub fn build_network_graph(options: NetworkOptions) -> Result<NetworkGraph> {
+pub fn build_network_graph(options: NetworkOptions) -> EngineResult<NetworkGraph> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let mut store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
-    store
-        .migrate()
-        .with_context(|| format!("running migrations on {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
     let repo = repo_name(&options.repo_root);
@@ -174,12 +172,8 @@ fn repo_name(repo_root: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

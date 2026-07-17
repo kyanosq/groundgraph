@@ -16,7 +16,8 @@ use groundgraph_core::{ArtifactId, EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::git_diff::{git_diff, parse_unified_diff, ChangedFile, Hunk};
 use crate::index::{index_repository, IndexOptions};
 use crate::slice::SliceItem;
@@ -140,15 +141,14 @@ pub struct ImpactReport {
     pub info: Vec<String>,
 }
 
-pub fn run_impact(options: ImpactOptions) -> Result<ImpactReport> {
+pub fn run_impact(options: ImpactOptions) -> EngineResult<ImpactReport> {
     let config = load_config(&options.repo_root)?;
     if options.reindex && config.impact.auto_reindex_changed_files {
         index_repository(IndexOptions::all(options.repo_root.clone()))
             .context("re-indexing repository before impact")?;
     }
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
 
     let diff_text = git_diff(&options.repo_root, &options.base_ref, &options.head_ref)?;
     let changed = parse_unified_diff(&diff_text);
@@ -163,7 +163,7 @@ pub fn run_impact(options: ImpactOptions) -> Result<ImpactReport> {
 }
 
 /// Compute an impact report from an already-parsed diff. Useful in tests.
-pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> Result<ImpactReport> {
+pub fn compute_impact(store: &Store, changed: &[ChangedFile]) -> EngineResult<ImpactReport> {
     compute_impact_with_policy(store, changed, ImpactPolicy::default())
 }
 
@@ -171,7 +171,7 @@ pub fn compute_impact_with_policy(
     store: &Store,
     changed: &[ChangedFile],
     policy: ImpactPolicy,
-) -> Result<ImpactReport> {
+) -> EngineResult<ImpactReport> {
     let mut report = ImpactReport::default();
     let mut affected_reqs: BTreeSet<ArtifactId> = BTreeSet::new();
     let mut changed_symbol_ids: BTreeSet<ArtifactId> = BTreeSet::new();
@@ -428,7 +428,7 @@ pub fn compute_impact_with_policy(
 /// is part of the confirmed graph; any subsequent change to its
 /// evidence files / symbols must surface in `impact` reports so the
 /// reviewer notices.
-pub fn merge_confirmed_candidates(report: &mut ImpactReport, repo_root: &Path) -> Result<()> {
+pub fn merge_confirmed_candidates(report: &mut ImpactReport, repo_root: &Path) -> EngineResult<()> {
     use crate::business_candidates::{
         candidate_artifact_id, load_business_candidates, ReviewStatus,
     };
@@ -641,12 +641,8 @@ fn sort_items(items: &mut [SliceItem]) {
     items.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]

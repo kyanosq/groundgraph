@@ -7,13 +7,14 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use groundgraph_core::artifact_id::requirement_id;
 use groundgraph_core::{ArtifactId, EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::{EngineError, EngineResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureSlice {
@@ -86,15 +87,14 @@ impl Default for SliceFanoutOptions {
 /// up `slice` JSON output.
 const SLICE_FANOUT_MAX: usize = 256;
 
-pub fn slice_requirement(options: SliceOptions) -> Result<FeatureSlice> {
+pub fn slice_requirement(options: SliceOptions) -> EngineResult<FeatureSlice> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     slice_from_store_with_options(&store, &options.requirement, options.fanout)
 }
 
-pub fn slice_from_store(store: &Store, requirement: &str) -> Result<FeatureSlice> {
+pub fn slice_from_store(store: &Store, requirement: &str) -> EngineResult<FeatureSlice> {
     slice_from_store_with_options(store, requirement, SliceFanoutOptions::default())
 }
 
@@ -102,11 +102,16 @@ pub fn slice_from_store_with_options(
     store: &Store,
     requirement: &str,
     fanout: SliceFanoutOptions,
-) -> Result<FeatureSlice> {
+) -> EngineResult<FeatureSlice> {
     let req_id = requirement_id(requirement);
+    // A store failure (e.g. unmigrated db) routes to `Store`; a *missing*
+    // requirement is a distinct `NotFound` — the db is healthy, the target
+    // just is not indexed (#166).
     let req_node = store
         .find_node(&req_id)?
-        .with_context(|| format!("requirement {requirement} not found in graph"))?;
+        .ok_or_else(|| EngineError::NotFound {
+            what: format!("requirement {requirement} not found in graph"),
+        })?;
 
     let mut slice = FeatureSlice {
         requirement_id: requirement.to_string(),
@@ -237,12 +242,8 @@ fn sort_items(items: &mut [SliceItem]) {
     items.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 /// True for nodes whose kind represents an "implementation" symbol that
@@ -291,18 +292,6 @@ mod helper_tests {
         // with the sibling `QuestionsOptions::default()` which uses "." so a
         // `Default`-constructed option set resolves against the current dir.
         assert_eq!(SliceOptions::default().repo_root, PathBuf::from("."));
-    }
-
-    #[test]
-    fn resolve_storage_path_returns_absolute_when_already_absolute() {
-        let cfg = EngineConfig {
-            storage: crate::config::StorageConfig {
-                path: "/tmp/a/b.db".into(),
-            },
-            ..EngineConfig::default()
-        };
-        let resolved = resolve_storage_path(Path::new("/elsewhere"), &cfg);
-        assert_eq!(resolved.to_string_lossy(), "/tmp/a/b.db");
     }
 
     #[test]

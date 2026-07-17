@@ -19,7 +19,8 @@ use groundgraph_core::{ArtifactId, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::search::{run_search_with_store, SearchMatch, SearchOptions};
 
 /// Edge kinds the forward closure follows. A curated subset of
@@ -116,23 +117,18 @@ pub struct TraceResult {
 }
 
 /// Open the repo's graph.db and trace the forward closure of `query`.
-pub fn run_trace(options: TraceOptions) -> Result<TraceResult> {
+pub fn run_trace(options: TraceOptions) -> EngineResult<TraceResult> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     run_trace_with_store(&store, options)
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
 }
 
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
-}
-
-pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> Result<TraceResult> {
+pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> EngineResult<TraceResult> {
     // 1. Resolve seeds via the same matching as `search`.
     let mut search_opts = SearchOptions::keywords(&options.repo_root, &options.query);
     search_opts.limit = options.max_seeds.max(1);
@@ -140,7 +136,7 @@ pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> Result<Trac
         .with_context(|| format!("resolving trace seeds for `{}`", options.query))?;
     let seeds = select_seeds(&search.matches, &options.query, options.max_seeds);
 
-    trace_forward(store, &options, seeds)
+    Ok(trace_forward(store, &options, seeds)?)
 }
 
 /// Choose trace seeds from ranked search matches.

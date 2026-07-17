@@ -36,10 +36,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use groundgraph_core::Confidence;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+use crate::error::EngineResult;
 
 /// Schema version embedded in every YAML file. Bump only on incompatible
 /// changes — readers must accept older minor versions.
@@ -60,7 +63,7 @@ pub struct BusinessCandidatesDocument {
     /// candidates does not silently drop them. Note: YAML *comments*
     /// are still lost on rewrite — serde-yaml is structure-only.
     #[serde(flatten)]
-    pub extra: serde_yml::Mapping,
+    pub extra: serde_norway::Mapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -77,11 +80,12 @@ pub struct BusinessCandidate {
     /// of failing the load.
     #[serde(default)]
     pub evidence: Vec<String>,
-    /// Optional `(low..=high)` confidence; defaults to `0.5` when
-    /// missing so a missing field doesn't silently look like high
-    /// confidence.
+    /// Optional confidence; defaults to `0.5` when missing so a missing
+    /// field doesn't silently look like high confidence. The [`Confidence`]
+    /// newtype guarantees a finite value in `[0, 1]` — out-of-range or
+    /// `.nan` YAML entries are sanitised at load time (#168).
     #[serde(default)]
-    pub confidence: Option<f32>,
+    pub confidence: Option<Confidence>,
     #[serde(default)]
     pub open_questions: Vec<String>,
     /// Optional AI-authored risk warnings — short sentences describing
@@ -118,7 +122,7 @@ pub struct BusinessCandidate {
     /// authors are advised to embed any human-narrative explanations
     /// inside `description` / `risks` rather than as `#` comments.
     #[serde(flatten)]
-    pub extra: serde_yml::Mapping,
+    pub extra: serde_norway::Mapping,
 }
 
 fn default_status() -> String {
@@ -261,7 +265,7 @@ pub struct ReviewApplyOutcome {
 /// Try to load the candidates document. If the file is missing we
 /// return a default outcome with an empty list — P9 is opt-in and
 /// repos without one should keep working unchanged.
-pub fn load_business_candidates(repo_root: &Path) -> Result<LoadOutcome> {
+pub fn load_business_candidates(repo_root: &Path) -> EngineResult<LoadOutcome> {
     let path = repo_root.join(BUSINESS_CANDIDATES_REL_PATH);
     if !path.exists() {
         return Ok(LoadOutcome {
@@ -272,7 +276,7 @@ pub fn load_business_candidates(repo_root: &Path) -> Result<LoadOutcome> {
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading business candidates from {}", path.display()))?;
-    let mut document: BusinessCandidatesDocument = serde_yml::from_str(&raw)
+    let mut document: BusinessCandidatesDocument = serde_norway::from_str(&raw)
         .with_context(|| format!("parsing business candidates YAML at {}", path.display()))?;
     let mut warnings = Vec::new();
     // Validate + clean candidates.
@@ -336,7 +340,7 @@ pub fn candidate_artifact_id(id: &str) -> String {
 /// - `already_reviewed`: candidates already accepted or rejected. Kept
 ///   for `groundgraph candidate list --all` use cases.
 /// - `warnings`: parser warnings forwarded from [`load_business_candidates`].
-pub fn list_for_review(repo_root: &Path) -> Result<CandidateListSnapshot> {
+pub fn list_for_review(repo_root: &Path) -> EngineResult<CandidateListSnapshot> {
     let outcome = load_business_candidates(repo_root)?;
     let mut needs = Vec::new();
     let mut done = Vec::new();
@@ -374,13 +378,17 @@ pub fn apply_review(
     repo_root: &Path,
     candidate_id: &str,
     verdict: ReviewVerdict,
-) -> Result<ReviewApplyOutcome> {
+) -> EngineResult<ReviewApplyOutcome> {
     let path = repo_root.join(BUSINESS_CANDIDATES_REL_PATH);
     if !path.exists() {
-        anyhow::bail!(
-            "no candidates file at {} — run `groundgraph connect propose` (or hand-author one) first",
-            path.display()
-        );
+        // A missing candidates file is a user-actionable `NotFound` (run
+        // `propose` first), not an internal failure.
+        return Err(crate::error::EngineError::NotFound {
+            what: format!(
+                "no candidates file at {} — run `groundgraph connect propose` (or hand-author one) first",
+                path.display()
+            ),
+        });
     }
     // #198: serialize the whole read → mutate → write. `write_atomic` only
     // makes the *replace* atomic; the lost-update window spans the read and
@@ -410,17 +418,15 @@ pub fn apply_review(
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut document: BusinessCandidatesDocument =
-        serde_yml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        serde_norway::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let Some(target) = document
         .candidates
         .iter_mut()
         .find(|c| c.id == candidate_id)
     else {
-        anyhow::bail!(
-            "candidate `{}` not found in {}",
-            candidate_id,
-            path.display()
-        );
+        return Err(crate::error::EngineError::NotFound {
+            what: format!("candidate `{candidate_id}` not found in {}", path.display()),
+        });
     };
     let reviewed_at = match verdict.reviewed_at.clone() {
         Some(t) => t,
@@ -451,7 +457,7 @@ pub fn apply_review(
     });
     target.status = verdict.status.as_str().to_string();
     let final_status = target.status.clone();
-    let serialised = serde_yml::to_string(&document)
+    let serialised = serde_norway::to_string(&document)
         .with_context(|| format!("re-serialising {}", path.display()))?;
     crate::atomic_write::write_atomic(&path, &serialised)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -507,8 +513,44 @@ candidates:
         let c = &outcome.document.candidates[0];
         assert_eq!(c.id, "complete_purchase");
         assert_eq!(c.evidence.len(), 2);
-        assert!((c.confidence.unwrap() - 0.78).abs() < 1e-4);
+        assert!((c.confidence.unwrap().get() - 0.78).abs() < 1e-4);
         assert_eq!(c.open_questions.len(), 1);
+    }
+
+    #[test]
+    fn out_of_range_yaml_confidence_is_sanitised_at_load() {
+        // #168: hand-edited `confidence: 2.0` / `.nan` used to be accepted as a
+        // bare f32 and clamped ad hoc downstream (graph.rs). The `Confidence`
+        // newtype folds them into [0, 1] at deserialisation time.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".groundgraph/candidates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("business_logic.yaml"),
+            r#"
+schema_version: 1
+batch_id: 2026-07-17-confidence-sanitise
+candidates:
+  - id: too_high
+    name: "Out of range"
+    description: "x"
+    confidence: 2.0
+    status: proposed
+    llm_model: claude-opus-4
+  - id: not_a_number
+    name: "NaN"
+    description: "x"
+    confidence: .nan
+    status: proposed
+    llm_model: claude-opus-4
+"#,
+        )
+        .unwrap();
+
+        let outcome = load_business_candidates(tmp.path()).unwrap();
+        let c = &outcome.document.candidates;
+        assert_eq!(c[0].confidence.unwrap(), 1.0);
+        assert_eq!(c[1].confidence.unwrap(), 1.0);
     }
 
     #[test]
@@ -736,6 +778,106 @@ candidates:
         assert_eq!(c.review_status(), Some(ReviewStatus::NeedsChanges));
         let pending = c.pending_open_questions();
         assert_eq!(pending, vec!["是否服务端校验？"]);
+    }
+
+    #[test]
+    fn candidates_yaml_round_trips_byte_stably_with_special_chars() {
+        // Characterization guard for the YAML backend. The candidates file is a
+        // user-editable data contract, so the serializer must be a fixpoint:
+        // after one normalisation, re-reading and re-writing the document must
+        // not churn a single byte. Key order, block scalars, Unicode, nested
+        // mappings, unknown forward-compat fields, quote-ambiguous strings and
+        // the `.nan` → sanitised fixpoint must all survive intact.
+        //
+        // This test is the safety net for the RUSTSEC-2025-0068 migration off
+        // `serde_yml` onto `serde_norway` — it pins byte-stable round-trip
+        // behaviour independent of which serde-YAML backend is plugged in.
+        let rich = "\
+schema_version: 1
+batch_id: 2026-07-17-往返-检查
+candidates:
+  - id: unicode_and_multiline
+    name: \"完成购买 — 解锁 Pro ⚡\"
+    description: |
+      第一行：监听购买流。
+      第二行：调用 applyPurchase。
+      第三行：写入 Hive。
+    evidence:
+      - dart_method::lib/a.dart#A.b
+    confidence: 0.83
+    open_questions:
+      - \"是否服务端校验？\"
+      - \"yes\"
+    risks:
+      - \"没有收据校验\"
+    recommendation: \"建议补完收据校验后再确认\"
+    status: needs_changes
+    llm_model: claude-opus-4
+    review:
+      status: needs_changes
+      reviewer: \"qjs\"
+      note: \"先补一个 unit test\"
+      reviewed_at: \"2026-05-20T03:21:09Z\"
+      answered_questions:
+        - \"是否服务端校验？\"
+  - id: nan_confidence
+    name: \"NaN 入口\"
+    description: \"x\"
+    confidence: .nan
+    status: proposed
+";
+        // Parse → serialise once (normalise), then parse → serialise again.
+        let doc1: BusinessCandidatesDocument = serde_norway::from_str(rich).unwrap();
+        let bytes1 = serde_norway::to_string(&doc1).unwrap();
+        let doc2: BusinessCandidatesDocument = serde_norway::from_str(&bytes1).unwrap();
+        let bytes2 = serde_norway::to_string(&doc2).unwrap();
+        // Idempotency: the serialiser is a fixpoint after one normalisation.
+        assert_eq!(
+            bytes1, bytes2,
+            "YAML round-trip is not byte-stable:\n--- bytes1 ---\n{bytes1}\n--- bytes2 ---\n{bytes2}"
+        );
+
+        // Value fidelity — nothing was corrupted through the round-trip.
+        let u = doc1
+            .candidates
+            .iter()
+            .find(|c| c.id == "unicode_and_multiline")
+            .unwrap();
+        assert!(u.name.contains("解锁 Pro ⚡"));
+        assert!(u.description.contains("第一行：监听购买流。"));
+        assert!(u.description.contains("写入 Hive。"));
+        assert_eq!(
+            u.open_questions,
+            vec!["是否服务端校验？".to_string(), "yes".to_string()]
+        );
+        assert_eq!(u.risks, vec!["没有收据校验".to_string()]);
+        assert_eq!(
+            u.recommendation.as_deref(),
+            Some("建议补完收据校验后再确认")
+        );
+        assert_eq!(u.review.as_ref().unwrap().reviewer.as_deref(), Some("qjs"));
+        // `.nan` reaches a stable sanitised fixpoint (1.0) instead of churning.
+        let n = doc1
+            .candidates
+            .iter()
+            .find(|c| c.id == "nan_confidence")
+            .unwrap();
+        assert_eq!(n.confidence.unwrap(), 1.0);
+
+        // Forward-compat unknown fields survive the serialised bytes.
+        assert!(
+            bytes1.contains("llm_model"),
+            "per-candidate unknown field lost: {bytes1}"
+        );
+        assert!(
+            bytes1.contains("batch_id"),
+            "top-level unknown field lost: {bytes1}"
+        );
+        // The quoted, ambiguity-prone string stays a string through the trip.
+        assert!(
+            bytes1.contains("yes"),
+            "quote-ambiguous string `yes` lost: {bytes1}"
+        );
     }
 
     #[test]

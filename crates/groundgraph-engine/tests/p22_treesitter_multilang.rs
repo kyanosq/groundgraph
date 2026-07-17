@@ -9,7 +9,11 @@
 use std::fs;
 use std::path::Path;
 
-use groundgraph_core::NodeKind;
+use groundgraph_core::{EdgeKind, NodeKind};
+use groundgraph_engine::config::DeadCodeConfig;
+use groundgraph_engine::dead_code::{
+    analyze_dead_code_with_store, DeadCodeConfidence, DeadCodeOptions,
+};
 use groundgraph_engine::index::index_repository;
 use groundgraph_engine::{IndexOptions, IndexResult};
 use groundgraph_store::Store;
@@ -385,4 +389,88 @@ fn unknown_languages_are_skipped_not_fatal() {
         "only rust should produce output"
     );
     assert_eq!(result.treesitter[0].language, "rust");
+}
+
+/// issues.md #123 — a `macro_rules!` definition must (a) become a RustMacro
+/// node and (b) receive an inbound `Calls` edge from every `foo!()` site, so a
+/// macro that is in use is reachable and never a dead-code false positive. A
+/// macro that is genuinely never invoked stays dead — the correctness floor is
+/// unchanged, the false positive the issue warns about is gone.
+#[test]
+fn rust_macro_in_use_is_not_a_dead_code_false_positive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // `used_macro` sits in the reachable crate root and is invoked by
+    // `helper`, which `main` calls — so the macro is reachable and must not
+    // be flagged. `dead_macro` lives in a separate file that no reachable
+    // code references, so it stays unreachable and MUST still be flagged —
+    // dead-code sensitivity is unchanged. (A same-file dead macro would be
+    // masked by file-level reachability up-propagation, so the control case
+    // has to be cross-file.)
+    write(
+        root,
+        "src/lib.rs",
+        "macro_rules! used_macro { () => { } }\n\
+         fn helper() { used_macro!(); }\n\
+         fn main() { helper(); }\n",
+    );
+    write(
+        root,
+        "src/orphan.rs",
+        "macro_rules! dead_macro { () => { } }\n",
+    );
+    enable_treesitter(root, "rust");
+    index(root);
+
+    let mut store = Store::open(root.join(".groundgraph/graph.db")).unwrap();
+    store.migrate().unwrap();
+    let nodes = store.list_all_nodes().unwrap();
+    let edges = store.list_all_edges().unwrap();
+
+    // (a) The macro definition is a node.
+    let used = nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::RustMacro && n.name.as_deref() == Some("used_macro"))
+        .expect("used_macro RustMacro node must exist");
+    // (b) The call site resolves to it with a Calls edge — the property the
+    // issue warns is missing when only the node (not the invocation edge) is
+    // emitted, which strands every macro at zero inbound.
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Calls && e.to_id == used.id),
+        "used_macro!() must link to the RustMacro node with a Calls edge"
+    );
+
+    // (c) Dead-code analysis: `main` is an implicit entry, so
+    // main → helper → used_macro keeps used_macro reachable; dead_macro is
+    // never invoked and must still be flagged.
+    let report = analyze_dead_code_with_store(
+        &store,
+        DeadCodeOptions {
+            repo_root: root.to_path_buf(),
+            min_confidence: DeadCodeConfidence::Medium,
+            include_tests: false,
+        },
+        &DeadCodeConfig::default(),
+    )
+    .expect("dead-code analysis");
+    let dead_names: Vec<&str> = report
+        .candidates
+        .iter()
+        .filter_map(|c| {
+            nodes
+                .iter()
+                .find(|n| n.id.to_string() == c.id)
+                .and_then(|n| n.name.as_deref())
+        })
+        .collect();
+    assert!(
+        !dead_names.contains(&"used_macro"),
+        "an invoked macro must not be flagged dead: {dead_names:?}"
+    );
+    assert!(
+        dead_names.contains(&"dead_macro"),
+        "a never-invoked macro must still be flagged dead: {dead_names:?}"
+    );
 }

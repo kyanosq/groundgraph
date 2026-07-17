@@ -55,7 +55,7 @@ pub fn index_links(store: &mut Store, options: &LinksIndexOptions) -> Result<Lin
     }
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading links manifest {}", path.display()))?;
-    let manifest: LinksManifest = serde_yml::from_str(&raw)
+    let manifest: LinksManifest = serde_norway::from_str(&raw)
         .with_context(|| format!("parsing links manifest {}", path.display()))?;
     let rel_manifest = path
         .strip_prefix(&options.repo_root)
@@ -315,5 +315,33 @@ fn slugify_or_keep(value: &str) -> String {
         value.to_string()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_ref_separates_path_from_non_empty_fragment() {
+        assert_eq!(
+            split_ref("docs/arch.md#overview"),
+            ("docs/arch.md", Some("overview"))
+        );
+        // An empty fragment after `#` collapses back to "no fragment".
+        assert_eq!(split_ref("docs/arch.md#"), ("docs/arch.md", None));
+        // No `#` at all: the whole spec is the path.
+        assert_eq!(split_ref("docs/arch.md"), ("docs/arch.md", None));
+    }
+
+    #[test]
+    fn slugify_or_keep_preserves_input_that_slugifies_to_section() {
+        // Literal "section" survives either branch unchanged.
+        assert_eq!(slugify_or_keep("section"), "section");
+        // "Section" slugifies to "section" but differs from it, so the
+        // original spelling is kept to avoid the generic fallback slug.
+        assert_eq!(slugify_or_keep("Section"), "Section");
+        // Anything else flows straight through slugify.
+        assert_eq!(slugify_or_keep("Overview"), "overview");
     }
 }

@@ -5,6 +5,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Output format for commands that emit either human-readable text or JSON
+/// (#115). Replaces the per-command bare-`String` + runtime `bail!` with a
+/// single clap `ValueEnum`, so an invalid value is rejected at parse time
+/// (exit 2 under the #233 contract) instead of reaching a per-command
+/// runtime `bail!` (the legacy exit 1 / 70 with an ad-hoc message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextJsonFormat {
+    /// Human-readable text (the default for every command that uses this).
+    Text,
+    /// JSON for agents / scripts.
+    Json,
+}
+
 /// Write `body` to `path` atomically: parent directories are created,
 /// content goes to a sibling temp file first, then an OS `rename` swaps
 /// it into place. A crash (or full disk) mid-write can therefore never

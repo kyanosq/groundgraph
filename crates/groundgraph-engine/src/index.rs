@@ -2,12 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{load_config, resolve_storage_path, EngineConfig};
 use crate::docs_indexer::{index_docs, DocsIndexOptions, DocsIndexResult, DOCS_INDEXER_NAME};
+use crate::error::EngineResult;
 use crate::go_indexer::{index_go, GoIndexOptions, GoIndexResult};
 use crate::java_indexer::{index_java, JavaIndexOptions, JavaIndexResult};
 use crate::links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
@@ -60,13 +61,14 @@ pub(crate) fn resolve_config_command(
     }
 }
 
-/// Env-reading wrapper over [`resolve_config_command`]; prints the "ignored"
-/// notice to stderr and returns the command to honour (if any).
+/// Env-reading wrapper over [`resolve_config_command`]; emits the "ignored"
+/// notice as a `warn!` tracing event (stderr) and returns the command to
+/// honour (if any).
 fn config_command(field: &str, value: Option<&str>) -> Option<String> {
     let trusted = std::env::var_os(TRUST_CONFIG_COMMANDS_ENV).is_some();
     let (cmd, notice) = resolve_config_command(trusted, field, value);
     if let Some(notice) = notice {
-        eprintln!("groundgraph: {notice}");
+        tracing::warn!("{notice}");
     }
     cmd
 }
@@ -151,6 +153,53 @@ pub struct IndexResult {
     /// `index`, mirroring the final node set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulltext: Option<crate::fulltext_indexer::FulltextIndexResult>,
+    /// #232 — indexers that partially failed (tree-sitter parse timeouts,
+    /// SCIP run failures). The schema-indexer failure is folded in by the
+    /// CLI. Empty on a fully successful index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_failures: Vec<PartialFailure>,
+}
+
+/// One indexer that partially failed during an `index` run (#232). The run
+/// still completes (other indexers succeeded, the graph is usable), but the
+/// failure is surfaced so CI does not mistake "indexed with gaps" for "fully
+/// indexed".
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PartialFailure {
+    /// Which indexer / language failed, e.g. `tree-sitter-python`, `scip-java`.
+    pub indexer: String,
+    /// Human-readable reason (parse budget exceeded, SCIP non-zero exit, …).
+    pub reason: String,
+}
+
+/// Collect partial failures from per-language tree-sitter parse timeouts and
+/// SCIP auto-invoke failures (#232). Pure so it can be unit-tested without a
+/// real index run; the CLI folds the schema-indexer failure in separately.
+pub fn collect_partial_failures(
+    treesitter: &[TreeSitterLangResult],
+    scip_runs: &[crate::scip_runner::ScipRunOutcome],
+) -> Vec<PartialFailure> {
+    let mut out = Vec::new();
+    for ts in treesitter {
+        if ts.parse_timeouts > 0 {
+            out.push(PartialFailure {
+                indexer: format!("tree-sitter-{}", ts.language),
+                reason: format!(
+                    "{} file(s) exceeded the parse time budget (GROUNDGRAPH_PARSE_BUDGET_MS)",
+                    ts.parse_timeouts
+                ),
+            });
+        }
+    }
+    for run in scip_runs {
+        if let crate::scip_runner::ScipRunStatus::Failed(reason) = &run.status {
+            out.push(PartialFailure {
+                indexer: format!("scip-{}", run.language),
+                reason: reason.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Per-language outcome of the unified tree-sitter pass.
@@ -175,16 +224,23 @@ const TIMING_ENV: &str = "GROUNDGRAPH_TIMING";
 /// Wall-clock phase reporter, enabled by `GROUNDGRAPH_TIMING=1`. Prints each
 /// index phase's elapsed time to stderr so a slow run can be attributed to
 /// parse / ingest / scip / fulltext without a sampling profiler.
-struct PhaseTimer {
+/// Wall-clock phase reporter + progress forwarder. `GROUNDGRAPH_TIMING=1`
+/// keeps the legacy per-phase `[timing]` stderr lines (the dedicated debug
+/// switch, #230); every mark is *also* forwarded to the [`ProgressSink`] so a
+/// CLI spinner can show the current phase without coupling the engine to a
+/// terminal library (#231).
+struct PhaseTimer<'a> {
     enabled: bool,
     last: std::time::Instant,
+    sink: &'a mut dyn crate::progress::ProgressSink,
 }
 
-impl PhaseTimer {
-    fn new() -> Self {
+impl<'a> PhaseTimer<'a> {
+    fn new(sink: &'a mut dyn crate::progress::ProgressSink) -> Self {
         Self {
             enabled: std::env::var_os(TIMING_ENV).is_some(),
             last: std::time::Instant::now(),
+            sink,
         }
     }
     fn mark(&mut self, phase: &str) {
@@ -194,19 +250,29 @@ impl PhaseTimer {
                 self.last.elapsed().as_secs_f64()
             );
         }
+        // Forward the phase boundary to the progress sink (no-op by default).
+        self.sink.phase(phase);
         self.last = std::time::Instant::now();
     }
 }
 
-pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
-    let mut timer = PhaseTimer::new();
+pub fn index_repository(options: IndexOptions) -> EngineResult<IndexResult> {
+    index_repository_with_progress(options, &mut crate::progress::NoopSink)
+}
+
+/// Same as [`index_repository`] but forwards coarse per-phase progress to
+/// `sink` (issues.md #231). The CLI passes an `indicatif` sink so a TTY gets
+/// a spinner; library callers usually want [`index_repository`] with its
+/// no-op default.
+pub fn index_repository_with_progress(
+    options: IndexOptions,
+    sink: &mut dyn crate::progress::ProgressSink,
+) -> EngineResult<IndexResult> {
+    let mut timer = PhaseTimer::new(sink);
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let mut store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
-    store
-        .migrate()
-        .with_context(|| format!("running migrations on {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
 
     // One bulk transaction for the whole ingest. Autocommit mode turns the
     // 10^5+ upserts of a large repo into as many WAL commits; the django
@@ -518,11 +584,21 @@ pub fn index_repository(options: IndexOptions) -> Result<IndexResult> {
     result.fulltext = Some(fulltext);
     timer.mark("fulltext");
 
+    // #137: one orphan sweep at the end of the bulk session. Every per-indexer
+    // `clear_indexer_outputs` above deleted only its own rows; the orphaned
+    // `evidence` / `symbol_ranges` / `node_fts` they left behind are reclaimed
+    // here in a single pass, not once per clear. Runs inside the bulk txn so a
+    // mid-ingest failure still rolls the sweep back with everything else.
+    store
+        .sweep_orphans()
+        .context("sweeping orphaned rows after ingest")?;
+
     store
         .commit_bulk()
         .context("committing bulk write session")?;
     timer.mark("commit");
 
+    result.partial_failures = collect_partial_failures(&result.treesitter, &result.scip_runs);
     Ok(result)
 }
 
@@ -580,7 +656,7 @@ fn indexed_languages(config: &EngineConfig) -> Vec<String> {
 /// sorted, deduplicated list; empty when the config already covers everything
 /// detection would elect. Threshold matches `init`'s own elector (≥3 files /
 /// ≥25% of sources / a language manifest), so stray scripts never trip it.
-pub fn unindexed_present_languages(repo_root: &Path) -> Result<Vec<String>> {
+pub fn unindexed_present_languages(repo_root: &Path) -> EngineResult<Vec<String>> {
     let config = load_config(repo_root)?;
     Ok(unindexed_languages_against_config(repo_root, &config))
 }
@@ -634,6 +710,75 @@ fn language_file_count(result: &IndexResult, lang: &str) -> usize {
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
+
+    #[test]
+    fn phase_timer_forwards_each_marked_phase_to_the_sink() {
+        // #231 — every phase boundary is forwarded to the progress sink so a
+        // CLI spinner can show the current phase without the engine depending
+        // on a terminal library.
+        let mut recorder = crate::progress::RecordingSink::default();
+        {
+            let mut timer = PhaseTimer::new(&mut recorder);
+            timer.mark("docs");
+            timer.mark("dart");
+            timer.mark("commit");
+        }
+        assert_eq!(
+            recorder.phases,
+            vec!["docs".to_string(), "dart".to_string(), "commit".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_partial_failures_surfaces_parse_timeouts_and_scip_failures() {
+        use crate::scip_runner::{ScipRunOutcome, ScipRunStatus};
+        let treesitter = vec![
+            TreeSitterLangResult {
+                language: "python".into(),
+                parse_timeouts: 2,
+                ..Default::default()
+            },
+            TreeSitterLangResult {
+                language: "go".into(),
+                ..Default::default()
+            },
+        ];
+        let scip_runs = vec![
+            ScipRunOutcome {
+                language: "java".into(),
+                status: ScipRunStatus::Failed("non-zero exit".into()),
+                output: None,
+            },
+            ScipRunOutcome {
+                language: "go".into(),
+                status: ScipRunStatus::Generated,
+                output: None,
+            },
+        ];
+        let partials = collect_partial_failures(&treesitter, &scip_runs);
+        assert_eq!(partials.len(), 2, "{partials:?}");
+        assert!(
+            partials
+                .iter()
+                .any(|p| p.indexer == "tree-sitter-python" && p.reason.contains("2 file")),
+            "{partials:?}"
+        );
+        assert!(
+            partials
+                .iter()
+                .any(|p| p.indexer == "scip-java" && p.reason == "non-zero exit"),
+            "{partials:?}"
+        );
+    }
+
+    #[test]
+    fn collect_partial_failures_empty_when_everything_succeeds() {
+        let treesitter = vec![TreeSitterLangResult {
+            language: "python".into(),
+            ..Default::default()
+        }];
+        assert!(collect_partial_failures(&treesitter, &[]).is_empty());
+    }
 
     #[test]
     fn config_command_is_dropped_unless_workspace_is_trusted() {

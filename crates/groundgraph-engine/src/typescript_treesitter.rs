@@ -15,7 +15,7 @@
 
 use crate::treesitter::{
     body_from_field, keep_callable_kind, name_from_field, no_src_roots, no_test_of, no_text,
-    node_text, strip_quotes, CallTestHit, LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    node_text, strip_quotes, CallKind, CallTestHit, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -251,45 +251,34 @@ fn ts_resolve_import(
 /// noise floor stays bounded — exactly as for the Rust resolver.
 fn ts_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_ts_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, TS_CALL_KINDS);
     out
 }
 
-fn collect_ts_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "call_expression" => {
-                if let Some(func) = child.child_by_field_name("function") {
-                    if let Some(name) = ts_callee_name(func, src) {
-                        out.push((name, RefKind::Call));
-                    }
-                }
-            }
-            // `new Widget()` → reference to the constructed type.
-            "new_expression" => {
-                if let Some(ctor) = child.child_by_field_name("constructor") {
-                    if let Some(name) = ts_callee_name(ctor, src) {
-                        out.push((name, RefKind::Reference));
-                    }
-                }
-            }
-            _ => {}
-        }
-        // Always descend: calls nest inside arguments, arrow bodies, JSX
-        // expressions, etc. Nested arrow / function expressions fold into the
-        // enclosing callable (they are not separately indexed symbols).
-        collect_ts_calls(child, src, out, depth + 1);
-    }
+/// `call_expression` whose `function` field names the callee.
+fn ts_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|func| ts_callee_name(func, src))
+        .map(|name| (name, RefKind::Call))
 }
+
+/// `new Widget()` → reference to the constructed type.
+fn ts_new_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("constructor")
+        .and_then(|ctor| ts_callee_name(ctor, src))
+        .map(|name| (name, RefKind::Reference))
+}
+
+static TS_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "call_expression",
+        extract: ts_call_extract,
+    },
+    CallKind {
+        kind: "new_expression",
+        extract: ts_new_extract,
+    },
+];
 
 /// Best-effort callee name for a call / new expression's function node.
 fn ts_callee_name(func: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -359,6 +348,7 @@ const fn ts_family_spec(
         module_scoped_resolution: false,
         recurse_declined_callables: true,
         claims_path: None,
+        partial_class_merge: false,
     }
 }
 
@@ -511,7 +501,7 @@ function save(u: any) {}
         let from_edit: Vec<&str> = s
             .references
             .iter()
-            .filter(|r| r.from_qualified == "EditUser" && r.kind == RefKind::Call)
+            .filter(|r| r.from_qualified.as_ref() == "EditUser" && r.kind == RefKind::Call)
             .map(|r| r.to_name.as_str())
             .collect();
         assert!(
@@ -543,7 +533,7 @@ export function run(): void {
         let from_run: Vec<&str> = s
             .references
             .iter()
-            .filter(|r| r.from_qualified == "run" && r.kind == RefKind::Call)
+            .filter(|r| r.from_qualified.as_ref() == "run" && r.kind == RefKind::Call)
             .map(|r| r.to_name.as_str())
             .collect();
         assert!(
@@ -569,7 +559,7 @@ export function build(): void {
         let refs: Vec<&str> = s
             .references
             .iter()
-            .filter(|r| r.from_qualified == "build" && r.kind == RefKind::Reference)
+            .filter(|r| r.from_qualified.as_ref() == "build" && r.kind == RefKind::Reference)
             .map(|r| r.to_name.as_str())
             .collect();
         assert!(

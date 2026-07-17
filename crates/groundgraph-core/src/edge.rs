@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_id::ArtifactId;
+use crate::confidence::Confidence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,32 +199,42 @@ pub struct EdgeAssertion {
     pub source: EdgeSource,
     pub certainty: EdgeCertainty,
     pub status: EdgeStatus,
-    /// Confidence in `[0.0, 1.0]`. Callers that compute a value should route it
-    /// through [`sanitize_confidence`] (or [`EdgeAssertion::with_confidence`]);
-    /// the store also sanitises on write and read so a stray `NaN`/out-of-range
-    /// value can never poison the graph (#63).
-    pub confidence: f32,
+    /// Confidence in `[0.0, 1.0]` as a type-level invariant (#168): the
+    /// [`Confidence`] newtype cannot hold `NaN`/`±∞`/out-of-range values, so
+    /// sorting and comparing confidences needs no defensive clamps. The store
+    /// still sanitises on read so rows written by older builds or external
+    /// tools are folded into range at decode time (#63).
+    pub confidence: Confidence,
     pub evidence_json: Option<String>,
     pub source_file: Option<String>,
-    pub source_hash: Option<String>,
     pub indexer: Option<String>,
-    pub index_generation: Option<i64>,
     pub metadata_json: Option<String>,
 }
 
 impl EdgeAssertion {
     /// Build a `Declared / Confirmed` edge with confidence 1.0.
     pub fn declared(from: ArtifactId, to: ArtifactId, kind: EdgeKind, source: EdgeSource) -> Self {
+        // Edge identity = `kind` + `source` + `from` + `to` (#205). `source` is
+        // part of the id so two indexers asserting the *same* `(kind, from, to)`
+        // edge from *different* provenance (e.g. `docs_indexer` `Markdown` vs
+        // `requirements_md_indexer` `ExternalManifest`) get distinct ids and
+        // coexist instead of UPSERT-overwriting each other's source/certainty.
+        // `certainty`/`status` are deliberately OUT of the id: they are the
+        // *mutable state* of one assertion, not its identity — including them
+        // would orphan the row whenever an edge upgrades `declared → fact`.
+        //
         // Length-prefix `from` so the `from`/`to` boundary is unambiguous: node
         // ids contain `::` (the `lang::file::qual` scheme; Rust/C++ qualified
         // names), and a plain `from::to` join collides for distinct edges like
         // (`a::b`→`c`) vs (`a`→`b::c`) — UPSERT would then drop one (#251). The
         // length prefix makes the encoding injective while staying deterministic
-        // and debuggable.
+        // and debuggable. `source` is a fixed enum token with no `:`, so it
+        // cannot blur the boundary.
         let from_str = from.as_str();
         let id = ArtifactId::new(format!(
-            "edge::{}::{}:{}::{}",
+            "edge::{}::{}::{}:{}::{}",
             kind.as_str(),
+            source.as_str(),
             from_str.len(),
             from_str,
             to
@@ -236,12 +247,10 @@ impl EdgeAssertion {
             source,
             certainty: EdgeCertainty::Declared,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: None,
-            index_generation: None,
             metadata_json: None,
         }
     }
@@ -254,8 +263,10 @@ impl EdgeAssertion {
         edge
     }
 
-    /// Build a `Fact / Confirmed` edge with an explicit, [`sanitize_confidence`]d
-    /// confidence — for heuristic/derived edges that carry a sub-1.0 score.
+    /// Build a `Fact / Confirmed` edge with an explicit confidence — for
+    /// heuristic/derived edges that carry a sub-1.0 score. The raw `f32` is
+    /// sanitised into the [`Confidence`] invariant (`NaN → 1.0`, out-of-range
+    /// clamped).
     pub fn with_confidence(
         from: ArtifactId,
         to: ArtifactId,
@@ -264,7 +275,7 @@ impl EdgeAssertion {
         confidence: f32,
     ) -> Self {
         let mut edge = Self::fact(from, to, kind, source);
-        edge.confidence = sanitize_confidence(confidence);
+        edge.confidence = Confidence::new(confidence);
         edge
     }
 }
@@ -378,6 +389,46 @@ mod tests {
             mk("rust::a.rs::Foo", "rust::a.rs::Bar"),
             mk("rust::a.rs::Foo::rust::a.rs::Bar", ""),
         );
+    }
+
+    /// #205: the edge id must encode `source` so that two indexers asserting
+    /// the *same* `(kind, from, to)` edge from *different* provenance get
+    /// distinct ids and can coexist instead of UPSERT-overwriting each other.
+    /// `certainty`/`status` stay OUT of the id (they are mutable state of one
+    /// assertion, not identity — putting them in would orphan the row whenever
+    /// certainty upgrades). This is the pure-id half of the test; the coexist
+    /// and anti-downgrade halves live in the store tests.
+    #[test]
+    fn declared_edge_id_encodes_source_so_distinct_sources_differ() {
+        let from = ArtifactId::new("dart_class::a.dart#Foo");
+        let to = ArtifactId::new("req::REQ-1");
+        let markdown = EdgeAssertion::declared(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Documents,
+            EdgeSource::Markdown,
+        )
+        .id;
+        let external = EdgeAssertion::declared(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Documents,
+            EdgeSource::ExternalManifest,
+        )
+        .id;
+        assert_ne!(
+            markdown, external,
+            "same (kind,from,to) from different sources must get distinct ids"
+        );
+        // The source token is literally present in the id, after the kind.
+        assert!(
+            markdown.as_str().contains("edge::documents::markdown::"),
+            "id must embed the source after the kind: {}",
+            markdown
+        );
+        // Determinism preserved (same inputs → same id), including the source.
+        let again = EdgeAssertion::declared(from, to, EdgeKind::Documents, EdgeSource::Markdown).id;
+        assert_eq!(markdown, again);
     }
 
     #[test]

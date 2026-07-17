@@ -32,6 +32,8 @@ ROOT="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 
 test -x "$ROOT/bin/groundgraph"
 test -x "$ROOT/libexec/groundgraph"
+test -x "$ROOT/bin/groundgraph-mcp"
+test -x "$ROOT/libexec/groundgraph-mcp"
 test -f "$ROOT/tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart"
 test -f "$ROOT/tool/groundgraph_dart_analyzer/pubspec.yaml"
 test -f "$ROOT/skills/groundgraph/SKILL.md"
@@ -46,6 +48,9 @@ fi
 
 lipo -info "$ROOT/libexec/groundgraph" | grep -q "x86_64"
 lipo -info "$ROOT/libexec/groundgraph" | grep -q "arm64"
+lipo -info "$ROOT/libexec/groundgraph-mcp" | grep -q "x86_64"
+lipo -info "$ROOT/libexec/groundgraph-mcp" | grep -q "arm64"
 "$ROOT/bin/groundgraph" --help >/dev/null
+"$ROOT/bin/groundgraph-mcp" --help >/dev/null
 
 echo "package is valid: $ARCHIVE"

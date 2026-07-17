@@ -15,8 +15,7 @@
 
 use crate::treesitter::{
     body_from_field, keep_callable_kind, name_from_field, no_call_test, no_src_roots, no_text,
-    node_text, simple_type_name, strip_quotes, LangSpec, RefKind, SymKind, TestKind,
-    MAX_NESTING_DEPTH,
+    node_text, simple_type_name, strip_quotes, CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -205,43 +204,35 @@ fn representative_go_file(all_files: &[String], dir: &str) -> Option<String> {
 /// floor bounded, exactly like the Rust / TypeScript resolvers.
 fn go_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_go_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, GO_CALL_KINDS);
     out
 }
 
-fn collect_go_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "call_expression" => {
-                if let Some(func) = child.child_by_field_name("function") {
-                    if let Some(name) = go_callee_name(func, src) {
-                        out.push((name, RefKind::Call));
-                    }
-                }
-            }
-            // `Repo{…}` / `&Repo{…}` — reference the constructed type.
-            "composite_literal" => {
-                if let Some(name) = child
-                    .child_by_field_name("type")
-                    .and_then(|ty| simple_type_name(ty, src))
-                {
-                    out.push((name, RefKind::Reference));
-                }
-            }
-            _ => {}
-        }
-        collect_go_calls(child, src, out, depth + 1);
-    }
+/// `call_expression` whose `function` field names the callee (bare name /
+/// selector / generic operand), resolved by [`go_callee_name`].
+fn go_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|func| go_callee_name(func, src))
+        .map(|name| (name, RefKind::Call))
 }
+
+/// `Repo{…}` / `&Repo{…}` — reference the constructed type's bare name.
+fn go_composite_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("type")
+        .and_then(|ty| simple_type_name(ty, src))
+        .map(|name| (name, RefKind::Reference))
+}
+
+static GO_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "call_expression",
+        extract: go_call_extract,
+    },
+    CallKind {
+        kind: "composite_literal",
+        extract: go_composite_extract,
+    },
+];
 
 /// Best-effort callee name for a Go call expression's `function` node.
 fn go_callee_name(func: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -291,6 +282,7 @@ pub(crate) static GO_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -311,7 +303,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

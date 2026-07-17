@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use groundgraph_engine::graph_diff::{diff_graphs, GraphDiff, GraphDiffOptions};
 
+use super::output::TextJsonFormat;
+
 #[derive(Debug, Clone)]
 pub struct GraphDiffRunArgs {
     pub base_db: PathBuf,
@@ -15,7 +17,7 @@ pub struct GraphDiffRunArgs {
     /// pulled from `.groundgraph/candidates/business_logic.yaml`.
     pub base_repo_root: Option<PathBuf>,
     pub head_repo_root: Option<PathBuf>,
-    pub format: String,
+    pub format: TextJsonFormat,
 }
 
 pub fn run(args: GraphDiffRunArgs) -> Result<()> {
@@ -26,13 +28,12 @@ pub fn run(args: GraphDiffRunArgs) -> Result<()> {
         head_repo_root: args.head_repo_root,
     })
     .context("computing graph diff")?;
-    match args.format.as_str() {
-        "json" => println!(
+    match args.format {
+        TextJsonFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialising graph diff")?
         ),
-        "text" | "" => print_text(&report),
-        other => anyhow::bail!("unsupported --format `{other}` (expected text|json)"),
+        TextJsonFormat::Text => print_text(&report),
     }
     Ok(())
 }

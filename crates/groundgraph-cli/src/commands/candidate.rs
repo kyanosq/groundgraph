@@ -191,7 +191,7 @@ pub fn run_review(repo_root: &Path, candidate_id: &str, args: ReviewArgs<'_>) ->
 fn print_human_list(snapshot: &CandidateListSnapshot, mode: ListMode) {
     if snapshot.warnings.iter().any(|w| !w.is_empty()) {
         for w in &snapshot.warnings {
-            eprintln!("groundgraph: 候选文件警告：{w}");
+            tracing::warn!("{w}");
         }
     }
     println!("GroundGraph 候选审阅清单");
@@ -407,7 +407,7 @@ fn print_json(snapshot: &CandidateListSnapshot, mode: ListMode) -> Result<()> {
                 Some(ReviewStatus::Pending) => "待定".into(),
                 None => "ai_proposed".into(),
             },
-            confidence: c.confidence,
+            confidence: c.confidence.map(|v| v.get()),
             description: &c.description,
             risks: &c.risks,
             recommendation: c.recommendation.as_deref(),
@@ -449,7 +449,7 @@ mod mermaid_tests {
             name: name.into(),
             description: format!("{name} 的简短描述"),
             evidence: evidence.iter().map(|s| s.to_string()).collect(),
-            confidence: Some(0.82),
+            confidence: Some(groundgraph_core::Confidence::new(0.82)),
             status: "proposed".into(),
             review,
             ..BusinessCandidate::default()

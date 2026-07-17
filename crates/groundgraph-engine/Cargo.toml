@@ -8,14 +8,14 @@ repository.workspace = true
 description = "GroundGraph engine: config, indexing, slice, impact, checks, context, export."
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core", version = "0.2.0" }
-groundgraph-store = { path = "../groundgraph-store", version = "0.2.0" }
-groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.2.0" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.3.0" }
+groundgraph-store = { path = "../groundgraph-store", version = "0.3.0" }
+groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.3.0" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 rusqlite = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
@@ -23,6 +23,9 @@ ignore = "0.4"
 sha2 = { workspace = true }
 shlex = { workspace = true }
 time = { workspace = true }
+# issues.md #230 — engine emits structured tracing events (phase timing,
+# adapter skips); it never installs a subscriber (that is the CLI's job).
+tracing = { workspace = true }
 tree-sitter = "0.26.9"
 tree-sitter-rust = "0.24.2"
 tree-sitter-go = "0.25.0"
@@ -32,18 +35,39 @@ tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-java = "0.23.5"
 tree-sitter-swift = "0.7.2"
-tree-sitter-dart = "0.0.4"
+# issues.md #211 — pinned exact (`=`, not `^`): 0.0.x crates carry no semver
+# stability promise, and the upstream tree-sitter-dart grammar is effectively
+# stalled, so any 0.0.x republish could silently shift node ids / queries.
+# `Cargo.lock` (committed) + CI `--locked` already pin the exact patch for
+# reproducible builds; the `=` makes the *requirement* explicit so a future
+# `cargo update` can never drift this grammar under us.
+tree-sitter-dart = "=0.0.4"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-php = "0.24.2"
 tree-sitter-kotlin-ng = "1.1.0"
-scip = "0.8"
-protobuf = "3"
+# issues.md #229 — SCIP schema compiled to Rust by prost at build time from the
+# vendored `proto/scip.proto`, replacing the runtime `scip` + `protobuf` crates
+# (which dragged in the full Google protobuf reflection runtime). See build.rs.
+prost = "0.14"
 rayon = "1.12.0"
 tempfile = { workspace = true }
 
+[build-dependencies]
+# issues.md #229 — generate the SCIP types from `proto/scip.proto`. protoc-bin-
+# -vendored supplies a protoc for every target so no system protoc is needed.
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
 [dev-dependencies]
 proptest = "1.11.0"
+criterion = { workspace = true }
 
 [lints]
 workspace = true
+
+# issues.md #143/#144/#156/#158/#160/#162: search hot-path micro-benchmarks.
+# `harness = false` so criterion owns `main`.
+[[bench]]
+name = "search_hot"
+harness = false

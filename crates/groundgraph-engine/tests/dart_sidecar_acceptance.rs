@@ -11,7 +11,7 @@
 //! Otherwise we still verify the fallback contract (resolver_used =
 //! "dart_lightweight", no diagnostics, graph still populated).
 
-use std::path::PathBuf;
+mod common;
 
 use groundgraph_engine::dart_indexer::{
     index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER, RESOLVER_DART_LIGHTWEIGHT,
@@ -19,67 +19,18 @@ use groundgraph_engine::dart_indexer::{
 use groundgraph_engine::graph::{build_graph_view, GraphOptions, GraphView};
 use groundgraph_engine::init::{init_repository, InitOptions};
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tests/fixtures/pixcraft_iap")
-}
-
-fn workspace_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn copy_fixture_into(dst: &std::path::Path) {
-    let src = fixture_path();
-    for entry in walkdir::WalkDir::new(&src) {
-        let entry = entry.unwrap();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&src).unwrap();
-        let target = dst.join(rel);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::copy(entry.path(), &target).unwrap();
-    }
-}
-
-fn dart_available() -> bool {
-    std::process::Command::new("dart")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn sidecar_source_present() -> bool {
-    workspace_dir()
-        .join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart")
-        .exists()
-}
-
 #[test]
 fn p7_fallback_path_still_indexes_when_sidecar_disabled() {
     // Make sure the env explicitly disables the sidecar so this test is
     // deterministic regardless of host configuration.
-    let _serial = env_lock();
-    let _guard = EnvGuard::set("GROUNDGRAPH_DART_ANALYZER", Some("0"));
+    let _serial = common::env_lock();
+    let _guard = common::EnvGuard::set("GROUNDGRAPH_DART_ANALYZER", Some("0"));
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
         repo_root: tmp.path().into(),
     })
     .unwrap();
-    copy_fixture_into(tmp.path());
+    common::copy_fixture_into(&common::fixture_dir("pixcraft_iap"), tmp.path());
     let mut store =
         groundgraph_store::Store::open(tmp.path().join(".groundgraph/graph.db")).unwrap();
     store.migrate().unwrap();
@@ -125,30 +76,26 @@ fn p7_fallback_path_still_indexes_when_sidecar_disabled() {
 
 #[test]
 fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
-    if !sidecar_source_present() {
-        eprintln!("skipping P7 happy-path: sidecar source not present");
+    if !common::dart_golden_ready(
+        common::sidecar_source_present() && common::dart_available(),
+        "p7_sidecar_acceptance",
+    ) {
         return;
     }
-    if !dart_available() {
-        eprintln!("skipping P7 happy-path: `dart` not on PATH");
-        return;
-    }
-    let _serial = env_lock();
-    let _guard = EnvGuard::set("GROUNDGRAPH_DART_ANALYZER", Some("1"));
+    let _serial = common::env_lock();
+    let _guard = common::EnvGuard::set("GROUNDGRAPH_DART_ANALYZER", Some("1"));
 
     let tmp = tempfile::TempDir::new().unwrap();
     init_repository(InitOptions {
         repo_root: tmp.path().into(),
     })
     .unwrap();
-    copy_fixture_into(tmp.path());
+    common::copy_fixture_into(&common::fixture_dir("pixcraft_iap"), tmp.path());
     // Point the sidecar bin at the in-repo file so we don't need a
     // global install.
-    let sidecar_abs =
-        workspace_dir().join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart");
-    let _bin_guard = EnvGuard::set(
+    let _bin_guard = common::EnvGuard::set(
         "GROUNDGRAPH_DART_ANALYZER_BIN",
-        Some(&format!("dart run {}", sidecar_abs.display())),
+        Some(&format!("dart run {}", common::sidecar_path().display())),
     );
 
     let mut store =
@@ -233,41 +180,4 @@ fn p7_sidecar_runs_when_enabled_and_tags_edges_dart_analyzer() {
             .contains("applyPurchase"),
         "snippet must capture the call site"
     );
-}
-
-/// Process-wide env mutations race between parallel tests (both tests here
-/// flip `GROUNDGRAPH_DART_ANALYZER` in opposite directions), so each test takes
-/// this lock for its whole body before touching the environment.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-struct EnvGuard {
-    key: String,
-    prev: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &str, value: Option<&str>) -> Self {
-        let prev = std::env::var(key).ok();
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        Self {
-            key: key.into(),
-            prev,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(p) => std::env::set_var(&self.key, p),
-            None => std::env::remove_var(&self.key),
-        }
-    }
 }

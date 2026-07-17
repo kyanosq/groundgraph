@@ -18,7 +18,7 @@
 
 use crate::treesitter::{
     body_from_field, name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws,
-    LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -200,59 +200,64 @@ fn php_resolve_import(
 /// - `new Greeter(…)` → `Reference` (object_creation_expression)
 fn php_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_php_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, PHP_CALL_KINDS);
     out
 }
 
-fn collect_php_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
+/// `helper()` — a global `function_call_expression` whose function is a bare
+/// or fully-qualified `name` → the trailing `\`-segment, tagged `Call`.
+fn php_function_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    let f = node.child_by_field_name("function")?;
+    if !matches!(f.kind(), "name" | "qualified_name") {
+        return None;
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "function_call_expression" => {
-                if let Some(f) = child.child_by_field_name("function") {
-                    if matches!(f.kind(), "name" | "qualified_name") {
-                        if let Some(t) = node_text(f, src) {
-                            let bare = t.rsplit('\\').next().unwrap_or(t);
-                            out.push((bare.to_string(), RefKind::Call));
-                        }
-                    }
-                }
-            }
-            "member_call_expression" | "scoped_call_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("name")
-                    .and_then(|n| node_text(n, src))
-                {
-                    out.push((name.to_string(), RefKind::Call));
-                }
-            }
-            "object_creation_expression" => {
-                for i in 0..child.named_child_count() {
-                    let Some(c) = child.named_child(u32::try_from(i).unwrap_or(u32::MAX)) else {
-                        break;
-                    };
-                    if matches!(c.kind(), "name" | "qualified_name") {
-                        if let Some(t) = node_text(c, src) {
-                            let bare = t.rsplit('\\').next().unwrap_or(t);
-                            out.push((bare.to_string(), RefKind::Reference));
-                        }
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-        collect_php_calls(child, src, out, depth + 1);
-    }
+    let t = node_text(f, src)?;
+    let bare = t.rsplit('\\').next().unwrap_or(t);
+    Some((bare.to_string(), RefKind::Call))
 }
+
+/// `$this->helper()` / `Greeter::run()` (`member_call_expression` /
+/// `scoped_call_expression`) → the invoked method name, tagged `Call`.
+/// Shared by both call-expression kinds (see [`PHP_CALL_KINDS`]).
+fn php_member_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("name")
+        .and_then(|n| node_text(n, src))
+        .map(|name| (name.to_string(), RefKind::Call))
+}
+
+/// `new Greeter(…)` → the constructed class's trailing `\`-segment, tagged
+/// `Reference`. The name is the first `name`/`qualified_name` child of the
+/// creation node (the grammar gives it no dedicated field).
+fn php_new_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    for i in 0..node.named_child_count() {
+        let c = node.named_child(u32::try_from(i).unwrap_or(u32::MAX))?;
+        if matches!(c.kind(), "name" | "qualified_name") {
+            let t = node_text(c, src)?;
+            let bare = t.rsplit('\\').next().unwrap_or(t);
+            return Some((bare.to_string(), RefKind::Reference));
+        }
+    }
+    None
+}
+
+static PHP_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "function_call_expression",
+        extract: php_function_call_extract,
+    },
+    CallKind {
+        kind: "member_call_expression",
+        extract: php_member_call_extract,
+    },
+    CallKind {
+        kind: "scoped_call_expression",
+        extract: php_member_call_extract,
+    },
+    CallKind {
+        kind: "object_creation_expression",
+        extract: php_new_extract,
+    },
+];
 
 pub(crate) static PHP_SPEC: LangSpec = LangSpec {
     language_id: "php",
@@ -290,6 +295,7 @@ pub(crate) static PHP_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -488,7 +494,7 @@ class Greeter {
         let refs: Vec<(String, String, RefKind)> = s
             .references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect();
         assert!(
             refs.contains(&("App::run".into(), "Greeter".into(), RefKind::Reference)),

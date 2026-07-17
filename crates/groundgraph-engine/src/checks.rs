@@ -32,7 +32,8 @@ use groundgraph_core::{EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::impact::ImpactReport;
 use crate::source_text::is_multi_word_identifier;
 
@@ -133,11 +134,10 @@ impl From<&crate::config::ChecksConfig> for CheckPolicy {
     }
 }
 
-pub fn run_checks(options: CheckOptions) -> Result<CheckReport> {
+pub fn run_checks(options: CheckOptions) -> EngineResult<CheckReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     let policy = CheckPolicy::from(&config.checks);
     let mut report = compute_checks_with_policy(&store, options.impact.as_ref(), policy.clone())?;
     // Content-level drift needs the working tree (doc bodies, file existence),
@@ -147,7 +147,7 @@ pub fn run_checks(options: CheckOptions) -> Result<CheckReport> {
     Ok(report)
 }
 
-pub fn compute_checks(store: &Store, impact: Option<&ImpactReport>) -> Result<CheckReport> {
+pub fn compute_checks(store: &Store, impact: Option<&ImpactReport>) -> EngineResult<CheckReport> {
     compute_checks_with_policy(store, impact, CheckPolicy::default())
 }
 
@@ -155,7 +155,7 @@ pub fn compute_checks_with_policy(
     store: &Store,
     impact: Option<&ImpactReport>,
     policy: CheckPolicy,
-) -> Result<CheckReport> {
+) -> EngineResult<CheckReport> {
     let mut report = CheckReport::default();
 
     let requirement_ids: BTreeSet<_> = store
@@ -858,10 +858,101 @@ fn compute_requirement_hints(
     Ok(())
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
 }
 
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_from_level_normalises_case_and_whitespace() {
+        assert_eq!(severity_from_level("error"), Some(CheckSeverity::Error));
+        assert_eq!(
+            severity_from_level("  WARNING "),
+            Some(CheckSeverity::Warning)
+        );
+        assert_eq!(severity_from_level("Warn"), Some(CheckSeverity::Warning));
+        assert_eq!(severity_from_level("INFO"), Some(CheckSeverity::Info));
+    }
+
+    #[test]
+    fn severity_from_level_disables_for_off_words_and_warns_for_unknown() {
+        for off in ["off", "none", "ignore"] {
+            assert_eq!(
+                severity_from_level(off),
+                None,
+                "level `{off}` should disable the check"
+            );
+        }
+        // An unknown level defaults to Warning rather than silently dropping the check.
+        assert_eq!(
+            severity_from_level("catastrophe"),
+            Some(CheckSeverity::Warning)
+        );
+    }
+
+    #[test]
+    fn has_template_tokens_flags_pattern_placeholders_not_real_names() {
+        assert!(has_template_tokens("round-XX-report-YYYY-MM-DD.md"));
+        assert!(has_template_tokens("batch-HH-run"));
+        assert!(!has_template_tokens("README"));
+        assert!(!has_template_tokens("src/engine.rs"));
+    }
+
+    #[test]
+    fn is_placeholder_path_detects_tutorial_and_my_app_stems() {
+        assert!(is_placeholder_path("lib/foo.rs"));
+        assert!(is_placeholder_path("pages/api/my-app.ts"));
+        assert!(is_placeholder_path("example.rs"));
+        assert!(!is_placeholder_path("lib/engine.rs"));
+    }
+
+    #[test]
+    fn classify_code_ref_accepts_paths_and_symbols_but_rejects_noise() {
+        // Repo-relative path with a known source extension.
+        assert_eq!(
+            classify_code_ref("src/engine.rs"),
+            Some(CodeRef::Path("src/engine.rs".to_string()))
+        );
+        // A leading `./` is stripped and a `#fragment` dropped before the extension test.
+        assert_eq!(
+            classify_code_ref("./lib/mod.rs#L10"),
+            Some(CodeRef::Path("lib/mod.rs".to_string()))
+        );
+        // A namespaced call surfaces as a Symbol reference.
+        assert_eq!(
+            classify_code_ref("Store::open()"),
+            Some(CodeRef::Symbol {
+                container: Some("Store".to_string()),
+                member: "open".to_string(),
+                raw: "Store::open()".to_string(),
+            })
+        );
+        // Tutorial shapes, globs, URLs, brace expansion, and templates are all rejected.
+        assert_eq!(classify_code_ref("lib/foo.rs"), None);
+        assert_eq!(classify_code_ref("src/*.rs"), None);
+        assert_eq!(classify_code_ref("https://example.com/x.rs"), None);
+        assert_eq!(classify_code_ref("{a,b}.rs"), None);
+        assert_eq!(classify_code_ref("round-XX-report.md"), None);
+        // Too short to be a meaningful reference.
+        assert_eq!(classify_code_ref("ab"), None);
+    }
+
+    #[test]
+    fn extract_inline_code_refs_skips_fenced_blocks() {
+        let body = "See `src/engine.rs`.\n```rust\n`ignored.rs`\n```\nCall `Store::open()`.";
+        let refs = extract_inline_code_refs(body);
+        assert!(refs
+            .iter()
+            .any(|r| matches!(r, CodeRef::Path(p) if p == "src/engine.rs")));
+        assert!(refs
+            .iter()
+            .any(|r| matches!(r, CodeRef::Symbol { member, .. } if member == "open")));
+        // The reference inside the fenced block must not leak out.
+        assert!(!refs
+            .iter()
+            .any(|r| matches!(r, CodeRef::Path(p) if p == "ignored.rs")));
+    }
 }

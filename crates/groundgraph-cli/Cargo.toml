@@ -12,15 +12,19 @@ name = "groundgraph"
 path = "src/bin/groundgraph.rs"
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core", version = "0.2.0" }
-groundgraph-store = { path = "../groundgraph-store", version = "0.2.0" }
-groundgraph-engine = { path = "../groundgraph-engine", version = "0.2.0" }
-groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.2.0" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.3.0" }
+groundgraph-store = { path = "../groundgraph-store", version = "0.3.0" }
+groundgraph-engine = { path = "../groundgraph-engine", version = "0.3.0" }
+groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.3.0" }
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
 
 # Restores default SIGPIPE handling (encapsulates the required `unsafe` so this
 # crate stays under the workspace `unsafe_code = "forbid"` policy).

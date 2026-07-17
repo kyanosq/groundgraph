@@ -10,7 +10,7 @@
 use crate::python_frameworks::{classify_decorators, FrameworkRole};
 use crate::treesitter::{
     body_from_field, keep_callable_kind, name_from_field, no_call_test, no_text, node_text,
-    LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -282,32 +282,23 @@ fn python_src_roots(all_files: &[String]) -> Vec<String> {
 /// that name exists — keeping the noise floor bounded.
 fn py_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_py_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, PYTHON_CALL_KINDS);
     out
 }
 
-fn collect_py_calls(
-    node: tree_sitter::Node<'_>,
-    src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "call" {
-            if let Some(name) = child
-                .child_by_field_name("function")
-                .and_then(|func| py_callee_name(func, src))
-            {
-                out.push((name, RefKind::Call));
-            }
-        }
-        collect_py_calls(child, src, out, depth + 1);
-    }
+/// The single Python call shape: a `call` node whose `function` field is
+/// resolved by [`py_callee_name`]. (tree-sitter-python spells the call node
+/// kind `call`, not `call_expression`.)
+fn py_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.child_by_field_name("function")
+        .and_then(|func| py_callee_name(func, src))
+        .map(|name| (name, RefKind::Call))
 }
+
+static PYTHON_CALL_KINDS: &[CallKind] = &[CallKind {
+    kind: "call",
+    extract: py_call_extract,
+}];
 
 /// Best-effort callee name for a Python `call` node's `function`.
 fn py_callee_name(func: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -369,6 +360,7 @@ pub(crate) static PYTHON_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -389,7 +381,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

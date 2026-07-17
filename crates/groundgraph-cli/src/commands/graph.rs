@@ -23,12 +23,17 @@ const DEFAULT_WEB_OUT: &str = ".groundgraph/export/graph-web.html";
 /// The `webui` viewer, the single source of truth for both the standalone dev
 /// page and the embedded CLI export. The `web` format inlines the graph into a
 /// copy of this template via the `SS_DATA_SLOT` marker.
-const VIEWER_TEMPLATE: &str = include_str!("../../../../webui/index.html");
+///
+/// This reads the crate-local copy (`crates/groundgraph-cli/webui/`) so
+/// `cargo package` / `cargo publish` work — `include_str!` cannot reach outside
+/// the crate root. `scripts/sync_webui_assets.sh` (with `--check` in CI) keeps
+/// the copy byte-identical to the `webui/` source of truth.
+const VIEWER_TEMPLATE: &str = include_str!("../../webui/index.html");
 
 /// The offline viewer bundle (three + 3d-force-graph + UnrealBloomPass as one
 /// classic IIFE). The dev page loads it via `<script src>`; the `web` export
 /// inlines it so the result is a single portable file with no network at all.
-const VIEWER_BUNDLE: &str = include_str!("../../../../webui/vendor/groundgraph-viewer.bundle.js");
+const VIEWER_BUNDLE: &str = include_str!("../../webui/vendor/groundgraph-viewer.bundle.js");
 
 /// The dev page's `<script src>` for the bundle; the export replaces it with the
 /// inlined bundle so a single file works straight from `file://`.
@@ -82,7 +87,7 @@ pub fn run(args: GraphRunArgs) -> Result<()> {
     // A typo'd `--focus` otherwise produces a silent empty export with a
     // `wrote …` success line — indistinguishable from an empty repo.
     if let Some(w) = focus_miss_warning(args.focus.as_deref(), view.nodes.len()) {
-        eprintln!("{w}");
+        tracing::warn!("{w}");
     }
 
     match args.format {

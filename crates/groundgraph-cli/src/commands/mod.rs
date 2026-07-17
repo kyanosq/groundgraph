@@ -7,6 +7,7 @@ pub mod context;
 pub mod contract;
 pub mod dashboard;
 pub mod dead_code;
+pub mod doctor;
 pub mod export;
 pub mod facts;
 pub mod feature_pack;

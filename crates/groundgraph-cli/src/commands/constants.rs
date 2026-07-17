@@ -14,6 +14,8 @@ use groundgraph_engine::constants::{
     analyze_constants, ConstantsOptions, ConstantsReport, LiteralKind,
 };
 
+use crate::exit_code::bail_user;
+
 #[derive(Debug, Clone)]
 pub struct ConstantsRunArgs {
     pub repo_root: PathBuf,
@@ -32,7 +34,8 @@ pub fn parse_kind(s: &str) -> Result<LiteralKind> {
         "str" | "string" => Ok(LiteralKind::Str),
         "bool" => Ok(LiteralKind::Bool),
         "char" => Ok(LiteralKind::Char),
-        other => anyhow::bail!("未知字面量类型 `{other}`（可选 int / float / str / bool / char）"),
+        // exit 2: user input — unknown literal kind.
+        other => bail_user!("未知字面量类型 `{other}`（可选 int / float / str / bool / char）"),
     }
 }
 

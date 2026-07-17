@@ -38,6 +38,7 @@ use groundgraph_core::{ArtifactId, EdgeKind, Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineResult;
 use crate::git_diff::{git_diff, parse_unified_diff, ChangedFile};
 use crate::impact::{compute_impact_with_policy, ImpactPolicy, ImpactPropagation};
 
@@ -111,10 +112,9 @@ pub struct SelectedTest {
 
 /// Entry point — read the diff, ask the store for the impact
 /// report, then build the test list.
-pub fn select_tests(options: TestSelectionOptions) -> Result<TestSelection> {
+pub fn select_tests(options: TestSelectionOptions) -> EngineResult<TestSelection> {
     let db_path = crate::config::storage_path_for_repo(&options.repo_root)?;
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening graph store at {}", db_path.display()))?;
+    let store = Store::open(&db_path)?;
     let diff_text = git_diff(&options.repo_root, &options.base_ref, &options.head_ref)
         .context("running git diff for test selection")?;
     let changed = parse_unified_diff(&diff_text);
@@ -127,7 +127,7 @@ pub fn select_tests_with_store(
     store: &Store,
     changed: &[ChangedFile],
     options: &TestSelectionOptions,
-) -> Result<TestSelection> {
+) -> EngineResult<TestSelection> {
     let mut selected: BTreeMap<String, SelectedTest> = BTreeMap::new();
 
     // Run the existing impact engine so changed symbols, propagated

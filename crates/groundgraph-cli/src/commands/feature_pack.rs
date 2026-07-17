@@ -13,10 +13,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use groundgraph_engine::feature_pack::{
     build_feature_pack, FeaturePack, FeaturePackOptions, FeaturePackSelector,
 };
+
+use crate::exit_code::bail_user;
 
 #[derive(Debug, Clone)]
 pub struct FeaturePackRunArgs {
@@ -31,8 +33,9 @@ pub fn run(args: FeaturePackRunArgs) -> Result<()> {
     let selector = match (args.path, args.requirement) {
         (Some(p), None) => FeaturePackSelector::Path(p),
         (None, Some(r)) => FeaturePackSelector::Requirement(r),
-        (Some(_), Some(_)) => bail!("--path 与 --requirement 二选一，不能同时给出"),
-        (None, None) => bail!("必须给出 --path <前缀> 或 --requirement <需求ID>"),
+        // exit 2: user input — selectors are mutually exclusive / required.
+        (Some(_), Some(_)) => bail_user!("--path 与 --requirement 二选一，不能同时给出"),
+        (None, None) => bail_user!("必须给出 --path <前缀> 或 --requirement <需求ID>"),
     };
     let pack = build_feature_pack(FeaturePackOptions {
         repo_root: args.repo_root,

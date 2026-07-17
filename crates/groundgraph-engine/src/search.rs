@@ -38,7 +38,8 @@ use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
 use crate::business_candidates::load_business_candidates;
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 
 // ---------------------------------------------------------------------------
 // Scoring weights — bucketed so `match_reasons` lines up 1:1 with score
@@ -471,15 +472,21 @@ const NOISE_TARGETS: &[&str] = &[
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn run_search(options: SearchOptions) -> Result<SearchResult> {
+pub fn run_search(options: SearchOptions) -> EngineResult<SearchResult> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    // A store failure (unopenable path, corrupt db) is an *operational* error,
+    // not internal — surface it as the typed `Store` variant. `StoreError`'s
+    // own `Display` already names the path, so the previous `with_context`
+    // prefix was redundant (#166).
+    let store = Store::open(&db_path)?;
     run_search_with_store(&store, options)
 }
 
-pub fn run_search_with_store(store: &Store, mut options: SearchOptions) -> Result<SearchResult> {
+pub fn run_search_with_store(
+    store: &Store,
+    mut options: SearchOptions,
+) -> EngineResult<SearchResult> {
     if options.kinds.is_empty() {
         options.kinds = default_search_kinds();
     }
@@ -616,16 +623,29 @@ fn attach_snippets(repo_root: &Path, matches: &mut [SearchMatch], tokens: &[Stri
     needles.sort();
     needles.dedup();
 
-    let mut cache: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+    // Cache both the raw lines and their lower-cased form per distinct path
+    // (#156): previously every span line was `to_lowercase()`-d on every
+    // search. Lowercasing once per file keeps match semantics byte-identical
+    // (full Unicode `to_lowercase`, pinned by
+    // attach_snippets_picks_max_needle_line_with_unicode_folding). The raw
+    // lines remain the source of the emitted snippet text.
+    // (raw lines, lower-cased lines) per distinct path.
+    type SnippetLines = (Vec<String>, Vec<String>);
+    let mut cache: BTreeMap<String, Option<SnippetLines>> = BTreeMap::new();
     for m in matches.iter_mut() {
         let Some(path) = m.path.clone() else { continue };
         let Some((start, end)) = m.line_range else {
             continue;
         };
-        let lines = cache
-            .entry(path.clone())
-            .or_insert_with(|| read_snippet_lines(repo_root, &path));
-        let Some(lines) = lines else { continue };
+        let entry = cache.entry(path.clone()).or_insert_with(|| {
+            read_snippet_lines(repo_root, &path).map(|lines| {
+                let lower: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
+                (lines, lower)
+            })
+        });
+        let Some((lines, lower_lines)) = entry.as_ref() else {
+            continue;
+        };
         let decl_idx = (start.max(1) as usize - 1).min(lines.len().saturating_sub(1));
         let ext_start =
             crate::fulltext_indexer::extend_over_leading_comments(lines.as_slice(), start);
@@ -638,8 +658,7 @@ fn attach_snippets(repo_root: &Path, matches: &mut [SearchMatch], tokens: &[Stri
         // ties) — "multi-byte" must not steal the snippet from the line that
         // says "byte boundary panic". No token anywhere → declaration line.
         let mut best: Option<(usize, usize)> = None; // (count, idx)
-        for (off, line) in lines[start_idx..end_idx].iter().enumerate() {
-            let low = line.to_lowercase();
+        for (off, low) in lower_lines[start_idx..end_idx].iter().enumerate() {
             let count = needles.iter().filter(|n| low.contains(n.as_str())).count();
             if count > 0 && best.map(|(c, _)| count > c).unwrap_or(true) {
                 best = Some((count, start_idx + off));
@@ -949,11 +968,10 @@ fn merge_candidate_evidence_edges(
 /// Build the search-driven HTML payload: a per-match focus card with
 /// trimmed canvas (≤ `focus_budget` nodes), edge inspectors, tests and
 /// candidate descriptions. Drives `groundgraph search --format html`.
-pub fn run_search_html(options: SearchOptions) -> Result<SearchHtmlPayload> {
+pub fn run_search_html(options: SearchOptions) -> EngineResult<SearchHtmlPayload> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     let repo_root = options.repo_root.clone();
     let result = run_search_with_store(&store, options)?;
     Ok(compute_search_html_payload(
@@ -1150,7 +1168,7 @@ fn build_focus_card(
                 })
                 .unwrap_or("unreviewed")
                 .into(),
-            confidence: c.confidence,
+            confidence: c.confidence.map(|v| v.get()),
             description: c.description.clone(),
             risks: c.risks.clone(),
             recommendation: c.recommendation.clone(),
@@ -1533,17 +1551,31 @@ fn keyword_matches(
         })
         .collect();
 
-    let mut hits: Vec<SearchMatch> = Vec::new();
-    for node in &nodes {
-        if !kinds.contains(&node.kind) {
-            continue;
-        }
-        let (score, reasons) = score_node(node, tokens, &candidate_text);
-        if score == 0 {
-            continue;
-        }
-        hits.push(make_match(node, score, reasons));
-    }
+    // Score every candidate node in parallel (#143): `score_node` is pure
+    // (node + query tokens + candidate text → score), so the per-node work —
+    // `split_identifier` / `compact_segments` / path-segment split, the
+    // largest per-node allocator block in this loop — fans out across cores.
+    // `enumerate` plus a stable sort by original index restores the exact
+    // `nodes` order, so the caller's tie-break ranking is byte-identical to
+    // the serial loop (`split_identifier`/`compact_segments` are per-node
+    // inherent — issues.md #143 — so the win is parallelism, not caching).
+    use rayon::prelude::*;
+    let mut scored: Vec<(usize, SearchMatch)> = nodes
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, node)| {
+            if !kinds.contains(&node.kind) {
+                return None;
+            }
+            let (score, reasons) = score_node(node, tokens, &candidate_text);
+            if score == 0 {
+                return None;
+            }
+            Some((idx, make_match(node, score, reasons)))
+        })
+        .collect();
+    scored.sort_by_key(|(idx, _)| *idx);
+    let mut hits: Vec<SearchMatch> = scored.into_iter().map(|(_, m)| m).collect();
 
     // Score candidates from YAML against the same tokens so they
     // become first-class search results even though they don't live
@@ -1652,9 +1684,14 @@ fn score_node(
         .as_deref()
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    let path_segments: Vec<String> = path_lower
+    // Borrow `path_lower`'s slices instead of allocating a fresh String per
+    // path segment (#144): ~5 segments × every candidate node was the largest
+    // per-node allocator in the ranking loop. `trim_end_matches` (not
+    // `strip_suffix`) keeps the repeated-`.dart`-trim semantics pinned by
+    // characterization_path_segment_repeated_dart_suffix_is_trimmed.
+    let path_segments: Vec<&str> = path_lower
         .split(['/', '\\'])
-        .map(|s| s.trim_end_matches(".dart").to_string())
+        .map(|s| s.trim_end_matches(".dart"))
         .filter(|s| !s.is_empty())
         .collect();
     let name_subtokens = node
@@ -1683,7 +1720,7 @@ fn score_node(
             continue;
         }
         // Path segment.
-        if path_segments.iter().any(|seg| seg == tok) {
+        if path_segments.contains(&tok.as_str()) {
             score += SCORE_PATH_SEGMENT;
             reasons.push(format!("path contains segment `{tok}`"));
             continue;
@@ -2004,12 +2041,8 @@ fn shell_quote(raw: &str) -> String {
 // Storage path helper (mirrors slice/impact/logic_confidence)
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2019,7 +2052,9 @@ fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use groundgraph_core::{EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus};
+    use groundgraph_core::{
+        Confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+    };
     use groundgraph_store::Store;
 
     fn empty_store() -> (Store, tempfile::TempDir) {
@@ -2041,9 +2076,7 @@ mod tests {
             content_hash: None,
             stable_key: None,
             source_file: Some(file.into()),
-            source_hash: None,
             indexer: Some("dart_analyzer".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_node(&node).unwrap();
@@ -2070,12 +2103,10 @@ mod tests {
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some("dart_analyzer".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_edge(&edge).unwrap();
@@ -2197,6 +2228,34 @@ mod tests {
         );
     }
 
+    /// issues.md #156: attach_snippets must pick the max-needle line and keep
+    /// full Unicode `to_lowercase` semantics — a non-ASCII uppercase line is
+    /// folded, not handled by an ASCII-only short-circuit. Pins the behaviour
+    /// before the per-document lowercase cache so that optimisation stays
+    /// byte-identical to the per-line lowercase it replaces.
+    #[test]
+    fn attach_snippets_picks_max_needle_line_with_unicode_folding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // L1 decoy (0 hits); L2 ASCII-uppercase AUTH → lowercased `auth` hit;
+        // L3 a non-ASCII uppercase É — folded to é by full `to_lowercase`,
+        // proving the pass is not an ASCII-only short-circuit (#156 risk).
+        std::fs::write(
+            root.join("app.dart"),
+            "void decoy() {}\nvoid AUTH() { return; }\nvoid Éxtra() {}\n",
+        )
+        .unwrap();
+        let mut matches = vec![match_at("app.dart", (1, 3))];
+        let tokens = vec!["auth".to_string()];
+        attach_snippets(&root, &mut matches, &tokens, "auth");
+        assert_eq!(
+            matches[0].snippet.as_deref(),
+            Some("L2: void AUTH() { return; }"),
+            "snippet must be the lowercased-match line, raw text preserved"
+        );
+    }
+
     /// issues2.md #52: a CJK phrase used to stay one opaque token, so
     /// `登录 服务` could not hit a node named `用户登录服务`. CJK runs now
     /// split into overlapping bigrams like the FTS layer.
@@ -2315,6 +2374,90 @@ mod tests {
         );
     }
 
+    // --- issues.md #143/#144 characterization -----------------------------
+    // Pin `score_node`'s exact (score, match_reasons) for representative
+    // name/path shapes so the token-preprocessing + path-segment-borrow
+    // optimisation cannot drift ranking semantics. The `.dart.dart` case
+    // nails down that path segments use `trim_end_matches` (repeated trim),
+    // NOT `strip_suffix` (single trim) — a behaviour-preserving refactor
+    // must keep the repeated-trim semantics.
+
+    fn one_hit_for(store: &Store, tokens: &[String], want_id: &str) -> SearchMatch {
+        let kinds: HashSet<_> = default_search_kinds().into_iter().collect();
+        let hits = keyword_matches(store, Path::new("."), tokens, &kinds).unwrap();
+        hits.iter()
+            .find(|h| h.id == want_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no hit for {want_id}; hits: {:?}", hits))
+    }
+
+    #[test]
+    fn characterization_path_segment_repeated_dart_suffix_is_trimmed() {
+        let (mut store, _dir) = empty_store();
+        // `.dart.dart` must trim *repeatedly* → segment `page`, not `page.dart`.
+        let id = insert_method(
+            &mut store,
+            "lib/x/page.dart.dart",
+            "PageLoader.load",
+            (1, 2),
+        );
+        let hit = one_hit_for(&store, &["page".into()], &id);
+        assert_eq!(hit.score, SCORE_PATH_SEGMENT);
+        assert_eq!(hit.match_reasons, vec!["path contains segment `page`"]);
+    }
+
+    #[test]
+    fn characterization_name_camel_subtoken_scores_name_token() {
+        let (mut store, _dir) = empty_store();
+        let id = insert_method(&mut store, "lib/a.dart", "AuthService.signIn", (1, 2));
+        let hit = one_hit_for(&store, &["service".into()], &id);
+        assert_eq!(hit.score, SCORE_NAME_TOKEN);
+        assert_eq!(hit.match_reasons, vec!["name token `service` matches"]);
+    }
+
+    #[test]
+    fn characterization_name_snake_subtoken_scores_name_token() {
+        let (mut store, _dir) = empty_store();
+        let id = insert_method(&mut store, "lib/a.dart", "sign_in_user", (1, 2));
+        let hit = one_hit_for(&store, &["user".into()], &id);
+        assert_eq!(hit.score, SCORE_NAME_TOKEN);
+        assert_eq!(hit.match_reasons, vec!["name token `user` matches"]);
+    }
+
+    #[test]
+    fn characterization_name_compact_segment_scores_name_token() {
+        let (mut store, _dir) = empty_store();
+        let id = insert_method(&mut store, "lib/a.dart", "Item.applyPurchase", (1, 2));
+        let hit = one_hit_for(&store, &["applypurchase".into()], &id);
+        assert_eq!(hit.score, SCORE_NAME_TOKEN);
+        assert_eq!(
+            hit.match_reasons,
+            vec!["name token `applypurchase` matches"]
+        );
+    }
+
+    #[test]
+    fn characterization_multi_token_reasons_order_is_stable() {
+        let (mut store, _dir) = empty_store();
+        let id = insert_method(
+            &mut store,
+            "lib/auth/auth_service.dart",
+            "AuthService.signIn",
+            (10, 20),
+        );
+        // reasons order follows the token loop order: `auth` → path segment,
+        // `signin` → name compact. Both the order and the score must hold.
+        let hit = one_hit_for(&store, &["auth".into(), "signin".into()], &id);
+        assert_eq!(hit.score, SCORE_PATH_SEGMENT + SCORE_NAME_TOKEN);
+        assert_eq!(
+            hit.match_reasons,
+            vec![
+                "path contains segment `auth`",
+                "name token `signin` matches"
+            ]
+        );
+    }
+
     #[test]
     fn framework_family_extracts_role_label_from_metadata_json() {
         let route = serde_json::json!({
@@ -2371,9 +2514,7 @@ mod tests {
                 content_hash: None,
                 stable_key: None,
                 source_file: Some("app/api.py".into()),
-                source_hash: None,
                 indexer: Some("python_ast".into()),
-                index_generation: None,
                 metadata_json: Some(metadata),
             })
             .unwrap();
@@ -2635,12 +2776,10 @@ candidates:
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some("dart_analyzer".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_edge(&edge).unwrap();
@@ -2658,9 +2797,7 @@ candidates:
             content_hash: None,
             stable_key: None,
             source_file: Some(file.into()),
-            source_hash: None,
             indexer: Some("dart_analyzer".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_node(&node).unwrap();
@@ -2706,9 +2843,7 @@ candidates:
                 content_hash: None,
                 stable_key: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2721,12 +2856,10 @@ candidates:
                 source: EdgeSource::LanguageAdapter,
                 certainty: EdgeCertainty::Fact,
                 status: EdgeStatus::Confirmed,
-                confidence: 1.0,
+                confidence: Confidence::FULL,
                 evidence_json: None,
                 source_file: None,
-                source_hash: None,
                 indexer: Some("dart_analyzer".into()),
-                index_generation: None,
                 metadata_json: None,
             })
             .unwrap();
@@ -2949,12 +3082,10 @@ candidates:
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some(indexer.into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_edge(&edge).unwrap();
@@ -3033,12 +3164,10 @@ candidates:
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some("dart_analyzer".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_edge(&edge2).unwrap();

@@ -209,7 +209,8 @@ pub fn language_of(kind: NodeKind) -> Language {
         | NodeKind::RustEnum
         | NodeKind::RustTrait
         | NodeKind::RustFunction
-        | NodeKind::RustMethod => Language::Rust,
+        | NodeKind::RustMethod
+        | NodeKind::RustMacro => Language::Rust,
         NodeKind::CFunction | NodeKind::CStruct | NodeKind::CEnum => Language::C,
         NodeKind::CppNamespace
         | NodeKind::CppClass
@@ -284,6 +285,7 @@ pub fn family_of(kind: NodeKind) -> SymbolFamily {
         | NodeKind::RustStruct
         | NodeKind::RustEnum
         | NodeKind::RustTrait
+        | NodeKind::RustMacro
         | NodeKind::CStruct
         | NodeKind::CEnum
         | NodeKind::CppClass
@@ -432,6 +434,7 @@ pub fn search_aliases(kind: NodeKind) -> &'static [&'static str] {
         NodeKind::BusinessCandidate => &["candidate", "business"],
         NodeKind::TestCase | NodeKind::TestGroup => &["test"],
         NodeKind::RustTrait => &["trait", "interface"],
+        NodeKind::RustMacro => &["macro", "macro_rules"],
         NodeKind::CppNamespace => &["namespace", "module"],
         _ => &[],
     }
@@ -463,7 +466,7 @@ mod tests {
         // to append to `NodeKind::ALL` fails this test loudly.
         assert_eq!(
             ALL_KINDS.len(),
-            82,
+            83,
             "NodeKind::ALL missing a variant. Append it there and update this count."
         );
     }

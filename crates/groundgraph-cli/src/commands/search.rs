@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use groundgraph_core::NodeKind;
 use groundgraph_engine::graph::GraphLayer;
 use groundgraph_engine::search::{
@@ -26,6 +26,7 @@ use groundgraph_engine::{default_search_kinds, SEARCH_DEFAULT_DEPTH, SEARCH_DEFA
 
 use crate::commands::graph_mermaid::{render_parts, MermaidEdge, MermaidNode};
 use crate::commands::search_html;
+use crate::exit_code::bail_user;
 
 /// Output mode selected on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,10 +225,12 @@ fn pick_query(args: &SearchRunArgs) -> Result<SearchQuery> {
     .filter(|x| **x)
     .count();
     if count == 0 {
-        bail!("provide a positional query, --code, or --file/--line");
+        // exit 2: user input — no query form supplied.
+        bail_user!("provide a positional query, --code, or --file/--line");
     }
     if count > 1 {
-        bail!("--code, --file and positional query are mutually exclusive");
+        // exit 2: user input — query forms are mutually exclusive.
+        bail_user!("--code, --file and positional query are mutually exclusive");
     }
     if let Some(q) = &args.query {
         return Ok(SearchQuery::Keywords(q.clone()));
@@ -236,9 +239,11 @@ fn pick_query(args: &SearchRunArgs) -> Result<SearchQuery> {
         return Ok(SearchQuery::Code(c.clone()));
     }
     let path = args.file.as_ref().unwrap().clone();
-    let line = args
-        .line
-        .context("--file requires --line; pass --line <N> together with --file")?;
+    // exit 2: user input — --file requires its --line counterpart.
+    let line = match args.line {
+        Some(l) => l,
+        None => bail_user!("--file requires --line; pass --line <N> together with --file"),
+    };
     Ok(SearchQuery::Position { path, line })
 }
 
@@ -315,7 +320,8 @@ fn match_kind(name: &str) -> Result<NodeKind> {
         "cxx_function" | "cpp_fn" => NodeKind::CppFunction,
         "cxx_method" => NodeKind::CppMethod,
         other => {
-            bail!(
+            // exit 2: user input — --kind value not recognised.
+            bail_user!(
                 "unknown --kind `{other}`. valid: {}",
                 default_search_kinds()
                     .iter()

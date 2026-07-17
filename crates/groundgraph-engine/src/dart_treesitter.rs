@@ -488,6 +488,7 @@ pub(crate) static DART_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: false,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 // ---------------------------------------------------------------------------

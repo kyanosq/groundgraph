@@ -4,10 +4,10 @@
 //! conflict targets always match the schema's primary keys.
 
 use groundgraph_core::{
-    sanitize_confidence, ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource,
-    EdgeStatus, Evidence, EvidenceKind, Node, NodeKind, SymbolRange,
+    ArtifactId, Confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+    Evidence, EvidenceKind, Node, NodeKind, SymbolRange,
 };
-use rusqlite::{params, Row};
+use rusqlite::{params, params_from_iter, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError, StoreResult};
@@ -27,7 +27,7 @@ pub struct FileIndexEntry {
 // #157).
 macro_rules! select_node_cols {
     () => {
-        "id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json"
+        "id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, indexer, metadata_json"
     };
 }
 const FIND_NODE_SQL: &str = concat!("SELECT ", select_node_cols!(), " FROM nodes WHERE id = ?1");
@@ -38,13 +38,29 @@ const LIST_NODES_BY_KIND_SQL: &str = concat!(
 );
 const LIST_ALL_NODES_SQL: &str = concat!("SELECT ", select_node_cols!(), " FROM nodes ORDER BY id");
 
-const SELECT_EDGE_COLS: &str = "id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json";
+const SELECT_EDGE_COLS: &str = "id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json";
 
 const SELECT_EVIDENCE_COLS: &str =
     "id, artifact_id, kind, path, start_line, end_line, snippet, hash, metadata_json";
 
 const SELECT_RANGE_COLS: &str =
     "file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id";
+
+/// #205: anti-downgrade guard applied to `edge_assertions.certainty` on UPSERT
+/// conflict. An incoming `fact` always wins (upgrade, or same-level refresh);
+/// an incoming `declared` only refreshes when the existing row is also
+/// `declared` — it must NOT overwrite an existing `fact`. The two values
+/// (`'declared'` < `'fact'`) happen to sort in semantic order, but the CASE
+/// states the rule explicitly instead of leaning on that coincidence.
+const CERTAINTY_CASE: &str = "CASE WHEN excluded.certainty='fact' OR edge_assertions.certainty='declared' THEN excluded.certainty ELSE edge_assertions.certainty END";
+
+/// #205: `confidence` rides the *same* condition as `certainty`. They are the
+/// pair that says "how sure we are about this assertion", so when a no-downgrade
+/// keeps the existing certainty it must also keep its confidence — otherwise a
+/// row could end up `fact`-certainty carrying a `declared`-grade score. The
+/// other SET columns (status / source_file / indexer / metadata_json) are
+/// provenance independent of certainty and refresh normally.
+const CONFIDENCE_CASE: &str = "CASE WHEN excluded.certainty='fact' OR edge_assertions.certainty='declared' THEN excluded.confidence ELSE edge_assertions.confidence END";
 
 /// Owned-`Value` constructors for the multi-row upsert paths, where borrowed
 /// `ToSql` references cannot outlive the per-row temporaries.
@@ -62,13 +78,6 @@ fn val_opt_text(o: &Option<String>) -> rusqlite::types::Value {
 fn val_opt_u32(o: Option<u32>) -> rusqlite::types::Value {
     match o {
         Some(v) => rusqlite::types::Value::Integer(i64::from(v)),
-        None => rusqlite::types::Value::Null,
-    }
-}
-
-fn val_opt_i64(o: Option<i64>) -> rusqlite::types::Value {
-    match o {
-        Some(v) => rusqlite::types::Value::Integer(v),
         None => rusqlite::types::Value::Null,
     }
 }
@@ -112,7 +121,10 @@ fn execute_chunk(
 
 impl Store {
     pub fn upsert_node(&mut self, node: &Node) -> StoreResult<()> {
-        let sql = "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
+        // #168: enforce node invariants at the write boundary — the all-pub
+        // struct fields cannot express them by type.
+        node.validate().map_err(StoreError::InvalidNode)?;
+        let sql = "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, indexer, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json";
         self.conn
             .prepare_cached(sql)
             .map_err(StoreError::sqlite)?
@@ -126,9 +138,7 @@ impl Store {
                 node.content_hash,
                 node.stable_key,
                 node.source_file,
-                node.source_hash,
                 node.indexer,
-                node.index_generation,
                 node.metadata_json,
             ])
             .map(|_| ())
@@ -186,14 +196,19 @@ impl Store {
     /// one is open, otherwise opens its own — so a mid-batch failure can
     /// never leave a partially-committed batch behind.
     pub fn upsert_nodes_bulk(&mut self, nodes: &[Node]) -> StoreResult<()> {
-        // 13 columns × 512 rows = 6656 bound variables, far under SQLite's
+        // #168: same write-boundary invariant check as `upsert_node`, done up
+        // front so a bad node fails the whole batch before any statement runs.
+        for node in nodes {
+            node.validate().map_err(StoreError::InvalidNode)?;
+        }
+        // 11 columns × 512 rows = 5632 bound variables, far under SQLite's
         // 32k limit while keeping the hot (full-chunk) statement cacheable.
         const CHUNK: usize = 512;
-        const COLS: usize = 13;
+        const COLS: usize = 11;
         self.with_write_tx(|conn| {
             for chunk in nodes.chunks(CHUNK) {
                 let sql = format!(
-                    "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                    "INSERT INTO nodes (id, kind, path, name, start_line, end_line, content_hash, stable_key, source_file, indexer, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, path=excluded.path, name=excluded.name, start_line=excluded.start_line, end_line=excluded.end_line, content_hash=excluded.content_hash, stable_key=excluded.stable_key, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json",
                     values_placeholders(chunk.len(), COLS)
                 );
                 let mut values: Vec<rusqlite::types::Value> =
@@ -208,9 +223,7 @@ impl Store {
                     values.push(val_opt_text(&node.content_hash));
                     values.push(val_opt_text(&node.stable_key));
                     values.push(val_opt_text(&node.source_file));
-                    values.push(val_opt_text(&node.source_hash));
                     values.push(val_opt_text(&node.indexer));
-                    values.push(val_opt_i64(node.index_generation));
                     values.push(val_opt_text(&node.metadata_json));
                 }
                 execute_chunk(conn, &sql, values, chunk.len() == CHUNK)?;
@@ -222,11 +235,11 @@ impl Store {
     /// Multi-row edge upsert; see [`Self::upsert_nodes_bulk`].
     pub fn upsert_edges_bulk(&mut self, edges: &[EdgeAssertion]) -> StoreResult<()> {
         const CHUNK: usize = 512;
-        const COLS: usize = 14;
+        const COLS: usize = 12;
         self.with_write_tx(|conn| {
             for chunk in edges.chunks(CHUNK) {
                 let sql = format!(
-                    "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json",
+                    "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty={CERTAINTY_CASE}, status=excluded.status, confidence={CONFIDENCE_CASE}, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json",
                     values_placeholders(chunk.len(), COLS)
                 );
                 let mut values: Vec<rusqlite::types::Value> =
@@ -239,14 +252,10 @@ impl Store {
                     values.push(val_text(edge.source.as_str()));
                     values.push(val_text(edge.certainty.as_str()));
                     values.push(val_text(edge.status.as_str()));
-                    values.push(rusqlite::types::Value::Real(f64::from(sanitize_confidence(
-                        edge.confidence,
-                    ))));
+                    values.push(rusqlite::types::Value::Real(f64::from(edge.confidence)));
                     values.push(val_opt_text(&edge.evidence_json));
                     values.push(val_opt_text(&edge.source_file));
-                    values.push(val_opt_text(&edge.source_hash));
                     values.push(val_opt_text(&edge.indexer));
-                    values.push(val_opt_i64(edge.index_generation));
                     values.push(val_opt_text(&edge.metadata_json));
                 }
                 execute_chunk(conn, &sql, values, chunk.len() == CHUNK)?;
@@ -256,9 +265,11 @@ impl Store {
     }
 
     pub fn upsert_edge(&mut self, edge: &EdgeAssertion) -> StoreResult<()> {
-        let sql = "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, source_hash, indexer, index_generation, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, source_hash=excluded.source_hash, indexer=excluded.indexer, index_generation=excluded.index_generation, metadata_json=excluded.metadata_json";
+        let sql = format!(
+            "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty={CERTAINTY_CASE}, status=excluded.status, confidence={CONFIDENCE_CASE}, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json"
+        );
         self.conn
-            .prepare_cached(sql)
+            .prepare_cached(&sql)
             .map_err(StoreError::sqlite)?
             .execute(params![
                 edge.id.as_str(),
@@ -268,12 +279,10 @@ impl Store {
                 edge.source.as_str(),
                 edge.certainty.as_str(),
                 edge.status.as_str(),
-                f64::from(sanitize_confidence(edge.confidence)),
+                f64::from(edge.confidence),
                 edge.evidence_json,
                 edge.source_file,
-                edge.source_hash,
                 edge.indexer,
-                edge.index_generation,
                 edge.metadata_json,
             ])
             .map(|_| ())
@@ -282,6 +291,26 @@ impl Store {
 
     pub fn list_edges_by_kind(&self, kind: EdgeKind) -> StoreResult<Vec<EdgeAssertion>> {
         self.query_edges("WHERE kind = ?1 ORDER BY id", params![kind.as_str()])
+    }
+
+    /// All edges whose `kind` is in `kinds`, ordered by id. Used by `connect`
+    /// to collapse an N+1 (one `list_edges_to` per requirement node, issues.md
+    /// #158) into a single query the caller buckets in memory by `to_id`.
+    ///
+    /// The prepared SQL is keyed by placeholder count, so a fixed `kinds`
+    /// length (e.g. `connect`'s three evidence kinds) reuses one cached
+    /// statement instead of recompiling per call.
+    pub fn list_edges_by_kinds(&self, kinds: &[EdgeKind]) -> StoreResult<Vec<EdgeAssertion>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = (1..=kinds.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let suffix = format!("WHERE kind IN ({placeholders}) ORDER BY id");
+        let params = params_from_iter(kinds.iter().map(|k| k.as_str()));
+        self.query_edges(&suffix, params)
     }
 
     pub fn list_edges_from(&self, from: &ArtifactId) -> StoreResult<Vec<EdgeAssertion>> {
@@ -462,8 +491,15 @@ impl Store {
         }
     }
 
-    /// Delete every node, edge, evidence and symbol range produced by the
-    /// given indexer name. Used to re-index without leaving stale rows.
+    /// Delete the `nodes` and `edge_assertions` rows produced by the given
+    /// indexer name. Used to re-index without leaving that indexer's stale rows
+    /// behind.
+    ///
+    /// Scoped to the indexer's own rows only: `evidence` / `symbol_ranges` /
+    /// `node_fts` carry no `indexer` column, so their orphan cleanup is deferred
+    /// to [`Self::sweep_orphans`], which the ingest flow runs once at the end
+    /// (#137) instead of re-anti-joining the whole `nodes` table on every
+    /// per-indexer clear.
     ///
     /// Rows with `indexer IS NULL` are deliberately untouched: NULL marks
     /// unmanaged data (operator-confirmed links, external imports) that no
@@ -471,9 +507,6 @@ impl Store {
     /// indexer tags its own writes — see e.g. `make_indexed_edge` in the
     /// docs indexer.
     pub fn clear_indexer_outputs(&mut self, indexer: &str) -> StoreResult<()> {
-        // `node_fts` only exists after migration 003; older databases skip
-        // the orphan sweep (they have no content layer to go stale).
-        let has_fts = self.fulltext_available()?;
         self.with_write_tx(|tx| {
             tx.execute("DELETE FROM nodes WHERE indexer = ?1", params![indexer])
                 .map_err(StoreError::sqlite)?;
@@ -482,27 +515,49 @@ impl Store {
                 params![indexer],
             )
             .map_err(StoreError::sqlite)?;
-            tx.execute(
-                "DELETE FROM evidence WHERE artifact_id NOT IN (SELECT id FROM nodes)",
-                params![],
-            )
-            .map_err(StoreError::sqlite)?;
-            tx.execute(
-                "DELETE FROM symbol_ranges WHERE symbol_id NOT IN (SELECT id FROM nodes)",
-                params![],
-            )
-            .map_err(StoreError::sqlite)?;
+            Ok(())
+        })
+    }
+
+    /// #137: the single self-healing GC pass — reclaim every `evidence` /
+    /// `symbol_ranges` / `node_fts` row whose referenced id no longer exists in
+    /// `nodes`. This used to run inside `clear_indexer_outputs`, so an ingest
+    /// that clears N indexers walked the whole `nodes` table N times; it now
+    /// runs once at the end of each ingest entry (`index_repository` and
+    /// `index_schema_into`). The scope is deliberately the same whole-table
+    /// `NOT IN` sweep it always was — it doubles as self-healing cleanup of
+    /// rows orphaned by a historical crash, so it must NOT be narrowed to the
+    /// ids a single indexer just deleted. Returns the number of rows removed.
+    pub fn sweep_orphans(&mut self) -> StoreResult<usize> {
+        // `node_fts` only exists after migration 003; older databases skip its
+        // sweep (they have no content layer to go stale).
+        let has_fts = self.fulltext_available()?;
+        self.with_write_tx(|tx| {
+            let mut removed = 0usize;
+            removed += tx
+                .execute(
+                    "DELETE FROM evidence WHERE artifact_id NOT IN (SELECT id FROM nodes)",
+                    params![],
+                )
+                .map_err(StoreError::sqlite)?;
+            removed += tx
+                .execute(
+                    "DELETE FROM symbol_ranges WHERE symbol_id NOT IN (SELECT id FROM nodes)",
+                    params![],
+                )
+                .map_err(StoreError::sqlite)?;
             // Fulltext rows referencing deleted nodes would otherwise survive
             // (`node_id` is UNINDEXED, no FK) and `fulltext_match` would keep
             // returning ghost ids that `find_node` cannot resolve.
             if has_fts {
-                tx.execute(
-                    "DELETE FROM node_fts WHERE node_id NOT IN (SELECT id FROM nodes)",
-                    params![],
-                )
-                .map_err(StoreError::sqlite)?;
+                removed += tx
+                    .execute(
+                        "DELETE FROM node_fts WHERE node_id NOT IN (SELECT id FROM nodes)",
+                        params![],
+                    )
+                    .map_err(StoreError::sqlite)?;
             }
-            Ok(())
+            Ok(removed)
         })
     }
 
@@ -660,10 +715,6 @@ fn required_u32(row: &Row<'_>, idx: usize) -> Result<u32, rusqlite::Error> {
     })
 }
 
-fn opt_i64(row: &Row<'_>, idx: usize) -> Result<Option<i64>, rusqlite::Error> {
-    row.get(idx)
-}
-
 fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
     let kind_str: String = row.get(1)?;
     // Single source of truth lives in `groundgraph-core`; the store no longer
@@ -680,10 +731,8 @@ fn node_from_row(row: &Row<'_>) -> Result<Node, rusqlite::Error> {
         content_hash: row.get(6)?,
         stable_key: row.get(7)?,
         source_file: row.get(8)?,
-        source_hash: row.get(9)?,
-        indexer: row.get(10)?,
-        index_generation: opt_i64(row, 11)?,
-        metadata_json: row.get(12)?,
+        indexer: row.get(9)?,
+        metadata_json: row.get(10)?,
     })
 }
 
@@ -699,15 +748,14 @@ fn edge_from_row(row: &Row<'_>) -> Result<EdgeAssertion, rusqlite::Error> {
         // SQLite stores REAL as f64; our domain type is f32. Closest-value
         // rounding is the desired behaviour for confidences in [0,1]. Sanitise
         // on read too (#63) so a row written by an older build / external tool
-        // with NaN/±∞/out-of-range can never reach a downstream comparator.
+        // with NaN/±∞/out-of-range can never reach a downstream comparator;
+        // `Confidence::new` folds exactly those cases into range (#168).
         #[allow(clippy::cast_possible_truncation)]
-        confidence: sanitize_confidence(row.get::<_, f64>(7)? as f32),
+        confidence: Confidence::new(row.get::<_, f64>(7)? as f32),
         evidence_json: row.get(8)?,
         source_file: row.get(9)?,
-        source_hash: row.get(10)?,
-        indexer: row.get(11)?,
-        index_generation: opt_i64(row, 12)?,
-        metadata_json: row.get(13)?,
+        indexer: row.get(10)?,
+        metadata_json: row.get(11)?,
     })
 }
 
@@ -839,11 +887,39 @@ mod decode_tests {
     }
 
     #[test]
+    fn upsert_node_rejects_inverted_line_range() {
+        // #168: `Node` fields are `pub`, so a caller can construct
+        // `start_line > end_line`. The store is the write boundary: an
+        // illegal row must be rejected before it can enter the graph.
+        let mut store = fresh_store();
+        let mut node = Node::new(ArtifactId::new("bad-range"), NodeKind::RustFunction);
+        node.start_line = Some(10);
+        node.end_line = Some(5);
+
+        let err = store.upsert_node(&node).expect_err("inverted range");
+        assert!(format!("{err}").contains("start_line 10"), "{err}");
+
+        let err = store
+            .upsert_nodes_bulk(std::slice::from_ref(&node))
+            .expect_err("bulk path validates too");
+        assert!(format!("{err}").contains("start_line 10"), "{err}");
+
+        assert!(
+            store
+                .find_node(&ArtifactId::new("bad-range"))
+                .unwrap()
+                .is_none(),
+            "rejected node must not be persisted"
+        );
+    }
+
+    #[test]
     fn upsert_edge_sanitises_out_of_range_and_nan_confidence() {
-        // #63: `EdgeAssertion.confidence` is a `pub f32`, so a caller can hand
-        // the store NaN / ±∞ / negative / >1 values. The store must persist a
-        // finite value in [0, 1] (read back via the normal decode path) so no
-        // downstream comparator ever sees a non-total-ordered confidence.
+        // #63: a caller can hand the store NaN / ±∞ / negative / >1 raw
+        // values (today only via `Confidence::new`, which already folds them;
+        // before #168 the field was a bare `pub f32`). The store must persist
+        // a finite value in [0, 1] (read back via the normal decode path) so
+        // no downstream comparator ever sees a non-total-ordered confidence.
         let mut store = fresh_store();
         let cases = [
             (f32::NAN, 1.0_f32),
@@ -861,7 +937,7 @@ mod decode_tests {
                 EdgeSource::LanguageAdapter,
             );
             edge.id = ArtifactId::new(format!("conf-{i}"));
-            edge.confidence = *raw;
+            edge.confidence = Confidence::new(*raw);
             // Exercise both write paths: single + bulk.
             if i % 2 == 0 {
                 store.upsert_edge(&edge).unwrap();
@@ -878,7 +954,7 @@ mod decode_tests {
                 .find(|e| e.id.as_str() == format!("conf-{i}"))
                 .unwrap_or_else(|| panic!("conf-{i} missing"));
             assert!(
-                got.confidence.is_finite() && (0.0..=1.0).contains(&got.confidence),
+                got.confidence.get().is_finite() && (0.0..=1.0).contains(&got.confidence.get()),
                 "conf-{i}: {} out of invariant",
                 got.confidence
             );
@@ -1232,9 +1308,7 @@ mod decode_tests {
         node.content_hash = Some("h".into());
         node.stable_key = Some("k".into());
         node.source_file = Some("lib/a.dart".into());
-        node.source_hash = Some("hh".into());
         node.indexer = Some("dart_lightweight".into());
-        node.index_generation = Some(3);
         node.metadata_json = Some("{}".into());
         store.upsert_node(&node).unwrap();
 
@@ -1245,15 +1319,104 @@ mod decode_tests {
             EdgeSource::LanguageAdapter,
         );
         edge.indexer = Some("dart_lightweight".into());
-        edge.index_generation = Some(7);
         edge.metadata_json = Some("{}".into());
         store.upsert_edge(&edge).unwrap();
 
         let found = store.find_node(&node.id).unwrap().unwrap();
         assert_eq!(found.start_line, Some(10));
-        assert_eq!(found.index_generation, Some(3));
         let edges = store.list_edges_from(&edge.from_id).unwrap();
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].index_generation, Some(7));
+        assert_eq!(edges[0].indexer.as_deref(), Some("dart_lightweight"));
+    }
+
+    /// #205: two indexers asserting the *same* `(kind, from, to)` edge from
+    /// *different* sources must coexist — the id now encodes `source`, so they
+    /// no longer UPSERT over each other.
+    #[test]
+    fn distinct_sources_for_same_kind_from_to_coexist() {
+        let mut store = fresh_store();
+        let from = ArtifactId::new("doc::section");
+        let to = ArtifactId::new("req::REQ-1");
+        let markdown = EdgeAssertion::declared(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Documents,
+            EdgeSource::Markdown,
+        );
+        let external = EdgeAssertion::declared(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Documents,
+            EdgeSource::ExternalManifest,
+        );
+        store.upsert_edge(&markdown).unwrap();
+        store.upsert_edge(&external).unwrap();
+
+        let edges = store.list_edges_from(&from).unwrap();
+        assert_eq!(
+            edges.len(),
+            2,
+            "distinct sources must coexist, not overwrite; got {edges:?}"
+        );
+        assert!(edges.iter().any(|e| e.source == EdgeSource::Markdown));
+        assert!(edges
+            .iter()
+            .any(|e| e.source == EdgeSource::ExternalManifest));
+    }
+
+    /// #205: when two edges resolve to the *same* id (same kind+source+from+to,
+    /// differing only in mutable state), a later `declared` must NOT downgrade
+    /// an existing `fact` — the ON CONFLICT update guards certainty.
+    #[test]
+    fn upsert_edge_does_not_downgrade_fact_to_declared() {
+        let mut store = fresh_store();
+        let from = ArtifactId::new("a");
+        let to = ArtifactId::new("b");
+        // Same id (certainty is not in the id), certainty Fact.
+        let fact = EdgeAssertion::fact(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Contains,
+            EdgeSource::Filesystem,
+        );
+        store.upsert_edge(&fact).unwrap();
+        // Same id again, this time a Declared edge trying to overwrite.
+        let declared =
+            EdgeAssertion::declared(from, to, EdgeKind::Contains, EdgeSource::Filesystem);
+        store.upsert_edge(&declared).unwrap();
+
+        let edges = store.list_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].certainty,
+            EdgeCertainty::Fact,
+            "a late Declared must not downgrade an existing Fact"
+        );
+    }
+
+    /// #205: the guard is one-directional — a later `fact` still upgrades an
+    /// existing `declared` (same id), and same-level writes refresh.
+    #[test]
+    fn upsert_edge_upgrades_declared_to_fact() {
+        let mut store = fresh_store();
+        let from = ArtifactId::new("a");
+        let to = ArtifactId::new("b");
+        let declared = EdgeAssertion::declared(
+            from.clone(),
+            to.clone(),
+            EdgeKind::Contains,
+            EdgeSource::Filesystem,
+        );
+        store.upsert_edge(&declared).unwrap();
+        let fact = EdgeAssertion::fact(from, to, EdgeKind::Contains, EdgeSource::Filesystem);
+        store.upsert_edge(&fact).unwrap();
+
+        let edges = store.list_all_edges().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].certainty,
+            EdgeCertainty::Fact,
+            "a late Fact must upgrade an existing Declared"
+        );
     }
 }

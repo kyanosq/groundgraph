@@ -26,7 +26,7 @@
 
 use crate::treesitter::{
     body_from_field, name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws,
-    LangSpec, RefKind, SymKind, TestKind, MAX_NESTING_DEPTH,
+    CallKind, LangSpec, RefKind, SymKind, TestKind,
 };
 use groundgraph_core::NodeKind;
 
@@ -331,65 +331,66 @@ fn swift_resolve_import(
 /// links are still captured and feed reachability within a file / type.
 fn swift_call_idents(body: tree_sitter::Node<'_>, src: &[u8]) -> Vec<(String, RefKind)> {
     let mut out = Vec::new();
-    collect_swift_calls(body, src, &mut out, 0);
+    crate::treesitter::collect_calls(body, src, &mut out, 0, SWIFT_CALL_KINDS);
     out
 }
 
-fn collect_swift_calls(
+/// `call_expression` whose callee (first named child) is resolved by
+/// [`swift_callee_name`] (covers trailing closures, `obj.member`, etc.).
+fn swift_call_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    node.named_child(0)
+        .and_then(|callee| swift_callee_name(callee, src))
+        .map(|name| (name, RefKind::Call))
+}
+
+/// A `type_identifier` used in a value position — a stored-property / local
+/// annotation, an `as?` cast, a generic argument, or the element of a `[T]`
+/// / `T?` type — is a *reference* to that type. This is the only link to
+/// models created by reflection (ObjectMapper / Codable) and to cells
+/// registered by metatype, which never appear as a construction call.
+fn swift_type_identifier_extract(
     node: tree_sitter::Node<'_>,
     src: &[u8],
-    out: &mut Vec<(String, RefKind)>,
-    depth: usize,
-) {
-    if depth > MAX_NESTING_DEPTH {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "call_expression" => {
-                if let Some(name) = child
-                    .named_child(0)
-                    .and_then(|callee| swift_callee_name(callee, src))
-                {
-                    out.push((name, RefKind::Call));
-                }
-            }
-            // A type name used in a value position — a stored-property /
-            // local annotation, an `as?` cast, a generic argument, or the
-            // element of a `[T]` / `T?` type — is a *reference* to that type.
-            // This is the only link to models created by reflection
-            // (ObjectMapper / Codable) and to cells registered by metatype,
-            // which never appear as a construction call.
-            "type_identifier" => {
-                if let Some(name) = node_text(child, src).and_then(swift_bare) {
-                    out.push((name, RefKind::Reference));
-                }
-            }
-            // A navigation whose *base* is an upper-camel-case identifier is a
-            // reference to a type or enum: `FooCell.self` (metatype),
-            // `ScreenManager.shared` (singleton), `Status.active` (enum case),
-            // `Factory.make()` (static call). The base parses as an expression
-            // identifier, not a `type_identifier`, so it needs its own arm.
-            // Lower-camel bases (`obj.method`, `self.x`) are instance access
-            // and are skipped — the method side is already a `Call`.
-            "navigation_expression" => {
-                if let Some(name) = child
-                    .child_by_field_name("target")
-                    .filter(|t| t.kind() == "simple_identifier")
-                    .and_then(|t| node_text(t, src))
-                    .and_then(swift_bare)
-                {
-                    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        out.push((name, RefKind::Reference));
-                    }
-                }
-            }
-            _ => {}
-        }
-        collect_swift_calls(child, src, out, depth + 1);
-    }
+) -> Option<(String, RefKind)> {
+    node_text(node, src)
+        .and_then(swift_bare)
+        .map(|name| (name, RefKind::Reference))
 }
+
+/// A navigation whose *base* is an upper-camel-case identifier is a reference
+/// to a type or enum: `FooCell.self` (metatype), `ScreenManager.shared`
+/// (singleton), `Status.active` (enum case), `Factory.make()` (static call).
+/// The base parses as an expression identifier, not a `type_identifier`, so it
+/// needs its own extractor. Lower-camel bases (`obj.method`, `self.x`) are
+/// instance access and are skipped (return `None`) — the method side is
+/// already a `Call`.
+fn swift_navigation_extract(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<(String, RefKind)> {
+    let name = node
+        .child_by_field_name("target")
+        .filter(|t| t.kind() == "simple_identifier")
+        .and_then(|t| node_text(t, src))
+        .and_then(swift_bare)?;
+    // Only upper-camel bases link to a type / enum.
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase())
+        .then_some((name, RefKind::Reference))
+}
+
+static SWIFT_CALL_KINDS: &[CallKind] = &[
+    CallKind {
+        kind: "call_expression",
+        extract: swift_call_extract,
+    },
+    CallKind {
+        kind: "type_identifier",
+        extract: swift_type_identifier_extract,
+    },
+    CallKind {
+        kind: "navigation_expression",
+        extract: swift_navigation_extract,
+    },
+];
 
 /// Best-effort callee name for a Swift `call_expression`'s callee node.
 fn swift_callee_name(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
@@ -507,6 +508,7 @@ pub(crate) static SWIFT_SPEC: LangSpec = LangSpec {
     module_scoped_resolution: true,
     recurse_declined_callables: false,
     claims_path: None,
+    partial_class_merge: false,
 };
 
 #[cfg(test)]
@@ -527,7 +529,7 @@ mod tests {
     fn refs(scan: &Scan) -> Vec<(String, String, RefKind)> {
         scan.references
             .iter()
-            .map(|r| (r.from_qualified.clone(), r.to_name.clone(), r.kind))
+            .map(|r| (r.from_qualified.to_string(), r.to_name.clone(), r.kind))
             .collect()
     }
 

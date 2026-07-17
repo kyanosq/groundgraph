@@ -9,8 +9,10 @@ use std::fs;
 use std::path::{Component, Path};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use ignore::WalkBuilder;
+
+use crate::error::EngineResult;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchSnapshot {
@@ -36,7 +38,7 @@ pub enum WatchChangeKind {
     Deleted,
 }
 
-pub fn collect_watch_snapshot(repo_root: &Path) -> Result<WatchSnapshot> {
+pub fn collect_watch_snapshot(repo_root: &Path) -> EngineResult<WatchSnapshot> {
     let mut files = BTreeMap::new();
     let mut builder = WalkBuilder::new(repo_root);
     builder

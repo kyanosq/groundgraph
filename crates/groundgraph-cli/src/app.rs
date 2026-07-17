@@ -7,18 +7,30 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod env;
+mod exit_code;
+mod logging;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "groundgraph",
     version,
-    about = "GroundGraph builds an evidence-backed context graph for AI coding.",
-    after_help = "Primary binary: groundgraph."
+    about = "GroundGraph builds an evidence-backed context graph for AI coding."
 )]
 struct Cli {
     /// Repository root that hosts `.groundgraph.yaml` and `.groundgraph/`.
     #[arg(long, global = true, default_value = ".")]
     repo_root: PathBuf,
+
+    /// Increase diagnostic verbosity: `-v`=info, `-vv`=debug (default warn).
+    /// `RUST_LOG` overrides this. Output goes to stderr (#127).
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Reduce diagnostic output to errors only (overrides `-v`, overridden by
+    /// `RUST_LOG`). Output goes to stderr (#127).
+    #[arg(short = 'q', long, global = true, action = clap::ArgAction::SetTrue)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -31,12 +43,14 @@ enum Commands {
     /// Install GroundGraph MCP config for local or global AI agents.
     Install(InstallArgs),
     /// Index docs and code into the graph store.
+    #[command(long_about = "Index docs and code into the graph store.\n\nExamples:\n  groundgraph index\n  groundgraph index --docs-only\n  groundgraph index --fail-on-partial=false")]
     Index(IndexArgs),
     /// Watch repository files and re-index when the graph may be stale.
     Watch(WatchArgs),
     /// Resolve a requirement into docs, implementation and tests.
     Slice(SliceArgs),
     /// Report which requirements, docs and tests are affected by a git diff.
+    #[command(long_about = "Report which requirements, docs and tests are affected by a git diff.\n\nExamples:\n  groundgraph impact\n  groundgraph impact --base main --head HEAD --format json")]
     Impact(ImpactArgs),
     /// Run consistency checks (broken links, missing linked test, orphan REQ).
     Check(CheckArgs),
@@ -60,6 +74,7 @@ enum Commands {
     #[command(name = "business-doc")]
     BusinessDoc(BusinessDocArgs),
     /// 代码图搜索 — `grep` 的代码图替代品。
+    #[command(long_about = "代码图搜索 — `grep` 的代码图替代品。\n\nExamples:\n  groundgraph search \"login auth\"\n  groundgraph search --code \"authService.signIn(email)\" --json")]
     Search(SearchArgs),
     /// 死代码报告 — 标注无法从任何入口点可达的代码符号。
     /// 不会自动删除任何文件。
@@ -139,6 +154,17 @@ enum Commands {
     /// 并汇总最终触达的表。`search` 只给 1 跳、`graph --view focus` 也偏浅；
     /// `trace` 才回答「这个接口背后牵动了图里的哪些东西」。
     Trace(TraceArgs),
+    /// Generate shell completions for bash / zsh / fish / powershell / elvish.
+    Completions(CompletionsArgs),
+    /// Diagnose the environment: git, SCIP indexers, Dart, graph.db, config.
+    Doctor,
+}
+
+#[derive(Debug, clap::Args)]
+struct CompletionsArgs {
+    /// Shell to generate completions for (bash / zsh / fish / powershell / elvish).
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 #[derive(Debug, clap::Args)]
@@ -415,7 +441,7 @@ struct GraphDiffArgs {
     head_repo_root: Option<std::path::PathBuf>,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
-    format: String,
+    format: TextJsonFormatArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -425,7 +451,7 @@ struct QuestionsArgs {
     max_per_category: usize,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
-    format: String,
+    format: TextJsonFormatArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -448,7 +474,7 @@ struct FeaturesArgs {
     min_cluster_size: usize,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
-    format: String,
+    format: TextJsonFormatArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -476,7 +502,7 @@ struct SelectTestsArgs {
     max_depth: usize,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
-    format: String,
+    format: TextJsonFormatArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -492,7 +518,7 @@ struct SimilarArgs {
     min_cluster_size: usize,
     /// 检测层级：`exact` 仅结构指纹、`near` 仅 SimHash 近似、`all` 两者（默认）。
     #[arg(long, value_name = "MODE", default_value = "all")]
-    mode: String,
+    mode: SimilarModeArg,
     /// 近似簇的最低 SimHash 相似度（仅在 `near` / `all` 模式生效，默认 0.85）。
     #[arg(long, value_name = "FLOAT", default_value_t = groundgraph_engine::similarity::DEFAULT_MIN_SIMILARITY)]
     min_score: f32,
@@ -504,7 +530,7 @@ struct SimilarArgs {
     max_pairwise: usize,
     /// 输出格式：`text`、`json`。
     #[arg(long, value_name = "FORMAT", default_value = "text")]
-    format: String,
+    format: TextJsonFormatArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -581,6 +607,48 @@ struct GraphArgs {
     /// hashCode / …). Off by default; on means "give me the full noisy graph".
     #[arg(long, default_value_t = false)]
     include_noise: bool,
+}
+
+/// Shared `--format text|json` ValueEnum (#115) for features / graph-diff /
+/// questions / select-tests / similar — replaces five bare-`String` fields
+/// whose only difference was the file they lived in. An invalid value is now
+/// rejected at parse time (exit 2) instead of by a per-command runtime bail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TextJsonFormatArg {
+    /// Human-readable text (default).
+    Text,
+    /// JSON for agents / scripts.
+    Json,
+}
+
+impl From<TextJsonFormatArg> for commands::output::TextJsonFormat {
+    fn from(value: TextJsonFormatArg) -> Self {
+        match value {
+            TextJsonFormatArg::Text => commands::output::TextJsonFormat::Text,
+            TextJsonFormatArg::Json => commands::output::TextJsonFormat::Json,
+        }
+    }
+}
+
+/// `groundgraph similar --mode` ValueEnum (#115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SimilarModeArg {
+    /// Tier 1 only: structural fingerprint (exact AST).
+    Exact,
+    /// Tier 2 only: SimHash near-duplicates.
+    Near,
+    /// Both tiers (default).
+    All,
+}
+
+impl From<SimilarModeArg> for groundgraph_engine::similarity::SimilarityMode {
+    fn from(value: SimilarModeArg) -> Self {
+        match value {
+            SimilarModeArg::Exact => groundgraph_engine::similarity::SimilarityMode::Exact,
+            SimilarModeArg::Near => groundgraph_engine::similarity::SimilarityMode::Near,
+            SimilarModeArg::All => groundgraph_engine::similarity::SimilarityMode::All,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -997,6 +1065,17 @@ struct IndexArgs {
     /// Only index documentation (Markdown). Useful before any code adapter is ready.
     #[arg(long)]
     docs_only: bool,
+    /// Exit non-zero (2) when an indexer partially failed (parse timeout, SCIP
+    /// failure, schema skip). Default true; pass `--fail-on-partial=false` to
+    /// tolerate partial failures and exit 0 (#232).
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    fail_on_partial: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1109,7 +1188,12 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("groundgraph: {err:#}");
-            ExitCode::from(1)
+            // #233 — one place maps a runner error to its exit code: explicit
+            // `UserError` or an engine `UserInput`/`NotFound` (anywhere in the
+            // cause chain) → 2; everything else → 70 (internal). Replaces the
+            // legacy undifferentiated exit 1 so CI can tell "you wrote the
+            // invocation wrong" from "something broke".
+            ExitCode::from(exit_code::classify(&err))
         }
     }
 }
@@ -1128,8 +1212,35 @@ fn reset_sigpipe() {
     sigpipe::reset();
 }
 
+/// Top-level `--help` epilogue: command category index (#128), exit-code
+/// contract (#233), and the environment-variable listing (#234). The
+/// environment section is generated from [`env::REGISTRY`] at runtime so the
+/// registry is the single source of truth for both `--help` and
+/// `docs/environment.md`.
+fn after_help_text() -> String {
+    let mut s = String::from(
+        "Primary binary: groundgraph.\n\nCommands by category (#128):\n  Setup     init, install, index, watch, doctor, completions\n  Query     search, trace, slice, context, impact, select-tests, questions, check\n  Graph     graph, graph-diff, graph-equiv, export, dashboard\n  Analysis dead-code, similar, features, facts, purity, constants, contract, suggest-tests\n  Business  candidate, logic, propose, business-doc, connect\n  Migration port-coverage, route-coverage, schema-index, feature-pack\n  Telemetry stats\n\nExit codes (#233): 0 success · 2 user error (bad argument, no workspace/file, partial index, doctor/ check findings) · 70 internal failure. See docs/cli-exit-codes.md.",
+    );
+    s.push_str("\n\n");
+    s.push_str(&env::render_environment_help());
+    s
+}
+
 fn run() -> Result<u8> {
-    let cli = Cli::parse();
+    // #234 — append the Environment section (generated from env::REGISTRY) to
+    // the top-level --help, then parse. The builder overrides the derive
+    // attribute because the registry is only resolvable at runtime.
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = Cli::command()
+        .after_help(after_help_text())
+        .get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // #127 — install the tracing subscriber before any runner can emit
+    // events. Engine/store libraries only emit; the CLI owns the sink.
+    logging::init_logging(cli.verbose, cli.quiet);
     let cmd_name = command_name(&cli.command);
     let repo_root = cli.repo_root.clone();
     let start = std::time::Instant::now();
@@ -1194,6 +1305,8 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::FeaturePack(_) => "feature-pack",
         Commands::Stats(_) => "stats",
         Commands::Trace(_) => "trace",
+        Commands::Completions(_) => "completions",
+        Commands::Doctor => "doctor",
     }
 }
 
@@ -1202,7 +1315,7 @@ fn command_name(command: &Commands) -> &'static str {
 /// arms read the disjoint `cli.repo_root` field (allowed within one function).
 fn dispatch(cli: Cli) -> Result<u8> {
     match cli.command {
-        Commands::Init => commands::init::run(&cli.repo_root).map(|()| 0),
+        Commands::Init => commands::init::run(&cli.repo_root).map(|()| exit_code::EXIT_SUCCESS),
         Commands::Install(args) => commands::install::run(
             &cli.repo_root,
             commands::install::InstallRunArgs {
@@ -1212,8 +1325,8 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 auto_allow: args.auto_allow,
             },
         )
-        .map(|()| 0),
-        Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only).map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
+        Commands::Index(args) => commands::index::run(&cli.repo_root, args.docs_only, args.fail_on_partial).map(|()| exit_code::EXIT_SUCCESS),
         Commands::Watch(args) => commands::watch::run(
             &cli.repo_root,
             commands::watch::WatchRunArgs {
@@ -1224,14 +1337,14 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 docs_only: args.docs_only,
             },
         )
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Slice(args) => commands::slice::run(
             &cli.repo_root,
             &args.requirement,
             args.json,
             args.call_depth,
         )
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Impact(args) => {
             let format = if args.json {
                 commands::impact::ImpactFormat::Json
@@ -1245,7 +1358,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             } else {
                 args.head.as_str()
             };
-            commands::impact::run(&cli.repo_root, &args.base, head, format, args.output).map(|()| 0)
+            commands::impact::run(&cli.repo_root, &args.base, head, format, args.output).map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Check(args) => {
             let exit = commands::check::run(&cli.repo_root, args.json, args.fail_on_warning)?;
@@ -1257,11 +1370,11 @@ fn dispatch(cli: Cli) -> Result<u8> {
             !args.no_snippets,
             args.json,
         )
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Connect(args) => match args.sub {
             ConnectSub::Propose(p) => {
                 commands::connect::run_propose(&cli.repo_root, p.out.as_deref(), p.pretty)
-                    .map(|()| 0)
+                    .map(|()| exit_code::EXIT_SUCCESS)
             }
             ConnectSub::Apply(a) => {
                 let exit =
@@ -1270,7 +1383,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             }
         },
         Commands::Export(args) => {
-            commands::export::run(&cli.repo_root, args.format.into()).map(|()| 0)
+            commands::export::run(&cli.repo_root, args.format.into()).map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Candidate(args) => match args.sub {
             CandidateSub::List(a) => {
@@ -1279,7 +1392,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 } else {
                     commands::candidate::ListMode::Pending
                 };
-                commands::candidate::run_list(&cli.repo_root, mode, a.json).map(|()| 0)
+                commands::candidate::run_list(&cli.repo_root, mode, a.json).map(|()| exit_code::EXIT_SUCCESS)
             }
             CandidateSub::Show(a) => {
                 let format = if a.json {
@@ -1331,7 +1444,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             max_modules: args.max_modules,
             max_entry_points: args.max_entry_points,
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::BusinessDoc(args) => {
             commands::business_doc::run(commands::business_doc::BusinessDocRunArgs {
                 repo_root: cli.repo_root.clone(),
@@ -1341,7 +1454,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 include_rejected: args.include_rejected,
                 pretty: args.pretty,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Graph(args) => commands::graph::run(commands::graph::GraphRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -1355,7 +1468,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             pretty: args.pretty,
             include_noise: args.include_noise,
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Search(args) => {
             // `--json` legacy flag wins when explicit; otherwise honour `--format`.
             let format = if args.json {
@@ -1376,7 +1489,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 output: args.output,
                 include_noise: args.include_noise,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::DeadCode(args) => {
             commands::dead_code::run(commands::dead_code::DeadCodeRunArgs {
@@ -1385,20 +1498,20 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 include_tests: args.include_tests,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Similar(args) => commands::similar::run(commands::similar::SimilarRunArgs {
             repo_root: cli.repo_root.clone(),
             focus_symbol_id: args.node,
             min_tokens: args.min_tokens,
             min_cluster_size: args.min_cluster_size,
-            mode: args.mode,
+            mode: args.mode.into(),
             min_similarity: args.min_score,
             shingle_k: args.shingle_k,
             max_pairwise: args.max_pairwise,
-            format: args.format,
+            format: args.format.into(),
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::SelectTests(args) => {
             // Empty head ref diffs `--base` against the working tree, mirroring
             // `impact --worktree` so the two git-diff analyses behave the same.
@@ -1413,42 +1526,42 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 head_ref: head,
                 include_dependent: args.include_deps,
                 max_propagation_depth: args.max_depth,
-                format: args.format,
+                format: args.format.into(),
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Features(args) => commands::features::run(commands::features::FeaturesRunArgs {
             repo_root: cli.repo_root.clone(),
             max_clusters: args.max_clusters,
             max_propagation_depth: args.max_depth,
             min_cluster_size: args.min_cluster_size,
-            format: args.format,
+            format: args.format.into(),
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::GraphDiff(args) => {
             commands::graph_diff::run(commands::graph_diff::GraphDiffRunArgs {
                 base_db: args.base_db,
                 head_db: args.head_db,
                 base_repo_root: args.base_repo_root,
                 head_repo_root: args.head_repo_root,
-                format: args.format,
+                format: args.format.into(),
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Questions(args) => {
             commands::questions::run(commands::questions::QuestionsRunArgs {
                 repo_root: cli.repo_root.clone(),
                 max_per_category: args.max_per_category,
-                format: args.format,
+                format: args.format.into(),
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Dashboard(args) => {
             commands::dashboard::run(commands::dashboard::DashboardRunArgs {
                 repo_root: cli.repo_root.clone(),
                 out: args.out,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Facts(args) => {
             let purity = match args.purity {
@@ -1463,7 +1576,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max_evidence: args.max_evidence,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Purity(args) => {
             let only = match args.only {
@@ -1476,7 +1589,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 only,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Constants(args) => {
             let kind = match args.kind {
@@ -1492,7 +1605,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max: args.max,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Contract(args) => commands::contract::run(commands::contract::ContractRunArgs {
             repo_root: cli.repo_root.clone(),
@@ -1500,7 +1613,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             keys_only: args.keys_only,
             json: args.json,
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::PortCoverage(args) => {
             commands::port_coverage::run(commands::port_coverage::PortCoverageRunArgs {
                 source_db: args.source_db,
@@ -1519,7 +1632,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max: args.max,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::RouteCoverage(args) => {
             commands::route_coverage::run(commands::route_coverage::RouteCoverageRunArgs {
@@ -1531,7 +1644,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max: args.max,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::GraphEquiv(args) => {
             commands::graph_equiv::run(commands::graph_equiv::GraphEquivRunArgs {
@@ -1547,14 +1660,14 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max: args.max,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::SchemaIndex(args) => {
             commands::schema_index::run(commands::schema_index::SchemaIndexRunArgs {
                 repo_root: cli.repo_root.clone(),
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::SuggestTests(args) => {
             commands::suggest_tests::run(commands::suggest_tests::SuggestTestsRunArgs {
@@ -1565,7 +1678,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max: args.max,
                 json: args.json,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::FeaturePack(args) => {
             commands::feature_pack::run(commands::feature_pack::FeaturePackRunArgs {
@@ -1575,14 +1688,14 @@ fn dispatch(cli: Cli) -> Result<u8> {
                 max_evidence: args.max_evidence,
                 text: args.text,
             })
-            .map(|()| 0)
+            .map(|()| exit_code::EXIT_SUCCESS)
         }
         Commands::Stats(args) => commands::stats::run(commands::stats::StatsRunArgs {
             repo_root: cli.repo_root.clone(),
             json: args.json,
             reset: args.reset,
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Trace(args) => commands::trace::run(commands::trace::TraceRunArgs {
             repo_root: cli.repo_root.clone(),
             query: args.query,
@@ -1592,7 +1705,20 @@ fn dispatch(cli: Cli) -> Result<u8> {
             include_noise: args.include_noise,
             json: args.json,
         })
-        .map(|()| 0),
+        .map(|()| exit_code::EXIT_SUCCESS),
+        Commands::Completions(args) => {
+            // #113 — emit a shell-completion script. The `Cli::command()` AST
+            // is rebuilt so the generated script reflects every subcommand and
+            // flag without a hand-maintained list.
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            clap_complete::generate(args.shell, &mut cmd, "groundgraph", &mut std::io::stdout());
+            Ok(exit_code::EXIT_SUCCESS)
+        }
+        Commands::Doctor => {
+            let exit = commands::doctor::run(&cli.repo_root)?;
+            Ok(exit_code(exit))
+        }
     }
 }
 

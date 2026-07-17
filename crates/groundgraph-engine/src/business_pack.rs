@@ -46,13 +46,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::language_traits;
 use groundgraph_core::{ArtifactId, EdgeAssertion, EdgeKind, Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::feature_cluster::detect_communities_with_resolution;
 
 pub const BUSINESS_PACK_SCHEMA_VERSION: u32 = 1;
@@ -271,18 +272,17 @@ pub struct ModuleDependency {
 }
 
 /// Open the store from `.groundgraph.yaml` and build the pack.
-pub fn propose_business_pack(options: BusinessPackOptions) -> Result<BusinessPack> {
+pub fn propose_business_pack(options: BusinessPackOptions) -> EngineResult<BusinessPack> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     propose_business_pack_with_store(&store, &options)
 }
 
 pub fn propose_business_pack_with_store(
     store: &Store,
     options: &BusinessPackOptions,
-) -> Result<BusinessPack> {
+) -> EngineResult<BusinessPack> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
     Ok(build_pack(&nodes, &edges, options))
@@ -2337,18 +2337,14 @@ candidates:
 // config helpers (mirrors connect.rs to keep the module self-contained)
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use groundgraph_core::{EdgeCertainty, EdgeSource, EdgeStatus};
+    use groundgraph_core::{Confidence, EdgeCertainty, EdgeSource, EdgeStatus};
     use tempfile::TempDir;
 
     fn empty_store() -> (Store, TempDir) {
@@ -3061,9 +3057,7 @@ mod tests {
             content_hash: None,
             stable_key: None,
             source_file: Some(path.to_string()),
-            source_hash: None,
             indexer: Some("test".into()),
-            index_generation: None,
             metadata_json: None,
         }
     }
@@ -3077,12 +3071,10 @@ mod tests {
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: Some("test".into()),
-            index_generation: None,
             metadata_json: None,
         }
     }

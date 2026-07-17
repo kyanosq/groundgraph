@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use crate::business_candidates::{
     candidate_artifact_id, load_business_candidates, BusinessCandidate, ReviewStatus,
 };
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 
 /// Confidence verdict per item. Order in this enum reflects display
 /// priority (most actionable first).
@@ -152,15 +153,19 @@ pub struct LogicConfidenceOptions {
 
 /// Build the confidence report from a workspace. Read-only: nothing on
 /// disk is mutated.
-pub fn run_logic_confidence(options: LogicConfidenceOptions) -> Result<LogicConfidenceReport> {
+pub fn run_logic_confidence(
+    options: LogicConfidenceOptions,
+) -> EngineResult<LogicConfidenceReport> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     compute_logic_confidence(&store, &options.repo_root)
 }
 
-pub fn compute_logic_confidence(store: &Store, repo_root: &Path) -> Result<LogicConfidenceReport> {
+pub fn compute_logic_confidence(
+    store: &Store,
+    repo_root: &Path,
+) -> EngineResult<LogicConfidenceReport> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let all_node_handles = store.list_all_nodes()?;
@@ -385,7 +390,7 @@ fn candidate_item(
         label_cn: verdict.label_cn().to_string(),
         title: c.name.clone(),
         path: None,
-        confidence: c.confidence,
+        confidence: c.confidence.map(|v| v.get()),
         issues,
         risks: c.risks.clone(),
     })
@@ -414,12 +419,8 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]
@@ -598,9 +599,7 @@ mod tests {
             content_hash: None,
             stable_key: None,
             source_file: Some(rel.into()),
-            source_hash: Some(h_old.clone()),
             indexer: Some("test".into()),
-            index_generation: None,
             metadata_json: None,
         };
         store.upsert_node(&node).unwrap();

@@ -283,7 +283,8 @@ mod tests {
     use super::{call, parse_resolvers, resolver_allowed, MAX_SUBGRAPH_NODES};
     use crate::server::Server;
     use groundgraph_core::{
-        ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus, Node, NodeKind,
+        ArtifactId, Confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+        Node, NodeKind,
     };
     use serde_json::json;
 
@@ -296,12 +297,10 @@ mod tests {
             source: EdgeSource::LanguageAdapter,
             certainty: EdgeCertainty::Fact,
             status: EdgeStatus::Confirmed,
-            confidence: 1.0,
+            confidence: Confidence::FULL,
             evidence_json: None,
             source_file: None,
-            source_hash: None,
             indexer: indexer.map(|s| s.to_string()),
-            index_generation: None,
             metadata_json: None,
         }
     }

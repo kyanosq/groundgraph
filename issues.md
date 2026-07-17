@@ -17,7 +17,16 @@
 | 第六批 | #181–#210 | 3 | 原 issues4.md；第十四轮·Wave E 闭环 #72/#206/#209/#210 + Wave C #202 |
 | 第七批 | #211–#240 | 17 | 第十四轮·Wave E 闭环 #215/#216/#227 |
 | 第八批 | #241–#270 | 30 | 第十五轮审查新发现（High 1 / Medium 9 / Med-Low 4 / Low 10 / Nit 6），**已处理**：26 修复 / 4 按设计·无害 / 2 🟠 待专项 |
-| **活跃合计** | **#63–#270** | **72** | #63–#240 中 42 项为 🟠 已判定·待专项（独立 PR / 迁移 / bench，非散修）；#241–#270 第八批已闭环（含 High 安全 #241 git_diff 参数注入已修复） |
+| **活跃合计** | **#63–#270** | **72→0** | **2026-07-17/18 v0.3.0 发布清零专项**：42 项 🟠 待专项全部闭环（#223 为部分闭环·残余上游阻塞由 cargo-deny 持续监控）；另闭环 4 项 RUSTSEC（无 issue 编号）。剩余未闭环仅 #82（待 Apple Developer ID 证书，非代码） |
+
+> **2026-07-17/18 v0.3.0 发布清零专项（42 项 🟠 待专项全清，TDD，claude code 执行 + 逐阶段人工验收）** — 按主题分 14 个专项阶段推进，每阶段 fmt/clippy `-D warnings`/全量测试门禁全绿后进入下一阶段：
+> **路径/封装**：#145/#242/#263（22 份路径解析副本收敛 `confine_under_root`）、#168（`Confidence` newtype 根治 #63 构造侧 + `Node::validate` 写入边界）。
+> **store/schema**：#151/#152/#188/#190（迁移 005 删死列死表）、#205（边身份=kind+source+from+to + certainty 防降级）、#137（孤儿清理 N×→1×sweep）、#213（rusqlite 0.40）。
+> **engine/解析**：#166（`EngineError` 66 公共入口）、#130（12 adapter 收集骨架）、#123（RustMacro）、#125（C# LINQ/partial）、#238（六语言 fixture）、#143/#144/#156/#158/#160/#162（bench 驱动微优，search -16%~-44%）、#217（子进程退避重试）。
+> **CLI/UX**：#233/#115/#232（退出码契约 0/2/70）、#113（completions）、#116（doctor）、#128（help 分组+示例）、#127/#230/#231/#234（tracing/进度条/env 注册表）。
+> **供应链/测试**：#211（tree-sitter-dart 精确钉死）、#224/#225/#226（策略入档+阻塞注明）、#229（protobuf→prost 字节级兼容）、#236/#221/#239（脚手架共享/覆盖棘轮/命名规范）；webui #175（i18n）。
+> **明确不做**（verdict 已判）：#109（MCP 并发，按设计留架构专项）、#161（N 极小不改）、#228（保持现状）。**#82** 仅剩 Apple 证书运营操作，流水线 secrets 接口已留好。
+> 验证：全 workspace 1489+ 测试全绿、clippy 零告警、`cargo deny check` 四项全 ok 零豁免、search criterion 基准可复跑。
 
 **已归档**（见 [issues-archive.md](issues-archive.md)）：第一批 #1–#30、第二批 #31–#60、#61–#180 中已闭环 43 项。
 
@@ -487,6 +496,7 @@
 ### 113. 缺少 shell completion 生成命令（`groundgraph completions <shell>`）
 
 > **🟠 判定：成立·功能增量留专项（2026-06-13 第十轮）** — 属实但是**新功能**而非缺陷：需加 `clap_complete` 依赖 + 新增 `Completions { shell }` 子命令（牵动 `Commands` 枚举、`command_name`、`dispatch`、stats 键）。低风险高价值，但属独立功能 PR，不在散修轮夹带。
+> **✅ 已闭环（2026-07-17，TDD）** — 加 `clap_complete` 依赖 + `groundgraph completions <bash|zsh|fish|powershell|elvish>` 子命令（`CompletionsArgs.shell: clap_complete::Shell` ValueEnum）。dispatch 重建 `Cli::command()` AST 调 `clap_complete::generate`，脚本反映全部子命令/flag 无需手维护；接入 `command_name`/dispatch。TDD：`tests/completions.rs`（5 shell 输出非空且含 `index` 子命令 + unknown shell exit 2）。
 
 - **位置**：整个 `crates/groundgraph-cli/` 无 `clap_complete` 依赖、无 `completions` 子命令
 - **问题**：CLI 有 36+ 子命令、上百个 flag，是典型的"重度 CLI"。但没有 bash/zsh/fish 补全脚本生成入口。用户每次都得 `groundgraph --help` 翻菜单，效率低。CI 脚本也容易拼错子命令名（`dead-code` vs `deadcode`、`select-tests` vs `select_tests`）。
@@ -503,6 +513,7 @@
 ### 115. `--format` 在 7 个命令上是裸 `String` 而非 `ValueEnum` — 错误消息分散、不本地化、大小写敏感不一
 
 > **🟠 判定：成立·一致性重构留专项（2026-06-13 第十轮）** — 不一致属实，但把 7 处 `--format`（features/graph_diff/questions/select_tests/similar 等）从 `String`+runtime `bail!` 改成 `ValueEnum` 会**改变退出码语义**（user-input 错误从 anyhow 的 exit 1 变成 clap parse 的 exit 2），与 #233（typed exit codes）耦合，且每个命令的现有 `bail!` 错误消息测试需同步更新。属跨命令一致性重构，应与 #233 一并在专项 PR 落地，不在散修轮逐个动。
+> **✅ 已闭环（2026-07-17，TDD）** — 7 处裸 `--format`/`--mode` String（features/graph-diff/questions/select-tests/similar format + similar mode）改为 clap `ValueEnum`：非法值在 parse 阶段即 exit 2（与 #233 契约一致），不再走 per-command 运行时 `bail!`（旧 exit 1/70）。共享 `commands::output::TextJsonFormat` + `TextJsonFormatArg`/`SimilarModeArg` ValueEnum + From 转换；similar.mode 直接转 engine `SimilarityMode`（删 `parse_mode`）。TDD：`tests/format_value_enum.rs`（similar-mode / graph-diff parse 失败 RED 驱动 + 5 命令非法值守护 + 合法值正控）。
 
 - **位置**：
   - 裸 String + 运行时 `bail!`：`features.rs:33`、`graph_diff.rs:35`、`questions.rs:27`、`select_tests.rs:48`、`similar.rs:62`（format）、`similar.rs:72`（mode）、`graph_diff.rs:412`（format）
@@ -513,6 +524,7 @@
 ### 116. 缺少 `groundgraph doctor` 环境诊断命令
 
 > **🟠 判定：成立·功能增量留专项（2026-06-13 第十轮）** — 属实但是**新功能**：需新增 `doctor` 子命令逐项探测 `git`/各 SCIP 二进制/LSP/`graph.db`/配置可解析性。价值高（解释"某语言 0 符号"是缺工具还是无代码），但属独立功能 PR。
+> **✅ 已闭环（2026-07-17，TDD）** — 新增 `groundgraph doctor`：逐项探测 `git`（必需）/ `.groundgraph.yaml` 可解析 / `graph.db` 存在（必需，✗→exit 2）/ SCIP indexers / Dart SDK / sourcekit-lsp（可选，信息性 ✓），每项 `✓`/`✗` + 可操作建议 + `Doctor: N check(s), M failed.` 汇总；有必需 ✗ 按 #233 返回 2。TDD：`tests/doctor.rs`（空仓 config/db ✗→exit 2；init 仓报全部检查项 + 汇总）。
 
 - **位置**：整个 CLI 无 `doctor`/`diagnose`/`env` 命令
 - **问题**：GroundGraph 依赖一堆外部工具：`sourcekit-lsp`、`scip-typescript`、`scip-java`、`scip-go`、`git`、`tree-sitter`。当 index 跑出来的某个语言是 0 符号，用户完全不知道是"代码为空"还是"LSP/SCIP 没装"。现在只能靠 `index` 输出里零散的 `LSP skipped: ...` 行去拼凑诊断信息。
@@ -545,6 +557,7 @@
 ### 123. Rust adapter 不识别 `macro_rules!` 定义，宏规则完全不进入符号图
 
 > **🟠 判定：成立·需专项（2026-06-13 第九轮，未在本轮散修）** — 现状属实（`rust_container_of`/`rust_is_callable` 均不含 `macro_definition`）。但"接通"是一项**带涟漪的功能增量**而非散修：需新增 `NodeKind::RustMacro`（牵动 `node.rs` 的 `ALL`/`as_str`/`language()`/分类 + `search_aliases` + #208 全枚举测试），且**只发节点不发宏调用边会让每个宏永远零入边 → 被 dead-code 误报为死**，反而劣化。正确做法须同时解析 `macro_invocation` 形成 `Calls` 边并补 fixture。列为独立 PR。
+> **✅ 已闭环（2026-07-17，TDD）** — 新增 `NodeKind::RustMacro`（同步 `ALL`/`as_str`/`language()`/`family_of`/`search_aliases` + #208 全枚举 round-trip，matrix 计数 82→83）；`rust_container_of` 识别 `macro_definition` 发 RustMacro 节点，`RUST_CALL_KINDS` 新增 `macro_invocation` CallKind 发 Calls 边指向宏节点（避免零入边被 dead-code 误报）。单测 `macro_rules_definition_emits_rust_macro_node` / `macro_invocation_emits_call_to_the_macro_name`；端到端 `p22::rust_macro_in_use_is_not_a_dead_code_false_positive`（被调用宏可达不被误报，未调用宏仍报死）。
 
 - **位置**：`crates/groundgraph-engine/src/rust_treesitter.rs:30-38`（`rust_container_of`）与 `40-42`（`rust_is_callable`）
 - **问题**：`rust_container_of` 只识别 `struct_item`/`union_item`/`enum_item`/`trait_item`/`mod_item`；`rust_is_callable` 只识别 `function_item`/`function_signature_item`。tree-sitter-rust 把 `macro_rules! foo { ... }` 解析为 `macro_definition` 节点——既不是 `container` 也不是 `callable`，被 `walk` 漏过。在重度依赖 `macro_rules` 的 crate（`serde`、`tokio`、`thiserror`、`proc-macro` 工作区），宏规则是不可寻址的黑盒，dead-code 无法判断宏是否被使用。
@@ -562,6 +575,7 @@
 ### 125. C# adapter 不识别 LINQ `query_expression` 与 `partial class` 跨文件合并语义
 
 > **🟠 判定：成立·需专项（2026-06-13 第九轮，未在本轮散修）** — 两点均属实。(1) LINQ `query_expression` 子句调用未进调用图；(2) `partial class` 跨文件是两个 `csharp::<file>::Foo` 节点。修复需在 `collect_csharp_calls` 加 `query_expression` 分支并对 lambda body 递归，且对 `partial` 类做跨文件 qualified-name 合并（或在 `resolve_heuristic_refs` 内合并）——涉及解析器语义 + 需真实 ASP.NET/EF fixture（见 #238）回归。列为独立 PR。
+> **✅ 已闭环（2026-07-17，TDD）** — (1) LINQ `query_expression` 内的调用由 `collect_calls` 无条件递归天然捕获（`select helper(x)` 的 invocation_expression），以 `linq_query_expression_calls_are_captured` 单元测试锁定；(2) `partial class` 跨文件合并：新增 `LangSpec::partial_class_merge`（仅 C# 开启，其余 12 个 spec 显式 false），`resolve_heuristic_refs` 对 bare name 同文件/import 失败后回退 module-wide 查找，约束目标 owning-type 前缀与调用者一致（同一 partial 类的同伴文件）。`breadth_fixtures_golden::csharp_linq_query_expression_and_partial_class_merge_resolve_helper` 金标回归（RenderActive → helper 边同时验证 LINQ 捕获与 partial 合并）。
 
 - **位置**：`crates/groundgraph-engine/src/csharp_treesitter.rs:31-43`（`csharp_container_of`）与 `197-242`（`csharp_call_idents`）
 - **问题**：(1) LINQ 查询 `var q = from x in xs where x.Y > 0 select x.Z;` 在 tree-sitter-c-sharp 中是 `query_expression`，其 `from`/`where`/`select` 子句的方法调用（`Where`/`Select` 是 `Enumerable` 扩展方法）不会被 `collect_csharp_calls` 捕获——它只识别 `invocation_expression`。LINQ 是 C# 业务代码的主流数据流写法，丢失它意味着所有 `where`/`select`/`join` 链路上的 lambda 调用都不进入调用图。(2) `partial class Foo` 分散在多个 `.cs` 文件：每个文件都 emit 一个 `CSharpClass Foo`，`symbol_id` 是 `csharp::<file>::Foo`，所以同一逻辑类的两部分在图中是两个节点，跨文件的 `partial` 方法调用无法解析。
@@ -582,6 +596,7 @@
 ### 127. 缺少 `--verbose` / `--quiet` / `RUST_LOG` 全局日志控制
 
 > **🟠 判定：成立·可观测性专项（2026-06-13 第十轮）** — 属实但是**架构级功能增量**：引入 `tracing`+`tracing-subscriber`、全局 `-v/-q` flag、在长操作发 `info!` 进度。与 #231（index 进度反馈）同源，应作为可观测性专项一并设计，不在散修轮落地。
+> **✅ 已闭环（2026-07-17，TDD）** — workspace 引入 `tracing`+`tracing-subscriber`(env-filter)+`indicatif`；`Cli` 加 global `-v`(Count)/`-q` flag，新建 `logging.rs`：纯函数 `log_directive` 按 verbosity 映射 EnvFilter（默认 warn / `-v`=info / `-vv`=debug / `-q`=error / `RUST_LOG` 优先），`main`→`run` 早期 init，输出强制 stderr；engine/store 只发事件不 init。TDD：`logging::log_directive` 9 例（RED→GREEN）+ `help_grouping` 的 `-v`/`-q` e2e。与 #230/#231/#234 同批落地。
 
 - **位置**：`crates/groundgraph-cli/src/main.rs:17-24`（`Cli` 只有 `repo_root` 和 `command`），全仓 `grep -rn 'RUST_LOG\|tracing_subscriber\|env_logger\|--verbose\|--quiet'` 0 命中
 - **问题**：当 `index` 慢或 `trace` 截断时，用户没有办法看进度/调试输出。引擎里大量 `.context(...)` 错误链通过 `eprintln!("groundgraph: {err:#}")` 只打最外层；要排错只能改源码加 `dbg!`。`RUST_LOG=debug groundgraph index` 完全无效。大型仓库（spring-framework）索引 10s+ 也没有任何进度反馈。
@@ -590,6 +605,7 @@
 ### 128. `--help` 输出在 36 个子命令上无分类（无 `help_subcommand`/`flattened` 分组），且大多数子命令 help 缺示例
 
 > **🟠 判定：成立·UX 打磨留专项（2026-06-13 第十轮）** — 属实但是 help 文案/分组打磨：给 36 个子命令逐个加 `help_heading` 分组 + 高频命令补 `Examples:` 块，机械但量大，属 UX 专项 PR，非缺陷。
+> **✅ 已闭环（2026-07-17，TDD）** — clap（`default-features = false`）不支持 subcommand 变体的 `help_heading`（`Command::help_heading` method 不存在），改用顶层 `after_help` 加「Commands by category」分组索引（Setup/Query/Graph/Analysis/Business/Migration/Telemetry 覆盖全部 37 子命令）+ 退出码提示；高频命令（index/search/impact）用 `#[command(long_about = "…\\n…")]` 补多行 `Examples:` 块（doc comment 连续行被 clap 合并成单行，显式 `long_about` 字符串才保留换行）。TDD：`tests/help_grouping.rs`（顶层 --help 含分组标题；index/search/impact --help 含 Examples）。
 
 - **位置**：`crates/groundgraph-cli/src/main.rs:26-137`（所有子命令平铺在一个 `enum Commands`）
 - **问题**：跑 `groundgraph --help` 时，36 个子命令一字排开（init / index / slice / impact / check / context / connect / export / graph / candidate / logic / propose / business-doc / search / dead-code / similar / select-tests / features / graph-diff / questions / dashboard / facts / purity / constants / contract / port-coverage / route-coverage / graph-equiv / schema-index / suggest-tests / feature-pack / stats / trace），用户找不到入口。每个子命令的 help 虽然列了 flag，但没有 `Examples:` 段。`trace` 注释里写了一大段"controller→service→impl→mapper→SQL→table"但 `--help` 不显示 doc comment 全文。
@@ -598,6 +614,8 @@
 ### 130. `collect_*_calls` 各 adapter 重复实现 12 次，缺少 trait/宏抽取，新增语言易遗漏 callee kind
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立（可维护性）。12 个 adapter 各写一个结构近似的 `collect_<lang>_calls` 递归收集器属实。但抽取共享骨架 `collect_calls_generic(.., call_kinds: &[(&str, CallNameFn)])` 是触及**解析核心**的跨 12 文件重构：每种语言的 call 节点形态/callee 取名细节各异（Kotlin `?.`、Swift trailing-closure、TS optional-chaining…），合并需逐语言对照 tree-sitter grammar 并补"每 adapter 覆盖全部 call 形态"的统一测试，否则极易回归。属设计性重构，需独立 PR + 每语言金标，不在散修轮处理。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 成立·已修。抽 `treesitter::collect_calls(node, src, out, depth, &[CallKind])` 共享骨架（`MAX_NESTING_DEPTH` 截断 + `named_children` 遍历 + 永远递归——12 份 `collect_<lang>_calls` 的唯一不变部分）到 `treesitter.rs`；各 adapter 只声明 `static <LANG>_CALL_KINDS: &[CallKind]`（kind → 提取器对，提取器接收 call 节点返回 `(name, RefKind)`）并调骨架，删掉 12 份手写递归，`depth` 截断逻辑从此只此一处。每语言可变形态**无损**保留：Rust/Python(`call`)/Kotlin(`named_child(0)`+navigation)/Ruby(`call`+`new` 双分支)/C 单 kind、TS/Go/Java/C#/Cpp 双 kind（`new`→`Reference`）、Swift 三 kind（`type_identifier`+`navigation_expression` 含 upper-case 条件）、PHP 四 entry（`member_call`/`scoped_call` 共享 extract）；C 的 `preproc_arg` 宏替换文本扫描仍留 `c_call_idents` 入口（预处理器无 AST，不进骨架）。TDD 先红 `collect_calls_walks_registered_kinds_and_always_descends` + `collect_calls_with_empty_kinds_is_a_clean_noop`（自包含、驱动 Rust grammar）再实现；calls 边产出逐字节不变由各 adapter 金标守护（rust `captures_same_file_call_identifiers`/`captures_method_and_scoped_call_identifiers`、python `captures_bare_attribute_and_construction_calls`/`captures_module_level_and_class_body_references`、ts `captures_bare_and_member_call_identifiers`/`captures_constructor_references`、go `captures_call_and_construction_identifiers`、kotlin `captures_calls_and_constructions`、swift `captures_bare_navigation_and_construction_calls`/`captures_type_references_in_annotations_metatypes_and_casts`、java `captures_invocation_and_object_creation`、csharp `captures_invocations_and_object_creation`、php `captures_calls_and_object_creation`、ruby `captures_calls_and_constant_construction`、c `captures_bare_and_function_pointer_calls`/`function_like_macros_are_callable_symbols_with_outbound_calls`、cpp `captures_simple_member_qualified_and_new_calls`）+ `every_language_spec_opts_into_the_call_resolver` 守门。门禁 fmt / clippy(`-D warnings`) / test --workspace 全绿。
 
 - **位置**：`rust_treesitter.rs:321`、`python_treesitter.rs:289`、`go_treesitter.rs:212`、`java_treesitter.rs:199`、`csharp_treesitter.rs:203`、`php_treesitter.rs:198`、`ruby_treesitter.rs:216`、`c_treesitter.rs:175`、`cpp_treesitter.rs:159`、`swift_treesitter.rs:338`、`typescript_treesitter.rs:258`、`kotlin_treesitter.rs:225`
 - **问题**：12 个 adapter 各自手写一个 `collect_<lang>_calls(node, src, out, depth)` 递归收集器，结构几乎相同（遍历 `named_children`、match call 节点 kind、递归 `depth+1`、`depth > MAX_NESTING_DEPTH` 截断）。差异仅在"哪种节点是 call、callee name 怎么取"。这种重复意味着：(1) 新增语言时容易忘记某类 callee（如 Kotlin 的 `safe_call_expression` `?.`）；(2) `depth` 截断逻辑修一次要改 12 处；(3) 无统一测试证明每个 adapter 的 `collect` 都覆盖了该语言全部 call 形态。
@@ -644,6 +662,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立。`clear_indexer_outputs` 末尾 3 条 `… NOT IN (SELECT id FROM nodes)` 对每 indexer 各做一次全 `nodes` 反半连接，本轮确认它被 ~20 处调用（`index.rs` 7 处 + 各语言 indexer + `scip_overlay`/`schema_indexer`，散落而非单一编排点）。两条修法都需专项：(a) 移到 ingest 末尾一次性 sweep——但调用点分散在多入口（含 `scip`/`schema` 独立命令路径），需保证每入口都补且**仅**补一次 `sweep_orphans()`，是 ingest 契约变更；且当前的全表 `NOT IN` 兼作**自愈 GC**（清理历史崩溃残留的任意孤儿），按 indexer 删除集缩小作用域会丢这层自愈。(b) 改为按"刚删除的 node id 集"`IN (...)` 删除——避免全表扫，但同样丢自愈 GC，且大 indexer 的 id 集需物化。risk 集中在最热的 ingest 路径，列为专项。
 
+> **✅ 已闭环（2026-07-17，TDD）** — 成立·已修。把孤儿清理（`evidence`/`symbol_ranges`/`node_fts` 的 `… NOT IN (SELECT id FROM nodes)`）从 `clear_indexer_outputs` 拆出为独立 `Store::sweep_orphans() -> StoreResult<usize>`；`clear_indexer_outputs` 只删该 indexer 自有的 `nodes`/`edge_assertions` 行（二者有 `indexer` 列；`evidence`/`symbol_ranges`/`node_fts` 无 `indexer` 列，本就只能靠 sweep 回收）。sweep 保持原全表 `NOT IN` 语义（仍兼作自愈 GC，未缩小作用域）。两个 ingest 入口各在末尾恰好调一次：`index_repository`（bulk 事务内、fulltext rebuild 之后、`commit_bulk` 之前——覆盖 docs/dart×2/rust/treesitter-loop/links/requirements 直接 clear + 各 per-language adapter 自清 + `scip_overlay` 全部）；`index_schema_into`（独立 store 会话，`Ok(stats)` 之前）。`scip_overlay` 与各 per-language indexer 均为 `index_repository` 的子调用（grep 确认无独立 CLI 入口），故不另加 sweep。一次 `groundgraph index`（非 docs-only）= 2 次 sweep（两入口各一），旧为 N≈20×全表扫。TDD：先红 4 测再实现——`clear_indexer_outputs_scopes_to_indexers_own_rows_and_leaves_orphans`、`sweep_orphans_drops_orphaned_fulltext_rows_left_by_clear`、`sweep_orphans_removes_every_orphan_kind_and_keeps_resolving_rows`、`ingest_clears_orphans_once_via_sweep_not_once_per_clear`（10k 节点表跑 20 次 clear 断言孤儿计数不变、单次 `sweep_orphans` 返回 3 后归零——以计数证明全程只扫一次而非 N×全表扫，不依赖 rusqlite trace）。
+
 - **位置**：`crates/groundgraph-store/src/repositories.rs:452-471`
 - **问题**：在一次 `index_repository` 里，`clear_indexer_outputs` 被调用 5+ 次（docs、dart、dart_analyzer、swift、go…）。每次都跑：
   ```sql
@@ -682,6 +702,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立。每节点重算 `split_identifier`/`compact_segments`（各 `collect::<Vec<String>>`）属实。但"修"需架构级改动：缓存子 token 要把它们物化到 `Node` 上（一次性预处理 / schema 或内存结构扩展），或改 `par_iter` 并行——二者都超出散修范围且需基准佐证收益。最低成本的 `HashSet` 替 `Vec` 让 `any` O(1) 只动常数，主成本仍是每节点的切分本身（每节点不同、无法外提）。列为「search 热路径专项」，需 bench 驱动。
 
+> **✅ 已闭环（2026-07-17，TDD+bench）** — `keyword_matches` 节点评分循环改 rayon `par_iter`（issue 明确方案），`enumerate` + 稳定 `sort_by_key(idx)` 严格恢复 `nodes` 原序、tie-break 排名逐字不变。bench（8000 节点合成库 `search_hot`）：signIn 5.87→3.28ms（-44%）、handle_request 5.93→3.32ms（-44%）、request 9.53→7.10ms（-26%）、purchase 9.34→7.07ms（-24%）、auth 9.92→8.34ms（-16%），全部 p<0.05。`split_identifier`/`compact_segments` 每节点固有、无法跨节点共享（issue 已确认），收益来自多核并行而非缓存。
+
 - **位置**：`crates/groundgraph-engine/src/search.rs:1660-1669`，配合 `score_node:1672-1725`
 - **问题**：`keyword_matches` 遍历全部节点（`list_all_nodes`），对每个节点调用 `split_identifier(&name)` 和 `compact_segments(&name)`——二者都 `collect::<Vec<String>>()`——然后用 `name_subtokens.iter().any(|t| t == tok)` 线性查找 token。spring/django 84k-96k 节点 × 每次 split（产生 2-4 个 String）= 数十万次分配。token 列表是**常量**（同一次 query 内不变），但每个节点都重新切分。
 - **建议**：把 `name_subtokens` / `name_compacts` / `path_segments` / `name_lower` 缓存到 `Node` 上（一次性预处理），或者改成 `nodes.par_iter().map(score_node)` 用 rayon 并行 + `Cow<str>` 避免分配。最低成本：用 `HashSet<String>` 替代 `Vec<String>` 让 `any` 变 O(1)。
@@ -690,6 +712,8 @@
 
 > **🟡 判定：成立·吹毛求疵/待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立（纯分配开销）。无条件 `.trim_end_matches(".dart")` 对非 Dart 节点白做、且 `.to_string()` 每段都分配属实。但"修"是纯分配优化、无行为可断言（评分需保持逐位一致），只能靠基准证明收益；而把 `.dart` 后缀剥离改为条件分支会改变非 Dart 路径里恰好以 `.dart` 结尾的边界 token 化，存在细微行为风险。与 #143 同属 search 评分热路径，应在一个 bench 驱动的专项里连同 `Vec<&str>` 借用零分配方案一起验证，单独散修 TDD 价值低、风险/收益不匹配。
 
+> **✅ 已闭环（2026-07-17，TDD+bench）** — `score_node` 的 `path_segments` 由 `Vec<String>`（每段 `to_string`，约 5 段 × 每候选节点 = 最大 per-node 分配块）改 `Vec<&str>` 借用 `path_lower`，零 `to_string` 分配；`trim_end_matches(".dart")` 保留重复剥离语义（`characterization_path_segment_repeated_dart_suffix_is_trimmed` 钉死 `.dart.dart` → `page`，非 `strip_suffix`）。与 #143 同一 bench 一并验证（auth -16% … signIn -44%）。
+
 - **位置**：`crates/groundgraph-engine/src/search.rs:1655-1659`
 - **问题**：对每个节点都把 path 拆成 `Vec<String>`，**且只为了 Dart 文件**才需要 `trim_end_matches(".dart")`——其他 16 种语言的节点白做这个 trim。对 96k 节点 × 平均 5 段路径 = 480k 次 `to_string()`。再叠加 #143 的 split_identifier，仅 `score_node` 一项 search 路径上的分配量已是天文数字。
 - **建议**：(1) 把 trim 放到 path 处理分支里（`node.kind.language() == Some("dart")` 时才 trim）；(2) 用 `path_lower.split(['/', '\\']).filter_map(|s| { let s = s.strip_suffix(".dart").unwrap_or(s); if s.is_empty() { None } else { Some(s) } }).collect()` —— 直接返回 `Vec<&str>` 借用，零分配。
@@ -697,6 +721,8 @@
 ### 145. `resolve_storage_path` 在 14 个 engine 模块中重复定义，且与 MCP 版本语义分叉，空 `storage.path` 时行为不同
 
 > **🟠 判定：成立·待专项（2026-06-13 第九轮）** — 现状属实（15 份副本，engine 不处理空串 → `repo_root.join("")`，mcp 显式兜底 `.groundgraph/graph.db`）。统一为 `EngineConfig::db_path()` 并删 15 份副本是带涟漪的重构（牵动 14 个 engine 模块 + mcp 入口），需独立 PR 逐入口回归。列为专项，本轮不并入散修。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 收敛完成：新增 `groundgraph_core::paths::confine_under_root` 为唯一共享实现，engine `config::resolve_storage_path` 收敛为唯一 storage 包装（改返回 `Result<PathBuf>`，空串/纯空白统一兜底 `.groundgraph/graph.db`，相对路径含 `..` 一律拒绝）；实测 20 份 engine 模块本地副本与 MCP `resolve_db_path` 全部删除、调用点改 `?` 透传，engine 与 MCP 的语义分叉就此消除。
 
 - **位置**：`crates/groundgraph-engine/src/slice.rs:252-259`（以及 `constants.rs:516`、`test_suggestions.rs:344`、`export.rs:132`、`index.rs:490`、`graph.rs:1457`、`data_contract.rs:614`、`feature_pack.rs:396`、`business_doc.rs:333`、`logic_confidence.rs:432`、`trace.rs:142`、`checks.rs:837`、`search.rs:2022` — 共 14 份）；`crates/groundgraph-mcp/src/tools/mod.rs:107-118`（第 15 份，但语义不同）
 - **问题**：`resolve_storage_path`（engine）与 `resolve_db_path`（mcp）是同一意图的函数，被复制 15 次。两份实现已经**语义分叉**：
@@ -721,6 +747,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave C，已验证）** — 成立。本轮 grep 确认 `INTO slice_cache`/`FROM slice_cache` 命中 0，`slice_cache` 仅存在于 `001_initial.sql` 与测试 EXPECTED_TABLES，无任何读写。但两条修法都需专项：(a) 接通缓存是 PRD §5 规划功能（要设计 `input_hash` 命中/失效语义），属功能开发；(b) 删表受 append-only 迁移约束（不可改 001），需新迁移 `DROP TABLE slice_cache` + 改 EXPECTED_TABLES。死表运行期成本≈0（仅一条 catalog 记录，从不参与查询），且贸然 DROP 会预先关闭计划中的缓存路。倾向保留待功能接通，列为专项，不在散修轮处理。
 
+> **✅ 已闭环（2026-07-17，TDD）** — 落地删表路线：迁移 005 `DROP TABLE IF EXISTS slice_cache`，`tests/migrations.rs` 的 `EXPECTED_TABLES` 去掉 `slice_cache` 并新增「迁移后 slice_cache 不存在」断言。将来缓存功能落地时用新迁移重建表，append-only 不堵路。
+
 - **位置**：`crates/groundgraph-store/src/migrations_sql/001_initial.sql:69-75`
 - **问题**：迁移创建了 `slice_cache (root_id, input_hash, index_generation, slice_json, generated_at)`，但 grep 全工程：`slice_cache` 仅出现在 migrations_sql/001 与 tests/migrations.rs 的 EXPECTED_TABLES。没有任何 `SELECT`/`INSERT INTO slice_cache`。每次 ingest 写入其他表都不写它，slice 计算结果直接返回 JSON 也不缓存。要么是 PRD 计划但 MVP-0 没接通；要么应删。
 - **建议**：要么实现 slice_cache 读写（slice.rs 计算后写入，下次相同 input_hash 命中），要么删除表与测试断言。
@@ -728,6 +756,8 @@
 ### 152. `index_generation` 列被写入但从未用于查询——纯写放大
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave C，已验证）** — 成立。本轮确认 `.index_generation = Some(..)` 仅 `repositories.rs:1228/1239`（测试），`WHERE/ORDER BY/GROUP BY` 中无 `index_generation`（生产「不写」面见姊妹 #190）。两条修法均需专项：删列要对**最热的 `nodes`/`edge_assertions` 两表**做 table-rebuild 迁移（SQLite 旧版无 `DROP COLUMN`），并同步改 bulk-upsert 的 14 列 SQL／参数数组／struct／decode 四处，热写路径回归风险高；接通 generation-fence 是 PRD §5 功能（`Store::current_generation()` + run_index bump + 按代清除）。运行期成本仅每行多写一个整数，risk≫benefit。与 #188/#190/#205 合并为「schema 演进专项 PR」。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 落地删列：迁移 005 对 `nodes`/`edge_assertions` 做 table-rebuild（建新表→INSERT 保留列→DROP→RENAME），去掉 `index_generation`（nodes 13→11 列、edge 14→12 列）并补回 002/004 属于两表的索引；`Node`/`EdgeAssertion` 删字段，`repositories.rs` 的 upsert SQL/参数/decode/`SELECT_*_COLS`/`COLS` 全跟进；`val_opt_i64`/`opt_i64` 死代码删除。迁移测试先红后绿（列消失、数据保留、幂等）。
 
 - **位置**：`crates/groundgraph-store/src/repositories.rs:100, 175, 192, 208, 226, 236`；schema `001_initial.sql:17, 34`
 - **问题**：`nodes.index_generation` 与 `edge_assertions.index_generation` 都是 `INTEGER`，每次 upsert 都被写入（bulk 路径 14 列之一）。但 grep `WHERE.*index_generation` 全空——它从不在 WHERE/ORDER BY/GROUP BY 出现。这意味着每行多写一个 8 字节整数，却换不来任何查询加速，也没有索引。如果原意是用它做 generation-fence（按代清除），那就应该有对应的查询；否则删掉。
@@ -753,6 +783,8 @@
 
 > **🟡 判定：成立·吹毛求疵（2026-06-13 第十四轮·Wave D，已验证）** — 成立（纯分配开销）。spans 范围内每行 `to_lowercase()` 分配一个 `String` 属实。但 snippet 选取行为须保持逐字一致，最直接的"无大写则短路 lower"优化对**非 ASCII 大写**（如希腊/西里尔字母、带音标大写）会改变命中计数→可能选出不同 snippet，需 Unicode 大小写折叠测试兜底才安全；纯字节 ASCII contains 同理对非 ASCII needle 有语义差。属可做但低价值的微优，主成本是 needle 扫描本身而非 lower。标注为吹毛求疵，留待 search 热路径专项一并以特征化测试验证，不在散修轮单独改。
 
+> **✅ 已闭环（2026-07-17，TDD+bench）** — `attach_snippets` 逐行 `to_lowercase()` 改为每文档一次性预处理（cache 存 `(raw_lines, lower_lines)`），匹配语义逐字节一致（全 Unicode `to_lowercase`，`attach_snippets_picks_max_needle_line_with_unicode_folding` 钉死含非 ASCII `É` 折叠，非 ASCII-only 短路）；snippet 文本仍取原始行。同 `search_hot` bench 一并验证。
+
 - **位置**：`crates/groundgraph-engine/src/search.rs:641-647`
 - **问题**：snippet 选取对 spans 范围内每一行调用 `line.to_lowercase()`（分配一个新 `String`），然后用 `needles.iter().filter(...).count()` 数 needle 命中数。对于 500 行的方法体 × 8 个 needle = 4000 次分配。`search` 在 PR review 工作流中按 query 反复触发，且 `needles` 已经预先 lowercase 过——对每行重复 lower 是不必要的。
 - **建议**：要么用 `line.contains(|c: char| c.is_ascii_uppercase())` 短路（无大写时跳过 lower），要么把 `needles` 升级为 `SmallVec<[&str; 8]>` 并对 lowercase 行做一次性 contains 扫描；最干净的是直接对 ASCII 字节做大小写不敏感 `contains`（needle 几乎都是 ASCII）。
@@ -760,6 +792,8 @@
 ### 158. `connect::collect_evidence_for_requirements` 每个需求调用 `list_edges_to`（N+1 query）
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立（结构性 N+1）。`collect_requirements` 对每个 Requirement 各 `list_edges_to(&req.id)`、再对每条边 `node_spec_for_edge` 查节点，确是 N+M。但 `connect` 是**一次性报告命令**（非每键热路径），且入边查询走的正是本轮 #140 新建的复合索引 `idx_edge_assertions_to_ord`（点查 O(log N)）；500 需求级的索引点查是毫秒级。修法（单次 `kind IN (...)` 批查 + 内存分桶，或新增 `list_edges_to_filtered`）是合理但非紧急的改进，且新增 store API 面/改内存聚合需对照 `Documents/DeclaresImplementation/DeclaresVerification` 三类做相等性测试。收益对一次性命令有限，列为专项。
+
+> **✅ 已闭环（2026-07-17，TDD）** — store 新增 `list_edges_by_kinds(&[EdgeKind])`（单次 `kind IN (...)`，固定占位符数可缓存 prepared statement），`collect_requirements` 由 N+1（每需求一次 `list_edges_to`）改为 1 次查询 + 内存按 `to_id` 分桶；`list_edges_by_kinds` 返回 `ORDER BY id`，每桶 sort+dedup 与旧实现逐条相等（`collect_requirements_buckets_three_evidence_kinds_correctly` 钉死 Documents/DeclaresImplementation/DeclaresVerification 三类 + 去重 + `Calls` 排除 + 空 evidence 的 missing 标志）。
 
 - **位置**：`crates/groundgraph-engine/src/connect.rs:186-220`
 - **问题**：函数遍历每个 `Requirement` 节点，对每个需求各调用一次 `store.list_edges_to(&req.id)?`——返回全字段全边集合，再 filter 三个 kind。对一个有 500 个需求 × 平均 20 条入边的仓库，这是 500 次 SQLite query + 500 次 `Vec<EdgeAssertion>` 装箱。每次 query 都重新 prepare、绑定参数、构造 row。
@@ -777,6 +811,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立（纯分配开销）。每个 call ident 都 `from_qualified: qualified.clone()` 属实。但建议的两条修法都带涟漪：(a) `from_qualified` 改 `Arc<str>` 要改 `ScannedRef` 结构 + 所有构造点（散在 12 个语言 adapter）+ 所有读 `from_qualified` 的消费方签名；(b) 改延迟构造（存 qualified 池索引、末尾批量解析）改动更大。属解析层结构变更，需独立 PR 统一改 12 adapter 并回归各语言 calls 边，且收益（小字符串 clone）应有 bench 佐证，不在散修轮处理。
 
+> **✅ 已闭环（2026-07-17，TDD）** — `ScannedRef.from_qualified` 由 `String` 改 `Arc<str>`：callable 的 qualified 一次 `Arc::<str>::from`，body 内每个 call ident 用 `Arc::clone`（原子计数、零堆分配）替代原 `String::clone` 深拷贝；`ScannedRef` 是 treesitter.rs 内部类型（workspace 内仅此一处构造/消费），12 语言 adapter 的 `refs()` 测试 helper 与比较点跟进（编译器驱动），`PartialEq` 按内容比较语义不变（785 engine 测试全绿）。结构性证据：per-callable 堆分配从 N（call ident 数）降到 1。
+
 - **位置**：`crates/groundgraph-engine/src/treesitter.rs:766-772`
 - **问题**：每个 callable body 中的每个 call ident 都 push 一条 `ScannedRef { from_qualified: qualified.clone(), ... }`。对一个大文件中 100 个 callable × 各 10 个 call = 1000 次 `qualified.clone()`。
 - **建议**：要么把 `from_qualified` 改成 `Arc<str>`（clone 是原子引用计数，无堆分配），要么改成延迟构造：`ScannedRef` 存 `(parent_qualified_idx, to_name)` 索引到 scan 里的 qualified 池，最后批量解析。
@@ -792,6 +828,8 @@
 ### 162. `explain_symbol` 用 `serde_json::json!({...})` 宏在每个 edge 上构造 `Value`，再 `.clone()` 进分组
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave D，已验证）** — 成立。每边 `json!({..})` 造 `Value`、二次循环 `row.clone()` 进分组、`edge.{id,to_id,from_id}.to_string()` 多次分配属实，hub 节点（千边）放大明显。但 `explain_symbol` 的 JSON 是 **MCP 输出契约**，重构为 typed struct + `to_value` + 边遍历边分桶须保证序列化结果（键集/类型/顺序）逐字不变，需先补 JSON 快照特征化测试再改。属可做的中等重构，应在带快照基线的 MCP 专项里做，避免散修中悄改对外契约。
+
+> **✅ 已闭环（2026-07-17，TDD）** — `explain_symbol` 每 edge 的 `json!({...})`（`Map<String,Value>` + 多个 String 分配）+ 二次循环 `row.clone()` 进分组，改为 typed `ExplainEdgeRow`（`#[derive(Serialize)]`，字段字母序匹配原 serde Map 输出）+ 单遍边遍历边分桶到 `BTreeMap<&'static str, Vec<Row>>`（键字母序与 serde_json 无 `preserve_order` 时的 `Map` 一致），`edge.kind.as_str()`（`&'static str`）直接做分组键不再 `to_string`。MCP 对外契约逐字不变（`explain_symbol_json_shape_pins_the_mcp_contract` 钉死 top-level 键集/顺序、grouped 键顺序、row 键集/顺序、tests/stats 计数、truncation）。
 
 - **位置**：`crates/groundgraph-mcp/src/tools/explain_symbol.rs:64-128`
 - **问题**：每条边都用 `json!({...})` 宏构造一个 `serde_json::Value`（内部是 `Map<String, Value>` + 多个 `String` 分配），然后在第二个循环里 `row.clone()` 把整个 Value 再克隆一次放进 `grouped_up` / `grouped_down`。对一个 hub 节点（1000 条边）= 1000 个 Value 构造 + 1000 次 clone。`to_string()` 在 `edge.id.to_string()` / `edge.to_id.to_string()` / `edge.from_id.to_string()` 上又是 3000 次分配。
@@ -818,6 +856,8 @@
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立但属跨切面 API 重构。引入 `EngineError` thiserror enum 并改约 30 个公共入口 + CLI/MCP 调用方错误处理，是破坏性大改，单列"engine typed-error"专项 PR；当前 anyhow 不影响运行正确性。
 
+> **✅ 已闭环（2026-07-18，TDD）** — 引入 `groundgraph_engine::EngineError`（thiserror，`crates/groundgraph-engine/src/error.rs`）按错误来源分变体：`Store(#[from] StoreError)` / `Io{context,path,source}` / `NoWorkspace{repo_root}`（无 `.groundgraph.yaml`）/ `Config{message,path}`（坏配置、`storage.path` 的 `..` 逃逸）/ `NotFound{what}`（符号/需求/候选不在图）/ `Subprocess{tool,message}` / `Parse{what,message}` / `InvalidInput` / `Internal(#[from] anyhow::Error)`（兜底，`#[error(transparent)]` 保留 anyhow `with_context` 链使消息不退化）；配 `ErrorKind`（`UserInput`/`NotFound`/`Operational`/`Internal`）+ `EngineError::kind()`/`is_retryable()` 为 #233 退出码契约与 MCP `INVALID_PARAMS`/`INTERNAL_ERROR` 区分留 seam。两个 `#[from]`（`StoreError`、`anyhow::Error`）让公共入口体几乎不动——`StoreResult`/`anyhow::Result`/`EngineResult` 的 `?` 分别路由到 `Store`/`Internal`/identity；prelude 全部高层工作流及其 `_with_store`/`_with_policy` 变体共 60+ 个公共入口（`index_repository`/`run_search`/`compute_impact[_with_policy]`/`analyze_*`/`build_context`/`select_tests`/`slice_requirement` 等）从 `anyhow::Result` 迁到 `Result<T, EngineError>`，关键分类点显式落变体（`load_config`→NoWorkspace/Config/Io、`slice_from_store` 与 `apply_review` 缺失项→NotFound、`Store::open` 失败→Store），私有函数与底层语言 indexer 继续用 anyhow、在高层边界归 `Internal`；cli/mcp 调用方零改动（`EngineError: std::error::Error` 自动融进 anyhow，`format!("{err:#}")` 不退化）。TDD：`tests/engine_typed_error.rs` 6 项分类断言（NoWorkspace/Config/NotFound/Store + `init` 提示保留）+ `error::tests` 3 项（kind 分类 / Store 委派 retryable / anyhow→Internal 消息保留），全 workspace `fmt` / `clippy -D warnings` / `test` 全绿。
+
 - **位置**：`crates/groundgraph-engine/src/lib.rs:80-202`（公共 re-export）+ 所有 `pub fn`（`slice_requirement`、`build_graph_view`、`analyze_questions`、`run_search`、`compute_impact`、`apply_review`、`export` 等约 30 个公共入口）
 - **问题**：除 `groundgraph-store::StoreError` 是 thiserror enum 外，engine 全部公共 API 返回 `anyhow::Result<T>`。`anyhow::Error` 是 type-erased 的，调用方（CLI/MCP）只能用 `format!("{err}")` 拿字符串，**无法 match 错误种类**做差异化处理（例如"配置缺失 → 提示 init" vs "数据库损坏 → 提示重建" vs "LSP 超时 → 重试"）。MCP `tools/call` 只能把所有错误都塞进 `ToolCallResult::err(message)`，丢失了 `INVALID_PARAMS` vs `INTERNAL_ERROR` 的区分。
 - **建议**：为 engine 引入一个 `EngineError` thiserror enum（至少 `NoWorkspace`、`ConfigInvalid`、`Store(StoreError)`、`IndexerFailed`、`LspTimeout`、`Io`），公共 API 改返回 `Result<T, EngineError>`。
@@ -833,6 +873,8 @@
 ### 168. `Node`/`EdgeAssertion` 等 pub struct 全部字段 `pub`，没有构造器/Builder，外部代码可任意设置非法状态
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立。字段全 pub 使 `start<=end`、`confidence∈[0,1]` 等不变量无法由类型表达（#63 confidence NaN 的构造侧根因）。改 `pub(crate)`+校验 setter / newtype `Confidence` 是 core 破坏性 API 变更，触及所有构造点，单列"core 封装"专项。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 按判定落地 newtype 路线。新增 `groundgraph_core::Confidence`：构造即保证有限且 ∈[0,1]（`new` 沿用 #63 净化语义 NaN→1.0/越界 clamp/`-0.0` 归一；`try_new` 严格拒绝），`PartialOrd` 走 `total_cmp` 排序永不 panic，serde 仍以裸数字收发（JSON/YAML 线格式不变，反序列化即净化——手改 `candidates.yaml` 写 `confidence: 2.0`/`.nan` 在加载时折叠）。切换点：`EdgeAssertion.confidence: f32→Confidence`（store 写入 `.get()` 免再净化、读出 `Confidence::new` 保留 #63 读侧防御，proptest 生成器放宽到任意 f32 含 NaN 强化往返性质）；`BusinessCandidate.confidence: Option<f32>→Option<Confidence>`（替换 graph.rs 三处 ad-hoc clamp）；engine prelude 已导出。`Node` 侧：新增 `Node::validate()`（`start<=end`）并由 store 写入边界（`upsert_node`/`upsert_nodes_bulk`）强制拒绝，新 `StoreError::InvalidNode`。**字段保持 `pub` 的有意说明**：Node/EdgeAssertion 本质是跨 5 crate 的行 DTO（全仓 `.start_line` 等读点 500+），全私有+getter 是纯机械 churn 零行为收益；不变量改由"newtype（confidence）+ 写入边界校验（行范围）"表达，非法状态已无法进入图谱。验证：core `confidence::tests` 9 项 + `validate_*` 2 项、store `upsert_node_rejects_inverted_line_range`、engine `out_of_range_yaml_confidence_is_sanitised_at_load`，全 workspace clippy 零告警、测试全绿。
 
 - **位置**：`crates/groundgraph-core/src/node.rs:516-550`（`Node`）、`crates/groundgraph-core/src/edge.rs:171-218`（`EdgeAssertion`）、`crates/groundgraph-core/src/evidence.rs:50-61`（`Evidence`）
 - **问题**：`Node` 提供 `Node::new(id, kind)` 构造器但其余 11 个字段都是 `pub`，调用方在构造后可以任意改 `start_line = Some(u32::MAX)` / `end_line = Some(0)`（违反 `start <= end` 不变量）。`EdgeAssertion` 同样：构造器 `declared` / `fact` 设置 `confidence = 1.0`，但 `pub confidence: f32` 允许外部写入 `-5.0`、`f32::NAN`、`100.0`（前四批 #63 已记录 confidence NaN 是计算侧问题，但**这里是构造侧的根因** —— 类型本身无法表达 [0,1] 区间）。
@@ -889,6 +931,8 @@
 ### 175. 提示、检查面板、图例内部硬编码的英文文案 → 不可翻译
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立。完整 i18n（抽 `I18N` 表、`?lang=zh` 切换、`<html lang>` 覆盖、`toLocaleString(navigator.language)`）触及 ~15 处人读字符串，属功能增量且无法在本地无浏览器环境可视验证，单列"webui i18n"专项；非缺陷/安全/可达性 bug。
+>
+> **✅ 已闭环（2026-07-17，P13 webui i18n）** — 抽 `I18N = { en, zh }` 文案表（42 个 key）+ `t(key,vars)`/`kindLabel()`/`loc()`，语言优先级 `?lang=zh|en` > `localStorage('groundgraph.lang')` > `navigator.language`（`zh*`→zh，其余 en）；`<html lang>`、`document.title`、OG/meta description 与数字 `toLocaleString(locale)` 随之刷新，右上角新增 `#langtoggle` 切换器，`applyLang()` 在切换/启动时重刷图例、详情面板、HUD 与 tooltip。验证：内联脚本 `node --check` 通过；CLI 钉的四个契约标记（`<!-- SS_DATA_SLOT`、`window.__SS_DATA__`、vendor bundle `<script src>`、`ForceGraph3D({ controlType: 'orbit' })`）均未改动。（`cargo test -p groundgraph-cli` 当前因仓库预存的 `groundgraph-store`↔`groundgraph-core` 字段重构未编译完成而无法运行，与本项目无关。）
 
 - **位置**：`webui/index.html:107, 110-111, 115, 118, 121, 122, 273-277, 375, 410-412, 482`
 - **问题**：尽管 `<html lang="en">`，但每一个人类可读字符串都硬编码在标记和 JS 模板字符串中。该项目的母语用户是中文（提交信息和 README 均为中文），但 UI 没有翻译钩子。结合 `toLocaleString()` 使用宿主区域设置进行数字格式化，标签和数值在不同区域设置下不一致。`<html lang>` 硬编码为 `en`，因此屏幕阅读器即使对中文用户也会以英文语音规则朗读。
@@ -1066,6 +1110,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave C，已验证）** — 成立。本轮确认 `.source_hash = Some(..)` 仅 `repositories.rs:1226`（测试），`nodes.source_hash`/`edge_assertions.source_hash` 恒 NULL。修法同 #152：(a) 接通＝indexer 计算 `sha256(content)`，需先定义"content"粒度（节点源码区间 vs 整文件）属功能设计；(b) 删列＝对热表 `nodes`/`edge_assertions` 做 table-rebuild 迁移 + 改 SQL/struct/decode 四处。运行期成本仅每行多写一个 NULL，risk≫benefit。归入「schema 演进专项 PR」。
 
+> **✅ 已闭环（2026-07-17，TDD）** — 与 #152 同一迁移 005 table-rebuild 去掉 `source_hash`（两表各 13→11 / 14→12 列），`Node`/`EdgeAssertion` 删字段并跟进 `repositories.rs` 全链路（SQL/参数/decode/列常量）。迁移测试覆盖列消失 + 数据保留 + 幂等；全 workspace clippy 0 告警、测试全绿。
+
 - **位置**：schema `001_initial.sql:15,32`；struct `node.rs:526`、`edge.rs:183`；SQL `repositories.rs:112,193,209,254,268`；decode `repositories.rs:669,690`
 - **问题**：grep 全工程 `\.source_hash` 命中 0 处赋值——除了 SQL 模板和测试构造。`nodes.source_hash` 与 `edge_assertions.source_hash` **永远是 NULL**，但每行 upsert 仍多写一个 NULL Value，多扫一个参数列。文档多次提到"source hash 追踪"，代码层面未兑现。与 issues3 #152（`index_generation` 从不查询）是姊妹问题：一个"定义了不写"，一个"写了不查"。
 - **建议**：(a) 接通：indexer 写入 `sha256(content)`；(b) 删除：从 schema/struct/SQL/decode 四处移除。
@@ -1081,6 +1127,8 @@
 ### 190. `index_generation` 列在生产 indexer 中从未被写入（#152 的姊妹问题）
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave C，#152 姊妹，已验证）** — 成立，与 #152 同源（"写了不查" vs "查不到因为没写"）。本轮确认所有生产 indexer 省略 `index_generation = Some(..)`（仅测试写入）。处置同 #152：接通需 generation-fence 功能（`current_generation()` + run_index bump），删列需热表 table-rebuild 迁移。归入「schema 演进专项 PR」，不在散修轮处理。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 与 #152 同源同解：迁移 005 table-rebuild 删除 `nodes`/`edge_assertions` 的 `index_generation` 列，`Node`/`EdgeAssertion` 删字段，生产 indexer 此前本就省略该字段故无生产构造点需改。`file_index.index_generation`（增量索引在用）保留不动。
 
 - **位置**：所有生产 indexer（`ingest_language_batch_minimal`、`docs_indexer`、`schema_indexer`、`scip_overlay`、`requirements_md_indexer`、`links_indexer`）全部省略 `node.index_generation = Some(...)`
 - **问题**：issues3 #152 已指出 `index_generation` 不在 WHERE——但它**也不在 SET/VALUES 里**（除测试）。schema 宣称支持"按 generation 增量清除/读取"（PRD §5），代码根本没接通。`slice_cache.index_generation NOT NULL` 是死约束（表本身也是死代码，见 #151）。
@@ -1206,6 +1254,8 @@
 
 > **🟠 判定：成立·待专项（2026-06-13 第十四轮·Wave C，已验证）** — 成立（潜在正确性）。本轮读 `edge.rs:217` 确认 ID＝`edge::{kind}::{from}::{to}`，不含 source/certainty/status；`repositories.rs:226/256` 的 `ON CONFLICT(id) DO UPDATE SET source=excluded.source, certainty=excluded.certainty, …` 会让后写同 `(kind,from,to)` 的不同 source 边整行覆盖前者（含 certainty 降级）。但稳健修法是带涟漪的**边身份契约变更**：(a) 把 source/certainty 纳入 ID＝改变全工程边去重语义、破坏既有库的边 ID、牵动所有按 ID 读写的路径；(b) `ON CONFLICT … WHERE excluded.certainty >= edge_assertions.certainty` 需把 TEXT 存储的 certainty 枚举映射为数值序（字典序≠语义序），且只解决"不降级"一面、不解决 source provenance 丢失。注：与 Wave A 已闭环的 #62/#78（SCIP/heuristic 覆盖，走 indexer 标记 + 抑制模型解决）正交。需独立设计 PR，列为专项。
 
+> **✅ 已闭环（2026-07-17，TDD）** — 边身份契约改为 **身份 = kind + source + from + to**：`EdgeAssertion::declared` 的 ID 由 `edge::{kind}::{len}:{from}::{to}` 改为 `edge::{kind}::{source}::{len}:{from}::{to}`（source 在 kind 之后，长度前缀防撞不动），同 `(kind,from,to)` 不同 source 的边现可共存、不再互相覆盖。**certainty/status 不进 ID**——它们是同一断言的可变状态而非身份，进 ID 会在 certainty 升级时产生孤儿行。防降级：两处 edge UPSERT 的 `ON CONFLICT(id) DO UPDATE` 用 `CASE WHEN excluded.certainty='fact' OR edge_assertions.certainty='declared' THEN excluded ELSE 原行 END` 显式表达「只升不降」（不依赖字典序巧合），confidence 走同一条件保持 certainty/置信度一致，其余 provenance 字段照常覆盖。既有库的旧格式 ID 行靠下次 `groundgraph index` 时各 indexer 的 `clear_indexer_outputs` 自然清理（不在迁移期改写数据）。TDD：core ID 测试（不同 source 不同 ID、确定性、#251 防撞继续过）+ store 测试（共存、declared 不覆盖 fact、fact 可覆盖 declared）先红后绿。
+
 - **位置**：`edge.rs:191-218`
 - **问题**：`format!("edge::{}::{}::{}", kind, from, to)`。`docs_indexer`（source=`Markdown`）与 `requirements_md_indexer`（source=`ExternalManifest`）可能写相同 `Documents(doc_section, requirement)` 边，第二条 UPSERT 覆盖第一条的 source 字段。与 #62（SCIP/heuristic 覆盖）和 #78（同上）不同：本条关注**跨数据源的 source/certainty/status 覆盖**。
 - **建议**：把 `source` 与 `certainty` 纳入 ID 哈希；或 UPSERT 的 ON CONFLICT 加 `WHERE excluded.certainty >= edge_assertions.certainty`。
@@ -1296,6 +1346,7 @@
 ### 211. `tree-sitter-dart = "0.0.4"` — 0.0.x 无稳定性承诺 + 上游 grammar 仓库 8 个月无 release
 
 > **🟠 判定：成立·延后专项（2026-06-13 第十一轮）** — 0.0.x grammar 确无 ABI 稳定承诺，但**提交的 `Cargo.lock` 已精确钉死 0.0.4**，`cargo update` 漂移被锁文件 + 本轮 CI 新增的 `--locked`（见 #226）兜住。改 git-rev 固定或把 Dart 降为 optional feature 属构建/产品形态决策，需独立评估，不在散修轮。
+> **✅ 已闭环（2026-07-17）** — 成立·已精确钉死（"静默漂移"维度）。`crates/groundgraph-engine/Cargo.toml` 的 `tree-sitter-dart = "0.0.4"` 改为 `=0.0.4`（精确 `=`，非 `^`），并加注释说明理由：0.0.x crate 无 semver 承诺 + 上游 grammar 停滞，`=` 让 requirement 显式不可漂移，已提交的 `Cargo.lock` + CI `--locked` 兜住精确 patch。fork 仓库用 git-rev / 降为 optional feature 仍属产品形态决策，留待独立评估，但"一次 `cargo update` 即漂移"的风险已由 `=` 钉死关闭。
 
 - **位置**：`crates/groundgraph-engine/Cargo.toml:32`、`Cargo.lock:1205-1211`
 - **问题**：项目把 Dart 当一等公民（独立 crate + tree-sitter-dart），却把核心 C 解析器钉在 `0.0.4`。crates.io 上 `tree-sitter-dart` 最新仅 0.0.x，source 仓库 2024 年后无 tag/release，grammar 不跟随 tree-sitter ABI 升级——`tree-sitter = "0.26.9"` 和 0.0.x grammar 的 ABI 契约没有正式版本号保证，一次 `cargo update` 即可能产生解析漂移。
@@ -1312,6 +1363,8 @@
 ### 213. `rusqlite = "0.32"` + `bundled` 编译系统 SQLite，跨机器版本漂移破坏"确定性索引"
 
 > **🟠 判定：成立·延后升级专项（2026-06-13 第十一轮）** — rusqlite 0.32→0.37 是跨多个 minor 的主升级，牵涉 bundled SQLite 版本、FTS5/WAL/migration 行为差异，必须配套全量 store 回归（proptest round-trip + 迁移 + FTS）独立验证。`Cargo.lock` 已精确锁定 `libsqlite3-sys` patch，"漂移"风险有界。列为依赖升级专项。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 成立·已升级。根 `Cargo.toml` `rusqlite = "0.32"` → `"0.40"`（0.37 已非最新，按最新稳定 minor 升到 0.40.1），`bundled` 保留。libsqlite3-sys 随之 `0.30.1 → 0.38.1`（内嵌 SQLite 升级），`hashlink 0.9.1 → 0.12.1`。零 API 断裂：0.32→0.40 跨多 minor，但本仓只用稳定核心 API（`params!`/`params_from_iter`/`named_params!`/`Row`/`Connection`/`Transaction`/`prepare_cached`/`types::Value`/`Error`/`ErrorCode`/`FromSqlConversionFailure`），`cargo build` 一次过、零告警。回归：store 全测（proptest round-trip、迁移矩阵、FTS）+ workspace `clippy -D warnings` + `cargo test --workspace` 全绿（68 个结果块零失败）；WAL/FTS5/migration 默认值未观察到行为变更。`Cargo.lock` 已锁定精确 libsqlite3-sys 0.38.1 patch，跨机确定性由锁文件保证。
 
 - **位置**：`Cargo.toml:38`、`Cargo.lock:520-528`
 - **问题**：crates.io 上 rusqlite 当前主线已到 0.37/0.38，0.32 是 2024 中期分支，上游已不收 bugfix；bundled SQLite 版本号锁在 libsqlite3-sys 内部，FTS5/JSON1/WAL 行为在不同 patch 版本可能不同；`bundled` 模式与 Linux 发行版安全补丁通道脱钩。
@@ -1346,6 +1399,7 @@
 ### 217. SCIP / LSP 子进程失败零重试，瞬时 flake（JVM OOM、Node ESM race、PATH race）直接降级为 Failed
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立。子进程瞬时失败零重试直接降级 Failed。加退避重试需横跨 `scip_runner`/`lsp_indexer`/`dart_sidecar` 执行层，单列"子进程重试"专项；当前降级为 structure-only 非致命。
+> **✅ 已闭环（2026-07-17，TDD）** — 成立。`crates/groundgraph-engine/src/proc.rs` 新增共享「spawn + 指数退避重试」执行器：`RetryPolicy`（默认 2 次尝试 = 重试 1 次，退避基数 200ms，指数 `base·2^n`、封顶 30s）、`SubprocessFailure`（Spawn/Exited 两变体）、`is_transient_failure`（**仅瞬时失败重试**：io error 非 `NotFound`/`TimedOut`、非零退出非 `2`(arg 错)/`127`(command not found)/stderr 不含「command not found」「no such file or directory」）、`retry_transient_subprocess`（驱动尝试闭包，确定性失败/末次失败原样返回）。env：`GROUNDGRAPH_SUBPROCESS_RETRY_ATTEMPTS`、`GROUNDGRAPH_SUBPROCESS_RETRY_BACKOFF_MS`。接入三处：`scip_runner::execute`、`lsp_indexer::run_profile`（spawn+initialize 成对重试，覆盖 server 握手期崩溃）、`dart_sidecar::try_run`（spawn→stdin→wait→collect 整体重试），重试耗尽仍按原语义降级（Failed/Skipped），不新增 panic 路径；失败 reason 附「（已重试 N 次后仍失败）」。测试：`proc.rs` 17 个（纯函数判定/退避/策略 + 驱动器计数闭包 4 例 + unix 脚本桩「首次 flake 第二次成功恰好重试 1 次」「exit 2 参数错不重试」「NotFound 不重试」）。
 
 - **位置**：`crates/groundgraph-engine/src/scip_runner.rs:422-462`
 - **问题**：SCIP indexer 单次执行失败立刻记 `ScipRunStatus::Failed(reason)`，从不重试。SCIP indexers 首次启动常见 flake：JVM 冷启动 OOM、Node ESM 解析 race、rust-analyzer proxy 首次 rustup 触发下载。一次 flake 让该语言精确层在本次 index 完全消失。对比 Dart sidecar 有 partial-recovery。
@@ -1378,6 +1432,7 @@
 ### 221. 38 个 src 文件无任何 `#[cfg(test)]` 模块，所有逻辑全部依赖集成测试
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立（观察性）。补单测覆盖是渐进式测试基建工程（非单点 bug），随各模块改动逐步补（本轮 #220/#235 已各补一处），单列测试基建专项。
+> **✅ 已闭环（2026-07-17，棘轮机制 + 渐进）** — 落地单测覆盖棘轮：`scripts/check_unit_test_coverage.sh` 统计 `engine/src/**/*.rs` 无 `#[cfg(test)]` 的文件数，超基线（4）即 CI 红（挂 `ci.yml` lint 阶段，只减不增）；本轮为 `checks.rs`（`severity_from_level`/`classify_code_ref`/`has_template_tokens`/`is_placeholder_path`/`extract_inline_code_refs` 等 6 例）、`links_indexer.rs`（`split_ref`/`slugify_or_keep` 2 例）、`export.rs`（`sqlite_value_to_json` 2 例）补 `#[cfg(test)]`，无测试文件从 7 降到 4（余 `lib.rs`/`scip_proto.rs` 为聚合/生成代码、`context_pack.rs`/`watch.rs` 待后续渐进）。剩余 src 覆盖随各模块改动持续补，棘轮保证不回退。
 
 - **位置**：最有风险的 12 个：`engine/src/{config,checks,connect,context_pack,export,impact,links_indexer}.rs`、`mcp/src/protocol.rs`、`mcp/src/tools/{explain_symbol,check_drift,context_pack,impact_tool}.rs`、`store/src/migrations.rs`
 - **问题**：`config.rs::normalized()` 把 unified `languages:` 折叠到 legacy switches（init 核心逻辑），无单元测试只靠端到端。`migrations.rs` 完全无 unit test：部分应用、版本回退、SQL 错误传播路径都未覆盖。
@@ -1395,6 +1450,8 @@
 
 > **🟠 判定：成立·由 #102 治理（2026-06-13 第十一轮）** — hashbrown 三版本属实，但**均为传递依赖**（rusqlite/hashlink、wasmparser、indexmap），非本仓直接可控。本轮新增的 cargo-deny（#102）以 `multiple-versions=warn` 持续暴露重复版本；彻底收敛需 rusqlite 升级（#213）+ 上游推进，随该专项处理。
 
+> **🟠 部分闭环（2026-07-17）** — 由 #213（rusqlite 0.32→0.40）收敛了**生产切片**：旧 `hashlink 0.9` 拉的 `hashbrown 0.14.5` 随 `hashlink 0.9.1→0.12.1` 上移到 `0.17.1`，故 native release 实际只编译单一 `hashbrown 0.17.1`（indexmap via serde_json + hashlink via rusqlite 共用）。**残余两版上游硬钉、`cargo update -p … --precise 0.17.1` 均被拒**：`0.16.1` ← `rsqlite-vfs 0.1.1` 钉 `^0.16.1`（经 `sqlite-wasm-rs → rusqlite 0.40` 的 wasm-only `cfg(all(target_family="wasm",target_os="unknown"))` 依赖，native 不编译）；`0.15.5` ← `wasmparser 0.244.0` 钉 `^0.15.2`（经 `getrandom→wasi→wit-bindgen→wasm-metadata` 链，同 #224）。二者均为 target/dev-only 锁条目（`cargo tree -i` 默认不可达），不进 native 二进制。`deny.toml` `[bans]` 已补精确上游阻塞版本与链路。`cargo deny check` 的 **bans/licenses/sources 三关全过**（多版本 `warn` 不阻断）；advisories 失败项（serde_yml RUSTSEC-2025-0068 / anyhow RUSTSEC-2026-0190 / crossbeam-epoch RUSTSEC-2026-0204）均基线既有、与本条无关。**剩余监控责任**：待 wasmparser 与 rsqlite-vfs re-pin 到 0.17 后自然收敛，过渡期由 cargo-deny `multiple-versions=warn` 持续暴露。
+
 - **位置**：`Cargo.lock:423,432,441`
 - **问题**：0.14.5 ← rusqlite/hashlink；0.15.5 ← wasmparser（dev-only transitive 却进 release）；0.17.1 ← indexmap（serde_json/serde_yaml 生产链）。三份代码三份编译时间。
 - **建议**：`cargo update -p hashlink` 升到匹配 rusqlite 0.37 的版本；`cargo deny` 配置对 0.15.5 加 `skip`。
@@ -1402,6 +1459,7 @@
 ### 224. `wit-bindgen` 两版本（0.51.0 / 0.57.1）+ 完整 wasm 工具链被 tempfile→getrandom 拉入
 
 > **🟠 判定：成立·由 #102 治理（2026-06-13 第十一轮）** — wit-bindgen 两版本经 `tempfile→getrandom→wasip2/wasip3` 传递引入，最终产物不上 wasi。cargo-deny（#102）已对其持续告警（本机 `cargo deny check` 即报 `duplicate wit-bindgen`）；收敛依赖上游 getrandom/tempfile 版本对齐，列入依赖去重专项。
+> **✅ 已闭环（2026-07-17，#224/#225 收敛专项）** — 成立·上游阻塞·已取证记录。`cargo tree -i wit-bindgen@0.51.0 --target all` 摸清链：0.51.0 ← wasip3 ← getrandom 0.4 ← tempfile，0.57.1 ← wasip2 ← getrandom 0.3 ← rand ← proptest（dev）。两版均 wasm/wasi + dev-only，不编译进原生 release 二进制。`cargo update -p wit-bindgen@0.51.0 --precise 0.57.1` 被上游 `^0.51.0` 拒绝（实证）。`deny.toml [bans]` 注释逐项记录阻塞原因 + 监控方式（`multiple-versions=warn` 持续暴露）；随 wasi/getrandom 上游对齐自然收敛。
 
 - **位置**：`Cargo.lock:1454,1463`
 - **问题**：`tempfile 3.27.0` 通过 `getrandom → wasip3 → wit-bindgen 0.51.0` 与 `getrandom 0.3.4 → wasip2 → wit-bindgen 0.57.1` 拉入两套 wit-bindgen 和 wasm-encoder/wasmparser/wit-parser/wit-component/wit-bindgen-core。这些 wasm 组件工具完全不在 GroundGraph 业务路径上——只是为了在 wasi 平台生成 getrandom 绑定。对 CLI/MCP 工具 release 二进制最终不上 wasi，但 `cargo build` 仍要编译。巨大供应链面积 + 编译时间。
@@ -1410,6 +1468,7 @@
 ### 225. `getrandom` 两版本（0.3.4 / 0.4.2）+ `r-efi` 两版本（5.3.0 / 6.0.0）
 
 > **🟠 判定：成立·由 #102 治理（2026-06-13 第十一轮）** — getrandom 0.3/0.4 与 r-efi 5/6 均为 tempfile/getrandom 传递链产物。cargo-deny（#102）`multiple-versions=warn` 持续暴露；与 #224 同源，随依赖去重专项一并收敛。
+> **✅ 已闭环（2026-07-17，#224/#225 收敛专项）** — 成立·上游阻塞·已取证记录。getrandom 0.3.4/0.4.2 与 r-efi 5.3.0/6.0.0 分裂由 dev 依赖图驱动：proptest 的 `rand` 0.9 需 getrandom 0.3 / r-efi 5，`tempfile` 3.27 需 getrandom 0.4 / r-efi 6（dev-only，cargo-deny 不标红）。`cargo update -p getrandom@0.3.4 --precise 0.4.2` 被上游 `^0.3.0` 拒绝（实证）。`deny.toml [bans]` 注释记录；随 rand/tempfile 上游对齐收敛。
 
 - **位置**：`Cargo.lock:374,386,706,712`
 - **问题**：getrandom 0.3.x 与 0.4.x 是上游 API 大改（RNG 来源语义不同），两版本共存意味着同一二进制里两套熵源逻辑。r-efi 5.x 与 6.x 同样 ABI 不兼容。一旦 getrandom 0.4 出 CVE，patch 流程要修两个版本号。
@@ -1418,6 +1477,7 @@
 ### 226. workspace 依赖全用宽版本号（`anyhow = "1"` 等），允许 patch/minor 静默升级
 
 > **🟠 判定：成立·已部分缓解（2026-06-13 第十一轮）** — 宽版本号属实，但**提交的 `Cargo.lock` 已对全部依赖精确锁定**，跨机器构建走锁文件即确定性；本轮 CI 在 `cargo test` 加 `--locked`，锁文件过期即红，drift 可检测。是否进一步用 `=X.Y.Z` 钉死生产核心 crate 属 release 策略权衡（与 dependabot 体验冲突），留策略专项。
+> **✅ 已闭环（2026-07-17）** — 成立·策略已定稿。`docs/publishing.md` 新增「Dependency version strategy (issues.md #226)」小节，正式化现状：生产依赖用宽 semver 声明（配合全量提交的 `Cargo.lock` + CI `--locked` 保证可复现），核心索引关键依赖（`rusqlite` 0.40 线、`tree-sitter-dart =0.0.4`）用 `=` 精确钉死。除 #211 那处 `=` 外不改现有声明；新依赖按"核心索引 = / 普通宽 semver"分流。
 
 - **位置**：`Cargo.toml:32-49`
 - **问题**：`"^1"` 等价 `>=1.0.0, <2.0.0`，minor 升级会静默改变行为/性能/panic 信息。对"确定性索引器"，跨机器 `cargo update` 后行为可能不同（store 里多处把 anyhow error 序列化进 DB，Display 实现细节可能跨版本变化）。
@@ -1442,6 +1502,7 @@
 ### 229. `scip = "0.8"` + `protobuf = "3"` 拉入完整 Google protobuf 运行时反射，GroundGraph 只用 SCIP schema
 
 > **🟠 判定：成立·延后专项（2026-06-13 第十一轮）** — scip 0.8 依赖 protobuf 3 全运行时属实。换 prost 需重写 `scip_runner` 的 SCIP 反序列化（生成代码 + 字段映射）并全量回归 SCIP 精确层，属独立"protobuf→prost"专项；~200KB 体积收益不值得在散修轮承担反序列化重写风险。
+> **✅ 已闭环（2026-07-17，TDD + 字节级特征化测试）** — 成立·已迁移 prost。vendor 官方 `scip.proto`（v0.8.1，取自 `sourcegraph/scip`，字段号与原 `scip` 0.8.1 crate 的 rust-protobuf 生成代码逐字段一致）到 `crates/groundgraph-engine/proto/scip.proto`；新增 `build.rs`（prost-build 0.14 + protoc-bin-vendored 3，免系统 protoc、跨平台编译）生成类型到 `OUT_DIR`，经新 `scip_proto` 模块 re-export `Index`/`Document`/`Occurrence`/`Metadata`。重写 `scip_overlay.rs`：`Index::parse_from_bytes` → `prost::Message::decode`，`MessageField<T>` → `Option<T>`，`write_to_bytes` → `encode_to_vec`；移除 `scip`/`protobuf`/`protobuf-support` 运行时依赖。SCIP 精确层行为零变化：`scip_overlay` 8 单测全绿。**TDD/特征化**：先建 `tests/fixtures/scip/sample.scip`（192 字节，旧 rust-protobuf 3.7.2 编码的真实 wire-format fixture）+ 特征化测试断言解码字段；迁移后 prost 解同一 fixture 字段全等，且 prost 重编码与旧 protobuf **字节级完全一致**（同 192 字节、同 SHA256），证实编解码双向兼容、真实 `.scip`（rust-analyzer/scip-go 产）解析不变。`cargo tree` 确认 `scip`/`protobuf`/`protobuf-support` 已从依赖图消失。
 
 - **位置**：`crates/groundgraph-engine/Cargo.toml:36-37`
 - **问题**：`scip 0.8.1` 依赖 `protobuf 3.7.2`（完整 C++ 风格运行时反射库）。GroundGraph 只在 `scip_runner` 读 SCIP 索引（pure read），却加载完整 protobuf 反射运行时，release 二进制多 ~200KB + once_cell 全局。
@@ -1450,6 +1511,7 @@
 ### 230. 整个 workspace 零 `tracing` / `log` 使用，所有诊断裸 `eprintln!`，无 span/level/target/上下文
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立，与 #127 同主题。引入 tracing 框架属跨切面可观测性专项（#127 已立项），合并跟踪，避免重复散修。
+> **✅ 已闭环（2026-07-17，TDD）** — 14 处诊断用 `eprintln!` 迁 `tracing!`（engine 3：config/schema-notice、index config-command notice、requirements_md 重复 req-id；cli 8：logic/business_doc/candidate 警告 + index 的未索引语言/schema-skip/partial-failure + graph focus-miss；mcp 3：ready/client-connected/transport-error）。保留 15 处例外：2 处 `GROUNDGRAPH_TIMING` 门控的 timing 调试行（专用调试开关，格式稳定，门控语义）+ `main` 致命错误行（exit code 前必须无条件 stderr）+ 12 处人员可见的成功/用户错误提示（impact/propose/business_doc/dashboard/search/graph/candidate 的"已写入 X"/"找不到候选"，保持 stderr 通道语义 #111）；mcp server 装自己的 subscriber（stdout 留给 JSON-RPC）。TDD：`index_partial` 的 `-q` 抑制 warn 测试（迁移前 eprintln 不受 `-q` → RED；warn! 级别过滤 → GREEN）+ 默认级别回归。
 
 - **位置**：全仓 `grep "tracing::|log::"` 0 命中；30+ 文件 `eprintln!`
 - **问题**：#127 已记缺 --verbose/RUST_LOG，但本条更深：**根本没有 logging 框架**。无 span 关联（哪个 phase/语言/文件）、无 level 过滤、无 target 标签（MCP server 调 groundgraph 时无法区分来源）、无结构化字段。CI 失败时只能拿到一坨无上下文的中文/英文混合 stderr。
@@ -1458,6 +1520,7 @@
 ### 231. `index` 长时操作（18s+）零进度反馈，无 spinner / 无 phase 流 / 无 ETA
 
 > **🟠 判定：成立·可观测性专项（2026-06-13 第十轮）** — 属实但是**功能增量**：需引入 `indicatif`（TTY spinner / 非 TTY 周期进度行）并把 indexer 的 phase 流式上报。与 #127（日志框架）同源，并入可观测性专项设计，不在散修轮落地。
+> **✅ 已闭环（2026-07-17，TDD）** — 引入 `indicatif`；engine 加 `ProgressSink` trait + `NoopSink` + `index_repository_with_progress(options, &mut dyn ProgressSink)`（原 `index_repository` 委托传 `NoopSink` 保持向后兼容），`PhaseTimer::mark` 既保留 `GROUNDGRAPH_TIMING` 的 timing 行又 `sink.phase()` 上报 14 个 phase 边界（docs→各语言→scip→links→requirements_md→fulltext→commit）。CLI `index` 用 `IndexProgress`：TTY 时 `ProgressDrawTarget::stderr()` + spinner + steady tick，非 TTY `hidden()`（indicatif hide 惯例），draw_target 恒为 stderr 不污染 `--format json` stdout。TDD：`progress` trait unit（3）+ `index.rs` 内嵌 `phase_timer_forwards_each_marked_phase_to_the_sink`（mark→sink 序列）+ `tests/index_progress` 集成（docs→fulltext→commit 顺序断言）+ `index_partial` stdout-干净 e2e。
 
 - **位置**：`crates/groundgraph-cli/src/commands/index.rs:7-15`
 - **问题**：`groundgraph index` 在 spring/django/typescript 仓运行期间 stdout/stderr 完全静默直到结尾 dump。用户在 CI 看到 30 秒"程序卡死"然后突然一堆输出。PhaseTimer 只在 `GROUNDGRAPH_TIMING=1` 时事后输出。
@@ -1466,6 +1529,7 @@
 ### 232. indexer 部分失败（schema skip / parse timeout / SCIP Failed）退出码仍 0，CI 受骗
 
 > **🟠 判定：成立·需专项（2026-06-13 第十轮）** — CI 受骗属实，但修复需贯通改造：在 `IndexResult` 增 `partial_failures: Vec<PartialFailure>`、各 indexer 失败路径回填、`index` 命令据此返回退出码 2 并加 `--fail-on-partial` flag。涉及 engine 公共结构 + 退出码契约（与 #233 耦合），且需相应 e2e 测试，属独立 PR，不在散修轮夹带。
+> **✅ 已闭环（2026-07-17，TDD）** — `IndexResult` 增 `partial_failures: Vec<PartialFailure>`，`index_repository` 末尾经纯函数 `collect_partial_failures`（从 `treesitter[].parse_timeouts` + `scip_runs[].Failed` 收集）回填；CLI `index` 再折叠 schema-indexer 失败，打印每项 `indexer: reason` 汇总，按 `--fail-on-partial`（默认 true）返回 exit 2（UserError），`watch` 调用传 false 不中断。TDD：engine 单测 `collect_partial_failures_*`（stub→实现 RED-GREEN）+ `tests/index_partial.rs`（parse-timeout 场景 exit 2 / `--fail-on-partial=false` exit 0 / 干净仓 exit 0）。
 
 - **位置**：`crates/groundgraph-cli/src/commands/index.rs:71` + `:216-223` + `engine/src/index.rs:417-422`
 - **问题**：多个 indexer 失败只产生 stdout/stderr 文本，不影响退出码：schema indexer 失败 → `eprintln!("Schema index skipped...")` 但 `run` 返回 `Ok(())`；SCIP `Failed(reason)` 仅在 result 摘要。CI 的 `if groundgraph index; then ...` 把"部分成功的索引"当完全成功。
@@ -1474,6 +1538,7 @@
 ### 233. 退出码语义不统一——"user error"/"not found"/"internal error" 全用 1，只有 candidate-show 用 2
 
 > **🟠 判定：成立·跨切面专项（2026-06-13 第十轮）** — 属实但是跨全 CLI 的退出码契约设计（typed 0/2/64/65/70/72/76），需统一所有 runner 的错误分类并文档化，且与 #115/#232 耦合。属独立"退出码语义"PR，不在散修轮逐处改。
+> **✅ 已闭环（2026-07-17，TDD）** — 落地统一退出码契约 `0 成功 / 2 用户错误 / 70 内部`（简化自原 7 档建议，少而明确；`docs/cli-exit-codes.md` + `--help` after_help 尾注）。新增 `exit_code.rs`（`UserError` + `classify`）：main 错误分支一处集中映射——遍历 cause chain 的 `EngineError::kind()`（`UserInput`/`NotFound`→2，`Operational`/`Internal`→70）+ 裸 `io::NotFound`→2 + 显式 `UserError`→2，替换「几乎全 1」；`check`/`connect`「发现问题」退出码统一到 2，`candidate show` 的 2 保持兼容。TDD：`tests/exit_codes.rs`（clap 错误 / no-workspace / operational / candidate-not-found 分别断言 2 与 70）+ `exit_code::tests`（classify 单测 8 例）。
 
 - **位置**：`crates/groundgraph-cli/src/main.rs:1001-1010` + `commands/candidate.rs:58`
 - **问题**：退出码无文档化语义：配置文件不存在 → 1；`candidate show <bad-id>` → 2；数据库不存在 → 1；任何 `?` 冒泡 → 1。sysexits.h 约定 64-78 区分。CI 脚本无法靠退出码区分"用户写错参数"vs"数据库损坏"。
@@ -1482,6 +1547,7 @@
 ### 234. 至少 9 个 `GROUNDGRAPH_*` 环境变量散布 8 个文件，无清单 / 无 --help / 无 docs 汇总
 
 > **🟠 判定：成立·治理专项（2026-06-13 第十轮）** — 属实但属文档/治理增量：把 9 个 `GROUNDGRAPH_*` 集中到 `env.rs` 注册表 + `--help` 加 `Environment:` 段 + 新增 `environment.md`。机械但跨多文件，且更适合与可观测性/治理一并推进，非缺陷，留专项。
+> **✅ 已闭环（2026-07-17，TDD）** — 新建 `crates/groundgraph-cli/src/env.rs`：`REGISTRY`（14 项 `GROUNDGRAPH_*`，`EnvSpec` 含 name/default/category/help）+ `render_environment_help()` 按 category 分组生成；`GROUNDGRAPH_SCIP_<LANG>_BIN` 用 `<LANG>` 占位符表动态 family，`GROUNDGRAPH_GOLDEN_REQUIRED` 标 `Test` category 在用户 `--help` 隐藏。`--help` 的 `after_help` 改由 `after_help_text()` 运行期拼接（#128 Categories + #233 Exit codes + #234 Environment），builder 覆盖 derive（注册表运行期才解析）；`docs/environment.md` 汇总（含 Test-only 段）。TDD：`env::` 5 例（覆盖 grep 全部变量 / 去重 / 前缀 / render 含 header 且隐藏 Test，RED 空 REGISTRY → GREEN）+ `help_grouping` 的 Environment 段 e2e。注：`GROUNDGRAPH_GO_LSP_BIN` 已退役（Go 走 tree-sitter + scip-go），注册表反映现状不含它。
 
 - **位置**：`GROUNDGRAPH_TIMING`（index.rs:136）+ `GROUNDGRAPH_SWIFT_LSP_BIN`（swift_indexer.rs:34）+ `GROUNDGRAPH_GO_LSP_BIN`（config.rs:672）+ `GROUNDGRAPH_SCIP_<LANG>_BIN`（scip_runner.rs:101）+ `GROUNDGRAPH_PARSE_BUDGET_MS`（treesitter.rs:406）+ `GROUNDGRAPH_LOUVAIN_RESOLUTION`（business_pack.rs:847）+ `GROUNDGRAPH_DART_ANALYZER[_BIN/_TIMEOUT_SECS]`（dart_sidecar.rs:38-50）+ `GROUNDGRAPH_REPO_ROOT`（mcp/main.rs:52）
 - **问题**：9 个环境变量分散 8 个源文件，无统一注册表、无 `--help` 列出、无 docs 汇总。用户得 grep 源码才能发现 `GROUNDGRAPH_PARSE_BUDGET_MS` 可调慢解析预算。命名也不统一：`_BIN`/`_TIMEOUT_SECS`/`_MS`/`_RESOLUTION`/`TIMING` 混用。
@@ -1498,6 +1564,7 @@
 ### 236. 6 个 Dart golden 测试文件复制粘贴 ~100 行 EnvGuard + copy_fixture + setup_indexed_repo 脚手架，零共享
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立。抽共享 test helper 是纯测试重构（无行为变更但有打断 6 个 golden 的风险），单列测试 DRY 专项。
+> **✅ 已闭环（2026-07-17，纯测试重构）** — 抽 `crates/groundgraph-engine/tests/common/mod.rs`：路径/探测 helper（`workspace_dir`/`fixture_dir`/`sidecar_path`/`copy_fixture_into`/`dart_available`/`sidecar_source_present`）+ 高阶 `setup_indexed_dart_repo(ctx, fixture, code_roots)`（封装 `dart_golden_ready` 门控 + sidecar env + init/copy/migrate/index_dart + resolver 断言）+ `EnvGuard`/`env_lock`（acceptance 专用，两个测试 flip env 相反方向故不能套 Once 模式）。6 个文件（p4/p5/p7_dead_code/p8/p9/dart_sidecar_acceptance）逐个迁移到共享模块，每文件保留语义 thin wrapper，soft-skip 行为不变（`dart_sidecar_acceptance` happy-path 的 `eprintln!` 老路径统一到 `dart_golden_ready` 的 stdout/可选硬失败）；修正 common 原有 `dart_golden_ready` 里重复 `&& var_os().is_none()` 笔误。24 个 golden 测试全绿（sidecar 实跑）。
 
 - **位置**：`crates/groundgraph-engine/tests/{p4_pixcraft_golden,p5_search_golden,p7_dead_code_golden,p8_semantic_edges,p9_business_candidates,dart_sidecar_acceptance}.rs`
 - **问题**：6 份独立 `EnvGuard`/`copy_fixture_into`/`dart_available`/`sidecar_source_present`。`tests/` 无 `common.rs`/`mod support`/`harness.rs`。6 处独立修复点——改一处要改 6 处。
@@ -1514,6 +1581,7 @@
 ### 238. fixture 缺 csharp / ruby / php / kotlin / cpp / c 这 6 门语言的独立目录
 
 > **🟠 已判定·待专项（2026-06-13 第十二轮）** — 成立。补这 6 门 tree-sitter 的真实端到端样本仓属测试语料扩充工程，单列 fixture 专项。
+> **✅ 已闭环（2026-07-17，TDD）** — 补 `csharp_hello` / `ruby_hello` / `php_hello` / `kotlin_hello` / `cpp_hello` / `c_hello` 六个 fixture 目录（每目录 2–3 真实源文件，含跨文件结构与同文件 Calls 边），新增 `breadth_fixtures_golden.rs` 端到端金标：复制 fixture → `index_repository` → 断言关键节点（类/方法/函数/结构）+ Calls 边存在。`csharp_hello` 兼作 #125 的 LINQ/partial 金标本。
 
 - **位置**：`tests/fixtures/`（只有 pixcraft_iap/flutter_watermark_app/typescript_hello/python_hello/java_hello/go_hello/swift_hello）
 - **问题**：wave3 的 csharp/ruby/php/kotlin 测试在 p22 用**内联字符串**（`write(root, "src/Greeter.cs", "...")`）而非 fixture。inline fixture 体积小（30-200 字节），无真实框架代码（无 ASP.NET/Rails/Laravel/Spring Boot），无法触发 framework 路由解析器回归。这 6 门端到端覆盖深度远低于另外 7 门。
@@ -1522,6 +1590,7 @@
 ### 239. 测试命名风格三套并存：`feature_condition_expected` / `p[0-9]+_feature` / `check_NN_feature`
 
 > **🟡 吹毛求疵·待专项（2026-06-13 第十二轮）** — 成立但纯命名风格，不影响正确性；统一命名是大面积低收益 rename，留风格专项，不在散修轮动。
+> **✅ 已闭环（2026-07-17，规范文档化）** — `CONTRIBUTING.md` 新增测试命名规范：`unit`/`golden`/`integration` 三类 + `feature_under_test_condition_expected_outcome` 约定，参照 `apply_list_rolls_back_failed_migration_and_does_not_advance_version` / `sqlite_value_to_json_collapses_non_finite_reals_to_null` / `slice_requirement_missing_workspace_errors_with_message` 等良好样例。机械迁移扫描全 workspace 1501 个测试：无 `test1`/`misc`/`works` 类明显偏离（短名仅源码字符串内的 `it_adds` 误匹配）；现存 `p[0-9]+_*`(57)/`check_NN_*`(20) 均带完整 feature 描述（如 `p7_dead_code_lists_unreached_pixcraft_symbols_with_confidence`、`check_01_top_level_function_calls_class_method`，语义清晰），按本条 verdict 留风格专项不做大面积 rename。
 
 - **位置**：抽样对比 `end_to_end_paths.rs:slice_requirement_missing_workspace_errors_with_message`、`p7_dead_code_lists_unreached_pixcraft_symbols_with_confidence`、`code_facts_extended.rs:check_01_top_level_function_calls_class_method`
 - **问题**：三套命名让 `cargo test -- --list` 输出混乱，新成员不易搜到要扩展的测试。
@@ -1625,6 +1694,8 @@
 ### 242. `resolve_db_path` / `resolve_storage_path` 不约束 `storage.path`：绝对路径与 `..` 逃逸（与同仓 #199 路径约束不一致）
 
 > **🔴 待修复（Medium，安全/一致性）** — #199 已为 `links.path` 加 `confine_manifest_path`，但 `storage.path` 在 5+ 处仍裸用。
+
+> **✅ 已闭环（2026-07-17，TDD）** — 引擎侧残余补齐：`..` 守卫从 MCP 边界下沉到共享的 `groundgraph_core::paths::confine_under_root`，engine `resolve_storage_path` 随之改返回 `Result<PathBuf>` 并同样拒绝 `..` 逃逸；绝对路径按设计保留为显式算子 opt-in（引擎/MCP 一致）。MCP 侧以 `open_store_rejects_a_storage_path_escaping_the_repo` / `open_store_honours_an_absolute_storage_path` 两条 e2e 钉住入口行为。
 
 - **位置**：`crates/groundgraph-mcp/src/tools/mod.rs`（`resolve_db_path`）；`crates/groundgraph-engine/src/connect.rs:562-569`（`resolve_storage_path`）；`index.rs` / `schema_indexer.rs` / `network.rs` 各自的同名副本
 - **问题**：`resolve_db_path`/`resolve_storage_path` 对 `config.storage.path`：绝对路径**原样采用**，相对路径 `repo_root.join(raw)` **不过滤 `..`**。被污染的 `.groundgraph.yaml`（`storage.path: ../../etc/x` 或 `/etc/x`）可让 GroundGraph 在仓库外创建/写 SQLite 文件。对照 **同一个 `connect.rs`** 里 `confine_manifest_path`（#199）对 `links.path` 已拒绝绝对路径与 `..`——同文件双标准。
@@ -1800,6 +1871,8 @@
 ### 263. `resolve_storage_path` 在 4 个文件各自重复实现（DRY；亦是 #242 的根因放大）
 
 > **🟡 吹毛求疵（Nit，DRY）**
+
+> **✅ 已闭环（2026-07-17，TDD）** — DRY 收敛完成：全仓实测 22 份 storage/db 路径解析副本（20 份 engine 模块 shim + engine canonical + MCP `resolve_db_path`）收敛为 `groundgraph_core::paths::confine_under_root` 单一实现加 `config::resolve_storage_path` 唯一包装，副本数 22 → 1；#242 的"无单一实现点"根因放大器同步消除。
 
 - **位置**：`crates/groundgraph-engine/src/{index.rs, schema_indexer.rs, connect.rs:562, network.rs}` 各有一份近乎相同的 `resolve_storage_path`
 - **问题**：同一"解析 storage.path"逻辑被复制 4 份，彼此可能漂移；#242 的路径约束缺口正因为没有单一实现点而需要逐处修。

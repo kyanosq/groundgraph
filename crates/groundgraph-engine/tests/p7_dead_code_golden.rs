@@ -9,101 +9,18 @@
 //!
 //! Skips when the Dart SDK or the sidecar source isn't available.
 
-use std::path::PathBuf;
-
 mod common;
 
 use groundgraph_engine::config::DeadCodeConfig;
-use groundgraph_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
+use groundgraph_engine::dart_indexer::{index_dart, DartIndexOptions};
 use groundgraph_engine::dead_code::{
     analyze_dead_code_with_store, DeadCodeConfidence, DeadCodeOptions,
 };
-use groundgraph_engine::init::{init_repository, InitOptions};
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tests/fixtures/pixcraft_iap")
-}
-
-fn workspace_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn copy_fixture_into(dst: &std::path::Path) {
-    let src = fixture_path();
-    for entry in walkdir::WalkDir::new(&src) {
-        let entry = entry.unwrap();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&src).unwrap();
-        let target = dst.join(rel);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::copy(entry.path(), &target).unwrap();
-    }
-}
-
-fn dart_available() -> bool {
-    std::process::Command::new("dart")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn sidecar_source_present() -> bool {
-    workspace_dir()
-        .join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart")
-        .exists()
-}
-
+/// Materialise the `pixcraft_iap` fixture and index it through the Dart
+/// analyzer sidecar. Soft-skips when the sidecar is unavailable.
 fn setup_indexed_repo() -> Option<tempfile::TempDir> {
-    if !common::dart_golden_ready(
-        sidecar_source_present() && dart_available(),
-        "p7_dead_code_golden",
-    ) {
-        return None;
-    }
-    let sidecar_abs =
-        workspace_dir().join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart");
-    common::enable_dart_sidecar_env(&sidecar_abs);
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    init_repository(InitOptions {
-        repo_root: tmp.path().into(),
-    })
-    .unwrap();
-    copy_fixture_into(tmp.path());
-    let mut store =
-        groundgraph_store::Store::open(tmp.path().join(".groundgraph/graph.db")).unwrap();
-    store.migrate().unwrap();
-    let result = index_dart(
-        &mut store,
-        &DartIndexOptions {
-            repo_root: tmp.path().into(),
-            code_roots: vec!["lib".into(), "test".into()],
-            exclude_globs: vec![],
-            disable_analyzer: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        result.resolver_used, RESOLVER_DART_ANALYZER,
-        "P7 dead-code golden requires sidecar resolver"
-    );
-    Some(tmp)
+    common::setup_indexed_dart_repo("p7_dead_code_golden", "pixcraft_iap", &["lib", "test"])
 }
 
 fn default_config() -> DeadCodeConfig {

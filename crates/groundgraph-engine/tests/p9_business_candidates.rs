@@ -9,70 +9,17 @@
 //! way: skip when `dart` is unavailable or the sidecar source is
 //! missing.
 
-use std::path::PathBuf;
-
 mod common;
 
 use groundgraph_engine::business_candidates::load_business_candidates;
-use groundgraph_engine::dart_indexer::{index_dart, DartIndexOptions, RESOLVER_DART_ANALYZER};
 use groundgraph_engine::graph::{build_graph_view, GraphOptions, GraphView};
-use groundgraph_engine::init::{init_repository, InitOptions};
-
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tests/fixtures/pixcraft_iap")
-}
-
-fn workspace_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn copy_fixture_into(dst: &std::path::Path) {
-    let src = fixture_path();
-    for entry in walkdir::WalkDir::new(&src) {
-        let entry = entry.unwrap();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&src).unwrap();
-        let target = dst.join(rel);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::copy(entry.path(), &target).unwrap();
-    }
-}
-
-fn dart_available() -> bool {
-    std::process::Command::new("dart")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn sidecar_source_present() -> bool {
-    workspace_dir()
-        .join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart")
-        .exists()
-}
 
 #[test]
 fn p9_fixture_yaml_is_readable_standalone() {
     // The candidates loader must work on the fixture even without the
     // engine — this protects us from silent regressions to the parser
     // (e.g. typo'd keys, broken serde tags).
-    let outcome = load_business_candidates(&fixture_path()).unwrap();
+    let outcome = load_business_candidates(&common::fixture_dir("pixcraft_iap")).unwrap();
     assert!(
         outcome.warnings.is_empty(),
         "fixture candidate file must parse cleanly, warnings = {:?}",
@@ -97,7 +44,7 @@ fn p9_fixture_yaml_is_readable_standalone() {
 
 #[test]
 fn p9_every_candidate_carries_evidence_and_open_questions() {
-    let outcome = load_business_candidates(&fixture_path()).unwrap();
+    let outcome = load_business_candidates(&common::fixture_dir("pixcraft_iap")).unwrap();
     for c in &outcome.document.candidates {
         assert!(
             !c.evidence.is_empty(),
@@ -111,7 +58,7 @@ fn p9_every_candidate_carries_evidence_and_open_questions() {
         );
         let confidence = c.confidence.unwrap();
         assert!(
-            (0.0..=1.0).contains(&confidence),
+            (0.0..=1.0).contains(&confidence.get()),
             "candidate `{}` confidence {} must be in 0.0..=1.0",
             c.id,
             confidence
@@ -130,39 +77,11 @@ fn p9_every_candidate_carries_evidence_and_open_questions() {
 
 #[test]
 fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
-    if !common::dart_golden_ready(
-        sidecar_source_present() && dart_available(),
-        "p9_business_candidates",
-    ) {
+    let Some(tmp) =
+        common::setup_indexed_dart_repo("p9_business_candidates", "pixcraft_iap", &["lib", "test"])
+    else {
         return;
-    }
-    let sidecar_abs =
-        workspace_dir().join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart");
-    common::enable_dart_sidecar_env(&sidecar_abs);
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    init_repository(InitOptions {
-        repo_root: tmp.path().into(),
-    })
-    .unwrap();
-    copy_fixture_into(tmp.path());
-    let mut store =
-        groundgraph_store::Store::open(tmp.path().join(".groundgraph/graph.db")).unwrap();
-    store.migrate().unwrap();
-    let result = index_dart(
-        &mut store,
-        &DartIndexOptions {
-            repo_root: tmp.path().into(),
-            code_roots: vec!["lib".into(), "test".into()],
-            exclude_globs: vec![],
-            disable_analyzer: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        result.resolver_used, RESOLVER_DART_ANALYZER,
-        "P9 graph test requires the analyzer sidecar"
-    );
+    };
 
     // Default options: candidates are included.
     let view = build_graph_view(
@@ -257,35 +176,11 @@ fn p9_candidates_surface_in_business_view_with_derives_from_edges() {
 
 #[test]
 fn p9_include_candidates_false_hides_business_candidates() {
-    if !common::dart_golden_ready(
-        sidecar_source_present() && dart_available(),
-        "p9_business_candidates",
-    ) {
+    let Some(tmp) =
+        common::setup_indexed_dart_repo("p9_business_candidates", "pixcraft_iap", &["lib", "test"])
+    else {
         return;
-    }
-    let sidecar_abs =
-        workspace_dir().join("tool/groundgraph_dart_analyzer/bin/groundgraph_dart_analyzer.dart");
-    common::enable_dart_sidecar_env(&sidecar_abs);
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    init_repository(InitOptions {
-        repo_root: tmp.path().into(),
-    })
-    .unwrap();
-    copy_fixture_into(tmp.path());
-    let mut store =
-        groundgraph_store::Store::open(tmp.path().join(".groundgraph/graph.db")).unwrap();
-    store.migrate().unwrap();
-    index_dart(
-        &mut store,
-        &DartIndexOptions {
-            repo_root: tmp.path().into(),
-            code_roots: vec!["lib".into(), "test".into()],
-            exclude_globs: vec![],
-            disable_analyzer: false,
-        },
-    )
-    .unwrap();
+    };
 
     let view = build_graph_view(
         tmp.path(),

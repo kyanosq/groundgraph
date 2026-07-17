@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::language_traits::is_code_symbol;
 use groundgraph_core::{ArtifactId, EdgeKind, Node, NodeKind};
 use groundgraph_store::Store;
@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::business_candidates::{
     candidate_artifact_id, load_business_candidates, BUSINESS_CANDIDATES_REL_PATH,
 };
+use crate::error::EngineResult;
 use crate::python_frameworks::FrameworkRole;
 
 pub const QUESTIONS_SCHEMA_VERSION: u32 = 1;
@@ -94,17 +95,16 @@ pub struct Question {
     pub path: Option<String>,
 }
 
-pub fn analyze_questions(options: QuestionsOptions) -> Result<QuestionsReport> {
+pub fn analyze_questions(options: QuestionsOptions) -> EngineResult<QuestionsReport> {
     let db_path = crate::config::storage_path_for_repo(&options.repo_root)?;
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening graph store at {}", db_path.display()))?;
+    let store = Store::open(&db_path)?;
     analyze_questions_with_store(&store, &options)
 }
 
 pub fn analyze_questions_with_store(
     store: &Store,
     options: &QuestionsOptions,
-) -> Result<QuestionsReport> {
+) -> EngineResult<QuestionsReport> {
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
 

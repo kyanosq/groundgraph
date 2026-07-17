@@ -106,6 +106,11 @@ pub enum NodeKind {
     RustTrait,
     RustFunction,
     RustMethod,
+    /// A `macro_rules!` declarative macro definition (issues.md #123).
+    /// Addressable like a function: `macro_rules! foo { … }` emits a node and
+    /// every `foo!()` call site links back to it with a `Calls` edge, so a
+    /// macro that is in use is never a zero-inbound dead-code false positive.
+    RustMacro,
     // ---- P22 C / C++ (tree-sitter, in-process) ----------------------------
     // The breadth backend's second wave. C has no classes/namespaces, so it
     // contributes structs, enums and free functions only. C++ adds
@@ -238,6 +243,7 @@ impl NodeKind {
         NodeKind::RustTrait,
         NodeKind::RustFunction,
         NodeKind::RustMethod,
+        NodeKind::RustMacro,
         NodeKind::CFunction,
         NodeKind::CStruct,
         NodeKind::CEnum,
@@ -473,6 +479,7 @@ impl NodeKind {
             NodeKind::RustTrait => "rust_trait",
             NodeKind::RustFunction => "rust_function",
             NodeKind::RustMethod => "rust_method",
+            NodeKind::RustMacro => "rust_macro",
             NodeKind::CFunction => "c_function",
             NodeKind::CStruct => "c_struct",
             NodeKind::CEnum => "c_enum",
@@ -523,9 +530,7 @@ pub struct Node {
     pub content_hash: Option<String>,
     pub stable_key: Option<String>,
     pub source_file: Option<String>,
-    pub source_hash: Option<String>,
     pub indexer: Option<String>,
-    pub index_generation: Option<i64>,
     pub metadata_json: Option<String>,
 }
 
@@ -541,17 +546,63 @@ impl Node {
             content_hash: None,
             stable_key: None,
             source_file: None,
-            source_hash: None,
             indexer: None,
-            index_generation: None,
             metadata_json: None,
         }
     }
+
+    /// Check the invariants the all-`pub` fields cannot express by type
+    /// (#168). The store enforces this at the write boundary so an illegal
+    /// row can never enter the graph.
+    ///
+    /// Currently: when both `start_line` and `end_line` are set, they must
+    /// satisfy `start <= end` (a single `Some` side is a legitimate
+    /// partial range).
+    pub fn validate(&self) -> Result<(), LineRangeError> {
+        if let (Some(start), Some(end)) = (self.start_line, self.end_line) {
+            if start > end {
+                return Err(LineRangeError { start, end });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`Node::validate`] failure: an inverted line range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("start_line {start} is greater than end_line {end}")]
+pub struct LineRangeError {
+    pub start: u32,
+    pub end: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_rejects_inverted_line_range() {
+        // #168: `start_line > end_line` is an illegal state the all-pub
+        // fields previously allowed anyone to construct.
+        let mut node = Node::new(ArtifactId::new("rust::a.rs::f"), NodeKind::RustFunction);
+        node.start_line = Some(10);
+        node.end_line = Some(5);
+        assert_eq!(node.validate(), Err(LineRangeError { start: 10, end: 5 }));
+    }
+
+    #[test]
+    fn validate_accepts_absent_and_ordered_line_ranges() {
+        let mut node = Node::new(ArtifactId::new("rust::a.rs::f"), NodeKind::RustFunction);
+        assert_eq!(node.validate(), Ok(()));
+        node.start_line = Some(10);
+        assert_eq!(node.validate(), Ok(()), "start without end is fine");
+        node.end_line = Some(10);
+        assert_eq!(node.validate(), Ok(()), "inclusive single-line range");
+        node.end_line = Some(42);
+        assert_eq!(node.validate(), Ok(()));
+        node.start_line = None;
+        assert_eq!(node.validate(), Ok(()), "end without start is fine");
+    }
 
     #[test]
     fn node_kind_str_round_trip() {
@@ -594,6 +645,7 @@ mod tests {
             (NodeKind::RustTrait, "rust_trait"),
             (NodeKind::RustFunction, "rust_function"),
             (NodeKind::RustMethod, "rust_method"),
+            (NodeKind::RustMacro, "rust_macro"),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected);

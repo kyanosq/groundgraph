@@ -32,8 +32,9 @@ use groundgraph_core::edge::EdgeKind;
 use groundgraph_core::language_batch::{ReferenceEdge, SymbolRange};
 use groundgraph_core::{EdgeAssertion, EdgeSource};
 use groundgraph_store::Store;
-use protobuf::Message;
-use scip::types::{Index, Occurrence};
+use prost::Message;
+
+use crate::scip_proto::{Index, Occurrence};
 
 /// Resolver tag stamped on every overlay edge. The ingest path copies it into
 /// the edge's `indexer` column, so SCIP edges are filterable and rank above
@@ -48,7 +49,7 @@ const ROLE_DEFINITION: i32 = 0x1;
 
 /// Parse a SCIP index from protobuf bytes (the contents of an `index.scip`).
 pub fn parse_index(bytes: &[u8]) -> Result<Index> {
-    Index::parse_from_bytes(bytes).context("parsing SCIP index protobuf")
+    Index::decode(bytes).context("parsing SCIP index protobuf")
 }
 
 /// Bind every cross-symbol SCIP occurrence to the tree-sitter symbol ranges
@@ -382,10 +383,10 @@ fn evidence_json(lines: &[u32], resolver: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scip_proto::{Document, Metadata, Occurrence};
     use groundgraph_core::artifact_id::ArtifactId;
     use groundgraph_core::edge::EdgeKind;
     use groundgraph_core::NodeKind;
-    use scip::types::{Document, Metadata, Occurrence};
 
     fn range(file: &str, id: &str, start: u32, end: u32, kind: NodeKind) -> SymbolRange {
         SymbolRange {
@@ -571,7 +572,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let bytes = index.write_to_bytes().expect("serialize SCIP index");
+        let bytes = index.encode_to_vec();
         let back = parse_index(&bytes).expect("parse SCIP index");
         assert_eq!(back.documents.len(), 1);
         assert_eq!(back.documents[0].relative_path, "a.rs");
@@ -629,8 +630,7 @@ mod tests {
         };
         let scip_dir = repo.join(".groundgraph").join("scip");
         std::fs::create_dir_all(&scip_dir).expect("mkdir scip");
-        std::fs::write(scip_dir.join("index.scip"), index.write_to_bytes().unwrap())
-            .expect("write scip");
+        std::fs::write(scip_dir.join("index.scip"), index.encode_to_vec()).expect("write scip");
 
         let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
         assert_eq!(
@@ -706,10 +706,12 @@ mod tests {
         // scip-go run in `asc-cli/`: project_root is the module dir and the
         // document paths are module-relative (`b.go`, not `asc-cli/b.go`).
         const RUN: &str = "scip-go gomod demo 0.1.0 demo/Svc#run().";
-        let mut metadata = Metadata::new();
-        metadata.project_root = format!("file://{}", repo.join("asc-cli").to_string_lossy());
+        let metadata = Metadata {
+            project_root: format!("file://{}", repo.join("asc-cli").to_string_lossy()),
+            ..Default::default()
+        };
         let index = Index {
-            metadata: protobuf::MessageField::some(metadata),
+            metadata: Some(metadata),
             documents: vec![
                 Document {
                     relative_path: "b.go".into(),
@@ -726,8 +728,7 @@ mod tests {
         };
         let scip_dir = repo.join(".groundgraph").join("scip");
         std::fs::create_dir_all(&scip_dir).expect("mkdir scip");
-        std::fs::write(scip_dir.join("go.scip"), index.write_to_bytes().unwrap())
-            .expect("write scip");
+        std::fs::write(scip_dir.join("go.scip"), index.encode_to_vec()).expect("write scip");
 
         let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
         assert_eq!(
@@ -819,8 +820,7 @@ mod tests {
         };
         let scip_dir = repo.join(".groundgraph").join("scip");
         std::fs::create_dir_all(&scip_dir).expect("mkdir scip");
-        std::fs::write(scip_dir.join("index.scip"), index.write_to_bytes().unwrap())
-            .expect("write scip");
+        std::fs::write(scip_dir.join("index.scip"), index.encode_to_vec()).expect("write scip");
 
         let res = ingest_scip_overlay(&mut store, repo).expect("ingest");
         assert_eq!(res.edges, 1, "one SCIP Calls edge overlaid");

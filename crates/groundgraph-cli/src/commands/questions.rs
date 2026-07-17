@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use groundgraph_engine::questions::{analyze_questions, QuestionsOptions, QuestionsReport};
 
+use super::output::TextJsonFormat;
+
 #[derive(Debug, Clone)]
 pub struct QuestionsRunArgs {
     pub repo_root: PathBuf,
     pub max_per_category: usize,
-    pub format: String,
+    pub format: TextJsonFormat,
 }
 
 pub fn run(args: QuestionsRunArgs) -> Result<()> {
@@ -18,13 +20,12 @@ pub fn run(args: QuestionsRunArgs) -> Result<()> {
         max_per_category: args.max_per_category,
     })
     .context("computing clarification questions")?;
-    match args.format.as_str() {
-        "json" => println!(
+    match args.format {
+        TextJsonFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialising questions report")?
         ),
-        "text" | "" => print_text(&report),
-        other => anyhow::bail!("unsupported --format `{other}` (expected text|json)"),
+        TextJsonFormat::Text => print_text(&report),
     }
     Ok(())
 }

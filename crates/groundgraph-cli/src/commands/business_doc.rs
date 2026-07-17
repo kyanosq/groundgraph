@@ -40,7 +40,7 @@ pub fn run(args: BusinessDocRunArgs) -> Result<()> {
     .context("building business document")?;
 
     for w in &doc.warnings {
-        eprintln!("groundgraph: 警告：{w}");
+        tracing::warn!("{w}");
     }
 
     let rendered = match args.format {

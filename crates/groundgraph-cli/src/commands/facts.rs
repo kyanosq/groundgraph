@@ -17,6 +17,8 @@ use groundgraph_engine::symbol_facts::{
     analyze_symbol_facts, Purity, SymbolFact, SymbolFactsOptions, SymbolFactsReport,
 };
 
+use crate::exit_code::bail_user;
+
 #[derive(Debug, Clone)]
 pub struct FactsRunArgs {
     pub repo_root: PathBuf,
@@ -40,7 +42,8 @@ pub fn parse_purity(s: &str) -> Result<Purity> {
         "pure" => Ok(Purity::Pure),
         "impure" => Ok(Purity::Impure),
         "unknown" => Ok(Purity::Unknown),
-        other => anyhow::bail!("未知 purity 取值 `{other}`（可选 pure / impure / unknown）"),
+        // exit 2: user input — unknown purity value.
+        other => bail_user!("未知 purity 取值 `{other}`（可选 pure / impure / unknown）"),
     }
 }
 

@@ -25,52 +25,43 @@ use groundgraph_engine::similarity::{
     analyze_similarity, SimilarityCluster, SimilarityMode, SimilarityOptions, SimilarityReport,
 };
 
+use super::output::TextJsonFormat;
+
 #[derive(Debug, Clone)]
 pub struct SimilarRunArgs {
     pub repo_root: PathBuf,
     pub focus_symbol_id: Option<String>,
     pub min_tokens: usize,
     pub min_cluster_size: usize,
-    pub mode: String,
+    pub mode: SimilarityMode,
     pub min_similarity: f32,
     pub shingle_k: usize,
     pub max_pairwise: usize,
-    pub format: String,
+    pub format: TextJsonFormat,
 }
 
 pub fn run(args: SimilarRunArgs) -> Result<()> {
-    let mode = parse_mode(&args.mode)?;
     let report = analyze_similarity(SimilarityOptions {
         repo_root: args.repo_root,
         min_tokens: args.min_tokens,
         min_cluster_size: args.min_cluster_size,
         focus_symbol_id: args.focus_symbol_id,
-        mode,
+        mode: args.mode,
         min_similarity: args.min_similarity,
         shingle_k: args.shingle_k,
         max_pairwise_symbols: args.max_pairwise,
     })
     .context("running similarity analysis")?;
-    match args.format.as_str() {
-        "json" => {
+    match args.format {
+        TextJsonFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).context("serialising similarity report")?
             );
         }
-        "text" | "" => print_text(&report),
-        other => anyhow::bail!("unsupported --format `{other}` (expected text|json)"),
+        TextJsonFormat::Text => print_text(&report),
     }
     Ok(())
-}
-
-fn parse_mode(raw: &str) -> Result<SimilarityMode> {
-    match raw {
-        "exact" => Ok(SimilarityMode::Exact),
-        "near" => Ok(SimilarityMode::Near),
-        "all" | "" => Ok(SimilarityMode::All),
-        other => anyhow::bail!("unsupported --mode `{other}` (expected exact|near|all)"),
-    }
 }
 
 fn print_text(report: &SimilarityReport) {

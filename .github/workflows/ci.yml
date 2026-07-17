@@ -38,9 +38,25 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
+      # The webui viewer assets are include_str!-ed into the CLI crate from a
+      # crate-local copy (so `cargo package -p groundgraph-cli` works without
+      # reaching across the crate boundary). Fail CI when that copy drifts from
+      # the canonical webui/ source — refresh with scripts/sync_webui_assets.sh.
+      - name: Webui assets in sync
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/sync_webui_assets.sh --check
+
       - name: Clippy (deny warnings)
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # issues.md #221: gate that engine/src never accumulates .rs files
+      # without a #[cfg(test)] module. Pure-logic modules should carry their
+      # own unit tests, not lean solely on integration tests. The baseline
+      # only goes down — see scripts/check_unit_test_coverage.sh.
+      - name: Unit-test coverage ratchet
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/check_unit_test_coverage.sh
 
       - name: Rustdoc (deny warnings)
         if: matrix.os == 'ubuntu-latest'

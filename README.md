@@ -47,7 +47,28 @@ Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexe
 
 ## Install
 
-GroundGraph is a Rust workspace. Build from source (a `rust-toolchain.toml` pins the exact toolchain):
+### Precompiled binaries (recommended)
+
+Download a build from [GitHub Releases](https://github.com/kyanosq/groundgraph/releases) — no Rust toolchain required. Every package includes both the `groundgraph` CLI and the `groundgraph-mcp` server.
+
+**macOS / Linux** — extract anywhere and add its `bin/` to `PATH`:
+
+```bash
+curl -L https://github.com/kyanosq/groundgraph/releases/latest/download/groundgraph-<VERSION>-macos-universal.tar.gz | tar -xz
+```
+
+**Windows** (PowerShell):
+
+```powershell
+Invoke-WebRequest https://github.com/kyanosq/groundgraph/releases/latest/download/groundgraph-<VERSION>-windows-x86_64.zip -OutFile groundgraph.zip
+Expand-Archive groundgraph.zip
+```
+
+Replace `<VERSION>` with the release version (e.g. `0.2.0`); on Linux pick `…-linux-x86_64.tar.gz` or `…-linux-aarch64.tar.gz`.
+
+### Build from source
+
+GroundGraph is a Rust workspace (a `rust-toolchain.toml` pins the exact toolchain):
 
 ```bash
 git clone https://github.com/kyanosq/groundgraph.git

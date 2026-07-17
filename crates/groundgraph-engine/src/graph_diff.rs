@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::business_candidates::{
     candidate_artifact_id, load_business_candidates, BusinessCandidate, ReviewStatus,
 };
+use crate::error::EngineResult;
 
 pub const GRAPH_DIFF_SCHEMA_VERSION: u32 = 1;
 
@@ -156,11 +157,9 @@ pub struct DiffCandidateStatusChange {
     pub to_status: String,
 }
 
-pub fn diff_graphs(options: GraphDiffOptions) -> Result<GraphDiff> {
-    let base = Store::open(&options.base_db)
-        .with_context(|| format!("opening base graph at {}", options.base_db.display()))?;
-    let head = Store::open(&options.head_db)
-        .with_context(|| format!("opening head graph at {}", options.head_db.display()))?;
+pub fn diff_graphs(options: GraphDiffOptions) -> EngineResult<GraphDiff> {
+    let base = Store::open(&options.base_db)?;
+    let head = Store::open(&options.head_db)?;
     let mut diff = diff_graphs_with_stores(&base, &head)?;
     if let (Some(base_root), Some(head_root)) = (
         options.base_repo_root.as_ref(),
@@ -171,7 +170,7 @@ pub fn diff_graphs(options: GraphDiffOptions) -> Result<GraphDiff> {
     Ok(diff)
 }
 
-pub fn diff_graphs_with_stores(base: &Store, head: &Store) -> Result<GraphDiff> {
+pub fn diff_graphs_with_stores(base: &Store, head: &Store) -> EngineResult<GraphDiff> {
     let base_nodes = base.list_all_nodes().context("listing base nodes")?;
     let head_nodes = head.list_all_nodes().context("listing head nodes")?;
     let base_edges = base.list_all_edges().context("listing base edges")?;

@@ -18,6 +18,8 @@ use groundgraph_engine::test_selection::{
     select_tests, SelectedTest, TestSelection, TestSelectionOptions,
 };
 
+use super::output::TextJsonFormat;
+
 #[derive(Debug, Clone)]
 pub struct SelectTestsRunArgs {
     pub repo_root: PathBuf,
@@ -25,7 +27,7 @@ pub struct SelectTestsRunArgs {
     pub head_ref: String,
     pub include_dependent: bool,
     pub max_propagation_depth: usize,
-    pub format: String,
+    pub format: TextJsonFormat,
 }
 
 pub fn run(args: SelectTestsRunArgs) -> Result<()> {
@@ -37,15 +39,14 @@ pub fn run(args: SelectTestsRunArgs) -> Result<()> {
         max_propagation_depth: args.max_propagation_depth,
     })
     .context("computing test selection")?;
-    match args.format.as_str() {
-        "json" => {
+    match args.format {
+        TextJsonFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).context("serialising test selection")?
             );
         }
-        "text" | "" => print_text(&report),
-        other => anyhow::bail!("unsupported --format `{other}` (expected text|json)"),
+        TextJsonFormat::Text => print_text(&report),
     }
     Ok(())
 }

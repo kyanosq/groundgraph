@@ -7,13 +7,15 @@ use groundgraph_engine::feature_map::{
     analyze_feature_map, FeatureCluster, FeatureMap, FeatureMapOptions,
 };
 
+use super::output::TextJsonFormat;
+
 #[derive(Debug, Clone)]
 pub struct FeaturesRunArgs {
     pub repo_root: PathBuf,
     pub max_clusters: usize,
     pub max_propagation_depth: usize,
     pub min_cluster_size: usize,
-    pub format: String,
+    pub format: TextJsonFormat,
 }
 
 pub fn run(args: FeaturesRunArgs) -> Result<()> {
@@ -24,13 +26,12 @@ pub fn run(args: FeaturesRunArgs) -> Result<()> {
         min_cluster_size: args.min_cluster_size,
     })
     .context("building feature map")?;
-    match args.format.as_str() {
-        "json" => println!(
+    match args.format {
+        TextJsonFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialising feature map")?
         ),
-        "text" | "" => print_text(&report),
-        other => anyhow::bail!("unsupported --format `{other}` (expected text|json)"),
+        TextJsonFormat::Text => print_text(&report),
     }
     Ok(())
 }

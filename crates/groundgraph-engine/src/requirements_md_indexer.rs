@@ -136,8 +136,8 @@ pub fn index_requirements_md(
             match first_seen.get(&req.id) {
                 Some(first) if first != &rel => {
                     if duplicates.insert(req.id.clone()) {
-                        eprintln!(
-                            "groundgraph: requirement id `{}` is declared in multiple files \
+                        tracing::warn!(
+                            "requirement id `{}` is declared in multiple files \
                              (`{first}` and `{rel}`); the later one overwrites the earlier node",
                             req.id
                         );

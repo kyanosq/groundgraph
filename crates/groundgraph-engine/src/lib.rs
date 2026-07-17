@@ -30,6 +30,7 @@ pub mod data_contract;
 pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
+pub mod error;
 pub mod export;
 pub mod feature_cluster;
 pub mod feature_map;
@@ -58,6 +59,7 @@ pub mod path_class;
 pub mod php_treesitter;
 pub mod port_coverage;
 pub(crate) mod proc;
+pub mod progress;
 pub mod python_frameworks;
 pub mod python_indexer;
 pub mod python_treesitter;
@@ -69,6 +71,7 @@ pub mod rust_indexer;
 pub mod rust_treesitter;
 pub mod schema_indexer;
 pub mod scip_overlay;
+pub mod scip_proto;
 pub mod scip_runner;
 pub mod search;
 pub mod similarity;
@@ -85,6 +88,8 @@ pub mod treesitter;
 pub mod typescript_indexer;
 pub mod typescript_treesitter;
 pub mod watch;
+
+pub use error::{EngineError, EngineResult, ErrorKind};
 
 pub use business_candidates::{
     apply_review, candidate_artifact_id, list_for_review, load_business_candidates,
@@ -152,7 +157,8 @@ pub use impact::{
     ImpactOptions, ImpactReport,
 };
 pub use index::{
-    index_repository, unindexed_present_languages, IndexOptions, IndexResult, TreeSitterLangResult,
+    collect_partial_failures, index_repository, index_repository_with_progress,
+    unindexed_present_languages, IndexOptions, IndexResult, PartialFailure, TreeSitterLangResult,
 };
 pub use init::{init_repository, InitOptions, InitOutcome};
 pub use links_indexer::{index_links, LinksIndexOptions, LinksIndexResult, LINKS_INDEXER_NAME};
@@ -182,7 +188,9 @@ pub use similarity::{
     DEFAULT_MIN_SIMILARITY as SIMILARITY_DEFAULT_MIN_SIMILARITY,
     DEFAULT_SHINGLE_K as SIMILARITY_DEFAULT_SHINGLE_K, SIMILARITY_SCHEMA_VERSION,
 };
-pub use slice::{slice_requirement, FeatureSlice, SliceItem, SliceOptions};
+pub use slice::{
+    slice_from_store, slice_requirement, FeatureSlice, SliceFanoutOptions, SliceItem, SliceOptions,
+};
 pub use symbol_facts::{
     analyze_symbol_facts, analyze_symbol_facts_with_store, BehaviorCounts, FactLine, Purity,
     SymbolFact, SymbolFactsOptions, SymbolFactsReport, SymbolFactsStats,
@@ -220,9 +228,10 @@ pub use typescript_indexer::{
 /// SQLite [`groundgraph_store::Store`] for advanced read-only integrations.
 pub mod prelude {
     pub use groundgraph_core::{
-        AdapterDiagnostic, ArtifactId, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource,
-        EdgeStatus, Evidence, EvidenceKind, FileArtifact, ImportEdge, Language, LanguageIndexBatch,
-        Node, NodeKind, ReferenceEdge, SymbolArtifact, SymbolFamily, SymbolRange, TestArtifact,
+        AdapterDiagnostic, ArtifactId, Confidence, EdgeAssertion, EdgeCertainty, EdgeKind,
+        EdgeSource, EdgeStatus, Evidence, EvidenceKind, FileArtifact, ImportEdge, Language,
+        LanguageIndexBatch, Node, NodeKind, ReferenceEdge, SymbolArtifact, SymbolFamily,
+        SymbolRange, TestArtifact,
     };
     pub use groundgraph_store::{Store, StoreError, StoreResult};
 
@@ -236,14 +245,14 @@ pub mod prelude {
         CheckSeverity, CodeSnippet, ConstantEntry, ConstantsOptions, ConstantsReport,
         ContextOptions, ContextPack, DataContractOptions, DataContractReport, DeadCodeCandidate,
         DeadCodeConfidence, DeadCodeOptions, DeadCodeReport, DocSnippet, EdgeSummary, EngineConfig,
-        FeatureCluster, FeatureMap, FeatureMapOptions, FeaturePack, FeaturePackOptions,
-        FeaturePackSelector, FeatureSlice, ImpactOptions, ImpactReport, IndexOptions, IndexResult,
-        InitOptions, InitOutcome, LogicConfidenceOptions, LogicConfidenceReport,
-        PortCoverageOptions, PortCoverageReport, Question, QuestionsOptions, QuestionsReport,
-        SearchEdge, SearchMatch, SearchNode, SearchOptions, SearchQuery, SearchResult,
-        SearchSubgraph, SelectedTest, SimilarityCluster, SimilarityMode, SimilarityOptions,
-        SimilarityReport, SliceItem, SliceOptions, SymbolFact, SymbolFactsOptions,
-        SymbolFactsReport, TestSelection, TestSelectionOptions, TestSuggestionsOptions,
-        TestSuggestionsReport, TreeSitterLangResult,
+        EngineError, EngineResult, ErrorKind, FeatureCluster, FeatureMap, FeatureMapOptions,
+        FeaturePack, FeaturePackOptions, FeaturePackSelector, FeatureSlice, ImpactOptions,
+        ImpactReport, IndexOptions, IndexResult, InitOptions, InitOutcome, LogicConfidenceOptions,
+        LogicConfidenceReport, PortCoverageOptions, PortCoverageReport, Question, QuestionsOptions,
+        QuestionsReport, SearchEdge, SearchMatch, SearchNode, SearchOptions, SearchQuery,
+        SearchResult, SearchSubgraph, SelectedTest, SimilarityCluster, SimilarityMode,
+        SimilarityOptions, SimilarityReport, SliceItem, SliceOptions, SymbolFact,
+        SymbolFactsOptions, SymbolFactsReport, TestSelection, TestSelectionOptions,
+        TestSuggestionsOptions, TestSuggestionsReport, TreeSitterLangResult,
     };
 }

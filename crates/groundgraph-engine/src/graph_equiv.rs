@@ -21,6 +21,7 @@ use groundgraph_core::{Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineResult;
 use crate::path_class::{is_generated_path, is_test_path};
 use crate::schema_indexer::{normalize_column, DbTableMeta};
 
@@ -163,12 +164,10 @@ impl Default for GraphEquivOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_graph_equiv(options: GraphEquivOptions) -> Result<GraphEquivReport> {
-    let source = Store::open(&options.source_db)
-        .with_context(|| format!("opening source graph at {}", options.source_db.display()))?;
-    let target = Store::open(&options.target_db)
-        .with_context(|| format!("opening target graph at {}", options.target_db.display()))?;
-    analyze_graph_equiv_with_stores(&source, &target, &options)
+pub fn analyze_graph_equiv(options: GraphEquivOptions) -> EngineResult<GraphEquivReport> {
+    let source = Store::open(&options.source_db)?;
+    let target = Store::open(&options.target_db)?;
+    Ok(analyze_graph_equiv_with_stores(&source, &target, &options)?)
 }
 
 pub fn analyze_graph_equiv_with_stores(

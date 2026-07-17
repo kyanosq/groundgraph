@@ -118,41 +118,21 @@ pub fn try_run(
         };
     }
     let probes = probe_locations(repo_root);
-    let mut cmd = match resolve_command_with(repo_root, &probes) {
-        Some(cmd) => cmd,
-        None => {
-            let tried = probes
-                .iter()
-                .map(|p| format!("    - {}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return SidecarOutcome::Skipped {
-                reason: format!(
-                    "could not locate sidecar — high-precision Dart analyzer is OFF. \
-                     Set {ENV_BIN}=/path/to/groundgraph_dart_analyzer.dart, or place the \
-                     sidecar source at one of:\n{tried}"
-                ),
-            };
-        }
-    };
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // #68: own process group so a timeout kill also reaps the analyzer
-    // subprocesses `dart run` forks (analysis_server, build tools).
-    crate::proc::detach_process_group(&mut cmd);
+    if resolve_command_with(repo_root, &probes).is_none() {
+        let tried = probes
+            .iter()
+            .map(|p| format!("    - {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return SidecarOutcome::Skipped {
+            reason: format!(
+                "could not locate sidecar — high-precision Dart analyzer is OFF. \
+                 Set {ENV_BIN}=/path/to/groundgraph_dart_analyzer.dart, or place the \
+                 sidecar source at one of:\n{tried}"
+            ),
+        };
+    }
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return SidecarOutcome::Skipped {
-                reason: format!("spawn failed: {e}"),
-            };
-        }
-    };
-
-    // Write the JSON request to stdin in a scoped block so the pipe is
-    // closed before we wait_with_output.
     let request_body = match write_request(repo_root, code_roots, exclude_globs) {
         Ok(json) => json,
         Err(e) => {
@@ -161,84 +141,151 @@ pub fn try_run(
             };
         }
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(e) = stdin.write_all(request_body.as_bytes()) {
-            return SidecarOutcome::Skipped {
-                reason: format!("write stdin: {e}"),
-            };
-        }
-    }
-    drop(child.stdin.take());
 
-    // Reader threads keep both pipes drained (a full pipe would deadlock
-    // the child) while the main thread enforces a wall-clock budget — a
-    // hung analyzer must not hang `groundgraph index` forever
-    // (issues2.md #48).
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            use std::io::Read;
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            use std::io::Read;
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
+    // #217: ride a one-off sidecar flake (`dart run`'s cold first start, an
+    // analyzer crash, a transient spawn io error) through a bounded retry
+    // before downgrading to Skipped. The whole spawn→stdin→wait→collect cycle
+    // is one attempt; only transient failures (a non-zero exit, or an io
+    // error that is neither NotFound nor TimedOut) retry.
+    let policy = crate::proc::subprocess_retry_policy();
+    let mut attempts = 0u32;
+    let attempt = || -> Result<Vec<u8>, crate::proc::SubprocessFailure> {
+        attempts += 1;
+        // `std::process::Command` is not `Clone`, so each attempt re-resolves
+        // it. We verified the sidecar is locable above; a None here (the
+        // source vanished between attempts) is surfaced as a deterministic
+        // NotFound so the driver does not loop on a missing binary.
+        let mut cmd = match resolve_command_with(repo_root, &probes) {
+            Some(cmd) => cmd,
+            None => {
+                return Err(crate::proc::SubprocessFailure::Spawn(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                )))
+            }
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // #68: own process group so a timeout kill also reaps the analyzer
+        // subprocesses `dart run` forks (analysis_server, build tools).
+        crate::proc::detach_process_group(&mut cmd);
 
-    let budget = sidecar_timeout();
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if started.elapsed() > budget {
-                    // #68/#77: take the whole group down (reaping forked
-                    // analyzer subprocesses) and bound the reap.
-                    crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Err(crate::proc::SubprocessFailure::Spawn(e)),
+        };
+
+        // Write the JSON request to stdin in a scoped block so the pipe is
+        // closed before we wait.
+        if let Some(stdin) = child.stdin.as_mut() {
+            if let Err(e) = stdin.write_all(request_body.as_bytes()) {
+                // Broken pipe = the sidecar died before reading the request.
+                // Reap it so it can't linger, then surface as a transient io
+                // error for the driver to retry.
+                crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
+                return Err(crate::proc::SubprocessFailure::Spawn(e));
+            }
+        }
+        drop(child.stdin.take());
+
+        // Reader threads keep both pipes drained (a full pipe would deadlock
+        // the child) while the main thread enforces a wall-clock budget — a
+        // hung analyzer must not hang `groundgraph index` forever
+        // (issues2.md #48).
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_thread = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_thread = std::thread::spawn(move || -> Vec<u8> {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let budget = sidecar_timeout();
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if started.elapsed() > budget {
+                        // #68/#77: take the whole group down (reaping forked
+                        // analyzer subprocesses) and bound the reap.
+                        crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        // TimedOut is treated as deterministic by the driver
+                        // (the sidecar already burned its whole budget), so it
+                        // is not retried — see proc::is_transient_failure.
+                        return Err(crate::proc::SubprocessFailure::Spawn(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("sidecar exceeded the {}s budget", budget.as_secs()),
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
                     let _ = stdout_thread.join();
                     let _ = stderr_thread.join();
-                    return SidecarOutcome::Skipped {
-                        reason: format!(
-                            "sidecar exceeded the {}s budget and was killed \
-                             (override with {ENV_TIMEOUT_SECS})",
-                            budget.as_secs()
-                        ),
-                    };
+                    return Err(crate::proc::SubprocessFailure::Spawn(e));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(e) => {
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return SidecarOutcome::Skipped {
-                    reason: format!("wait sidecar: {e}"),
-                };
+        };
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let stderr = stderr_thread.join().unwrap_or_default();
+        if !status.success() {
+            return Err(crate::proc::SubprocessFailure::Exited {
+                code: status.code(),
+                stderr,
+            });
+        }
+        Ok(stdout)
+    };
+
+    match crate::proc::retry_transient_subprocess(policy, attempt) {
+        Ok(stdout) => parse_response(&stdout),
+        Err(crate::proc::SubprocessFailure::Spawn(e))
+            if e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            SidecarOutcome::Skipped {
+                reason: format!(
+                    "sidecar exceeded the budget and was killed (override with {ENV_TIMEOUT_SECS})"
+                ),
             }
         }
-    };
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    if !status.success() {
-        return SidecarOutcome::Skipped {
-            reason: format!(
-                "sidecar exited with {:?} stderr={}",
-                status.code(),
+        Err(crate::proc::SubprocessFailure::Spawn(e)) => {
+            let mut reason = format!("spawn/wait sidecar: {e}");
+            let retries = attempts.saturating_sub(1);
+            if retries > 0 {
+                reason.push_str(&format!("（已重试 {retries} 次后仍失败）"));
+            }
+            SidecarOutcome::Skipped { reason }
+        }
+        Err(crate::proc::SubprocessFailure::Exited { code, stderr }) => {
+            let mut reason = format!(
+                "sidecar exited code={:?} stderr={}",
+                code,
                 String::from_utf8_lossy(&stderr)
                     .chars()
                     .take(200)
                     .collect::<String>()
-            ),
-        };
+            );
+            let retries = attempts.saturating_sub(1);
+            if retries > 0 {
+                reason.push_str(&format!("（已重试 {retries} 次后仍失败）"));
+            }
+            SidecarOutcome::Skipped { reason }
+        }
     }
-    parse_response(&stdout)
 }
 
 /// Wall-clock budget for one sidecar run. Large Flutter repos legitimately

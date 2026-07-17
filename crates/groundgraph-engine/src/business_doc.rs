@@ -29,13 +29,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use groundgraph_core::{Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
 use crate::business_candidates::{load_business_candidates, BusinessCandidate, ReviewStatus};
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 
 pub const BUSINESS_DOC_SCHEMA_VERSION: u32 = 1;
 
@@ -119,12 +120,11 @@ pub struct DocEvidence {
 
 /// Open the store + candidates file from the repo root and assemble the
 /// document.
-pub fn build_business_doc(options: BusinessDocOptions) -> Result<BusinessDoc> {
+pub fn build_business_doc(options: BusinessDocOptions) -> EngineResult<BusinessDoc> {
     let loaded = load_business_candidates(&options.repo_root)?;
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let nodes_by_id: HashMap<String, &Node> = nodes.iter().map(|n| (n.id.to_string(), n)).collect();
     let mut doc = assemble_doc(
@@ -191,7 +191,7 @@ fn assemble_doc(
             name: c.name.clone(),
             description: c.description.trim().to_string(),
             status: status.key().to_string(),
-            confidence: c.confidence,
+            confidence: c.confidence.map(|v| v.get()),
             recommendation: c.recommendation.clone(),
             reviewer: review.and_then(|r| r.reviewer.clone()),
             reviewed_at: review.and_then(|r| r.reviewed_at.clone()),
@@ -315,12 +315,8 @@ fn doc_evidence(node: &Node) -> DocEvidence {
     }
 }
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]
@@ -339,9 +335,7 @@ mod tests {
             content_hash: None,
             stable_key: None,
             source_file: Some(path.to_string()),
-            source_hash: None,
             indexer: Some("test".into()),
-            index_generation: None,
             metadata_json: None,
         }
     }
@@ -352,7 +346,7 @@ mod tests {
             name: name.to_string(),
             description: format!("{name} 的业务描述。"),
             evidence: evidence.iter().map(|s| s.to_string()).collect(),
-            confidence: Some(0.8),
+            confidence: Some(groundgraph_core::Confidence::new(0.8)),
             status: status.to_string(),
             ..Default::default()
         }

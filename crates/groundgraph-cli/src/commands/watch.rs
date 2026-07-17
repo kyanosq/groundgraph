@@ -19,7 +19,7 @@ pub struct WatchRunArgs {
 pub fn run(repo_root: &Path, args: WatchRunArgs) -> Result<()> {
     if args.initial_index {
         println!("Initial index:");
-        index::run(repo_root, args.docs_only)?;
+        index::run(repo_root, args.docs_only, false)?;
     }
 
     let mut snapshot = collect_watch_snapshot(repo_root)?;
@@ -49,7 +49,7 @@ pub fn run(repo_root: &Path, args: WatchRunArgs) -> Result<()> {
             args.debounce.as_millis()
         );
         thread::sleep(args.debounce);
-        index::run(repo_root, args.docs_only)?;
+        index::run(repo_root, args.docs_only, false)?;
         snapshot = collect_watch_snapshot(repo_root)?;
     }
 }

@@ -22,7 +22,8 @@ use groundgraph_core::{ArtifactId, EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
-use crate::config::EngineConfig;
+use crate::config::{resolve_storage_path, EngineConfig};
+use crate::error::EngineResult;
 use crate::links_indexer::{
     strict_resolve_doc, strict_resolve_implementation, strict_resolve_test,
 };
@@ -160,11 +161,10 @@ pub struct RejectedCandidate {
 // propose_evidence
 // ---------------------------------------------------------------------------
 
-pub fn propose_evidence(repo_root: &Path) -> Result<EvidencePack> {
+pub fn propose_evidence(repo_root: &Path) -> EngineResult<EvidencePack> {
     let config = load_config(repo_root)?;
-    let db_path = resolve_storage_path(repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(repo_root, &config)?;
+    let store = Store::open(&db_path)?;
 
     let requirements = collect_requirements(&store)?;
     let orphan_doc_sections = collect_orphan_doc_sections(&store)?;
@@ -183,20 +183,40 @@ pub fn propose_evidence(repo_root: &Path) -> Result<EvidencePack> {
 }
 
 fn collect_requirements(store: &Store) -> Result<Vec<EvidenceRequirement>> {
+    // Collapse the per-requirement `list_edges_to` N+1 (issues.md #158) into
+    // a single `list_edges_by_kinds` query, bucketed in memory by `to_id`.
+    // Only the three evidence kinds are fetched, and `list_edges_by_kinds`
+    // returns rows ordered by id — the same order the per-requirement scan
+    // produced — so each bucket's sort + dedup is byte-identical to before.
+    let evidence_kinds = [
+        EdgeKind::Documents,
+        EdgeKind::DeclaresImplementation,
+        EdgeKind::DeclaresVerification,
+    ];
+    let mut by_req: BTreeMap<ArtifactId, Vec<(EdgeKind, ArtifactId)>> = BTreeMap::new();
+    for edge in store.list_edges_by_kinds(&evidence_kinds)? {
+        by_req
+            .entry(edge.to_id.clone())
+            .or_default()
+            .push((edge.kind, edge.from_id.clone()));
+    }
+
     let mut out = Vec::new();
     for req in store.list_nodes_by_kind(NodeKind::Requirement)? {
         let mut linked_docs = Vec::new();
         let mut linked_impls = Vec::new();
         let mut linked_tests = Vec::new();
-        for edge in store.list_edges_to(&req.id)? {
-            let Some(spec) = node_spec_for_edge(store, &edge.from_id)? else {
-                continue;
-            };
-            match edge.kind {
-                EdgeKind::Documents => linked_docs.push(spec),
-                EdgeKind::DeclaresImplementation => linked_impls.push(spec),
-                EdgeKind::DeclaresVerification => linked_tests.push(spec),
-                _ => {}
+        if let Some(edges) = by_req.get(&req.id) {
+            for (kind, from_id) in edges {
+                let Some(spec) = node_spec_for_edge(store, from_id)? else {
+                    continue;
+                };
+                match kind {
+                    EdgeKind::Documents => linked_docs.push(spec),
+                    EdgeKind::DeclaresImplementation => linked_impls.push(spec),
+                    EdgeKind::DeclaresVerification => linked_tests.push(spec),
+                    _ => {}
+                }
             }
         }
         linked_docs.sort();
@@ -362,15 +382,14 @@ fn confine_manifest_path(repo_root: &Path, links_path: &str) -> Result<PathBuf> 
     Ok(repo_root.join(rel))
 }
 
-pub fn apply_candidates(options: ApplyOptions) -> Result<ApplyOutcome> {
+pub fn apply_candidates(options: ApplyOptions) -> EngineResult<ApplyOutcome> {
     let config = load_config(&options.repo_root)?;
-    let db_path = resolve_storage_path(&options.repo_root, &config);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening SQLite database at {}", db_path.display()))?;
+    let db_path = resolve_storage_path(&options.repo_root, &config)?;
+    let store = Store::open(&db_path)?;
 
     let raw = std::fs::read_to_string(&options.candidates_path)
         .with_context(|| format!("reading candidates {}", options.candidates_path.display()))?;
-    let doc: CandidatesDocument = serde_yml::from_str(&raw).with_context(|| {
+    let doc: CandidatesDocument = serde_norway::from_str(&raw).with_context(|| {
         format!(
             "parsing candidates file {}",
             options.candidates_path.display()
@@ -512,7 +531,7 @@ fn load_existing_manifest(path: &Path) -> Result<BTreeMap<String, WriteRequireme
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading existing manifest {}", path.display()))?;
-    let parsed: WriteManifest = serde_yml::from_str(&raw)
+    let parsed: WriteManifest = serde_norway::from_str(&raw)
         .with_context(|| format!("parsing existing manifest {}", path.display()))?;
     Ok(parsed.requirements)
 }
@@ -525,7 +544,7 @@ fn write_manifest(path: &Path, manifest: &BTreeMap<String, WriteRequirement>) ->
     let doc = WriteManifest {
         requirements: manifest.clone(),
     };
-    let yaml = serde_yml::to_string(&doc)
+    let yaml = serde_norway::to_string(&doc)
         .with_context(|| format!("serialising manifest {}", path.display()))?;
     crate::atomic_write::write_atomic(path, &yaml)
         .with_context(|| format!("writing manifest {}", path.display()))?;
@@ -544,12 +563,8 @@ fn merge_unique(dst: &mut Vec<String>, src: &[String]) {
 // Config helpers (duplicated locally to keep connect.rs self-contained)
 // ---------------------------------------------------------------------------
 
-fn load_config(repo_root: &Path) -> Result<EngineConfig> {
+fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
     crate::config::load_config(repo_root)
-}
-
-fn resolve_storage_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
-    crate::config::resolve_storage_path(repo_root, config)
 }
 
 #[cfg(test)]
@@ -569,5 +584,89 @@ mod tests {
         // `..` escape → refused, even though it stays "relative".
         assert!(confine_manifest_path(root, "../../etc/passwd").is_err());
         assert!(confine_manifest_path(root, ".groundgraph/../../escape").is_err());
+    }
+
+    use groundgraph_core::{EdgeAssertion, EdgeSource, Node};
+
+    fn empty_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        (store, dir)
+    }
+
+    fn requirement(store: &mut Store, stable_key: &str, name: &str) -> ArtifactId {
+        let aid = ArtifactId::new(format!("req::{stable_key}"));
+        let mut node = Node::new(aid.clone(), NodeKind::Requirement);
+        node.stable_key = Some(stable_key.to_string());
+        node.name = Some(name.to_string());
+        store.upsert_node(&node).unwrap();
+        aid
+    }
+
+    /// Insert a node whose `node_spec_for_edge` serialises to `{path}#{name}`.
+    fn evidence_symbol(store: &mut Store, id: &str, path: &str, name: &str) -> ArtifactId {
+        let aid = ArtifactId::new(id.to_string());
+        let mut node = Node::new(aid.clone(), NodeKind::DocSection);
+        node.path = Some(path.to_string());
+        node.name = Some(name.to_string());
+        store.upsert_node(&node).unwrap();
+        aid
+    }
+
+    fn link(store: &mut Store, from: &ArtifactId, to: &ArtifactId, kind: EdgeKind) {
+        let e = EdgeAssertion::fact(from.clone(), to.clone(), kind, EdgeSource::LanguageAdapter);
+        store.upsert_edge(&e).unwrap();
+    }
+
+    /// issues.md #158: pin the per-requirement evidence buckets so the
+    /// N+1 → single-query refactor keeps `linked_docs` / `linked_implementations`
+    /// / `linked_tests` byte-identical, including sort + dedup and the
+    /// exclusion of unrelated edge kinds (e.g. `Calls`).
+    #[test]
+    fn collect_requirements_buckets_three_evidence_kinds_correctly() {
+        let (mut store, _dir) = empty_store();
+        let r1 = requirement(&mut store, "REQ-1", "Login");
+        let _r2 = requirement(&mut store, "REQ-2", "Search");
+
+        let doc = evidence_symbol(&mut store, "doc::auth", "docs/auth.md", "Login");
+        let impl1 = evidence_symbol(&mut store, "py::auth", "src/auth.py", "login");
+        let impl2 = evidence_symbol(&mut store, "ts::auth", "src/auth.ts", "login");
+        let test = evidence_symbol(&mut store, "test::auth", "tests/auth_test.py", "test_login");
+
+        link(&mut store, &doc, &r1, EdgeKind::Documents);
+        link(&mut store, &impl1, &r1, EdgeKind::DeclaresImplementation);
+        link(&mut store, &impl2, &r1, EdgeKind::DeclaresImplementation);
+        link(&mut store, &impl1, &r1, EdgeKind::DeclaresImplementation); // dup → deduped
+        link(&mut store, &test, &r1, EdgeKind::DeclaresVerification);
+        // An unrelated Calls edge on R1 must NOT leak into any bucket.
+        link(&mut store, &impl2, &r1, EdgeKind::Calls);
+
+        let reqs = collect_requirements(&store).unwrap();
+        let r1e = reqs
+            .iter()
+            .find(|r| r.id == "REQ-1")
+            .expect("REQ-1 present");
+        let r2e = reqs
+            .iter()
+            .find(|r| r.id == "REQ-2")
+            .expect("REQ-2 present");
+
+        assert_eq!(r1e.linked_docs, vec!["docs/auth.md#Login"]);
+        assert_eq!(
+            r1e.linked_implementations,
+            vec!["src/auth.py#login", "src/auth.ts#login"]
+        );
+        assert_eq!(r1e.linked_tests, vec!["tests/auth_test.py#test_login"]);
+        assert!(!r1e.missing_docs);
+        assert!(!r1e.missing_implementations);
+        assert!(!r1e.missing_tests);
+
+        assert!(r2e.linked_docs.is_empty());
+        assert!(r2e.linked_implementations.is_empty());
+        assert!(r2e.linked_tests.is_empty());
+        assert!(r2e.missing_docs);
+        assert!(r2e.missing_implementations);
+        assert!(r2e.missing_tests);
     }
 }

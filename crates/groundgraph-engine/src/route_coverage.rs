@@ -30,6 +30,8 @@ use groundgraph_core::{Node, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineResult;
+
 pub const ROUTE_COVERAGE_SCHEMA_VERSION: u32 = 1;
 
 /// Default number of trailing path segments used as the cross-graph match key.
@@ -138,12 +140,12 @@ impl Default for RouteCoverageOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn analyze_route_coverage(options: RouteCoverageOptions) -> Result<RouteCoverageReport> {
-    let source = Store::open(&options.source_db)
-        .with_context(|| format!("opening source graph at {}", options.source_db.display()))?;
-    let target = Store::open(&options.target_db)
-        .with_context(|| format!("opening target graph at {}", options.target_db.display()))?;
-    analyze_route_coverage_with_stores(&source, &target, &options)
+pub fn analyze_route_coverage(options: RouteCoverageOptions) -> EngineResult<RouteCoverageReport> {
+    let source = Store::open(&options.source_db)?;
+    let target = Store::open(&options.target_db)?;
+    Ok(analyze_route_coverage_with_stores(
+        &source, &target, &options,
+    )?)
 }
 
 pub fn analyze_route_coverage_with_stores(

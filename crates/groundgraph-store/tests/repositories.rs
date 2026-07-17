@@ -15,6 +15,59 @@ fn fresh_store() -> (TempDir, Store) {
     (tmp, store)
 }
 
+/// Count the orphan-marker rows across the three tables `sweep_orphans`
+/// reclaims (`evidence` / `symbol_ranges` / `node_fts`) whose referenced id is
+/// the synthetic `"ghost"` that no `nodes` row ever carries. Used by the #137
+/// tests to prove a pass touched — or did not touch — the orphan set.
+fn ghost_orphan_count(store: &Store) -> i64 {
+    let conn = store.connection();
+    let ev: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE artifact_id = 'ghost'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let sr: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM symbol_ranges WHERE symbol_id = 'ghost'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let ft: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM node_fts WHERE node_id = 'ghost'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    ev + sr + ft
+}
+
+/// Seed the three orphan-marker rows (`evidence` / `symbol_ranges` /
+/// `node_fts`) all referencing the synthetic `"ghost"` node id that no `nodes`
+/// row carries. Returns 3 — the count `sweep_orphans` must reclaim.
+fn seed_ghost_orphans(store: &Store) {
+    let conn = store.connection();
+    conn.execute(
+        "INSERT INTO evidence (id, artifact_id, kind) VALUES ('ev-ghost', 'ghost', 'import')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, symbol_kind, \
+         qualified_name) VALUES ('g.dart', 'ghost', 1, 2, 'dart_class', 'G')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO node_fts (node_id, body) VALUES ('ghost', 'ghost body words')",
+        [],
+    )
+    .unwrap();
+}
+
 /// Multi-row VALUES upserts must behave exactly like row-at-a-time upserts:
 /// same rows land, conflicts update in place, and chunking (more rows than
 /// one statement carries) is invisible. This is the ingest hot path — 84k
@@ -516,8 +569,14 @@ fn decode_error_for_edge_kind_when_raw_sql_writes_unknown_value() {
     assert!(err.contains("mystery_kind") || err.contains("unknown edge kind"));
 }
 
+/// #137: `clear_indexer_outputs` deletes only the rows an indexer owns
+/// (`nodes` / `edge_assertions` carry an `indexer` column). It must NOT
+/// re-sweep orphaned `symbol_ranges` / `evidence` / `node_fts` — that
+/// self-healing GC now happens once at the end of ingest via `sweep_orphans`,
+/// so the per-indexer clear is cheap instead of a full-table anti-join run N
+/// times.
 #[test]
-fn clear_indexer_outputs_removes_relevant_rows() {
+fn clear_indexer_outputs_scopes_to_indexers_own_rows_and_leaves_orphans() {
     let (_tmp, mut store) = fresh_store();
     let mut node = Node::new(
         ArtifactId::new("dart_class::a.dart#Foo"),
@@ -535,6 +594,8 @@ fn clear_indexer_outputs_removes_relevant_rows() {
     edge.indexer = Some("dart_lightweight".into());
     store.upsert_edge(&edge).unwrap();
 
+    // `symbol_ranges` has no `indexer` column, so this row is only ever removed
+    // by the orphan sweep (its `symbol_id` references the node just deleted).
     store
         .upsert_symbol_range(&SymbolRange {
             file_path: "a.dart".into(),
@@ -549,6 +610,7 @@ fn clear_indexer_outputs_removes_relevant_rows() {
 
     store.clear_indexer_outputs("dart_lightweight").unwrap();
 
+    // The indexer's own rows are gone.
     assert!(store
         .find_node(&ArtifactId::new("dart_class::a.dart#Foo"))
         .unwrap()
@@ -557,17 +619,35 @@ fn clear_indexer_outputs_removes_relevant_rows() {
         .list_edges_by_kind(EdgeKind::DeclaresImplementation)
         .unwrap()
         .is_empty());
-    assert!(store
-        .list_symbol_ranges_for_file("a.dart")
-        .unwrap()
-        .is_empty());
+    // The now-orphaned symbol range SURVIVES the clear — `clear_indexer_outputs`
+    // no longer sweeps orphans. It is reclaimed by `sweep_orphans` at ingest end.
+    assert_eq!(
+        store.list_symbol_ranges_for_file("a.dart").unwrap().len(),
+        1,
+        "clear must leave orphaned symbol ranges for the end-of-ingest sweep"
+    );
+    let removed = store.sweep_orphans().unwrap();
+    assert!(
+        removed >= 1,
+        "sweep reclaims the orphaned symbol range; got {removed}"
+    );
+    assert!(
+        store
+            .list_symbol_ranges_for_file("a.dart")
+            .unwrap()
+            .is_empty(),
+        "sweep must remove the orphaned symbol range"
+    );
 }
 
 /// Re-indexing clears an indexer's nodes; the fulltext layer must not keep
 /// referencing the deleted ids, or `fulltext_match` returns ghost node ids
-/// that `find_node` can no longer resolve (issues.md #4).
+/// that `find_node` can no longer resolve (issues.md #4). After #137 the
+/// orphan sweep is deferred to `sweep_orphans` at the end of ingest, so a bare
+/// `clear_indexer_outputs` leaves the stale fts row behind and the sweep is
+/// what removes it.
 #[test]
-fn clear_indexer_outputs_also_drops_orphaned_fulltext_rows() {
+fn sweep_orphans_drops_orphaned_fulltext_rows_left_by_clear() {
     let (_tmp, mut store) = fresh_store();
 
     let mut kept = Node::new(
@@ -597,17 +677,143 @@ fn clear_indexer_outputs_also_drops_orphaned_fulltext_rows() {
         ])
         .unwrap();
 
+    // Clear deletes the doomed node but, post-#137, leaves its orphaned fts row.
     store.clear_indexer_outputs("dart_lightweight").unwrap();
+    let hits = store.fulltext_match("\"ghost\"", 10).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "clear no longer sweeps fts; the orphan row survives until sweep_orphans: {hits:?}"
+    );
 
+    // The single end-of-ingest sweep reclaims it.
+    store.sweep_orphans().unwrap();
     let hits = store.fulltext_match("\"ghost\"", 10).unwrap();
     assert!(
         hits.is_empty(),
-        "fulltext must not return ids of deleted nodes: {hits:?}"
+        "sweep must drop orphaned fts rows: {hits:?}"
     );
     // The surviving indexer's content row must be untouched.
     let hits = store.fulltext_match("\"kept\"", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].node_id, "rust::keep.rs#kept");
+}
+
+/// #137: `sweep_orphans` is the single self-healing GC pass. It must remove
+/// every orphaned `evidence` / `symbol_ranges` / `node_fts` row (whose
+/// referenced id no longer exists in `nodes`) in one go, while leaving every
+/// legitimate row that still resolves to a live node untouched.
+#[test]
+fn sweep_orphans_removes_every_orphan_kind_and_keeps_resolving_rows() {
+    let (_tmp, mut store) = fresh_store();
+
+    let mut live = Node::new(ArtifactId::new("rust::live.rs#f"), NodeKind::RustFunction);
+    live.indexer = Some("rust_treesitter".into());
+    store.upsert_node(&live).unwrap();
+
+    // Legit rows that still resolve to the live node — must survive the sweep.
+    {
+        let conn = store.connection();
+        conn.execute(
+            "INSERT INTO evidence (id, artifact_id, kind) \
+             VALUES ('ev-live', 'rust::live.rs#f', 'import')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_ranges (file_path, symbol_id, start_line, end_line, \
+             symbol_kind, qualified_name) \
+             VALUES ('live.rs', 'rust::live.rs#f', 1, 2, 'rust_function', 'f')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_fts (node_id, body) VALUES ('rust::live.rs#f', 'live body words')",
+            [],
+        )
+        .unwrap();
+    }
+    // Orphan rows referencing a node id that does NOT exist.
+    seed_ghost_orphans(&store);
+    assert_eq!(ghost_orphan_count(&store), 3);
+
+    let removed = store.sweep_orphans().unwrap();
+    assert_eq!(removed, 3, "sweep reclaims exactly the 3 orphan rows");
+    assert_eq!(ghost_orphan_count(&store), 0);
+
+    // Resolving rows for the live node are untouched.
+    let conn = store.connection();
+    let live_ev: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM evidence WHERE artifact_id = 'rust::live.rs#f'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let live_sr: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM symbol_ranges WHERE symbol_id = 'rust::live.rs#f'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let live_ft: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM node_fts WHERE node_id = 'rust::live.rs#f'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((live_ev, live_sr, live_ft), (1, 1, 1));
+}
+
+/// #137: an ingest calls `clear_indexer_outputs` once per indexer (≈20× on a
+/// polyglot repo). Before the fix each clear re-scanned the whole `nodes`
+/// table to find orphans — N× full-table anti-joins. Now the clears touch only
+/// their own indexed rows and a single `sweep_orphans` at the end does the
+/// orphan scan. On a 10 000-row `nodes` table this asserts the orphan rows
+/// survive every one of the N clears (zero sweeps inside clears) and are
+/// removed by exactly the one end-of-ingest sweep.
+#[test]
+fn ingest_clears_orphans_once_via_sweep_not_once_per_clear() {
+    let (_tmp, mut store) = fresh_store();
+
+    // 10k nodes spread across 20 indexers — the anti-join target the old code
+    // walked once *per clear*. Chunked so it stays well under SQLite's 32k
+    // bound-variable limit (3 cols × 1000 rows = 3000).
+    const NODES: usize = 10_000;
+    const INDEXERS: usize = 20;
+    {
+        let conn = store.connection();
+        for start in (0..NODES).step_by(1000) {
+            let mut chunk = String::from("INSERT INTO nodes (id, kind, indexer) VALUES ");
+            for i in start..(start + 1000).min(NODES) {
+                if i > start {
+                    chunk.push(',');
+                }
+                chunk.push_str(&format!("('n{i}', 'rust_function', 'ix{}')", i % INDEXERS));
+            }
+            conn.execute_batch(&chunk).unwrap();
+        }
+    }
+    seed_ghost_orphans(&store);
+    assert_eq!(ghost_orphan_count(&store), 3);
+
+    // Simulate `index_repository`'s per-indexer clears. Under the old behaviour
+    // the first clear would already have swept (and dropped) all 3 orphans via
+    // a 10k-row anti-join; here they must all survive every clear.
+    for ix in 0..INDEXERS {
+        store.clear_indexer_outputs(&format!("ix{ix}")).unwrap();
+    }
+    assert_eq!(
+        ghost_orphan_count(&store),
+        3,
+        "clear_indexer_outputs must not sweep orphans — they survive all N clears"
+    );
+
+    // The single end-of-ingest sweep is what reclaims them.
+    let removed = store.sweep_orphans().unwrap();
+    assert_eq!(removed, 3);
+    assert_eq!(ghost_orphan_count(&store), 0);
 }
 
 #[test]

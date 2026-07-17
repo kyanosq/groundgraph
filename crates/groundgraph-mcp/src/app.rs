@@ -95,18 +95,30 @@ pub fn main() -> ExitCode {
 }
 
 fn serve(repo_root_arg: Option<PathBuf>) -> ExitCode {
+    // #127/#230 — install the tracing subscriber. stdout is reserved for
+    // JSON-RPC envelopes, so every event is steered to stderr. Default level
+    // is info so the "ready" / "client connected" lifecycle is visible;
+    // RUST_LOG overrides.
+    use tracing_subscriber::filter::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let repo_root = repo_root_arg
         .or_else(env_repo_root)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    eprintln!(
-        "groundgraph-mcp: ready · protocol=2024-11-05 · repo_root={}",
-        repo_root.display()
+    tracing::info!(
+        repo_root = %repo_root.display(),
+        protocol = "2024-11-05",
+        "groundgraph-mcp ready"
     );
     let server = Server::new(repo_root);
     let mut reader = BufReader::new(stdin().lock());
     let mut writer = BufWriter::new(stdout().lock());
     if let Err(err) = server.pump(&mut reader, &mut writer) {
-        eprintln!("groundgraph-mcp: transport error: {err}");
+        tracing::error!("transport error: {err}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS

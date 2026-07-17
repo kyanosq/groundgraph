@@ -62,7 +62,7 @@ fn fresh_store_with_index() -> (TempDir, Store) {
 fn write_workspace(tmp: &std::path::Path) {
     std::fs::write(
         tmp.join(".groundgraph.yaml"),
-        serde_yml::to_string(&EngineConfig::default()).unwrap(),
+        serde_norway::to_string(&EngineConfig::default()).unwrap(),
     )
     .unwrap();
     std::fs::create_dir_all(tmp.join(".groundgraph")).unwrap();
