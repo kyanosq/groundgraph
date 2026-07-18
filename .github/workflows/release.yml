@@ -200,11 +200,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # merge-multiple flattens all four artifact sets into the workspace; each
-      # artifact preserves its `dist/` prefix, so the files land under ./dist/.
+      # upload-artifact strips the least common ancestor (`dist/`) from each
+      # upload, so the artifacts contain the bare package files. Download them
+      # INTO ./dist to recreate the layout the release step expects.
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+          path: dist
 
       - name: Create GitHub Release
         env:
