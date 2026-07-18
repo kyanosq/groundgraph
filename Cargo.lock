@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-engine"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "criterion",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-lang-dart"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "groundgraph-core",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-mcp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "groundgraph-store"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "groundgraph-core",

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Lightweight Dart language adapter for GroundGraph."
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core", version = "0.3.0" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.3.1" }
 anyhow = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }

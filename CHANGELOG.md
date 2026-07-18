@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1] - 2026-07-18
+
+### 修复
+
+- **子进程超时死锁**（#271，High）：`index` 在子进程超时杀树后不再无条件 join 管道读取线程——逃逸进程组的孙进程（dartdev / analysis_server 类守护进程）持有管道不关，会导致 `groundgraph index` 在 Linux 上永久挂起而非按预算降级。同时修复 `dart_sidecar` 与 `scip_runner` 两处同模式路径。
+- CI：lint-and-test 任务安装 Dart SDK，Dart 金标测试在双平台真实运行（修复 main 自 2026-07-08 起的既有红）。
+
 ## [0.3.0] - 2026-07-18
 
 ### 预编译发布（头条）

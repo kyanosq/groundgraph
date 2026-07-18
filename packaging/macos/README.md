@@ -49,13 +49,13 @@ $env:Path = "$env:LOCALAPPDATA\Programs\groundgraph\groundgraph-<VERSION>-window
 groundgraph --help
 ```
 
-Replace `<VERSION>` with the package version (e.g. `0.3.0`) and `<PLATFORM>`
+Replace `<VERSION>` with the package version (e.g. `0.3.1`) and `<PLATFORM>`
 with `macos-universal` / `linux-x86_64` / `linux-aarch64`.
 
 If you do not want to use `/usr/local`, put the extracted directory anywhere
 and add its `bin` directory to PATH.
 
-## Supported languages (0.3.0)
+## Supported languages (0.3.1)
 
 GroundGraph indexes in two tiers. **Breadth** is always available (the
 tree-sitter grammars are linked into the binary — no external tool, no

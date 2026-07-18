@@ -715,8 +715,7 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
 
             with_env_var(ENV_ENABLE, Some("1"), || {

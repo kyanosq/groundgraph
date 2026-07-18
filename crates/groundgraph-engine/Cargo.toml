@@ -8,9 +8,9 @@ repository.workspace = true
 description = "GroundGraph engine: config, indexing, slice, impact, checks, context, export."
 
 [dependencies]
-groundgraph-core = { path = "../groundgraph-core", version = "0.3.0" }
-groundgraph-store = { path = "../groundgraph-store", version = "0.3.0" }
-groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.3.0" }
+groundgraph-core = { path = "../groundgraph-core", version = "0.3.1" }
+groundgraph-store = { path = "../groundgraph-store", version = "0.3.1" }
+groundgraph-lang-dart = { path = "../groundgraph-lang-dart", version = "0.3.1" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
