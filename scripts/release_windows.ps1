@@ -99,7 +99,10 @@ try {
   $rev = & git -C $Root rev-parse --short HEAD 2>$null
   if ($rev) { $gitRev = $rev.Trim() }
 } catch {}
-$buildTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd''T''HH:mm:ss''Z')
+# .NET custom format literals need matched single quotes; a double-quoted
+# PowerShell string passes them through literally (the '' escape form produced
+# an unmatched trailing quote — FormatException on the runner).
+$buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
 $buildInfo = @"
 name: groundgraph
 version: $Version

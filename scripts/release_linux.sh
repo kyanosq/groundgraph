@@ -70,6 +70,15 @@ fi
 
 read -ra BUILDER_RUN <<<"$BUILDER"
 
+# Native `cargo` builds need the target's std installed; `cross` carries its
+# own toolchain inside the Docker image. Auto-add like the macOS script does
+# (CI's `rustup show` only installs the host target).
+if [ "$BUILDER" = "cargo" ] &&
+  ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
+  echo "==> rustup target add $TARGET"
+  rustup target add "$TARGET"
+fi
+
 echo "==> building $TARGET (groundgraph-cli + groundgraph-mcp) via ${BUILDER_RUN[*]}"
 "${BUILDER_RUN[@]}" build \
   --release --locked --target "$TARGET" \

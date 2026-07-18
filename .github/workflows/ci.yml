@@ -68,15 +68,25 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo package -p groundgraph-core --locked
 
+      # The Dart-sidecar golden tests (engine goldens + the CLI graph tests in
+      # crates/groundgraph-cli/tests/graph.rs) require a real Dart SDK — they
+      # hard-fail rather than soft-skip when the analyzer cannot resolve. Run
+      # them for real on both OSes instead of letting them silently degrade.
+      - name: Install Dart SDK
+        uses: dart-lang/setup-dart@v1
+
+      - name: Resolve sidecar pub dependencies
+        working-directory: tool/groundgraph_dart_analyzer
+        run: dart pub get
+
       # `--locked` makes CI fail if Cargo.lock is stale, pinning the dependency
       # graph for deterministic, reproducible indexing (issues.md #226 / #240).
       - name: Test
         run: cargo test --workspace --locked
 
-      # LSP / Dart-sidecar integration tests are #[ignore] by default and soft
-      # skip when their external binary is absent, so the job stays green on a
-      # clean runner. They can be exercised in a dedicated job that installs the
-      # toolchains, if/when desired.
+      # LSP integration tests remain #[ignore] by default and soft-skip when
+      # their external binary is absent; SCIP/LSP binaries are not installed on
+      # the runners. They can be exercised in a dedicated job if/when desired.
 
   supply-chain:
     # issues.md #102: 167 Rust dependencies had zero supply-chain scanning.

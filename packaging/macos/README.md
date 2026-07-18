@@ -1,16 +1,20 @@
-# GroundGraph macOS Universal Package
+# GroundGraph Precompiled Binary Package
 
-This package contains the closed-source GroundGraph Rust CLI binary for macOS
-Apple Silicon and Intel, plus the Dart analyzer sidecar source that enables
-higher-precision Flutter/Dart indexing.
+This package contains the prebuilt GroundGraph Rust CLI binaries (`groundgraph`
+and `groundgraph-mcp`) for your platform — no Rust toolchain needed — plus the
+Dart analyzer sidecar source that enables higher-precision Flutter/Dart
+indexing. Platform notes: the **macOS** package is a universal binary (Apple
+Silicon + Intel) with `bin/` shell wrappers; the **Linux** package is a static
+musl binary with the same layout; the **Windows** package ships `bin/*.exe`
+directly (no wrappers).
 
 ## Contents
 
 ```text
-bin/groundgraph
-bin/groundgraph-mcp
-libexec/groundgraph
-libexec/groundgraph-mcp
+bin/groundgraph[.exe]
+bin/groundgraph-mcp[.exe]
+libexec/groundgraph          # macOS/Linux only
+libexec/groundgraph-mcp      # macOS/Linux only
 tool/groundgraph_dart_analyzer/
 skills/groundgraph/
 README.md
@@ -18,24 +22,35 @@ README-AI-SKILL.md
 BUILD-INFO.txt
 ```
 
-`bin/groundgraph` and `bin/groundgraph-mcp` are the user-facing wrappers;
-`libexec/groundgraph` and `libexec/groundgraph-mcp` are the universal binaries
-(arm64 + x86_64). The Dart analyzer sidecar is intentionally included as source
-under `tool/groundgraph_dart_analyzer/`. To expose the graph to AI agents over
-MCP, point a stdio MCP client at `bin/groundgraph-mcp` — no separate install
-needed.
+`bin/groundgraph` and `bin/groundgraph-mcp` are the user-facing entry points;
+on macOS/Linux they are thin wrappers over the real binaries in `libexec/`, on
+Windows they are the executables themselves. The Dart analyzer sidecar is
+intentionally included as source under `tool/groundgraph_dart_analyzer/`. To
+expose the graph to AI agents over MCP, point a stdio MCP client at
+`bin/groundgraph-mcp` — no separate install needed.
 
 ## Install
 
+macOS / Linux:
+
 ```bash
-tar -xzf groundgraph-<VERSION>-macos-universal.tar.gz
-sudo cp -R groundgraph-<VERSION>-macos-universal /usr/local/groundgraph
+tar -xzf groundgraph-<VERSION>-<PLATFORM>.tar.gz
+sudo cp -R groundgraph-<VERSION>-<PLATFORM> /usr/local/groundgraph
 sudo ln -sf /usr/local/groundgraph/bin/groundgraph /usr/local/bin/groundgraph
 sudo ln -sf /usr/local/groundgraph/bin/groundgraph-mcp /usr/local/bin/groundgraph-mcp   # optional, for AI agents
 groundgraph --help
 ```
 
-Replace `<VERSION>` with the package version (e.g. `0.3.0`).
+Windows (PowerShell):
+
+```powershell
+Expand-Archive groundgraph-<VERSION>-windows-x86_64.zip -DestinationPath "$env:LOCALAPPDATA\Programs\groundgraph"
+$env:Path = "$env:LOCALAPPDATA\Programs\groundgraph\groundgraph-<VERSION>-windows-x86_64\bin;$env:Path"   # current session; add permanently via System Settings
+groundgraph --help
+```
+
+Replace `<VERSION>` with the package version (e.g. `0.3.0`) and `<PLATFORM>`
+with `macos-universal` / `linux-x86_64` / `linux-aarch64`.
 
 If you do not want to use `/usr/local`, put the extracted directory anywhere
 and add its `bin` directory to PATH.
@@ -166,7 +181,11 @@ GroundGraph does not require annotations in production code, tests, or docs.
 
 ## Uninstall
 
+macOS / Linux:
+
 ```bash
 sudo rm -f /usr/local/bin/groundgraph /usr/local/bin/groundgraph-mcp
 sudo rm -rf /usr/local/groundgraph
 ```
+
+Windows: remove the extracted directory and delete its `bin` entry from PATH.
