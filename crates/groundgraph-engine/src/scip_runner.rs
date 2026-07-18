@@ -780,7 +780,14 @@ fn run_with_capped_stderr_budget(
                 if started.elapsed() > budget {
                     // #68/#77: take the whole group down, bound the reap.
                     crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
-                    let _ = reader.join();
+                    // Same wedge class as the dart sidecar's ubuntu CI hang: a
+                    // group-escaped grandchild (a daemonised scip-java/node
+                    // worker) keeps stderr open, so an unconditional join here
+                    // blocks past the budget. Grace, then walk away.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if reader.is_finished() {
+                        let _ = reader.join();
+                    }
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("indexer exceeded the {}s budget", budget.as_secs()),
@@ -790,7 +797,10 @@ fn run_with_capped_stderr_budget(
             }
             Err(e) => {
                 crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
-                let _ = reader.join();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if reader.is_finished() {
+                    let _ = reader.join();
+                }
                 return Err(e);
             }
         }

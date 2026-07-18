@@ -221,8 +221,20 @@ pub fn try_run(
                         // #68/#77: take the whole group down (reaping forked
                         // analyzer subprocesses) and bound the reap.
                         crate::proc::kill_and_reap(&mut child, std::time::Duration::from_secs(2));
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
+                        // ubuntu CI hang (2026-07-18): a grandchild that escaped
+                        // the process group (re-setsid) keeps the pipes open, so
+                        // an unconditional `join` on the reader threads blocks
+                        // until IT exits — the budget never fires. Give the
+                        // threads a short grace window to drain, then walk away:
+                        // a leaked blocked reader thread on this error path is
+                        // cheap, a wedged indexer is not.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        if stdout_thread.is_finished() {
+                            let _ = stdout_thread.join();
+                        }
+                        if stderr_thread.is_finished() {
+                            let _ = stderr_thread.join();
+                        }
                         // TimedOut is treated as deterministic by the driver
                         // (the sidecar already burned its whole budget), so it
                         // is not retried — see proc::is_transient_failure.
@@ -676,6 +688,58 @@ mod tests {
                     }
                     _ => panic!("expected Skipped, got {outcome:?}"),
                 }
+            });
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_run_timeout_does_not_hang_when_a_grandchild_holds_the_pipes() {
+        // ubuntu CI hang (2026-07-18): `dart run` can leave a grandchild that
+        // escaped the process group (re-setsid) still holding the stdout /
+        // stderr pipes. The timeout branch then blocked **forever** joining
+        // the reader threads after `kill_and_reap` — the 600s budget never
+        // surfaced. This stub forks a group-escaping grandchild (`setsid`)
+        // that inherits the pipes, then sleeps far past the 1s budget: the
+        // call must return a Skipped/timeout outcome in bounded wall time.
+        with_env_lock(|| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let stub = tmp.path().join("stub-sidecar.sh");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\n\
+                 python3 -c 'import os,time; os.setsid(); time.sleep(60)' &\n\
+                 exec sleep 60\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+
+            with_env_var(ENV_ENABLE, Some("1"), || {
+                with_env_var(ENV_BIN, Some(stub.to_str().unwrap()), || {
+                    with_env_var(ENV_TIMEOUT_SECS, Some("1"), || {
+                        let started = std::time::Instant::now();
+                        let outcome = try_run(tmp.path(), &[tmp.path().join("lib")], &[]);
+                        let elapsed = started.elapsed();
+                        assert!(
+                            elapsed < std::time::Duration::from_secs(15),
+                            "timeout path wedged for {elapsed:?} — reader-thread join blocked on a group-escaped grandchild"
+                        );
+                        match outcome {
+                            SidecarOutcome::Skipped { reason } => {
+                                assert!(
+                                    reason.contains("budget") || reason.contains("timed out"),
+                                    "expected a timeout reason, got {reason}"
+                                );
+                            }
+                            _ => panic!("expected Skipped, got {outcome:?}"),
+                        }
+                    });
+                });
             });
         });
     }

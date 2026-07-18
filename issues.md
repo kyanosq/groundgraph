@@ -1936,6 +1936,13 @@
 - **触发场景**：PR 含文件重命名/移动（重构常见）。
 - **建议**：解析 `rename from`/`rename to`（及 `copy from/to`）显式产出旧→新两条信息，状态标 `Renamed`；对含空格路径优先用 `rename to`/`+++` 的整行剩余而非按空格切分。
 
+### 271. 子进程超时杀树后 join 读取线程：组外孙进程持有管道 → 超时分支永久挂起（ubuntu CI 实锤）
+
+> **✅ 已闭环（2026-07-18，TDD）** — 成立（High，生产可触发）。CI 在 ubuntu 装 Dart SDK 后 `cargo test` 挂起 44 分钟（macOS 正常）：`dart_sidecar::try_run` 与 `scip_runner::run_with_capped_stderr` 的超时分支在 `kill_and_reap` 后**无条件 `join()` 读取线程**——读取线程阻塞在管道 `read_to_end`，而逃逸进程组的孙进程（dartdev/analysis_server 这类会重新 setsid 的守护进程）持有管道写端不关，EOF 永不到达，join 卡死、预算机制完全失效。修复：杀树后给 200ms 排水宽限，`is_finished()` 才 join，否则携带错误直接返回（错误路径泄漏一个阻塞读线程，远好于卡死整个 indexer）。TDD 复现测试 `try_run_timeout_does_not_hang_when_a_grandchild_holds_the_pipes`：桩 sidecar fork 一个 `os.setsid()` 孙进程持管，修复前精确卡住 60s（孙进程全程），修复后 1.25s 按预算返回。`scip_runner` 同模式两处（超时 + try_wait 错误分支）一并修。
+
+- **位置**：`crates/groundgraph-engine/src/dart_sidecar.rs`（try_run 超时分支）、`crates/groundgraph-engine/src/scip_runner.rs:780-795`
+- **发现**：v0.3.0 发布后 ubuntu CI（装 Dart SDK 跑 Dart 金标）挂起；与 #68（孙进程孤儿）同源——#68 修了"杀"，本条是"杀完等管道"的下半截。
+
 ---
 
 ## 归档附录（已闭环问题）
