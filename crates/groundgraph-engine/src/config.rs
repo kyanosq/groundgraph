@@ -129,6 +129,9 @@ pub struct EngineConfig {
     /// analyzer overlay.
     #[serde(default)]
     pub enrichment: EnrichmentConfig,
+    /// Optional JDK compiler binding, with an always-retained Java call inventory.
+    #[serde(default)]
+    pub java_semantics: crate::java_semantics::JavaSemanticsConfig,
 }
 
 /// One entry in the unified [`EngineConfig::languages`] list.

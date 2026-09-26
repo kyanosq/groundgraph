@@ -15,7 +15,7 @@ python3 scripts/migration.py prepare \
   --out /path/to/local-work/price-v1
 ```
 
-只读取明确选定的源码文件；XML 必须是 MyBatis mapper。它把源码复制到隔离的本地工作目录后索引，禁用自动外部语义工具，输出：
+只读取明确选定的源码文件；XML 必须是 MyBatis mapper。它把源码复制到隔离的本地工作目录后索引，禁用自动外部语义工具。选定切片没有原项目完整模块可见性，因此只保留 Java 调用清单，不猜测编译上下文；完整 javac 绑定在配置好 source sets 的原项目索引中执行。输出：
 
 - `source/`：选定源码的快照及可重建的图缓存。
 - `feature-pack.json`：源码行号、符号、关系、检查线索和关系的完整 assertion。
@@ -60,8 +60,9 @@ python3 scripts/migration.py check \
 
 ## 精度边界
 
-- Java 实现桥只来自真实 `implements` 声明，按包名和显式/星号导入定位接口，跳过歧义。方法连接仍是名称候选，标记 candidate/proposed，置信度低于 1，并带声明位置；没有解析重载、继承传递、Spring qualifier 或实际运行时绑定。
-- 普通调用关系仍含 tree-sitter 启发式结果，新生成的启发式关系标记 candidate/proposed。旧图必须重新索引，才能更新这些标签。`feature-pack` 和 `trace` 导出原始置信度、来源、证据、状态和 indexer；读取方不得丢弃这些字段后称其为确定调用链。
+- Java 使用带参数签名的身份、逐调用点清单与 javac 编译期绑定；传递继承和多实现保留候选，Feign 按显式服务映射关联。配置及限制见 [Java 结构层](java-semantics.md)。运行时 Bean、反射和缺失私有依赖仍需独立证据。
+- 其他语言普通关系可能含 tree-sitter 启发式结果，标记 candidate/proposed。`feature-pack` 和 `trace` 保留原始置信度、来源、证据、状态和 indexer；不得丢弃这些字段后声称确定调用链。Java 旧 ID/旧快照须重新生成并复核映射。
+- 每个未解析 Java 调用都须在 `call_dispositions` 中明确处置；映射到本地或平台的调用须关联目标文件及独立回归检查。旧 Java 工作包缺少调用清单时阻塞，须重建。
 - 证据行有上限，依赖可能位于选定范围外；未出现的调用不等于不存在。`review.status=reviewed` 之前必须回看源码并审查依赖边界，不凭图的空白自动排除行为。
 - 有可用 Java 构建/classpath 时，可复用现有 SCIP 导入来增强语义；不为了取得语义图重建整个旧生产环境。
 - 任意程序等价、并发、外部接口效果、生产数据对账、实际界面流程仍需分别验证。本脚本验证所声明的工作包证据，不代替这些验收。

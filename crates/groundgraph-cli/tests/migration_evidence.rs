@@ -156,7 +156,7 @@ fn invalid_workspace_config_cannot_reset_a_different_stats_ledger() {
 }
 
 #[test]
-fn heuristic_calls_are_candidates_and_java_calls_do_not_prove_purity() {
+fn compiler_calls_keep_static_evidence_and_unknown_calls_do_not_prove_purity() {
     let dir = tempfile::tempdir().unwrap();
     index(dir.path(), &[("Price.java", "class Price { int quote(int n) { return helper(n); } int helper(int n) { return n * 2; } int external() { return mapper.selectCount(); } }")]);
     let pack = json(dir.path(), &["feature-pack", "--path", "src"]);
@@ -166,9 +166,20 @@ fn heuristic_calls_are_candidates_and_java_calls_do_not_prove_purity() {
         .iter()
         .find(|e| e["kind"] == "calls")
         .unwrap();
-    assert_eq!(call["assertion"]["certainty"], "candidate");
-    assert_eq!(call["assertion"]["status"], "proposed");
-    assert!(call["assertion"]["confidence"].as_f64().unwrap() < 1.0);
+    assert_eq!(call["assertion"]["certainty"], "fact");
+    assert_eq!(call["assertion"]["status"], "confirmed");
+    let evidence: Value =
+        serde_json::from_str(call["assertion"]["evidence_json"].as_str().unwrap()).unwrap();
+    assert_eq!(evidence["resolver"], "javac");
+    assert_eq!(evidence["static_target_only"], true);
+    let unknown = pack["java_analysis"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["expression"] == "mapper.selectCount()")
+        .unwrap();
+    assert_eq!(unknown["resolution"], "unresolved");
+    assert!(unknown["target"].is_null());
     let method = pack["symbols"]
         .as_array()
         .unwrap()

@@ -578,7 +578,8 @@ impl Store {
                     "DELETE FROM edge_assertions \
                      WHERE source_file = ?1 \
                        AND kind IN (?2, ?3) \
-                       AND (indexer IS NULL OR indexer != ?4)",
+                       AND (indexer IS NULL OR indexer != ?4) \
+                       AND (indexer IS NULL OR indexer NOT IN ('java_semantics', 'java_feign'))",
                 )
                 .map_err(StoreError::sqlite)?;
             for file in source_files {

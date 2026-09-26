@@ -58,6 +58,32 @@ try {
   assert.match(await page.locator("#edge-list").innerText(), /没有关系/);
   const graph = {
     meta: { repo: "test snapshot" },
+    java_analysis: {
+      calls: [
+        {
+          id: "call:1",
+          caller: "a",
+          path: "A.java",
+          line: 3,
+          column: 9,
+          expression: "missing.save()",
+          resolution: "unresolved",
+          reason: "compiler_error_at_call",
+        },
+        {
+          id: "call:2",
+          caller: "a",
+          path: "A.java",
+          line: 4,
+          column: 9,
+          expression: "check()",
+          resolution: "resolved",
+          reason: "compiler_static_binding",
+          target: "b",
+        },
+      ],
+      diagnostics: [],
+    },
     nodes: [
       { id: "a", name: "Entry", kind: "java_method", path: "A.java", line: 3 },
       { id: "b", name: "Check", kind: "java_method" },
@@ -101,6 +127,16 @@ try {
   assert.equal(await page.locator(".assertion").count(), 2);
   assert.match(await page.locator("#inspector").innerText(), /tree_sitter/);
   assert.match(await page.locator("#inspector").innerText(), /compiler/);
+  await page.locator('[data-tab="calls"]').click();
+  assert.equal(await page.locator("#call-list tr").count(), 2);
+  await page.locator("#call-status").selectOption("unresolved");
+  assert.equal(await page.locator("#call-list tr").count(), 1);
+  assert.match(
+    await page.locator("#call-list").innerText(),
+    /missing.save\(\)/,
+  );
+  await page.getByRole("button", { name: "A.java:3:9", exact: true }).click();
+  await page.locator("#explore").waitFor({ state: "visible" });
   await page
     .locator("#files")
     .setInputFiles(file("invalid.json", '{"invalid":true}'));

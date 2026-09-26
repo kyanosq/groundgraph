@@ -413,10 +413,8 @@ pub fn index_repository_with_progress(
             timer.mark("typescript_adapter");
         }
 
-        // P20/P23.3 — Java adapter. The tree-sitter driver owns structure +
-        // heuristic `Calls`/`References`; precise edges come from a SCIP
-        // overlay (`scip-java`) when present. `index_java` clears its own prior
-        // `java_treesitter` rows (and any retired `java_lsp` rows).
+        // Java: tree-sitter owns structure/inventory, javac owns static bindings.
+        // SCIP can add evidence without deleting the compiler call-site records.
         if config.java.enabled {
             let java_paths = config.java.paths_or(&["src"]);
             let java_options = JavaIndexOptions {
@@ -602,12 +600,27 @@ pub fn index_repository_with_progress(
         .sweep_orphans()
         .context("sweeping orphaned rows after ingest")?;
 
+    result.partial_failures = collect_partial_failures(&result.treesitter, &result.scip_runs);
+    if options.include_code {
+        let mut unavailable = 0;
+        for node in store.list_nodes_by_kind(groundgraph_core::NodeKind::File)? {
+            if let Some(meta) = node.metadata_json {
+                let value: serde_json::Value =
+                    serde_json::from_str(&meta).context("reading Java analysis status")?;
+                if value["java_analysis"]["compiler"] == "unavailable" {
+                    unavailable += 1;
+                }
+            }
+        }
+        if unavailable > 0 {
+            result.partial_failures.push(PartialFailure { indexer:"java_semantics".into(), reason:format!("compiler unavailable for {unavailable} files; call inventory retained with unresolved status") });
+        }
+    }
     store
         .commit_bulk()
         .context("committing bulk write session")?;
     timer.mark("commit");
 
-    result.partial_failures = collect_partial_failures(&result.treesitter, &result.scip_runs);
     if let Some(schema) = &result.schema {
         if schema.skipped_oversized > 0 {
             result.partial_failures.push(PartialFailure {

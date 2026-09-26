@@ -47,6 +47,8 @@
         data-tab="explore"
       >
         依赖探索</button
+      ><button class="tab" aria-pressed="false" data-tab="calls">
+        调用点 <span id="call-count" class="count">—</span></button
       ><button class="tab" aria-pressed="false" data-tab="migration">
         迁移核对 <span id="migration-count" class="count">—</span></button
       ><button class="tab" aria-pressed="false" data-tab="gaps">
@@ -161,6 +163,45 @@
           </div>
           <div id="inspector"></div>
         </aside>
+      </section>
+      <section id="calls" class="document" hidden>
+        <span class="eyebrow">SOURCE CALL INVENTORY</span>
+        <h1>逐调用点核查</h1>
+        <p>
+          每次调用保留独立源码位置。已解析表示编译期目标，运行时注入与远程服务仍需验证。
+        </p>
+        <div class="toolbar">
+          <label
+            >解析状态
+            <select id="call-status">
+              <option value="">全部</option>
+              <option value="unresolved">未解析</option>
+              <option value="resolved">已解析</option>
+            </select></label
+          >
+          <label
+            >搜索
+            <input
+              id="call-search"
+              type="search"
+              placeholder="调用表达式、路径或目标"
+          /></label>
+        </div>
+        <p id="call-summary" class="muted"></p>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>调用位置</th>
+                <th>表达式</th>
+                <th>解析结果 / 原因</th>
+                <th>静态目标</th>
+              </tr>
+            </thead>
+            <tbody id="call-list"></tbody>
+          </table>
+        </div>
+        <button id="call-more" hidden>显示更多</button>
       </section>
       <section id="migration" class="document" hidden>
         <div class="document-head">

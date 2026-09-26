@@ -167,6 +167,7 @@ mod tests {
 
     fn view() -> GraphViewModel {
         GraphViewModel {
+            java_analysis: Default::default(),
             schema_version: 2,
             view: "overview".into(),
             repo_root: "/tmp".into(),

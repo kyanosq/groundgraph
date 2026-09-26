@@ -23,6 +23,29 @@ const fixture = {
     { source: "check", target: "check", kind: "calls", assertions: [] },
   ],
 };
+test("unresolved calls retain their source anchor in diagnostics", () => {
+  const m = normalize({
+    ...fixture,
+    java_analysis: {
+      calls: [
+        {
+          id: "call",
+          caller: "entry",
+          path: "A.java",
+          line: 3,
+          column: 8,
+          expression: "unknown()",
+          resolution: "unresolved",
+          reason: "missing dependency",
+        },
+      ],
+      diagnostics: ["compiler incomplete"],
+    },
+  });
+  assert.equal(m.diagnostics[0].target, "entry");
+  assert.match(m.diagnostics[0].message, /A.java:3:8/);
+  assert.equal(m.raw.java_analysis.calls.length, 1);
+});
 test("projection retains evidence, recursion and isolated searchable nodes", () => {
   const m = normalize(fixture);
   assert.equal(m.edges[0].assertions.length, 2);

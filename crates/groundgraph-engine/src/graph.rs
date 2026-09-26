@@ -62,6 +62,8 @@ pub const GRAPH_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphViewModel {
+    #[serde(default)]
+    pub java_analysis: crate::java_semantics::JavaAnalysis,
     pub schema_version: u32,
     pub view: String,
     pub repo_root: String,
@@ -405,7 +407,14 @@ pub fn build_graph_view(repo_root: &Path, options: GraphOptions) -> EngineResult
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
 
+    let files = nodes.iter().filter_map(|n| n.path.clone()).collect();
+    let mut java_analysis = crate::java_semantics::analysis_for_files(&store, &files)?;
+    let selected: BTreeSet<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+    java_analysis
+        .calls
+        .retain(|c| selected.contains(c.caller.as_str()));
     Ok(GraphViewModel {
+        java_analysis,
         schema_version: GRAPH_SCHEMA_VERSION,
         view: options.view.as_str().into(),
         repo_root: repo_root.to_string_lossy().into_owned(),

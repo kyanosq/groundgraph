@@ -1,26 +1,6 @@
-//! P23.3 — Java language spec for the generic tree-sitter driver.
-//!
-//! Owns `.java` and is the **sole structural backend** for Java: classes /
-//! interfaces / enums / records, methods + constructors, JUnit `@Test`
-//! cases, and `import x.y.Z;` resolved to repo-relative file ids all flow
-//! from here. Output is tagged `indexer = java_treesitter`.
-//!
-//! The `jdtls` LSP adapter is demoted to an optional Tier-3 enrichment that
-//! only overlays `Calls` / `References` by the same symbol id (see
-//! [`crate::java_indexer`]).
-//!
-//! Notes on Java's irregular shape, and how the data-driven driver handles
-//! it without special cases:
-//! - `package com.example;` is **not** an AST ancestor of the types it
-//!   scopes, so qualified names are file-local (`Outer.Inner.method`) and
-//!   the unified `java::<file>::<qname>` id keeps them globally unique.
-//!   Package identity is recovered for *import resolution* via path suffix
-//!   matching, which needs no source-root configuration.
-//! - Constructors share the callable path but keep the distinct
-//!   [`NodeKind::JavaConstructor`] via the driver's `callable_kind_of` hook.
-//! - Methods declared inside an `enum` sit under an `enum_body_declarations`
-//!   wrapper, so that node is marked *transparent* for the driver to
-//!   descend through it.
+//! Java structural declarations and source-signature identities.
+//! Package-qualified metadata supports exact mapper namespaces. Calls are
+//! inventoried and bound by `java_semantics`, not by method-name matching.
 
 use crate::treesitter::{
     body_from_field, name_from_field, no_call_test, no_src_roots, no_text, node_text, normalise_ws,
@@ -30,6 +10,90 @@ use groundgraph_core::NodeKind;
 
 fn java_language() -> tree_sitter::Language {
     tree_sitter_java::LANGUAGE.into()
+}
+
+/// Source-level parameter types disambiguate overloads without a classpath.
+/// The compiler binds calls by declaration position, never by this spelling.
+fn java_name(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    let name = name_from_field(node, src)?;
+    if !java_is_callable(node.kind()) {
+        return Some(name);
+    }
+    let mut parameters = Vec::new();
+    if let Some(list) = node.child_by_field_name("parameters") {
+        let mut c = list.walk();
+        for p in list.named_children(&mut c) {
+            if p.kind() == "receiver_parameter" {
+                continue;
+            }
+            let mut ty = p
+                .child_by_field_name("type")
+                .and_then(|t| node_text(t, src))
+                .unwrap_or("?")
+                .split_whitespace()
+                .collect::<String>();
+            if p.kind() == "spread_parameter" {
+                // tree-sitter puts the type before variable_declarator here.
+                if ty == "?" {
+                    ty = p
+                        .named_child(0)
+                        .and_then(|n| node_text(n, src))
+                        .unwrap_or("?")
+                        .split_whitespace()
+                        .collect();
+                }
+                ty.push_str("[]");
+            }
+            if let Some(dim) = p.child_by_field_name("dimensions") {
+                ty.push_str(
+                    &node_text(dim, src)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .collect::<String>(),
+                );
+            }
+            parameters.push(ty);
+        }
+    }
+    Some(format!("{name}({})", parameters.join(",")))
+}
+
+pub(crate) fn java_metadata(node: tree_sitter::Node<'_>, src: &[u8]) -> Option<String> {
+    let mut root = node;
+    let mut owners = Vec::new();
+    while let Some(parent) = root.parent() {
+        if java_container_of(parent, src).is_some() {
+            if let Some(name) = name_from_field(parent, src) {
+                owners.push(name);
+            }
+        }
+        root = parent;
+    }
+    owners.reverse();
+    let mut c = root.walk();
+    let package = root
+        .named_children(&mut c)
+        .find(|n| n.kind() == "package_declaration")
+        .and_then(|n| node_text(n, src))
+        .unwrap_or("")
+        .trim_start_matches("package")
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    let name = name_from_field(node, src)?;
+    let qualified = [package.as_str(), &owners.join("."), &name]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    let signature = java_name(node, src)?;
+    let local_name = [owners.join("."), signature.clone()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    Some(serde_json::json!({"java": {"start_byte":node.start_byte(), "end_byte":node.end_byte(), "name":name, "qualified_name":qualified, "local_name":local_name, "signature":signature}}).to_string())
 }
 
 fn java_container_of(node: tree_sitter::Node<'_>, _src: &[u8]) -> Option<SymKind> {
@@ -245,10 +309,10 @@ pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     impl_type_of: no_text,
     receiver_type_of: no_text,
     import_of: java_import_of,
-    name_of: name_from_field,
+    name_of: java_name,
     body_of: body_from_field,
     is_transparent_kind: java_is_transparent,
-    metadata_of: no_text,
+    metadata_of: java_metadata,
     test_of: java_test_of,
     call_test_of: no_call_test,
     src_roots_of: no_src_roots,
@@ -261,192 +325,6 @@ pub(crate) static JAVA_SPEC: LangSpec = LangSpec {
     claims_path: None,
     partial_class_merge: false,
 };
-
-/// Recover direct `implements` declarations without requiring a build/classpath.
-/// These are static method-name candidates, not Spring bean or overload resolution.
-/// ponytail: direct declarations only; use the existing SCIP overlay when a
-/// usable classpath makes full semantic resolution possible.
-pub(crate) fn implementation_edges(
-    store: &groundgraph_store::Store,
-    root: &std::path::Path,
-) -> anyhow::Result<Vec<groundgraph_core::EdgeAssertion>> {
-    use groundgraph_core::{EdgeAssertion, EdgeKind, EdgeSource};
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let methods = store.list_nodes_by_kind(NodeKind::JavaMethod)?;
-    let paths: BTreeSet<_> = methods.iter().filter_map(|m| m.path.as_deref()).collect();
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&java_language())?;
-    // FQN -> (file, file-local qualified type, interface, direct parents, imports, line).
-    let mut types =
-        BTreeMap::<String, Vec<(String, String, bool, Vec<String>, Vec<String>, usize)>>::new();
-    for path in paths {
-        let abs = root.join(path);
-        if crate::source_text::is_oversized_source(&abs) {
-            continue;
-        }
-        let Ok(src) = std::fs::read(&abs) else {
-            continue;
-        };
-        let Some(tree) = parser.parse(&src, None) else {
-            continue;
-        };
-        let mut package = String::new();
-        let mut imports = Vec::new();
-        let mut cursor = tree.root_node().walk();
-        for n in tree.root_node().named_children(&mut cursor) {
-            let text = node_text(n, &src).unwrap_or("");
-            if n.kind() == "package_declaration" {
-                package = text
-                    .trim_start_matches("package")
-                    .trim()
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-            } else if n.kind() == "import_declaration" && !text.contains(" static ") {
-                imports.push(
-                    text.trim_start_matches("import")
-                        .trim()
-                        .trim_end_matches(';')
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-        let mut pending = vec![(tree.root_node(), String::new())];
-        while let Some((n, parent)) = pending.pop() {
-            let mut qualified = parent.clone();
-            if matches!(
-                n.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-            ) {
-                let Some(name) = n
-                    .child_by_field_name("name")
-                    .and_then(|v| node_text(v, &src))
-                else {
-                    continue;
-                };
-                qualified = if parent.is_empty() {
-                    name.into()
-                } else {
-                    format!("{parent}.{name}")
-                };
-                let fqn = if package.is_empty() {
-                    qualified.clone()
-                } else {
-                    format!("{package}.{qualified}")
-                };
-                let mut parents = Vec::new();
-                if let Some(interfaces) = n.child_by_field_name("interfaces") {
-                    let mut ic = interfaces.walk();
-                    for list in interfaces.named_children(&mut ic) {
-                        let mut lc = list.walk();
-                        for ty in list.named_children(&mut lc) {
-                            if let Some(t) = node_text(ty, &src) {
-                                parents.push(t.split('<').next().unwrap_or(t).trim().to_string());
-                            }
-                        }
-                    }
-                }
-                types.entry(fqn).or_default().push((
-                    path.into(),
-                    qualified.clone(),
-                    n.kind() == "interface_declaration",
-                    parents,
-                    imports.clone(),
-                    n.start_position().row + 1,
-                ));
-            }
-            // Do not confuse local/anonymous method classes with the indexer's type ids.
-            if matches!(n.kind(), "method_declaration" | "constructor_declaration") {
-                continue;
-            }
-            let mut c = n.walk();
-            pending.extend(
-                n.named_children(&mut c)
-                    .map(|child| (child, qualified.clone())),
-            );
-        }
-    }
-    let by_id: BTreeMap<_, _> = methods.iter().map(|m| (m.id.to_string(), m)).collect();
-    let mut result = Vec::new();
-    for (fqn, entries) in &types {
-        if entries.len() != 1 {
-            continue;
-        } // ambiguous duplicate source roots
-        let (path, qualified, is_interface, parents, imports, line) = &entries[0];
-        if *is_interface {
-            continue;
-        }
-        let package = fqn.strip_suffix(qualified).unwrap_or("");
-        for parent in parents {
-            let explicit: Vec<_> = imports
-                .iter()
-                .filter(|i| i.rsplit('.').next() == Some(parent.as_str()))
-                .cloned()
-                .collect();
-            let candidates = if parent.contains('.') {
-                vec![parent.clone()]
-            } else if !explicit.is_empty() {
-                explicit
-            } else {
-                let same_package = format!("{package}{parent}");
-                if types.contains_key(&same_package) {
-                    vec![same_package]
-                } else {
-                    imports
-                        .iter()
-                        .filter_map(|i| i.strip_suffix('*').map(|p| format!("{p}{parent}")))
-                        .collect()
-                }
-            };
-            let resolved: Vec<_> = candidates
-                .iter()
-                .filter_map(|c| types.get(c))
-                .filter(|v| v.len() == 1 && v[0].2)
-                .collect();
-            if resolved.len() != 1 {
-                continue;
-            }
-            let (iface_path, iface_name, _, _, _, _) = &resolved[0][0];
-            let prefix = format!("java::{iface_path}::{iface_name}.");
-            for (id, declaration) in &by_id {
-                let Some(method) = id.strip_prefix(&prefix).filter(|s| !s.contains('.')) else {
-                    continue;
-                };
-                let target = format!("java::{path}::{qualified}.{method}");
-                let Some(implementation) = by_id.get(&target) else {
-                    continue;
-                };
-                let mut edge = EdgeAssertion::with_confidence(
-                    declaration.id.clone(),
-                    implementation.id.clone(),
-                    EdgeKind::DeclaresImplementation,
-                    EdgeSource::LanguageAdapter,
-                    0.75,
-                );
-                edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
-                edge.status = groundgraph_core::EdgeStatus::Proposed;
-                edge.source_file = Some(path.clone());
-                edge.evidence_json = Some(
-                    serde_json::json!({
-                        "kind": "java_implements", "path": path, "line": line,
-                        "declared_type": parent, "resolution": "candidate", "resolver": "declared_type_method_name",
-                        "limitations": ["overload_not_resolved", "runtime_binding_not_resolved"]
-                    })
-                    .to_string(),
-                );
-                result.push(edge);
-            }
-        }
-    }
-    result.sort_by(|a, b| a.id.cmp(&b.id));
-    result.dedup_by(|a, b| a.id == b.id);
-    Ok(result)
-}
 
 #[cfg(test)]
 mod tests {
@@ -493,15 +371,15 @@ class App {
 "#;
         let got = refs(&scan(src));
         assert!(
-            got.contains(&("Greeter.greet".into(), "build".into(), RefKind::Call)),
+            got.contains(&("Greeter.greet()".into(), "build".into(), RefKind::Call)),
             "bare method invocation: {got:?}"
         );
         assert!(
-            got.contains(&("App.run".into(), "Greeter".into(), RefKind::Reference)),
+            got.contains(&("App.run()".into(), "Greeter".into(), RefKind::Reference)),
             "object creation reference: {got:?}"
         );
         assert!(
-            got.contains(&("App.run".into(), "greet".into(), RefKind::Call)),
+            got.contains(&("App.run()".into(), "greet".into(), RefKind::Call)),
             "qualified invocation keeps the trailing name: {got:?}"
         );
     }
@@ -542,12 +420,12 @@ class Outer {
         // Package is not part of the qualified name (file id disambiguates).
         let methods = qnames(&s, NodeKind::JavaMethod);
         assert!(
-            methods.contains(&"Greeter.greet".to_string()),
+            methods.contains(&"Greeter.greet()".to_string()),
             "{methods:?}"
         );
         let ctors = qnames(&s, NodeKind::JavaConstructor);
         assert!(
-            ctors.contains(&"Greeter.Greeter".to_string()),
+            ctors.contains(&"Greeter.Greeter(String)".to_string()),
             "constructor keeps its own kind, nested under the class: {ctors:?}"
         );
         assert!(
@@ -558,7 +436,7 @@ class Outer {
         // under both.
         assert!(qnames(&s, NodeKind::JavaClass).contains(&"Outer.Inner".to_string()));
         assert!(
-            methods.contains(&"Outer.Inner.ping".to_string()),
+            methods.contains(&"Outer.Inner.ping()".to_string()),
             "{methods:?}"
         );
     }
@@ -584,7 +462,7 @@ public enum Status {
             "exactly one JavaEnum, never a JavaClass"
         );
         assert!(
-            qnames(&s, NodeKind::JavaMethod).contains(&"Status.isLive".to_string()),
+            qnames(&s, NodeKind::JavaMethod).contains(&"Status.isLive()".to_string()),
             "enum methods nest through enum_body_declarations: {:?}",
             qnames(&s, NodeKind::JavaMethod)
         );
@@ -620,24 +498,24 @@ class GreeterTest {
             .filter(|t| t.kind == TestKind::Case)
             .map(|t| t.qualified_name.as_str())
             .collect();
-        assert!(cases.contains(&"GreeterTest.greetsByName"), "{cases:?}");
-        assert!(cases.contains(&"GreeterTest.greetsAnyone"), "{cases:?}");
+        assert!(cases.contains(&"GreeterTest.greetsByName()"), "{cases:?}");
+        assert!(cases.contains(&"GreeterTest.greetsAnyone()"), "{cases:?}");
         // The non-test method stays a structural symbol; test methods leave
         // the JavaMethod bucket.
         let methods = qnames(&s, NodeKind::JavaMethod);
         assert!(
-            methods.contains(&"GreeterTest.helper".to_string()),
+            methods.contains(&"GreeterTest.helper()".to_string()),
             "{methods:?}"
         );
         assert!(
-            !methods.contains(&"GreeterTest.greetsByName".to_string()),
+            !methods.contains(&"GreeterTest.greetsByName()".to_string()),
             "JUnit method must not also be a structural method: {methods:?}"
         );
         // The test case parents onto its enclosing class.
         let case = s
             .tests
             .iter()
-            .find(|t| t.qualified_name == "GreeterTest.greetsByName")
+            .find(|t| t.qualified_name == "GreeterTest.greetsByName()")
             .unwrap();
         assert_eq!(case.parent_qualified_name.as_deref(), Some("GreeterTest"));
     }

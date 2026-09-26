@@ -105,6 +105,8 @@ pub struct TraceEdge {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceResult {
+    #[serde(default)]
+    pub java_analysis: crate::java_semantics::JavaAnalysis,
     pub query: String,
     pub seeds: Vec<String>,
     pub nodes: Vec<TraceNode>,
@@ -258,7 +260,14 @@ fn trace_forward(
         })
         .collect();
 
+    let files = nodes.iter().filter_map(|n| n.path.clone()).collect();
+    let mut java_analysis = crate::java_semantics::analysis_for_files(store, &files)?;
+    let selected: BTreeSet<_> = nodes.iter().map(|n| n.id.as_str()).collect();
+    java_analysis
+        .calls
+        .retain(|c| selected.contains(c.caller.as_str()));
     Ok(TraceResult {
+        java_analysis,
         query: options.query.clone(),
         seeds: seeds.iter().map(|s| s.as_str().to_string()).collect(),
         nodes,

@@ -805,6 +805,13 @@ fn walk(
                 };
                 let kind = (spec.callable_kind_of)(child, source, base_kind);
                 let qualified = combine(eff_parent.as_deref(), &name, spec.separator);
+                // Java identity needs the signature; the display/search name stays
+                // bare so existing entry-point and cross-language name logic holds.
+                let display_name = if spec.language_id == "java" {
+                    name.split('(').next().unwrap_or(&name)
+                } else {
+                    &name
+                };
                 // Hooks inspect the *signature* node (`child`); the line
                 // range is taken from the (possibly wider) span node so a
                 // method whose body is a grammar sibling still covers it.
@@ -818,15 +825,22 @@ fn walk(
                     || !spec.emit_nested_callables_with_metadata_only
                     || metadata.is_some();
                 if emit {
-                    match (spec.test_of)(child, source, kind, &name, eff_parent.as_deref()) {
+                    match (spec.test_of)(child, source, kind, display_name, eff_parent.as_deref()) {
                         Some(role) => {
-                            push_test(scan, role, &name, &qualified, eff_parent.as_deref(), span);
+                            push_test(
+                                scan,
+                                role,
+                                display_name,
+                                &qualified,
+                                eff_parent.as_deref(),
+                                span,
+                            );
                         }
                         None => {
                             push_symbol(
                                 scan,
                                 kind,
-                                &name,
+                                display_name,
                                 &qualified,
                                 eff_parent.as_deref(),
                                 span,
@@ -1696,7 +1710,7 @@ fn index_repo_with_spec_impl(
     // hand the inputs back.
     let mut inputs = RefResolutionInputs::default();
     if resolve_inline {
-        if !pending_refs.is_empty() {
+        if !pending_refs.is_empty() && spec.language_id != "java" {
             let view: Vec<(&str, &str, &str)> = batch
                 .symbols
                 .iter()
@@ -1725,6 +1739,10 @@ fn index_repo_with_spec_impl(
         result.resolver_used = name;
     }
     mark("ingest", spec.language_id);
+    if spec.language_id == "java" {
+        result.references =
+            crate::java_semantics::index_java_calls(store, &options.repo_root, &all_files)?;
+    }
     Ok((result, inputs))
 }
 
@@ -2841,7 +2859,7 @@ describe('outer', () => {
         // by bare name (as `baseMapper.selectStyleConflicted(id)` would collect).
         std::fs::write(
             root.join("com/x/service/CraftConflictServiceImpl.java"),
-            "package com.x.service;\nimport com.x.mapper.*;\npublic class CraftConflictServiceImpl {\n    public int selectStyleConflictById(int id) {\n        return selectStyleConflicted(id);\n    }\n}\n",
+            "package com.x.service;\nimport com.x.mapper.*;\npublic class CraftConflictServiceImpl {\n    CraftConflictMapper mapper;\n    public int selectStyleConflictById(int id) {\n        return mapper.selectStyleConflicted(id);\n    }\n}\n",
         )
         .unwrap();
 
@@ -2930,8 +2948,8 @@ describe('outer', () => {
                 .id
                 .clone()
         };
-        let ctrl = find("StyleInfoController.selectMeasuresInfo");
-        let svc = find("IStyleInfoService.selectMeasuresInfo");
+        let ctrl = find("StyleInfoController.selectMeasuresInfo(Integer)");
+        let svc = find("IStyleInfoService.selectMeasuresInfo(Integer)");
         let calls = store.list_edges_by_kind(EdgeKind::Calls).unwrap();
         assert!(
             calls.iter().any(|e| e.from_id == ctrl && e.to_id == svc),

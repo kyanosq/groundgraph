@@ -45,6 +45,7 @@ pub struct NetworkMeta {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkGraph {
+    pub java_analysis: crate::java_semantics::JavaAnalysis,
     pub dangling_assertions: Vec<EdgeAssertion>,
     pub meta: NetworkMeta,
     pub nodes: Vec<NetworkNode>,
@@ -135,6 +136,7 @@ pub fn network_from_graph(
     }
     dangling_assertions.sort_by(|a, b| a.id.cmp(&b.id));
     NetworkGraph {
+        java_analysis: Default::default(),
         dangling_assertions,
         meta: NetworkMeta {
             schema_version: 2,
@@ -157,12 +159,10 @@ pub fn build_network_graph(options: NetworkOptions) -> EngineResult<NetworkGraph
     let nodes = store.list_all_nodes().context("listing nodes")?;
     let edges = store.list_all_edges().context("listing edges")?;
     let repo = repo_name(&options.repo_root);
-    Ok(network_from_graph(
-        &repo,
-        &nodes,
-        &edges,
-        options.keep_isolated,
-    ))
+    let mut graph = network_from_graph(&repo, &nodes, &edges, options.keep_isolated);
+    let files = nodes.iter().filter_map(|n| n.path.clone()).collect();
+    graph.java_analysis = crate::java_semantics::analysis_for_files(&store, &files)?;
+    Ok(graph)
 }
 
 /// Human-friendly repo label: the canonical directory name, falling back to the

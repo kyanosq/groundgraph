@@ -47,6 +47,7 @@ pub mod impact;
 pub mod index;
 pub mod init;
 pub mod java_indexer;
+pub mod java_semantics;
 pub mod java_treesitter;
 pub mod kotlin_treesitter;
 pub mod links_indexer;

@@ -19,6 +19,16 @@
     }));
     for (const message of raw.limitations ?? [])
       diagnostics.push({ message: String(message) });
+    for (const call of raw.java_analysis?.calls ?? []) {
+      if (call.resolution !== "resolved")
+        diagnostics.push({
+          message: `${call.resolution}: ${call.path}:${call.line}:${call.column} · ${call.expression} · ${call.reason}`,
+          target: call.caller,
+          call,
+        });
+    }
+    for (const message of raw.java_analysis?.diagnostics ?? [])
+      diagnostics.push({ message: String(message) });
     if (raw.omitted_symbols?.length || Number(raw.omitted_symbols) > 0)
       diagnostics.push({
         message: `Source evidence omitted: ${raw.omitted_symbols.length ?? raw.omitted_symbols}`,

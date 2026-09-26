@@ -79,6 +79,12 @@ jobs:
         working-directory: tool/groundgraph_dart_analyzer
         run: dart pub get
 
+      - name: Install JDK for semantic Java regression tests
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       # `--locked` makes CI fail if Cargo.lock is stale, pinning the dependency
       # graph for deterministic, reproducible indexing (issues.md #226 / #240).
       - name: Test

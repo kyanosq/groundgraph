@@ -743,7 +743,7 @@ fn run_with_capped_stderr(
 /// `stderr.read()` to EOF with no timeout, so a hung indexer (rust-analyzer
 /// stuck on a bad toolchain, a sidecar that never exits) hung `groundgraph index`
 /// indefinitely. The Dart sidecar already had this guard; SCIP did not.
-fn run_with_capped_stderr_budget(
+pub(crate) fn run_with_capped_stderr_budget(
     cmd: &mut Command,
     budget: std::time::Duration,
 ) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {

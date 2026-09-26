@@ -64,6 +64,9 @@ def prepare(binary, source, paths, out):
     config = "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .groundgraph/graph.db\nlanguages:\n"
     config += "".join(f"  - id: {lang}\n    paths: [src]\n" for lang in ids)
     config += "enrichment:\n  scip: false\n  analyzer: false\n  lsp: false\n"
+    # A selected slice has no verified build/module context. Retain inventory;
+    # full-workspace javac analysis belongs to the explicitly configured source repo.
+    config += "java_semantics:\n  enabled: false\n"
     (stage / ".groundgraph.yaml").write_text(config)
     binary = str(Path(binary).resolve())
     index = subprocess.run([binary, "--repo-root", str(stage), "index"], capture_output=True, text=True, timeout=300)
@@ -84,6 +87,8 @@ def prepare(binary, source, paths, out):
         "review": {"status": "pending", "evidence": ""},
         "items": [{"id": f"item-{i + 1}", "sources": [s["id"]], "disposition": "unresolved", "reason": "", "targets": [], "checks": []} for i, s in enumerate(pack["symbols"])],
         "checks": [],
+        "call_dispositions": [{"id": c["id"], "disposition": "unresolved", "reason": "", "targets": [], "checks": []}
+                              for c in pack.get("java_analysis", {}).get("calls", []) if c.get("resolution") != "resolved"],
     }
     write_json(out / "migration.json", manifest)
     return {"source_files": len(pins), "source_symbols": len(pack["symbols"]), "manifest": str(out / "migration.json"), "status": "unresolved"}
@@ -116,6 +121,8 @@ def check(manifest, work, source, target, run_tests=False):
         source_pins = manifest["source_files"]
         if not source_pins:
             raise ValueError("missing source snapshot")
+        if any(Path(p["path"]).suffix == ".java" for p in source_pins) and not isinstance(pack.get("java_analysis", {}).get("calls"), list):
+            raise ValueError("missing Java call inventory; reindex the legacy evidence pack")
         verify(source, source_pins)
         # ponytail: local review/oracle attestations; require externally verified
         # approvals before using this workflow as an unattended publishing gate.
@@ -125,6 +132,23 @@ def check(manifest, work, source, target, run_tests=False):
         if len(checks) != len(manifest["checks"]):
             blockers.append("duplicate check id")
         covered, item_ids, needed = set(), set(), set()
+        calls = pack.get("java_analysis", {}).get("calls", [])
+        if len({c["id"] for c in calls}) != len(calls):
+            raise ValueError("duplicate Java call site identity")
+        unknown_calls = {c["id"] for c in calls if c.get("resolution") != "resolved"}
+        dispositions = manifest.get("call_dispositions", [])
+        disposition_ids = [d["id"] for d in dispositions]
+        if len(set(disposition_ids)) != len(disposition_ids) or set(disposition_ids) != unknown_calls:
+            blockers.append("unresolved call inventory must have exactly one disposition per call site")
+        for item in dispositions:
+            kind = item.get("disposition")
+            if kind not in {"mapped", "platform", "excluded"} or not item.get("reason", "").strip():
+                blockers.append(f"unresolved call disposition: {item['id']}")
+            if kind in {"mapped", "platform"}:
+                if not item.get("targets") or not item.get("checks"):
+                    blockers.append(f"call disposition needs target artifacts and regression checks: {item['id']}")
+                target_pins.extend(item.get("targets", []))
+                needed.update(item.get("checks", []))
         counts = {"mapped": 0, "platform": 0, "excluded": 0, "unresolved": 0}
         for item in manifest["items"]:
             ident = item["id"]

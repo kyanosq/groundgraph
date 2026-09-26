@@ -1,17 +1,6 @@
-//! P20/P23.3 — Java language adapter (structure + heuristic).
-//!
-//! The in-process tree-sitter driver ([`crate::java_treesitter`]) is the
-//! **sole source of truth** for Java: classes / interfaces / enums / records,
-//! methods + constructors, JUnit `@Test` cases, `import x.y.Z;` resolved to
-//! repo-relative file ids, and the medium-confidence heuristic `Calls` /
-//! `References` edges its body scan produces. Output is tagged `indexer =
-//! java_treesitter`.
-//!
-//! Precise cross-symbol resolution is supplied out-of-band by a SCIP overlay
-//! (`scip-java`; ADR-0001 R1/R2) when one is present, which authoritatively
-//! supersedes the heuristic edges on the files it covers. The former in-process
-//! `jdtls` Tier-3 sidecar was retired in favour of SCIP — only Swift keeps an
-//! LSP (no mature SCIP indexer exists for it).
+//! Java structure comes from tree-sitter with source-signature identities.
+//! `java_semantics` retains every call site and enriches it with javac bindings.
+//! SCIP may add evidence but cannot erase the Java call inventory or Feign edges.
 
 use std::path::PathBuf;
 
@@ -39,8 +28,7 @@ pub struct JavaIndexResult {
     pub symbols: usize,
     pub tests: usize,
     pub imports: usize,
-    /// Medium-confidence heuristic `Calls` / `References` edges produced by the
-    /// tree-sitter body scan. SCIP supersedes these on the files it covers.
+    /// Compiler-bound calls plus candidate implementation/Feign relationships.
     #[serde(default)]
     pub references: usize,
     /// `java_treesitter` when the structural pass produced anything, empty when

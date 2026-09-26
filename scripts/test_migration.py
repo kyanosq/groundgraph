@@ -2,6 +2,8 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 import migration
@@ -23,7 +25,7 @@ class MigrationGateTest(unittest.TestCase):
             "import sys\nfrom pathlib import Path\n"
             "Path(sys.argv[1]).write_text('<testsuite><testcase name=\"quote\"/></testsuite>')\n"
         )
-        pack = {"symbols": [{"id": "old:quote"}, {"id": "old:check"}]}
+        pack = {"symbols": [{"id": "old:quote"}, {"id": "old:check"}], "java_analysis": {"calls": []}}
         (self.work / "feature-pack.json").write_text(json.dumps(pack))
         self.manifest = {
             "schema_version": 1,
@@ -101,6 +103,34 @@ class MigrationGateTest(unittest.TestCase):
         p.write_text(p.read_text() + "Path('new.ts').write_text('changed during test')\n")
         self.manifest["checks"][0]["files"] = [migration.pin(self.target, "test.py")]
         self.assertFalse(self.check()["ready_for_review"])
+
+    def test_unresolved_calls_require_individual_disposition(self):
+        path = self.work / "feature-pack.json"
+        pack = json.loads(path.read_text())
+        pack["java_analysis"] = {"calls": [{"id": "call:1", "resolution": "unresolved"}]}
+        migration.write_json(path, pack)
+        self.manifest["feature_pack_sha256"] = migration.digest(path)
+        self.assertFalse(self.check()["ready_for_review"])
+        self.manifest["call_dispositions"] = [{"id": "call:1", "disposition": "excluded", "reason": "Confirmed external telemetry, outside this migration"}]
+        self.assertTrue(self.check()["ready_for_review"])
+
+    def test_legacy_java_pack_without_call_inventory_blocks(self):
+        path = self.work / "feature-pack.json"
+        pack = json.loads(path.read_text())
+        del pack["java_analysis"]
+        migration.write_json(path, pack)
+        self.manifest["feature_pack_sha256"] = migration.digest(path)
+        self.assertFalse(self.check()["ready_for_review"])
+
+    def test_partial_source_package_does_not_guess_compiler_visibility(self):
+        out = self.root / "prepared"
+        pack = json.loads((self.work / "feature-pack.json").read_text())
+        with patch.object(migration.subprocess, "run", side_effect=[
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(stdout=json.dumps(pack)),
+        ]):
+            migration.prepare(self.root / "groundgraph", self.source, ["Old.java"], out)
+        self.assertIn("java_semantics:\n  enabled: false", (out / "source/.groundgraph.yaml").read_text())
 
 
 if __name__ == "__main__":

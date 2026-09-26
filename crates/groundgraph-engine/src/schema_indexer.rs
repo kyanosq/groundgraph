@@ -89,7 +89,7 @@ pub struct SchemaIndexStats {
     /// `SqlMapperStmt --persists_to--> DbTable` edges linked.
     pub stmt_table_edges: usize,
     /// `interface method --declares_implementation--> impl method` edges linked
-    /// (source-declared Java `implements`, with method-name candidates) so traversal descends
+    /// (javac override bindings, retained as runtime dispatch candidates) so traversal descends
     /// through interface dispatch instead of dead-ending at the declaration.
     pub iface_impl_edges: usize,
     /// `callable --persists_to--> DbTable` edges linked from *inline* SQL string
@@ -414,30 +414,31 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
 /// they are keyed by their id suffix; tables/stmts carry `name`.
 fn link_data_layer_edges(
     store: &mut Store,
-    root: &Path,
+    _root: &Path,
     stats: &mut SchemaIndexStats,
 ) -> Result<()> {
     use std::collections::HashMap;
 
-    // id-suffix (`SimpleClass.method`, lower-cased) -> method node ids.
+    // XML namespaces are case-sensitive fully-qualified Java identities.
     let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
     for m in store.list_nodes_by_kind(NodeKind::JavaMethod)? {
-        let id = m.id.as_str();
-        if let Some(suffix) = id.rsplit("::").next() {
-            method_by_suffix
-                .entry(suffix.to_ascii_lowercase())
-                .or_default()
-                .push(m.id.clone());
+        if let Some(metadata) = &m.metadata_json {
+            let value: serde_json::Value = serde_json::from_str(metadata)?;
+            if let Some(name) = value["java"]["qualified_name"].as_str() {
+                method_by_suffix
+                    .entry(name.into())
+                    .or_default()
+                    .push(m.id.clone());
+            }
         }
     }
-
     let mut edges: Vec<EdgeAssertion> = Vec::new();
-
-    // Only source-declared implementations can bridge an interface. Naming
-    // conventions alone cannot establish a Java type relationship.
-    let implementations = crate::java_treesitter::implementation_edges(store, root)?;
-    stats.iface_impl_edges = implementations.len();
-    edges.extend(implementations);
+    // javac owns inheritance; schema must not rewrite its assertion provenance.
+    stats.iface_impl_edges = store
+        .list_edges_by_kind(EdgeKind::DeclaresImplementation)?
+        .iter()
+        .filter(|e| e.indexer.as_deref() == Some("java_semantics"))
+        .count();
     // table name (lower-cased) -> table node ids, plus a registry of existing
     // synthetic "external" tables (so re-index reuses them instead of dupes).
     let mut table_by_name: HashMap<String, Vec<ArtifactId>> = HashMap::new();
@@ -462,16 +463,23 @@ fn link_data_layer_edges(
         };
         // method link: <namespace-simple-name>.<stmt-id>
         if let (Some(ns), Some(stmt_id)) = (&meta.namespace, &stmt.name) {
-            let simple = ns.rsplit('.').next().unwrap_or(ns);
-            let key = format!("{simple}.{stmt_id}").to_ascii_lowercase();
+            let key = format!("{ns}.{stmt_id}");
             if let Some(method_ids) = method_by_suffix.get(&key) {
                 for mid in method_ids {
-                    edges.push(EdgeAssertion::fact(
+                    let mut edge = EdgeAssertion::fact(
                         mid.clone(),
                         stmt.id.clone(),
                         EdgeKind::References,
                         EdgeSource::LanguageAdapter,
-                    ));
+                    );
+                    if method_ids.len() > 1 {
+                        edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+                        edge.status = groundgraph_core::EdgeStatus::Proposed;
+                        edge.confidence = groundgraph_core::Confidence::new(0.5);
+                    }
+                    edge.source_file = stmt.source_file.clone();
+                    edge.evidence_json = Some(serde_json::json!({"resolver":"mybatis_namespace", "namespace":ns,"line":stmt.start_line,"overload_candidates":method_ids.len()}).to_string());
+                    edges.push(edge);
                     stats.stmt_method_edges += 1;
                 }
             }
@@ -624,7 +632,7 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
     if routes.is_empty() {
         return Ok(());
     }
-    let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
+    let mut method_by_suffix: HashMap<String, Vec<Node>> = HashMap::new();
     // Java (`JavaMethod`) and Go (`GoMethod`) handler nodes share the id suffix
     // shape `Type.method`; Python handlers are module-level functions whose
     // suffix is the bare function name (`list_strategies`). Indexing all of
@@ -638,9 +646,15 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
         for m in store.list_nodes_by_kind(kind)? {
             if let Some(suffix) = m.id.as_str().rsplit("::").next() {
                 method_by_suffix
-                    .entry(suffix.to_ascii_lowercase())
+                    .entry(
+                        suffix
+                            .split('(')
+                            .next()
+                            .unwrap_or(suffix)
+                            .to_ascii_lowercase(),
+                    )
                     .or_default()
-                    .push(m.id.clone());
+                    .push(m.clone());
             }
         }
     }
@@ -666,7 +680,17 @@ fn link_http_route_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
             format!("{}.{}", meta.handler_class, meta.handler_method).to_ascii_lowercase()
         };
         if let Some(method_ids) = method_by_suffix.get(&key) {
-            for mid in method_ids {
+            for method in method_ids {
+                if method.kind == NodeKind::JavaMethod
+                    && (method.path != route.source_file
+                        || !route.start_line.is_some_and(|l| {
+                            method.start_line.is_some_and(|s| s <= l)
+                                && method.end_line.is_some_and(|e| l <= e)
+                        }))
+                {
+                    continue;
+                }
+                let mid = &method.id;
                 edges.push(EdgeAssertion::fact(
                     route.id.clone(),
                     mid.clone(),
@@ -3769,11 +3793,13 @@ public class StyleInfoController {
         store.migrate().unwrap();
         // Pre-seed the handler method node (normally from the Java code indexer).
         let method_id = ArtifactId::new(
-            "java::src/main/java/com/kutesmart/cloud/style/controller/StyleInfoController.java::StyleInfoController.measuresInfo",
+            "java::StyleInfoController.java::StyleInfoController.measuresInfo(Integer)",
         );
-        store
-            .upsert_node(&Node::new(method_id.clone(), NodeKind::JavaMethod))
-            .unwrap();
+        let mut method = Node::new(method_id.clone(), NodeKind::JavaMethod);
+        method.path = Some("StyleInfoController.java".into());
+        method.start_line = Some(6);
+        method.end_line = Some(7);
+        store.upsert_node(&method).unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
         assert_eq!(stats.http_routes, 1, "one HTTP route indexed");
@@ -5542,13 +5568,13 @@ public class SizeSysVO implements Serializable {
         let mut store = Store::open(root.join("graph.db")).unwrap();
         store.migrate().unwrap();
         // Pre-seed the Java mapper-interface method node (normally from the code
-        // indexer). Its `name` is None; identity is the id suffix.
+        // indexer). XML linkage uses its package-qualified metadata.
         let method_id = ArtifactId::new(
             "java::rcmtm-cloud-craft/src/main/java/com/kutesmart/cloud/craft/mapper/CraftConflictMapper.java::CraftConflictMapper.selectConflictListTreeByCloth",
         );
-        store
-            .upsert_node(&Node::new(method_id.clone(), NodeKind::JavaMethod))
-            .unwrap();
+        let mut method = Node::new(method_id.clone(), NodeKind::JavaMethod);
+        method.metadata_json = Some(serde_json::json!({"java":{"qualified_name":"com.kutesmart.cloud.craft.mapper.CraftConflictMapper.selectConflictListTreeByCloth"}}).to_string());
+        store.upsert_node(&method).unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
         assert_eq!(stats.mapper_stmts, 1, "one mapper stmt indexed");

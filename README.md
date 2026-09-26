@@ -31,6 +31,8 @@ It indexes your repository into a SQLite graph of **nodes** (symbols, files, doc
 
 See the [offline evidence workspace](webui/README.md) and [design audit with remaining limits](docs/design-review-2026-09-26.md).
 
+Java now includes a per-call-site inventory, optional JDK compiler bindings, and service-scoped Feign candidates. See [Java semantics](docs/java-semantics.md) for configuration and signature-ID migration.
+
 ## Highlights
 
 - 🔎 **`search`** — hybrid retrieval: structural scoring (ids/names/paths/evidence/adjacency) **plus a BM25 fulltext content layer** over code bodies, doc comments and markdown bodies — bilingual (CJK bigrams), with a grounding source snippet per hit. Concept queries like `byte boundary panic` or `错位竞争` hit even when no identifier contains those words.

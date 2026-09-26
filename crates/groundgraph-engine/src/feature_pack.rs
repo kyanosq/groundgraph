@@ -36,7 +36,7 @@ use crate::test_suggestions::{
     analyze_test_suggestions_with_store, SymbolSuggestions, TestSuggestionsOptions,
 };
 
-pub const FEATURE_PACK_SCHEMA_VERSION: u32 = 2;
+pub const FEATURE_PACK_SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Data contract
@@ -70,6 +70,8 @@ pub struct FeaturePackStats {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeaturePack {
+    #[serde(default)]
+    pub java_analysis: crate::java_semantics::JavaAnalysis,
     pub schema_version: u32,
     pub limitations: Vec<String>,
     pub evidence_limit_per_symbol: usize,
@@ -221,6 +223,7 @@ pub fn build_feature_pack_with_store(
     };
 
     Ok(FeaturePack {
+        java_analysis: crate::java_semantics::analysis_for_files(store, &scope_files)?,
         schema_version: FEATURE_PACK_SCHEMA_VERSION,
         limitations: vec![
             "call_resolution_may_be_incomplete".into(),

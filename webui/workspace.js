@@ -66,13 +66,14 @@
       b.classList.toggle("active", b.dataset.tab === name);
       b.setAttribute("aria-pressed", String(b.dataset.tab === name));
     });
-    for (const id of ["explore", "migration", "gaps"])
+    for (const id of ["explore", "calls", "migration", "gaps"])
       $(id).hidden = id !== name || (id === "explore" && !state.model);
     $("empty").hidden = !!state.model || name !== "explore";
   }
   function setGraph(raw, label) {
     state.model = M.normalize(raw);
     state.gapLimit = 100;
+    state.callLimit = 100;
     state.selected = null;
     state.edge = null;
     state.limit = 100;
@@ -126,6 +127,7 @@
     renderList();
     renderScope();
     renderDiagnostics();
+    renderCalls();
     tab("explore");
   }
   function select(id) {
@@ -240,14 +242,12 @@
       width = Math.max(600, columns.length * 250 + 40),
       positions = new Map();
     columns.forEach((col, i) =>
-      groups
-        .get(col)
-        .forEach((n, j) =>
-          positions.set(n.id, {
-            x: 25 + (i * (width - 50)) / columns.length,
-            y: (height - groups.get(col).length * 90) / 2 + j * 90 + 18,
-          }),
-        ),
+      groups.get(col).forEach((n, j) =>
+        positions.set(n.id, {
+          x: 25 + (i * (width - 50)) / columns.length,
+          y: (height - groups.get(col).length * 90) / 2 + j * 90 + 18,
+        }),
+      ),
     );
     const svgNS = "http://www.w3.org/2000/svg",
       svgEl = (tag, attrs = {}) => {
@@ -503,6 +503,57 @@
       );
     }
   }
+  function renderCalls() {
+    const all = state.model?.raw.java_analysis?.calls ?? [];
+    const status = $("call-status").value;
+    const query = $("call-search").value.toLocaleLowerCase();
+    const calls = all.filter(
+      (c) =>
+        (!status || c.resolution === status) &&
+        `${c.path} ${c.expression} ${c.target ?? c.external_target ?? ""}`
+          .toLocaleLowerCase()
+          .includes(query),
+    );
+    set("call-count", all.length);
+    set(
+      "call-summary",
+      `${calls.length} / ${all.length} 个调用点 · 未解析 ${all.filter((c) => c.resolution !== "resolved").length} · 仅代表当前导出范围`,
+    );
+    if (!state.model?.raw.java_analysis) {
+      set("call-count", "—");
+      set("call-summary", "此快照未提供调用点清单；重新索引并导出后核查。");
+    }
+    $("call-list").replaceChildren(
+      ...calls.slice(0, state.callLimit ?? 100).map((c) => {
+        const row = el("tr");
+        const location = el("td");
+        location.append(
+          state.model.byId.has(c.caller)
+            ? button(`${c.path}:${c.line}:${c.column}`, () => select(c.caller))
+            : el("code", `${c.path}:${c.line}:${c.column}`),
+        );
+        const expression = el("td");
+        expression.append(el("code", c.expression));
+        row.append(
+          location,
+          expression,
+          el("td", `${c.resolution} · ${c.reason}`),
+          el("td", c.target ?? c.external_target ?? "未找到目标"),
+        );
+        return row;
+      }),
+    );
+    $("call-more").hidden = calls.length <= (state.callLimit ?? 100);
+  }
+  for (const id of ["call-search", "call-status"])
+    $(id).addEventListener("input", () => {
+      state.callLimit = 100;
+      renderCalls();
+    });
+  $("call-more").addEventListener("click", () => {
+    state.callLimit = (state.callLimit ?? 100) + 100;
+    renderCalls();
+  });
   function renderDiagnostics() {
     const box = $("diagnostics");
     box.replaceChildren();
@@ -761,6 +812,12 @@
       meta: { repo: state.model.repo },
       nodes: s.nodes,
       edges: s.edges,
+      java_analysis: {
+        calls: (state.model.raw.java_analysis?.calls ?? []).filter((c) =>
+          s.nodes.some((n) => n.id === c.caller),
+        ),
+        diagnostics: state.model.raw.java_analysis?.diagnostics ?? [],
+      },
       limitations: [
         ...state.model.diagnostics.map((d) => d.message),
         "Local selection export; not a complete repository graph.",
