@@ -137,7 +137,9 @@ fn build_candidate_pack(
         let node = store.find_node(&aid).context("loading evidence node")?;
         let snippet = if include_snippets {
             node.as_ref()
-                .and_then(|n| read_snippet(repo_root, n).ok().flatten())
+                .map(|n| read_snippet(repo_root, n))
+                .transpose()?
+                .flatten()
         } else {
             None
         };
@@ -202,7 +204,7 @@ fn build_symbol_pack(repo_root: &Path, symbol_id: &str, include_snippets: bool) 
     }
 
     let snippet_self = if include_snippets {
-        read_snippet(repo_root, &node).ok().flatten()
+        read_snippet(repo_root, &node)?
     } else {
         None
     };
@@ -318,18 +320,17 @@ fn read_snippet(repo_root: &Path, node: &groundgraph_core::Node) -> Result<Optio
     {
         return Ok(None);
     }
-    let abs = repo_root.join(rel);
-    if !abs.exists() {
-        return Ok(None);
-    }
+    let abs = match groundgraph_engine::source_text::resolve_source_path(repo_root, rel_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     // Bound memory: a symbol whose `path` points at a generated / minified /
     // vendored multi-MB file must not be slurped whole just to extract a few
     // lines (#88). A corrupt `end_line` would otherwise also force an O(file)
     // `lines()` walk over that whole blob.
-    if let Ok(meta) = std::fs::metadata(&abs) {
-        if meta.len() > SNIPPET_MAX_FILE_BYTES {
-            return Ok(None);
-        }
+    if std::fs::metadata(&abs)?.len() > SNIPPET_MAX_FILE_BYTES {
+        return Ok(None);
     }
     let body =
         std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
@@ -351,6 +352,22 @@ mod tests {
 
     /// #88: a snippet must not slurp a multi-MB file into memory. An oversized
     /// file yields no snippet; a small one with the same range still does.
+    #[test]
+    #[cfg(unix)]
+    fn snippet_symlinks_cannot_escape_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "private").unwrap();
+        std::os::unix::fs::symlink(outside, root.join("link")).unwrap();
+        let mut n = Node::new(ArtifactId::new("x"), NodeKind::JavaMethod);
+        n.path = Some("link".into());
+        n.start_line = Some(1);
+        n.end_line = Some(1);
+        assert!(read_snippet(&root, &n).is_err());
+    }
+
     #[test]
     fn read_snippet_skips_oversized_files_but_reads_small_ones() {
         let dir = tempfile::tempdir().unwrap();

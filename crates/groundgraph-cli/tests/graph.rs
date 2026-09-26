@@ -203,19 +203,18 @@ fn graph_html_writes_self_contained_file_to_default_path() {
     );
     let body = std::fs::read_to_string(&out).unwrap();
     assert!(body.starts_with("<!doctype html>"), "missing doctype");
-    assert!(body.contains("GroundGraph Graph"));
+    assert!(body.contains("GroundGraph"));
     assert!(body.contains("<script id=\"groundgraph-data\""));
     assert!(body.contains("REQ-WATERMARK-001"));
     // Offline-only: no remote dependencies allowed.
-    assert!(!body.contains("https://"), "remote https URL leaked");
-    assert!(!body.contains("http://"), "remote http URL leaked");
+    assert!(!body.contains("<script src="), "external script leaked");
+    assert!(!body.contains("unsafe-eval"), "dynamic eval enabled");
     assert!(!body.contains("cdn."), "CDN reference leaked");
-    // The renderer JS must distinguish layers visually.
     assert!(
-        body.contains("layer-confirmed"),
-        "missing confirmed CSS class"
+        body.contains("stroke-dasharray"),
+        "evidence strength must be distinguishable"
     );
-    assert!(body.contains("layer-fact"), "missing fact CSS class");
+    assert!(body.contains("原始断言"));
 }
 
 #[test]
@@ -312,13 +311,13 @@ fn graph_html_renders_three_pane_explorer_with_tree_canvas_detail() {
     assert!(html.contains("class=\"detail\""));
     // The view selector and tree-item / node-card CSS classes are the
     // explorer's contract surface.
-    assert!(html.contains("id=\"view\""));
+    assert!(html.contains("id=\"direction\""));
     assert!(html.contains("tree-item"));
     assert!(html.contains("node-card"));
     // module aggregator must be embedded (proves new contract).
     assert!(html.contains("\"kind\":\"module\""));
-    assert!(!html.contains("https://"));
-    assert!(!html.contains("http://"));
+    assert!(!html.contains("<script src="));
+    assert!(!html.contains("unsafe-eval"));
 }
 
 #[test]

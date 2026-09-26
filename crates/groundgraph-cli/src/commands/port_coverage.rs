@@ -72,9 +72,10 @@ pub fn run(args: PortCoverageRunArgs) -> Result<()> {
 }
 
 fn print_human(report: &PortCoverageReport) {
+    println!("仅比较结构和名称；未验证业务行为等价，不能作为迁移验收。");
     let s = &report.stats;
     println!(
-        "GroundGraph 移植覆盖率账本 (schema v{})",
+        "GroundGraph 名称匹配账本 (schema v{})",
         report.schema_version
     );
     println!(
@@ -82,7 +83,7 @@ fn print_human(report: &PortCoverageReport) {
         s.source_symbols, s.source_distinct_names, s.target_symbols, s.target_distinct_names,
     );
     println!(
-        "已移植 {} · 缺失 {} · 目标独有 {} · 覆盖率 {:.1}%",
+        "同名匹配 {} · 缺失 {} · 目标独有 {} · 覆盖率 {:.1}%",
         s.ported_names,
         s.missing_names,
         s.extra_names,

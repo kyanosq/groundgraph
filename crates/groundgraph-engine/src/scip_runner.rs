@@ -387,7 +387,19 @@ pub(crate) fn run_indexers_with(
     // graph and the overlay carry their own (caller-supplied) root.
     let repo_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let repo_root = repo_root.as_path();
-    let scip_dir = crate::config::workspace_dir_for_repo(repo_root).join("scip");
+    let scip_dir = match crate::config::workspace_dir_for_repo(repo_root) {
+        Ok(dir) => dir.join("scip"),
+        Err(error) => {
+            return languages
+                .iter()
+                .map(|language| ScipRunOutcome {
+                    language: language.clone(),
+                    status: ScipRunStatus::Failed(format!("invalid workspace: {error}")),
+                    output: None,
+                })
+                .collect()
+        }
+    };
     let mut outcomes = Vec::new();
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for language in languages {

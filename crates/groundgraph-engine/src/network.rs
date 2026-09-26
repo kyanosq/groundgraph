@@ -1,14 +1,6 @@
-//! `groundgraph graph --format web` data backend.
-//!
-//! Builds a *full* force-directed network view of the graph store — every
-//! stored node plus the de-duplicated edge set — for the WebGL constellation
-//! viewer (`webui/index.html`). Unlike [`crate::graph::build_graph_view`], which
-//! produces a curated, capped *business* view, this is the raw topology: the
-//! viewer itself does the adaptive degradation (degree capping, kind hiding) at
-//! render time. This is the Rust port of the bootstrap `webui/export_graph.py`
-//! script so the export is a first-class CLI feature with no Python dependency.
+//! Evidence-preserving network projection for the offline workspace.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -19,9 +11,9 @@ use serde::Serialize;
 use crate::config::{resolve_storage_path, EngineConfig};
 use crate::error::EngineResult;
 
-/// A node in the force-directed network. Field names match the JSON the viewer
+/// A searchable node in the offline workspace. Field names match the JSON it
 /// consumes (`webui/index.html`): `id, kind, name, path, line, deg`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkNode {
     pub id: String,
     pub kind: String,
@@ -29,28 +21,31 @@ pub struct NetworkNode {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
-    /// Undirected degree over the de-duplicated link set; drives node size and
-    /// the viewer's top-N backbone cap on large graphs.
+    /// Undirected degree over grouped links, independent of assertion count.
     pub deg: usize,
 }
 
 /// A directed link `source --kind--> target` between two node ids.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkLink {
+    pub assertions: Vec<EdgeAssertion>,
     pub source: String,
     pub target: String,
     pub kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkMeta {
+    pub schema_version: u32,
+    pub omitted_isolated: usize,
     pub repo: String,
     pub nodes: usize,
     pub links: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkGraph {
+    pub dangling_assertions: Vec<EdgeAssertion>,
     pub meta: NetworkMeta,
     pub nodes: Vec<NetworkNode>,
     pub links: Vec<NetworkLink>,
@@ -59,14 +54,12 @@ pub struct NetworkGraph {
 #[derive(Debug, Clone)]
 pub struct NetworkOptions {
     pub repo_root: PathBuf,
-    /// Keep nodes with degree 0. Off by default: a force layout of thousands of
-    /// disconnected points is noise, so the export drops them like the viewer.
+    /// Keep isolated nodes so they remain searchable even without relationships.
     pub keep_isolated: bool,
 }
 
 /// Assemble the network from already-loaded nodes/edges. Pure (no I/O) so the
-/// topology rules — self-loop drop, dangling-edge drop, `(from,to,kind)`
-/// de-duplication, degree, isolated-node filtering — are unit-testable without
+/// topology, assertion grouping and explicit omissions are unit-testable without
 /// a database.
 pub fn network_from_graph(
     repo: &str,
@@ -76,7 +69,7 @@ pub fn network_from_graph(
 ) -> NetworkGraph {
     let mut out: Vec<NetworkNode> = Vec::with_capacity(nodes.len());
     let mut id_to_idx: HashMap<&str, usize> = HashMap::with_capacity(nodes.len());
-    for (idx, n) in nodes.iter().enumerate() {
+    for n in nodes {
         let id = n.id.as_str();
         // First id wins; duplicate ids in the store would otherwise inflate
         // degree counts on a phantom second copy.
@@ -97,25 +90,28 @@ pub fn network_from_graph(
             line: n.start_line,
             deg: 0,
         });
-        let _ = idx;
     }
 
     let mut links: Vec<NetworkLink> = Vec::new();
-    let mut seen: BTreeSet<(usize, usize, &str)> = BTreeSet::new();
+    let mut seen: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+    let mut dangling_assertions = Vec::new();
     let mut deg: Vec<usize> = vec![0; out.len()];
     for e in edges {
         let (a, b) = (e.from_id.as_str(), e.to_id.as_str());
-        if a == b {
-            continue; // self-loop: no visual signal in a force layout
-        }
         let (Some(&ai), Some(&bi)) = (id_to_idx.get(a), id_to_idx.get(b)) else {
-            continue; // edge to a node not in the store: skip the dangling link
+            dangling_assertions.push(e.clone());
+            continue;
         };
         let kind = e.kind.as_str();
-        if !seen.insert((ai, bi, kind)) {
-            continue; // collapse parallel edges of the same kind
+        if let Some(&idx) = seen.get(&(a, b, kind)) {
+            if !links[idx].assertions.iter().any(|old| old.id == e.id) {
+                links[idx].assertions.push(e.clone());
+            }
+            continue;
         }
+        seen.insert((a, b, kind), links.len());
         links.push(NetworkLink {
+            assertions: vec![e.clone()],
             source: a.to_string(),
             target: b.to_string(),
             kind: kind.to_string(),
@@ -127,12 +123,22 @@ pub fn network_from_graph(
         n.deg = deg[i];
     }
 
+    let original_count = out.len();
     if !keep_isolated {
         out.retain(|n| n.deg > 0);
     }
 
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    links.sort_by(|a, b| (&a.source, &a.target, &a.kind).cmp(&(&b.source, &b.target, &b.kind)));
+    for link in &mut links {
+        link.assertions.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    dangling_assertions.sort_by(|a, b| a.id.cmp(&b.id));
     NetworkGraph {
+        dangling_assertions,
         meta: NetworkMeta {
+            schema_version: 2,
+            omitted_isolated: original_count - out.len(),
             repo: repo.to_string(),
             nodes: out.len(),
             links: links.len(),
@@ -232,26 +238,40 @@ mod tests {
     }
 
     #[test]
-    fn drops_self_loops_dangling_edges_and_dedupes_parallel() {
+    fn preserves_recursion_and_reports_dangling_assertions() {
         let nodes = vec![
             node("a", NodeKind::GoMethod, "A", "a.go", 1),
             node("b", NodeKind::GoMethod, "B", "b.go", 2),
         ];
         let edges = vec![
-            edge("a", "a", EdgeKind::Calls),      // self-loop → dropped
+            edge("a", "a", EdgeKind::Calls),      // self-loop → retained
             edge("a", "ghost", EdgeKind::Calls),  // dangling target → dropped
             edge("a", "b", EdgeKind::Calls),      // kept
             edge("a", "b", EdgeKind::Calls),      // parallel duplicate → collapsed
             edge("a", "b", EdgeKind::References), // different kind → kept
         ];
         let g = network_from_graph("demo", &nodes, &edges, false);
-        assert_eq!(
-            g.meta.links, 2,
-            "one calls + one references, dups/self/dangling removed"
-        );
+        assert_eq!(g.meta.links, 3, "recursion + calls + references retained");
         let a = g.nodes.iter().find(|n| n.id == "a").expect("a");
         // a–b counted twice (two distinct-kind links); degree is over links.
-        assert_eq!(a.deg, 2);
+        assert_eq!(a.deg, 4);
+        let json = serde_json::to_value(&g).unwrap();
+        assert_eq!(json["dangling_assertions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parallel_assertions_keep_their_provenance() {
+        let nodes = vec![
+            node("a", NodeKind::GoMethod, "A", "a.go", 1),
+            node("b", NodeKind::GoMethod, "B", "b.go", 2),
+        ];
+        let first = edge("a", "b", EdgeKind::Calls);
+        let mut second = first.clone();
+        second.id = ArtifactId::new("another-resolver");
+        second.source_file = Some("evidence.json".into());
+        let g = network_from_graph("demo", &nodes, &[first, second], true);
+        let value = serde_json::to_value(g).unwrap();
+        assert_eq!(value["links"][0]["assertions"].as_array().unwrap().len(), 2);
     }
 
     #[test]

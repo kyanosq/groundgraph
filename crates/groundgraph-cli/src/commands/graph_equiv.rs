@@ -1,4 +1,4 @@
-//! `groundgraph graph-equiv` — 业务图等价 (P24+).
+//! `groundgraph graph-equiv` — 图结构对比 (P24+).
 //!
 //! Scopes the *same business slice* in two prebuilt graph databases (e.g.
 //! Java source ↔ Go rewrite) and emits a quantified structural comparison:
@@ -49,12 +49,12 @@ pub fn run(args: GraphEquivRunArgs) -> Result<()> {
         skip_tests: !args.include_tests,
         max_items: args.max,
     })
-    .context("计算业务图等价")?;
+    .context("计算图结构对比")?;
 
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&report).context("序列化业务图等价报告")?
+            serde_json::to_string_pretty(&report).context("序列化图结构对比报告")?
         );
     } else {
         print_human(&report);
@@ -75,9 +75,10 @@ fn fam(counts: &SideNodeCounts, family: &str) -> usize {
 }
 
 fn print_human(report: &GraphEquivReport) {
+    println!("仅比较结构和名称；未验证业务行为等价，不能作为迁移验收。");
     let n = &report.nodes;
     let m = &report.metrics;
-    println!("GroundGraph 业务图等价 (schema v{})", report.schema_version);
+    println!("GroundGraph 图结构对比 (schema v{})", report.schema_version);
     println!("源切片: {}", scope_label(&report.source_scope));
     println!("目标切片: {}", scope_label(&report.target_scope));
     println!();
@@ -96,7 +97,7 @@ fn print_human(report: &GraphEquivReport) {
     );
     let names = &report.names;
     println!(
-        "名称  源去重 {} · 目标去重 {} · 已移植 {} · 缺失 {} · 目标独有 {} · 覆盖率 {:.1}%",
+        "名称  源去重 {} · 目标去重 {} · 同名匹配 {} · 缺失 {} · 目标独有 {} · 覆盖率 {:.1}%",
         names.source_distinct,
         names.target_distinct,
         names.ported,

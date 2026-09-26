@@ -51,7 +51,7 @@ pub enum Purity {
     Pure,
     /// At least one side-effect signal (see `impurity_signals`).
     Impure,
-    /// Body unavailable — cannot judge.
+    /// Body unavailable or Java callees are not verified — cannot judge.
     Unknown,
 }
 
@@ -383,13 +383,34 @@ pub fn build_fact(
     let purity = if src.raw.trim().is_empty() {
         Purity::Unknown
     } else if impurity.is_empty() {
-        Purity::Pure
+        // A local lexical scan cannot certify injected services, mappers or remote calls.
+        // Reuse the Java AST scanner; unknown is safer than calling missing callees pure.
+        if src.language == Language::Java {
+            let scan = crate::treesitter::extract(
+                &crate::java_treesitter::JAVA_SPEC,
+                &format!("class GroundGraphPurity {{ {} }}", src.raw),
+            );
+            if scan.parse_timed_out
+                || scan.symbols.is_empty()
+                || !scan.references.is_empty()
+                || !src.raw.contains('{')
+            {
+                Purity::Unknown
+            } else {
+                Purity::Pure
+            }
+        } else {
+            Purity::Pure
+        }
     } else {
         Purity::Impure
     };
 
     let evidence = collect_evidence(src, &stripped, max_evidence);
-    let summary = build_summary(&counts, &impurity, purity);
+    let mut summary = build_summary(&counts, &impurity, purity);
+    if src.language == Language::Java && purity == Purity::Unknown {
+        summary.push("Java 调用、抽象声明或解析缺口未经副作用验证，不能认定为纯函数".into());
+    }
 
     SymbolFact {
         id: node.id.to_string(),

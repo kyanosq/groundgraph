@@ -72,6 +72,8 @@ pub struct DbTableMeta {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaIndexStats {
+    #[serde(default)]
+    pub skipped_oversized: usize,
     pub files_scanned: usize,
     pub sql_tables: usize,
     pub orm_tables: usize,
@@ -87,7 +89,7 @@ pub struct SchemaIndexStats {
     /// `SqlMapperStmt --persists_to--> DbTable` edges linked.
     pub stmt_table_edges: usize,
     /// `interface method --declares_implementation--> impl method` edges linked
-    /// (Spring `I<Name>` ↔ `<Name>Impl` convention) so traversal descends
+    /// (source-declared Java `implements`, with method-name candidates) so traversal descends
     /// through interface dispatch instead of dead-ending at the declaration.
     pub iface_impl_edges: usize,
     /// `callable --persists_to--> DbTable` edges linked from *inline* SQL string
@@ -187,7 +189,10 @@ pub fn index_schema(repo_root: &Path) -> EngineResult<SchemaIndexStats> {
     let db_path = resolve_storage_path(repo_root, &config)?;
     let mut store = Store::open(&db_path)?;
     store.migrate()?;
-    index_schema_into(&mut store, repo_root)
+    store.begin_bulk()?;
+    let result = index_schema_into(&mut store, repo_root)?;
+    store.commit_bulk()?;
+    Ok(result)
 }
 
 fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
@@ -217,10 +222,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
         .into_iter()
         .filter_entry(|e| !is_skipped_walk_entry(e))
     {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry.context("walking schema sources")?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -230,21 +232,24 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        // Bound memory before any full-file `read_to_string` in this loop (XML
-        // mapper, route scan, Dart/TS consumed-call scan, DDL `read_and`): an
-        // 8 GB vendored/generated file, minified bundle or `.g.dart` would
-        // otherwise be slurped whole into a String and OOM-kill the indexer.
-        // Same capacity gate as the code/docs indexers (#67/#76/#186); an
-        // oversized file simply contributes no schema/route evidence.
-        if crate::source_text::is_oversized_source(path) {
+        if !matches!(ext.as_str(), "xml" | "sql" | "java" | "dart")
+            && !is_embedded_sql_source_ext(&ext)
+        {
             continue;
         }
+        if crate::source_text::is_oversized_source(path) {
+            stats.skipped_oversized += 1;
+            continue;
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading schema source {}", path.display()))?;
         // MyBatis mapper XML: index each statement as a SqlMapperStmt node so
         // the SQL becomes searchable graph evidence (porting bible).
         if ext == "xml" {
-            let Some(stmts) = read_and_xml(path) else {
+            let stmts = parse_mapper_stmts(&text);
+            if stmts.is_empty() {
                 continue;
-            };
+            }
             stats.files_scanned += 1;
             let rel = path
                 .strip_prefix(root)
@@ -270,7 +275,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
             "java" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs"
         );
         if is_route_lang && !is_go_test {
-            if let Ok(text) = std::fs::read_to_string(path) {
+            {
                 // Spring MVC annotations (Java), net/http + Gin registrations
                 // (Go), FastAPI/Flask decorators (Python) and Express/Hono
                 // registrations (TS/JS) all land as HttpRoute nodes so the *URL
@@ -309,7 +314,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
         // them now; nodes/edges are emitted after the walk so the consuming
         // callable nodes already exist.
         if ext == "dart" {
-            if let Ok(text) = std::fs::read_to_string(path) {
+            {
                 dart_route_consts.extend(parse_dart_route_constants(&text));
                 let calls = parse_dart_consumed_calls(&text);
                 if !calls.is_empty() {
@@ -327,7 +332,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
         // TS/JS clients (axios/fetch) consume backend routes the same inline way;
         // `.tsx` is included since hooks/components call the API directly too.
         if matches!(ext.as_str(), "ts" | "tsx" | "js" | "jsx" | "mjs") {
-            if let Ok(text) = std::fs::read_to_string(path) {
+            {
                 let calls = parse_ts_consumed_calls(&text);
                 if !calls.is_empty() {
                     let rel = path
@@ -342,18 +347,20 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
             }
         }
         let tables = match ext.as_str() {
-            "sql" => read_and(path, parse_sql_tables_from_sql_file),
-            "java" => read_and(path, parse_java_entity_tables),
+            "sql" => parse_sql_tables_from_sql_file(&text),
+            "java" => parse_java_entity_tables(&text),
             // Backends that keep their schema as an embedded string literal
             // (Go `migrations.go`, Rust/Python/TS migration modules, …) define
             // `CREATE TABLE` inside source code, never a `.sql` file. The same
             // tolerant DDL scanner finds it there too, so the inline-SQL linker
             // below can reach those tables. Java is excluded — it uses ORM
             // annotations (handled above) and the MyBatis XML path.
-            _ if is_embedded_sql_source_ext(&ext) => read_and(path, parse_sql_tables),
+            _ if is_embedded_sql_source_ext(&ext) => parse_sql_tables(&text),
             _ => continue,
         };
-        let Some(tables) = tables else { continue };
+        if tables.is_empty() {
+            continue;
+        }
         stats.files_scanned += 1;
         let rel = path
             .strip_prefix(root)
@@ -375,7 +382,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
                 .with_context(|| format!("upserting table {} from {rel}", t.name))?;
         }
     }
-    link_data_layer_edges(store, &mut stats)?;
+    link_data_layer_edges(store, root, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
@@ -405,13 +412,15 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
 /// existing controller→service→impl→mapper traversal now extends to the SQL
 /// and the tables. Idempotent (upsert). Java methods have no `name` field, so
 /// they are keyed by their id suffix; tables/stmts carry `name`.
-fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
+fn link_data_layer_edges(
+    store: &mut Store,
+    root: &Path,
+    stats: &mut SchemaIndexStats,
+) -> Result<()> {
     use std::collections::HashMap;
 
-    // id-suffix (`SimpleClass.method`, lower-cased) -> method node ids, plus a
-    // flat list keeping original case for the interface→impl convention match.
+    // id-suffix (`SimpleClass.method`, lower-cased) -> method node ids.
     let mut method_by_suffix: HashMap<String, Vec<ArtifactId>> = HashMap::new();
-    let mut java_methods: Vec<(String, ArtifactId)> = Vec::new();
     for m in store.list_nodes_by_kind(NodeKind::JavaMethod)? {
         let id = m.id.as_str();
         if let Some(suffix) = id.rsplit("::").next() {
@@ -419,64 +428,16 @@ fn link_data_layer_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Res
                 .entry(suffix.to_ascii_lowercase())
                 .or_default()
                 .push(m.id.clone());
-            java_methods.push((suffix.to_string(), m.id.clone()));
         }
     }
 
     let mut edges: Vec<EdgeAssertion> = Vec::new();
 
-    // interface → impl edges, two Java/Spring conventions (both require the
-    // paired method to actually exist, so no bogus edge is emitted; a dedup set
-    // prevents double-counting when the two conventions ever overlap):
-    //   A) C#/legacy `I<Core>` interface ⇒ `<Core>Impl`   (ICraftService→CraftServiceImpl)
-    //   B) dominant Spring `<Name>` interface ⇒ `<Name>Impl` (DictSystemService→DictSystemServiceImpl)
-    // Convention B is what real Spring services overwhelmingly use; only relying
-    // on A made polyglot/Spring repos report near-zero interface→impl coverage.
-    let mut iface_impl_seen: std::collections::HashSet<(ArtifactId, ArtifactId)> =
-        std::collections::HashSet::new();
-    for (suffix, node_id) in &java_methods {
-        let Some((class, method)) = suffix.rsplit_once('.') else {
-            continue;
-        };
-        // A: this node is the `I<Core>` interface; pair with `<Core>Impl`.
-        if is_interface_class_name(class) {
-            let impl_key = format!("{}Impl.{method}", &class[1..]).to_ascii_lowercase();
-            if let Some(impl_ids) = method_by_suffix.get(&impl_key) {
-                for impl_id in impl_ids {
-                    if node_id != impl_id
-                        && iface_impl_seen.insert((node_id.clone(), impl_id.clone()))
-                    {
-                        edges.push(EdgeAssertion::fact(
-                            node_id.clone(),
-                            impl_id.clone(),
-                            EdgeKind::DeclaresImplementation,
-                            EdgeSource::LanguageAdapter,
-                        ));
-                        stats.iface_impl_edges += 1;
-                    }
-                }
-            }
-        }
-        // B: this node is the `<Name>Impl` impl; pair with interface `<Name>`.
-        if let Some(core) = class.strip_suffix("Impl").filter(|c| !c.is_empty()) {
-            let iface_key = format!("{core}.{method}").to_ascii_lowercase();
-            if let Some(iface_ids) = method_by_suffix.get(&iface_key) {
-                for iface_id in iface_ids {
-                    if iface_id != node_id
-                        && iface_impl_seen.insert((iface_id.clone(), node_id.clone()))
-                    {
-                        edges.push(EdgeAssertion::fact(
-                            iface_id.clone(),
-                            node_id.clone(),
-                            EdgeKind::DeclaresImplementation,
-                            EdgeSource::LanguageAdapter,
-                        ));
-                        stats.iface_impl_edges += 1;
-                    }
-                }
-            }
-        }
-    }
+    // Only source-declared implementations can bridge an interface. Naming
+    // conventions alone cannot establish a Java type relationship.
+    let implementations = crate::java_treesitter::implementation_edges(store, root)?;
+    stats.iface_impl_edges = implementations.len();
+    edges.extend(implementations);
     // table name (lower-cased) -> table node ids, plus a registry of existing
     // synthetic "external" tables (so re-index reuses them instead of dupes).
     let mut table_by_name: HashMap<String, Vec<ArtifactId>> = HashMap::new();
@@ -921,16 +882,6 @@ fn body_references_token(body: &str, token: &str) -> bool {
     false
 }
 
-fn read_and_xml(path: &Path) -> Option<Vec<ParsedMapperStmt>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let stmts = parse_mapper_stmts(&text);
-    if stmts.is_empty() {
-        None
-    } else {
-        Some(stmts)
-    }
-}
-
 /// Build a `SqlMapperStmt` node for one mapper statement. The id is namespaced
 /// by file + statement id so the same method name in different mappers stays
 /// distinct; `name` is the bare statement id so `search` matches it like a
@@ -1138,18 +1089,6 @@ fn expand_includes(
     }
     out.push_str(&body[i..]);
     out
-}
-
-/// True for a Java interface class name following the `I<Upper>…` convention
-/// (`ICraftService`, `IOrderService`) — used to pair interfaces with their
-/// `<Name>Impl` implementations. Requires the 2nd char to be uppercase so
-/// ordinary names like `Image` / `Item` are not mistaken for interfaces.
-fn is_interface_class_name(class: &str) -> bool {
-    let mut chars = class.chars();
-    match (chars.next(), chars.next()) {
-        (Some('I'), Some(second)) => second.is_ascii_uppercase(),
-        _ => false,
-    }
 }
 
 /// Extract the table names a SQL statement reads/writes, best-effort: the
@@ -1368,16 +1307,6 @@ fn is_embedded_sql_source_ext(ext: &str) -> bool {
             | "scala"
             | "swift"
     )
-}
-
-fn read_and(path: &Path, f: fn(&str) -> Vec<ParsedTable>) -> Option<Vec<ParsedTable>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let tables = f(&text);
-    if tables.is_empty() {
-        None
-    } else {
-        Some(tables)
-    }
 }
 
 pub fn db_table_node(rel_path: &str, table: &ParsedTable) -> Node {
@@ -5703,11 +5632,10 @@ public class SizeSysVO implements Serializable {
     }
 
     #[test]
-    fn links_spring_service_impl_without_i_prefix() {
-        // Dominant Spring convention: `FooService` (interface) ⇒ `FooServiceImpl`
-        // (impl), with NO `I` prefix. The linker must pair them so traversal
-        // descends through interface dispatch instead of dead-ending at the
-        // declaration. Reproduces the vub/yolan miss (DictSystemService).
+    fn name_only_spring_nodes_do_not_prove_implementation() {
+        // Old name-only matching fabricated implementation edges even when
+        // neither source declaration was available. Imported/stale nodes must
+        // not regain that behavior on schema re-index.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(
@@ -5732,17 +5660,9 @@ public class SizeSysVO implements Serializable {
             .unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
-        assert!(
-            stats.iface_impl_edges >= 1,
-            "expected >=1 interface->impl edge (Spring <Name>Service convention), got {}",
-            stats.iface_impl_edges
-        );
-        let from_iface = store.list_edges_from(&iface).unwrap();
-        assert!(
-            from_iface
-                .iter()
-                .any(|e| e.kind == EdgeKind::DeclaresImplementation && e.to_id == impl_id),
-            "expected DictSystemService->DictSystemServiceImpl DeclaresImplementation edge, got {from_iface:?}"
+        assert_eq!(
+            stats.iface_impl_edges, 0,
+            "no source declaration, no bridge"
         );
     }
 
@@ -5871,17 +5791,7 @@ public class SizeSysVO implements Serializable {
     }
 
     #[test]
-    fn classifies_interface_class_names() {
-        assert!(is_interface_class_name("ICraftService"));
-        assert!(is_interface_class_name("IOrderService"));
-        assert!(!is_interface_class_name("Image"));
-        assert!(!is_interface_class_name("Item"));
-        assert!(!is_interface_class_name("CraftServiceImpl"));
-        assert!(!is_interface_class_name("I"));
-    }
-
-    #[test]
-    fn links_interface_methods_to_impls() {
+    fn name_only_legacy_nodes_do_not_prove_implementation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // schema-index needs at least one scanned file to run; an empty mapper
@@ -5904,14 +5814,9 @@ public class SizeSysVO implements Serializable {
             .unwrap();
 
         let stats = index_schema_into(&mut store, root).unwrap();
-        assert_eq!(stats.iface_impl_edges, 1, "one interface->impl edge");
-
-        let from_iface = store.list_edges_from(&iface).unwrap();
-        assert!(
-            from_iface
-                .iter()
-                .any(|e| e.kind == EdgeKind::DeclaresImplementation && e.to_id == imp),
-            "expected interface->impl DeclaresImplementation edge, got {from_iface:?}"
+        assert_eq!(
+            stats.iface_impl_edges, 0,
+            "no source declaration, no bridge"
         );
     }
 

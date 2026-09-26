@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use groundgraph_core::language_traits::is_code_symbol;
-use groundgraph_core::EdgeKind;
+use groundgraph_core::{EdgeAssertion, EdgeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
@@ -36,13 +36,13 @@ use crate::test_suggestions::{
     analyze_test_suggestions_with_store, SymbolSuggestions, TestSuggestionsOptions,
 };
 
-pub const FEATURE_PACK_SCHEMA_VERSION: u32 = 1;
+pub const FEATURE_PACK_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Data contract
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackEdge {
     pub kind: String,
     pub from: String,
@@ -50,6 +50,8 @@ pub struct PackEdge {
     /// `true` when both endpoints are in scope; `false` for an external
     /// callee (a dependency the rewrite must also satisfy or stub).
     pub in_scope: bool,
+    /// Preserve the original evidence, confidence and resolver identity.
+    pub assertion: EdgeAssertion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -66,9 +68,13 @@ pub struct FeaturePackStats {
     pub impure_symbols: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeaturePack {
     pub schema_version: u32,
+    pub limitations: Vec<String>,
+    pub evidence_limit_per_symbol: usize,
+    /// Indexed symbols whose source could not be read at export time.
+    pub omitted_symbols: Vec<String>,
     /// Echo of the selector, e.g. `path:lib/alarm` or `requirement:REQ-X`.
     pub focus: String,
     pub stats: FeaturePackStats,
@@ -120,6 +126,7 @@ pub fn build_feature_pack_with_store(
 
     // In-scope symbols + their facts.
     let mut symbols: Vec<SymbolFact> = Vec::new();
+    let mut omitted_symbols = Vec::new();
     let mut scope_ids: BTreeSet<String> = BTreeSet::new();
     let mut pure = 0usize;
     let mut impure = 0usize;
@@ -140,9 +147,12 @@ pub fn build_feature_pack_with_store(
                 crate::symbol_facts::Purity::Unknown => {}
             }
             symbols.push(fact);
+        } else {
+            omitted_symbols.push(node.id.to_string());
         }
     }
     symbols.sort_by(|a, b| a.id.cmp(&b.id));
+    omitted_symbols.sort();
 
     // Edges touching the scope.
     let mut edges: Vec<PackEdge> = Vec::new();
@@ -165,6 +175,7 @@ pub fn build_feature_pack_with_store(
                 | EdgeKind::ReadsProvider
                 | EdgeKind::PersistsTo
                 | EdgeKind::NavigatesTo
+                | EdgeKind::DeclaresImplementation
         ) {
             continue;
         }
@@ -179,6 +190,7 @@ pub fn build_feature_pack_with_store(
             from,
             to,
             in_scope,
+            assertion: edge,
         });
     }
     edges.sort_by(|a, b| {
@@ -210,6 +222,14 @@ pub fn build_feature_pack_with_store(
 
     Ok(FeaturePack {
         schema_version: FEATURE_PACK_SCHEMA_VERSION,
+        limitations: vec![
+            "call_resolution_may_be_incomplete".into(),
+            "evidence_lines_are_bounded_not_full_source".into(),
+            "purity_and_test_suggestions_are_heuristic".into(),
+            "behavioral_equivalence_not_evaluated".into(),
+        ],
+        evidence_limit_per_symbol: options.max_evidence_per_symbol,
+        omitted_symbols,
         focus,
         stats,
         files: scope_files.into_iter().collect(),

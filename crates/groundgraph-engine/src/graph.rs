@@ -616,6 +616,7 @@ fn map_node(node: &Node) -> GraphNode {
 fn map_edge(edge: &EdgeAssertion) -> GraphEdge {
     let layer = layer_for_edge(edge);
     let status = match edge.status {
+        EdgeStatus::Proposed => GraphStatus::Proposed,
         EdgeStatus::Confirmed => GraphStatus::Confirmed,
         EdgeStatus::Deprecated => GraphStatus::Stale,
     };
@@ -949,7 +950,9 @@ fn layer_for_edge(edge: &EdgeAssertion) -> GraphLayer {
     // Manifest-declared links are the only ones we lift to the Confirmed
     // layer; everything else (filesystem `contains`, parser facts, declared
     // edges without a manifest origin) stays in the Fact layer for now.
-    if matches!(edge.source, EdgeSource::ExternalManifest) {
+    if matches!(edge.certainty, EdgeCertainty::Candidate) {
+        GraphLayer::Candidate
+    } else if matches!(edge.source, EdgeSource::ExternalManifest) {
         GraphLayer::Confirmed
     } else {
         let _ = EdgeCertainty::Fact;

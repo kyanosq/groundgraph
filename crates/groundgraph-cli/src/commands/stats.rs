@@ -19,7 +19,7 @@ pub struct StatsRunArgs {
 }
 
 pub fn run(args: StatsRunArgs) -> Result<()> {
-    let workspace_dir = workspace_dir_for_repo(&args.repo_root);
+    let workspace_dir = workspace_dir_for_repo(&args.repo_root)?;
     let path = workspace_dir.join(STATS_REL_PATH);
     // The ledger rotates at a size cap (#250): old records spill into a single
     // `.1` sibling, so the summary must fold both files and reset must clear both.

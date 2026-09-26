@@ -46,21 +46,10 @@ const SELECT_EVIDENCE_COLS: &str =
 const SELECT_RANGE_COLS: &str =
     "file_path, symbol_id, start_line, end_line, symbol_kind, qualified_name, parent_symbol_id";
 
-/// #205: anti-downgrade guard applied to `edge_assertions.certainty` on UPSERT
-/// conflict. An incoming `fact` always wins (upgrade, or same-level refresh);
-/// an incoming `declared` only refreshes when the existing row is also
-/// `declared` — it must NOT overwrite an existing `fact`. The two values
-/// (`'declared'` < `'fact'`) happen to sort in semantic order, but the CASE
-/// states the rule explicitly instead of leaning on that coincidence.
-const CERTAINTY_CASE: &str = "CASE WHEN excluded.certainty='fact' OR edge_assertions.certainty='declared' THEN excluded.certainty ELSE edge_assertions.certainty END";
-
-/// #205: `confidence` rides the *same* condition as `certainty`. They are the
-/// pair that says "how sure we are about this assertion", so when a no-downgrade
-/// keeps the existing certainty it must also keep its confidence — otherwise a
-/// row could end up `fact`-certainty carrying a `declared`-grade score. The
-/// other SET columns (status / source_file / indexer / metadata_json) are
-/// provenance independent of certainty and refresh normally.
-const CONFIDENCE_CASE: &str = "CASE WHEN excluded.certainty='fact' OR edge_assertions.certainty='declared' THEN excluded.confidence ELSE edge_assertions.confidence END";
+/// Evidence and certainty form one assertion: never retain a fact's confidence
+/// while replacing its provenance with a weaker guess. Same-rank refreshes and
+/// upgrades replace the entire row; reindex clears stale generations separately.
+const ASSERTION_REPLACEMENT_ALLOWED: &str = "excluded.certainty='fact' OR edge_assertions.certainty='candidate' OR (excluded.certainty='declared' AND edge_assertions.certainty='declared')";
 
 /// Owned-`Value` constructors for the multi-row upsert paths, where borrowed
 /// `ToSql` references cannot outlive the per-row temporaries.
@@ -239,7 +228,7 @@ impl Store {
         self.with_write_tx(|conn| {
             for chunk in edges.chunks(CHUNK) {
                 let sql = format!(
-                    "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty={CERTAINTY_CASE}, status=excluded.status, confidence={CONFIDENCE_CASE}, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json",
+                    "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES {} ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json WHERE {ASSERTION_REPLACEMENT_ALLOWED}",
                     values_placeholders(chunk.len(), COLS)
                 );
                 let mut values: Vec<rusqlite::types::Value> =
@@ -266,7 +255,7 @@ impl Store {
 
     pub fn upsert_edge(&mut self, edge: &EdgeAssertion) -> StoreResult<()> {
         let sql = format!(
-            "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty={CERTAINTY_CASE}, status=excluded.status, confidence={CONFIDENCE_CASE}, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json"
+            "INSERT INTO edge_assertions (id, from_id, to_id, kind, source, certainty, status, confidence, evidence_json, source_file, indexer, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET from_id=excluded.from_id, to_id=excluded.to_id, kind=excluded.kind, source=excluded.source, certainty=excluded.certainty, status=excluded.status, confidence=excluded.confidence, evidence_json=excluded.evidence_json, source_file=excluded.source_file, indexer=excluded.indexer, metadata_json=excluded.metadata_json WHERE {ASSERTION_REPLACEMENT_ALLOWED}"
         );
         self.conn
             .prepare_cached(&sql)
@@ -1392,6 +1381,33 @@ mod decode_tests {
             EdgeCertainty::Fact,
             "a late Declared must not downgrade an existing Fact"
         );
+    }
+
+    #[test]
+    fn weaker_assertion_cannot_replace_stronger_assertions_evidence() {
+        for bulk in [false, true] {
+            let mut store = fresh_store();
+            let mut fact = EdgeAssertion::fact(
+                ArtifactId::new("a"),
+                ArtifactId::new("b"),
+                EdgeKind::Calls,
+                EdgeSource::LanguageAdapter,
+            );
+            fact.source_file = Some("compiler-evidence".into());
+            fact.evidence_json = Some("{\"resolver\":\"compiler\"}".into());
+            store.upsert_edge(&fact).unwrap();
+            let mut weak = fact.clone();
+            weak.certainty = groundgraph_core::EdgeCertainty::Candidate;
+            weak.status = groundgraph_core::EdgeStatus::Proposed;
+            weak.source_file = Some("name-guess".into());
+            weak.evidence_json = None;
+            if bulk {
+                store.upsert_edges_bulk(&[weak]).unwrap();
+            } else {
+                store.upsert_edge(&weak).unwrap();
+            }
+            assert_eq!(store.list_all_edges().unwrap(), vec![fact]);
+        }
     }
 
     /// #205: the guard is one-directional — a later `fact` still upgrades an

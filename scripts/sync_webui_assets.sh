@@ -11,7 +11,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$ROOT/webui"
 DST_DIR="$ROOT/crates/groundgraph-cli/webui"
-FILES=(index.html vendor/groundgraph-viewer.bundle.js)
+FILES=(index.html workspace.css model.js workspace.js)
 
 CHECK=0
 for arg in "$@"; do
@@ -38,7 +38,7 @@ done
 
 # In write mode only, materialise the destination tree before copying.
 if [ "$CHECK" -eq 0 ]; then
-  mkdir -p "$DST_DIR/vendor"
+  mkdir -p "$DST_DIR"
 fi
 
 status=0

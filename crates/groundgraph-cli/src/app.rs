@@ -114,9 +114,8 @@ enum Commands {
     /// 与 `obj['key'] ?? default` 形式的序列化键映射。移植时用来对齐
     /// DB 结构与 JSON 线格式 / 默认值。
     Contract(ContractArgs),
-    /// 移植覆盖率账本 (P24) — 按符号名对比「源」与「目标」两份 graph.db，
-    /// 报告已移植 / 缺失 / 目标独有，以及按源文件的覆盖率。用于重写时
-    /// 跟踪「还差哪些没移植」。
+    /// 名称匹配账本 (P24) — 按符号名对比「源」与「目标」两份 graph.db，
+    /// 报告同名匹配 / 缺失 / 目标独有。不验证业务行为，不能作为迁移验收。
     #[command(name = "port-coverage")]
     PortCoverage(PortCoverageArgs),
     /// 路由移植覆盖率 (P26) — 按规范化路由路径对比「消费方」(客户端 graph.db)
@@ -125,15 +124,14 @@ enum Commands {
     /// 哪些没实现」。匹配键默认取末 2 段(controller/action)以容忍网关前缀差异。
     #[command(name = "route-coverage")]
     RouteCoverage(RouteCoverageArgs),
-    /// 业务图等价 (P24+) — 把「同一业务切片」在源/目标两份 graph.db 中按
+    /// 图结构对比 (P24+) — 把「同一业务切片」在源/目标两份 graph.db 中按
     /// 路径 glob 圈定，量化对比节点数(按种类/家族)、内部边数、名称覆盖率。
-    /// JSON 输出可喂给 AI 逐子图遍历、逐项审查差异，用数字证明「Go 等价替代
-    /// Java」。
+    /// JSON 输出用于审查结构差异；名称和数量一致不证明业务行为等价。
     #[command(name = "graph-equiv")]
     GraphEquiv(GraphEquivArgs),
     /// 索引数据库表结构 (P25) — 扫描 .sql 的 CREATE TABLE 与 Java 实体的
     /// @TableName/@Table，把「表(含列)」写入 graph.db 作为 DbTable 节点，
-    /// 让数据契约成为业务图等价的证据(graph-equiv 会对比表/列)。
+    /// 供 graph-equiv 对比表/列；不验证 SQL 或业务行为等价。
     #[command(name = "schema-index")]
     SchemaIndex(SchemaIndexArgs),
     /// 从事实生成测试建议 (P24) — 基于分支 / 比较 / 空值 / 抛出 / 纯度 +
@@ -1249,8 +1247,14 @@ fn run() -> Result<u8> {
     let ok = matches!(&outcome, Ok(0));
     let metrics = groundgraph_engine::stats::take_metrics();
     let stat = groundgraph_engine::stats::make_stat(cmd_name, duration_ms, ok, metrics);
-    let stats_dir = groundgraph_engine::config::workspace_dir_for_repo(&repo_root);
-    let _ = groundgraph_engine::stats::append_stat(&stats_dir, &stat);
+    match groundgraph_engine::config::workspace_dir_for_repo(&repo_root) {
+        Ok(stats_dir) => {
+            if let Err(error) = groundgraph_engine::stats::append_stat(&stats_dir, &stat) {
+                tracing::warn!("command statistics not recorded: {error}");
+            }
+        }
+        Err(error) => tracing::warn!("command statistics skipped: {error}"),
+    }
     outcome
 }
 

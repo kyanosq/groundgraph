@@ -4,7 +4,7 @@
 
 **A non-invasive *intent layer* for AI-assisted coding.**
 
-GroundGraph builds an evidence-linked graph of your codebase — connecting requirements, docs, tests and code — so AI agents (and humans) get *grounded* context instead of guesses. It never touches your source: everything lives under the GroundGraph workspace directory `.groundgraph/`.
+GroundGraph builds an evidence-linked graph of your codebase — connecting requirements, docs, tests and code — so AI agents (and humans) get *grounded* context instead of guesses. It never touches your source: index caches live in the configured GroundGraph workspace, while human declarations and migration packages are retained separately.
 
 [![CI](https://github.com/kyanosq/groundgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/kyanosq/groundgraph/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -20,25 +20,27 @@ GroundGraph builds an evidence-linked graph of your codebase — connecting requ
 
 Most "code intelligence" tools answer *"where is this symbol?"*. GroundGraph also answers *"what is this code **for**, and what proves it?"*
 
-It indexes your repository into a SQLite graph of **nodes** (symbols, files, docs, requirements, tests, routes, DB tables…) and **edges** (calls, references, implements, verifies, persists…), where every edge carries **evidence**. On top of that graph it offers code search, impact analysis, dead-code detection, behavioral-fact extraction, and an AI **propose → human confirm** workflow for capturing business logic.
+It indexes your repository into a SQLite graph of **nodes** (symbols, files, docs, requirements, tests, routes, DB tables…) and **edges** (calls, references, implements, verifies, persists…), where edges retain available **evidence and provenance**. On top of that graph it offers code search, impact analysis, dead-code detection, behavioral-fact extraction, and an AI **propose → human confirm** workflow for capturing business logic.
 
-- **Non-invasive (zero write-back).** GroundGraph never edits, annotates, or commits to your code. All state is a rebuildable cache under `.groundgraph/`.
-- **Evidence over assertion.** Edges are backed by concrete facts (a call site, a doc link, a test reference), each with a confidence level — not opaque heuristics.
+- **Non-invasive (zero write-back).** GroundGraph never edits, annotates, or commits to your code. Index caches use the configured workspace. Human declarations and migration work packages need separate versioned retention; they are not disposable caches.
+- **Evidence and candidates stay distinct.** Heuristic calls are stored as candidate/proposed with provenance and confidence. Unresolved calls are not yet exhaustively inventoried; a missing edge does not prove absence.
 - **AI proposes, humans confirm.** Business-logic candidates are generated from code/doc/test facts and only become authoritative after a human review step.
 - **Tiered, multi-language.** A fast in-process tree-sitter backend covers breadth (Rust, TypeScript, Python, Go, Java, C, C++, Swift, C#, Ruby, PHP, Kotlin) plus a Dart analyzer sidecar; an *optional* SCIP/LSP overlay adds precise call/reference edges where you want them.
 
 > GroundGraph is **not** a faster grep. It is the layer above retrieval: intent alignment, traceability, and doc/code drift. It self-hosts — GroundGraph indexes its own Rust source.
 
+See the [offline evidence workspace](webui/README.md) and [design audit with remaining limits](docs/design-review-2026-09-26.md).
+
 ## Highlights
 
 - 🔎 **`search`** — hybrid retrieval: structural scoring (ids/names/paths/evidence/adjacency) **plus a BM25 fulltext content layer** over code bodies, doc comments and markdown bodies — bilingual (CJK bigrams), with a grounding source snippet per hit. Concept queries like `byte boundary panic` or `错位竞争` hit even when no identifier contains those words.
 - 📋 **`check`** — doc→code drift detection: stale doc references (`doc_stale_code_ref` — a doc mentions a path/symbol that no longer exists), orphan requirements with **graph-suggested implementations** (`requirement_implementation_hint`), broken declared links, missing linked tests.
-- 🧭 **`trace`** — endpoint → full downstream chain (controller → service → impl → SQL → table).
+- 🧭 **`trace`** — endpoint → indexed downstream relationships, including candidates and explicit truncation (controller → service → impl → SQL → table).
 - 💥 **`impact`** — which requirements, docs and tests a git diff affects.
 - 🪦 **`dead-code`** — symbols unreachable from any entry point, with reasons and confidence (never auto-deletes).
-- 🧪 **`facts` / `purity` / `constants` / `contract`** — deterministic behavioral facts for refactoring & porting.
+- 🧪 **`facts` / `purity` / `constants` / `contract`** — static behavioral signals for refactoring & porting, with explicit semantic limits.
 - 🧠 **`propose` / `candidate` / `logic`** — AI business-logic evidence packs and a human review workflow.
-- 🔁 **`port-coverage` / `graph-equiv`** — track and prove a rewrite/port against the source graph.
+- 🔁 **`port-coverage` / `graph-equiv`** — compare source/target names and structure; these are not behavioral-equivalence checks.
 - 📊 **`dashboard`** — a single self-contained offline HTML panel aggregating overview, business modules, feature clusters, checks, dead code, open questions and purity. No server, no CDN — open it from `file://`.
 - 🔌 **MCP server** — expose the graph to AI agents via the Model Context Protocol.
 - 🧩 **`install` / `watch`** — configure Cursor, Claude Code and Codex for MCP, then keep the graph refreshed during agent work.
@@ -158,7 +160,7 @@ Run `groundgraph --help` (or `groundgraph <command> --help`) for the full, autho
 | **Quality** | `dead-code`, `similar`, `check`, `questions` | Unreachable code, duplicate clusters, consistency checks, open questions |
 | **Behavioral facts** | `facts`, `purity`, `constants`, `contract` | Branches/returns/nullability, purity census, literal catalogue, data contracts |
 | **Business intent** | `propose`, `candidate`, `logic`, `business-doc`, `connect` | Generate/review business-logic candidates; render confirmed docs |
-| **Porting** | `port-coverage`, `route-coverage`, `graph-equiv`, `feature-pack`, `schema-index` | Track a rewrite against the source graph and prove equivalence |
+| **Porting** | `port-coverage`, `route-coverage`, `graph-equiv`, `feature-pack`, `schema-index` | Compare rewrite inventory and structure (not behavioral equivalence) |
 
 > Read-only commands never mutate your source. `dead-code`, `similar`, `select-tests` etc. **report** — they never delete or run anything on your behalf.
 
@@ -290,3 +292,7 @@ Licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+### Migration review gate
+
+Use [the migration workflow](docs/migration-workflow.md) to prepare a source-pinned work package, record many-to-many mappings, and check current regression evidence. `port-coverage` and `graph-equiv` are inventory aids, not acceptance gates.

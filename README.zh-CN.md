@@ -22,23 +22,25 @@ GroundGraph 为代码库构建一张**带证据**的图——把需求、文档�
 
 它把仓库索引成一张 SQLite 图：**节点**（符号、文件、文档、需求、测试、路由、数据库表……）和**边**（调用、引用、实现、验证、持久化……），且每条边都带**证据**。在这张图之上，提供代码检索、影响分析、死代码检测、行为事实抽取，以及一套「AI 提候选 → 人确认」的业务逻辑沉淀流程。
 
-- **非侵入（零写回）。** GroundGraph 绝不编辑、注解或提交你的代码。所有状态都是可重建的缓存，只在 `.groundgraph/` 下。
-- **证据优先于断言。** 边由具体事实支撑（一个调用点、一处文档链接、一条测试引用），并带置信度——不是黑盒启发式。
+- **非侵入（零写回）。** GroundGraph 绝不编辑、注解或提交你的代码。索引缓存位于配置的工作目录；人工声明和迁移工作包应独立保存、版本管理，不能当缓存删除。
+- **区分证据与候选。** 启发式调用以 candidate/proposed 保存；导出保留来源和置信度。未知调用尚未完整收录，不能把没有连线当作不存在。
 - **AI 提候选，人确认。** 业务逻辑候选由代码/文档/测试事实生成，必须经人工审阅后才成为权威。
 - **分层、多语言。** 进程内 tree-sitter 后端覆盖广度（Rust、TypeScript、Python、Go、Java、C、C++、Swift、C#、Ruby、PHP、Kotlin）外加 Dart 分析器 sidecar；**可选**的 SCIP/LSP 叠加层在你需要的地方补上精确的调用/引用边。
 
 > GroundGraph **不是**更快的 grep。它是检索之上的一层：意图对齐、可追溯、文档/代码漂移。它能自举——GroundGraph 索引自己的 Rust 源码。
 
+新版 [代码证据工作台](webui/README.md) 支持局部依赖、原始断言和迁移核对；[本轮设计审查](docs/design-review-2026-09-26.md) 列出了已修复问题与仍缺的语义能力。
+
 ## 核心能力
 
 - 🔎 **`search`** — 混合检索：结构打分（id/名称/路径/证据/邻接）**叠加 BM25 全文内容层**（代码正文、文档注释、markdown 正文），中英双语（CJK 二元组分词），每个命中附带一行定位片段。像 `byte boundary panic`、`错位竞争` 这类"词不在标识符里"的概念查询也能命中。
 - 📋 **`check`** — 文档→代码漂移检测：文档引用了已不存在的路径/符号（`doc_stale_code_ref`）、孤儿需求自动给出**图上疑似实现**（`requirement_implementation_hint`）、声明链接断裂、缺验证测试。
-- 🧭 **`trace`** — 端点 → 完整下游链路（controller → service → impl → SQL → 表）。
+- 🧭 **`trace`** — 端点 → 已索引的下游关系（可能含候选与截断）（controller → service → impl → SQL → 表）。
 - 💥 **`impact`** — 一次 git diff 影响了哪些需求、文档、测试。
 - 🪦 **`dead-code`** — 从任何入口都不可达的符号，带中文理由与置信度（绝不自动删除）。
-- 🧪 **`facts` / `purity` / `constants` / `contract`** — 重构/移植用的确定性行为事实。
+- 🧪 **`facts` / `purity` / `constants` / `contract`** — 重构/移植用的静态行为线索；纯度与契约存在解析边界。
 - 🧠 **`propose` / `candidate` / `logic`** — AI 业务逻辑证据包与人工审阅流程。
-- 🔁 **`port-coverage` / `graph-equiv`** — 对照源图跟踪并证明一次重写/移植。
+- 🔁 **`port-coverage` / `graph-equiv`** — 对照源图比较名称与结构，不证明业务行为等价。
 - 📊 **`dashboard`** — 单文件离线 HTML 管理面板：概览 / 业务模块 / 功能簇 / 检查 / 死代码 / 待澄清 / 纯度一页聚合，浏览器直接打开（`file://`），无服务、无 CDN。
 - 🔌 **MCP 服务** — 通过 Model Context Protocol 把图暴露给 AI 智能体。
 
@@ -153,7 +155,7 @@ crate 分层：
 | **质量** | `dead-code`、`similar`、`check`、`questions` | 死代码、重复簇、一致性检查、待澄清问题 |
 | **行为事实** | `facts`、`purity`、`constants`、`contract` | 分支/返回/空值、纯度普查、字面量目录、数据契约 |
 | **业务意图** | `propose`、`candidate`、`logic`、`business-doc`、`connect` | 生成/审阅业务候选；渲染已确认文档 |
-| **移植** | `port-coverage`、`route-coverage`、`graph-equiv`、`feature-pack`、`schema-index` | 对照源图跟踪重写并证明等价 |
+| **移植** | `port-coverage`、`route-coverage`、`graph-equiv`、`feature-pack`、`schema-index` | 对照源图比较名称与结构，不能替代回归验收 |
 
 > 只读命令绝不改动源码。`dead-code`、`similar`、`select-tests` 等只**报告**——绝不替你删除或执行任何东西。
 
@@ -271,3 +273,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - MIT 许可（[LICENSE-MIT](LICENSE-MIT)）
 
 除非你明确声明，否则你有意提交并被纳入本作品的任何贡献（按 Apache-2.0 定义），都将按上述双许可授权，不附加任何额外条款。
+
+### 迁移工作包与验证
+
+[迁移工作流](docs/migration-workflow.md)提供源码版本固定、多对多映射和实际回归结果检查。名称覆盖率仅用于盘点；未解析、过期或缺少独立预期的记录不能通过审查门。

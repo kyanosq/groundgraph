@@ -103,6 +103,8 @@ impl IndexOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IndexResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<crate::schema_indexer::SchemaIndexStats>,
     pub docs: Option<DocsIndexResult>,
     pub code: Option<crate::dart_indexer::DartIndexResult>,
     pub links: Option<LinksIndexResult>,
@@ -154,8 +156,7 @@ pub struct IndexResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulltext: Option<crate::fulltext_indexer::FulltextIndexResult>,
     /// #232 — indexers that partially failed (tree-sitter parse timeouts,
-    /// SCIP run failures). The schema-indexer failure is folded in by the
-    /// CLI. Empty on a fully successful index.
+    /// SCIP run failures). Empty on a fully successful index.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partial_failures: Vec<PartialFailure>,
 }
@@ -574,6 +575,14 @@ pub fn index_repository_with_progress(
         timer.mark("requirements_md");
     }
 
+    if options.include_code {
+        result.schema = Some(
+            crate::schema_indexer::index_schema_into(&mut store, &options.repo_root)
+                .context("indexing schema and routes")?,
+        );
+        timer.mark("schema");
+    }
+
     // Content layer LAST: it mirrors whatever node set the passes above just
     // produced (docs sections, code symbols, requirements), reading each
     // source file once and rebuilding `node_fts` wholesale. This is what lets
@@ -599,6 +608,17 @@ pub fn index_repository_with_progress(
     timer.mark("commit");
 
     result.partial_failures = collect_partial_failures(&result.treesitter, &result.scip_runs);
+    if let Some(schema) = &result.schema {
+        if schema.skipped_oversized > 0 {
+            result.partial_failures.push(PartialFailure {
+                indexer: "schema".into(),
+                reason: format!(
+                    "{} oversized source files skipped",
+                    schema.skipped_oversized
+                ),
+            });
+        }
+    }
     Ok(result)
 }
 
@@ -710,6 +730,46 @@ fn language_file_count(result: &IndexResult, lang: &str) -> usize {
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
+
+    #[test]
+    fn code_and_schema_share_one_transaction_for_every_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join(".groundgraph.yaml"), "repo:\n  root: .\n  default_branch: main\nstorage:\n  path: .groundgraph/graph.db\nlanguages:\n  - id: java\n    paths: [src]\nenrichment:\n  scip: false\n  analyzer: false\n  lsp: false\n").unwrap();
+        std::fs::write(root.join("src/A.java"), "class A { void original() {} }").unwrap();
+        std::fs::write(
+            root.join("schema.sql"),
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        index_repository(IndexOptions::all(root)).unwrap();
+        let db = root.join(".groundgraph/graph.db");
+        let before = Store::open(&db).unwrap().list_all_nodes().unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|n| n.kind == groundgraph_core::NodeKind::DbTable),
+            "library/watch callers must also index schema"
+        );
+        std::fs::write(root.join("src/A.java"), "class A { void replacement() {} }").unwrap();
+        std::fs::write(root.join("schema.sql"), [0xff, 0xfe]).unwrap();
+        assert!(
+            index_repository(IndexOptions::all(root)).is_err(),
+            "unreadable schema must not be silently accepted"
+        );
+        let after = Store::open(&db).unwrap().list_all_nodes().unwrap();
+        assert_eq!(
+            before, after,
+            "failed pass must roll back code and schema together"
+        );
+        assert!(crate::schema_indexer::index_schema(root).is_err());
+        assert_eq!(
+            before,
+            Store::open(&db).unwrap().list_all_nodes().unwrap(),
+            "standalone schema refresh must also roll back"
+        );
+    }
 
     #[test]
     fn phase_timer_forwards_each_marked_phase_to_the_sink() {

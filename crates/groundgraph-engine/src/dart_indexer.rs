@@ -455,7 +455,50 @@ fn build_reference_evidence_json(line: u32, snippet: &str, resolver: &str) -> St
         resolver
     };
     obj.insert("resolver".into(), Value::from(resolver.to_string()));
+    if resolver.contains("heuristic") || resolver == "dart_lightweight" {
+        obj.insert("resolution".into(), Value::from("candidate"));
+        obj.insert(
+            "limitations".into(),
+            serde_json::json!([
+                "receiver_types_not_resolved",
+                "unresolved_calls_not_in_graph"
+            ]),
+        );
+    }
     Value::Object(obj).to_string()
+}
+
+/// One ingestion rule for both bulk and incremental reference writers.
+/// Name-based resolution is a candidate even if it has only one match.
+fn reference_assertion(
+    reference: &groundgraph_core::ReferenceEdge,
+    indexer_name: &str,
+) -> EdgeAssertion {
+    let mut edge = EdgeAssertion::fact(
+        reference.from_symbol_id.clone(),
+        reference.to_symbol_id.clone(),
+        reference.kind,
+        EdgeSource::LanguageAdapter,
+    );
+    let heuristic =
+        reference.resolver.contains("heuristic") || reference.resolver == "dart_lightweight";
+    if heuristic {
+        edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+        edge.status = groundgraph_core::EdgeStatus::Proposed;
+        edge.confidence = groundgraph_core::Confidence::new(0.5);
+    }
+    edge.indexer = Some(indexer_name.into());
+    if !reference.source_file.is_empty() {
+        edge.source_file = Some(reference.source_file.clone());
+    }
+    if reference.line > 0 || !reference.snippet.is_empty() || !reference.resolver.is_empty() {
+        edge.evidence_json = Some(build_reference_evidence_json(
+            reference.line,
+            &reference.snippet,
+            &reference.resolver,
+        ));
+    }
+    edge
 }
 
 /// Minimal glob matcher. Recognises `**` (cross-directory wildcard) and `*`
@@ -646,25 +689,7 @@ fn ingest(
             // corrupting the store.
             continue;
         }
-        let mut edge = EdgeAssertion::fact(
-            reference.from_symbol_id.clone(),
-            reference.to_symbol_id.clone(),
-            reference.kind,
-            EdgeSource::LanguageAdapter,
-        );
-        edge.indexer = Some(indexer_name.into());
-        // P6.3 — propagate evidence so the UI can show file:line + snippet
-        // and the user can judge how trustworthy a heuristic edge is.
-        if !reference.source_file.is_empty() {
-            edge.source_file = Some(reference.source_file.clone());
-        }
-        if reference.line > 0 || !reference.snippet.is_empty() || !reference.resolver.is_empty() {
-            edge.evidence_json = Some(build_reference_evidence_json(
-                reference.line,
-                &reference.snippet,
-                &reference.resolver,
-            ));
-        }
+        let edge = reference_assertion(reference, indexer_name);
         store.upsert_edge(&edge)?;
     }
 
@@ -822,23 +847,7 @@ pub fn ingest_language_batch_minimal(
         ) {
             continue;
         }
-        let mut edge = EdgeAssertion::fact(
-            reference.from_symbol_id.clone(),
-            reference.to_symbol_id.clone(),
-            reference.kind,
-            EdgeSource::LanguageAdapter,
-        );
-        edge.indexer = Some(indexer_name.into());
-        if !reference.source_file.is_empty() {
-            edge.source_file = Some(reference.source_file.clone());
-        }
-        if reference.line > 0 || !reference.snippet.is_empty() || !reference.resolver.is_empty() {
-            edge.evidence_json = Some(build_reference_evidence_json(
-                reference.line,
-                &reference.snippet,
-                &reference.resolver,
-            ));
-        }
+        let edge = reference_assertion(reference, indexer_name);
         edges.push(edge);
     }
 

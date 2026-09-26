@@ -95,8 +95,9 @@ pub struct TraceNode {
     pub layer: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TraceEdge {
+    pub assertion: groundgraph_core::EdgeAssertion,
     pub from: String,
     pub to: String,
     pub kind: String,
@@ -112,7 +113,7 @@ pub struct TraceResult {
     pub tables: Vec<String>,
     /// Node count per layer.
     pub layer_counts: BTreeMap<String, usize>,
-    /// `true` when the closure hit `max_nodes` and stopped early.
+    /// `true` when the closure hit `max_nodes` or `max_depth` and stopped early.
     pub truncated: bool,
 }
 
@@ -175,7 +176,7 @@ fn trace_forward(
     seeds: Vec<ArtifactId>,
 ) -> Result<TraceResult> {
     let mut depth_of: BTreeMap<String, usize> = BTreeMap::new();
-    let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut edges = BTreeMap::new();
     let mut queue: VecDeque<(ArtifactId, usize)> = VecDeque::new();
     let mut truncated = false;
 
@@ -187,6 +188,13 @@ fn trace_forward(
 
     while let Some((node, depth)) = queue.pop_front() {
         if depth >= options.max_depth {
+            truncated |= store.list_edges_from(&node)?.iter().any(|edge| {
+                TRACE_EDGE_KINDS.contains(&edge.kind.as_str())
+                    && (options.include_noise
+                        || edge.kind.as_str() != "calls"
+                        || !is_noise_target(edge.to_id.as_str()))
+                    && !depth_of.contains_key(edge.to_id.as_str())
+            });
             continue;
         }
         for edge in store.list_edges_from(&node)? {
@@ -198,7 +206,7 @@ fn trace_forward(
                 continue;
             }
             let to = edge.to_id.as_str().to_string();
-            edges.insert((node.as_str().to_string(), to.clone(), kind.to_string()));
+            edges.insert(edge.id.to_string(), edge.clone());
             if !depth_of.contains_key(&to) {
                 if depth_of.len() >= options.max_nodes {
                     truncated = true;
@@ -241,8 +249,13 @@ fn trace_forward(
     nodes.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.id.cmp(&b.id)));
 
     let edges: Vec<TraceEdge> = edges
-        .into_iter()
-        .map(|(from, to, kind)| TraceEdge { from, to, kind })
+        .into_values()
+        .map(|edge| TraceEdge {
+            from: edge.from_id.to_string(),
+            to: edge.to_id.to_string(),
+            kind: edge.kind.as_str().to_string(),
+            assertion: edge,
+        })
         .collect();
 
     Ok(TraceResult {
@@ -589,5 +602,9 @@ mod tests {
         opts.max_depth = 0; // no expansion at all
         let res = trace_forward(&store, &opts, vec![a.id.clone()]).unwrap();
         assert_eq!(res.nodes.len(), 1, "depth 0 keeps only the seed");
+        assert!(
+            res.truncated,
+            "depth-limited traces must not appear complete"
+        );
     }
 }

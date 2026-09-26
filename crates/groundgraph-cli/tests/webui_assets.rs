@@ -39,6 +39,8 @@ fn crate_local_viewer_template_matches_webui_source() {
 }
 
 #[test]
-fn crate_local_viewer_bundle_matches_webui_source() {
-    assert_copy_matches_source("vendor/groundgraph-viewer.bundle.js");
+fn crate_local_viewer_code_matches_webui_source() {
+    for file in ["workspace.css", "model.js", "workspace.js"] {
+        assert_copy_matches_source(file);
+    }
 }

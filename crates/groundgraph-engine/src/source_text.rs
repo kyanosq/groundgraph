@@ -39,6 +39,34 @@ pub(crate) fn is_oversized_source(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve an existing source file, rejecting absolute paths, parent traversal
+/// and symlinks outside the repository. Graph paths are data, not operator grants.
+pub fn resolve_source_path(
+    repo_root: &Path,
+    relative: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = Path::new(relative);
+    let denied = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("source path escapes repository: {relative}"),
+        )
+    };
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(denied());
+    }
+    let root = repo_root.canonicalize()?;
+    let resolved = root.join(path).canonicalize()?;
+    if !resolved.starts_with(root) {
+        return Err(denied());
+    }
+    Ok(resolved)
+}
+
 /// The recovered source span of a graph node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeSource {
@@ -59,7 +87,7 @@ pub fn read_node_source(repo_root: &Path, node: &Node) -> Option<NodeSource> {
         (Some(s), Some(e)) if e >= s && s >= 1 => (s, e),
         _ => return None,
     };
-    let abs = repo_root.join(path);
+    let abs = resolve_source_path(repo_root, path).ok()?;
     // Bound memory: skip files past the index budget so a node whose `path`
     // points at a generated / vendored multi-MB blob is not slurped whole by
     // the parallel fact passes (#245; same budget as the tree-sitter / FTS
@@ -259,6 +287,35 @@ pub fn identifier_tokens(src: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use groundgraph_core::{ArtifactId, Node, NodeKind};
+
+    #[test]
+    #[cfg(unix)]
+    fn source_spans_never_follow_paths_outside_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "private content").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link.java")).unwrap();
+        let mut n = groundgraph_core::Node::new(
+            groundgraph_core::ArtifactId::new("x"),
+            groundgraph_core::NodeKind::JavaMethod,
+        );
+        n.start_line = Some(1);
+        n.end_line = Some(1);
+        for path in [
+            "../outside.txt".to_string(),
+            outside.to_string_lossy().into_owned(),
+            "link.java".to_string(),
+        ] {
+            n.path = Some(path);
+            assert!(
+                read_node_source(&root, &n).is_none(),
+                "source path must be confined: {:?}",
+                n.path
+            );
+        }
+    }
 
     #[test]
     fn is_oversized_source_flags_only_files_past_budget() {

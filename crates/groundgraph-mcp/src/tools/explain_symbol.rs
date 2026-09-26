@@ -165,7 +165,8 @@ pub fn call(server: &Server, args: &Value) -> Result<Value> {
 
     // Look for business candidates whose evidence cites this symbol.
     let mut candidate_refs: Vec<Value> = Vec::new();
-    if let Ok(doc) = groundgraph_engine::load_business_candidates(&repo_root) {
+    {
+        let doc = groundgraph_engine::load_business_candidates(&repo_root)?;
         for c in doc.document.candidates {
             if c.evidence.iter().any(|e| e == &symbol_id) {
                 candidate_refs.push(json!({

@@ -470,16 +470,15 @@ fn check_19_no_self_loops_in_calls() {
 }
 
 #[test]
-fn check_20_calls_and_references_are_fact_layer() {
-    // Body-derived edges are Fact-layer (not Confirmed); they should never
-    // be presented as manifest-declared truth.
+fn check_20_lightweight_calls_and_references_are_candidates() {
+    // Lexical body matches are candidates, not semantic facts.
     let tmp = rich_fixture();
     let view = full_graph(tmp.path());
     for e in &view.edges {
         if e.kind == "calls" || e.kind == "references" {
             assert!(
-                matches!(e.layer, groundgraph_engine::graph::GraphLayer::Fact),
-                "{:?} edge promoted out of Fact layer: {:?}",
+                matches!(e.layer, groundgraph_engine::graph::GraphLayer::Candidate),
+                "{:?} heuristic edge must stay in Candidate layer: {:?}",
                 e.kind,
                 e
             );

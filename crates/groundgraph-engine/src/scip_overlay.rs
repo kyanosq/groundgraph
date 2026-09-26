@@ -230,7 +230,7 @@ pub struct ScipOverlayResult {
 /// resolver also found is *upgraded* (re-tagged `scip`) rather than duplicated.
 pub fn ingest_scip_overlay(store: &mut Store, repo_root: &Path) -> Result<ScipOverlayResult> {
     let scip_files =
-        collect_scip_files(&crate::config::workspace_dir_for_repo(repo_root).join("scip"));
+        collect_scip_files(&crate::config::workspace_dir_for_repo(repo_root)?.join("scip"));
     let mut result = ScipOverlayResult::default();
     if scip_files.is_empty() {
         return Ok(result);

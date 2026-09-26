@@ -1,4 +1,4 @@
-//! 业务图等价 (graph-equiv) — structural + name equivalence between the same
+//! Graph comparison (graph-equiv) — structural counts and name matches for the same
 //! business slice in two graphs (e.g. Java source ↔ Go rewrite).
 //!
 //! `port-coverage` answers "which symbol names exist on both sides" globally.
@@ -8,8 +8,8 @@
 //! **name coverage** — and emit AI-traversable JSON so an agent can walk the
 //! subgraph and audit each divergence.
 //!
-//! The numbers are the point: they make "the Go port faithfully replaces the
-//! Java service" a measurable claim, not an assertion.
+//! These numbers do not establish graph isomorphism or behavioral equivalence.
+//! Regression evidence and an explicit migration ledger are required separately.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use crate::error::EngineResult;
 use crate::path_class::{is_generated_path, is_test_path};
 use crate::schema_indexer::{normalize_column, DbTableMeta};
 
-pub const GRAPH_EQUIV_SCHEMA_VERSION: u32 = 1;
+pub const GRAPH_EQUIV_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Report
@@ -114,6 +114,8 @@ pub struct EquivMetrics {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphEquivReport {
     pub schema_version: u32,
+    pub assessment: String,
+    pub behavioral_equivalence: String,
     pub source_scope: Vec<String>,
     pub target_scope: Vec<String>,
     pub nodes: NodeComparison,
@@ -222,6 +224,8 @@ pub fn analyze_graph_equiv_with_stores(
 
     Ok(GraphEquivReport {
         schema_version: GRAPH_EQUIV_SCHEMA_VERSION,
+        assessment: "structural_only".into(),
+        behavioral_equivalence: "not_evaluated".into(),
         source_scope: options.source_scope.clone(),
         target_scope: options.target_scope.clone(),
         metrics: EquivMetrics {

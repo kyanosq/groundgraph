@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::EngineResult;
 use crate::path_class::{is_generated_path, is_test_path};
 
-pub const PORT_COVERAGE_SCHEMA_VERSION: u32 = 1;
+pub const PORT_COVERAGE_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Data contract
@@ -84,6 +84,8 @@ pub struct PortCoverageStats {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortCoverageReport {
     pub schema_version: u32,
+    pub assessment: String,
+    pub behavioral_equivalence: String,
     pub stats: PortCoverageStats,
     pub missing: Vec<MissingSymbol>,
     pub ported: Vec<PortedSymbol>,
@@ -455,6 +457,8 @@ pub fn analyze_port_coverage_with_stores(
 
     Ok(PortCoverageReport {
         schema_version: PORT_COVERAGE_SCHEMA_VERSION,
+        assessment: "structural_only".into(),
+        behavioral_equivalence: "not_evaluated".into(),
         stats,
         missing,
         ported,

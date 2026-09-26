@@ -492,16 +492,20 @@ pub fn resolve_links_path(repo_root: &Path, config: &EngineConfig) -> PathBuf {
     }
 }
 
-pub fn workspace_dir_for_repo(repo_root: &Path) -> PathBuf {
-    if let Ok(config) = load_config(repo_root) {
-        if let Some(parent) = resolve_storage_path(repo_root, &config)
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-        {
-            return parent;
+/// Missing workspace permits pre-init tools to use the default directory;
+/// malformed or escaping configuration must never redirect reads/writes there.
+pub fn workspace_dir_for_repo(repo_root: &Path) -> EngineResult<PathBuf> {
+    let config = match load_config(repo_root) {
+        Ok(config) => config,
+        Err(crate::error::EngineError::NoWorkspace { .. }) => {
+            return Ok(repo_root.join(DEFAULT_STORAGE_DIR))
         }
-    }
-    repo_root.join(DEFAULT_STORAGE_DIR)
+        Err(error) => return Err(error),
+    };
+    let db = resolve_storage_path(repo_root, &config)?;
+    db.parent().map(Path::to_path_buf).ok_or_else(|| {
+        crate::error::EngineError::InvalidInput("storage path has no parent directory".into())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

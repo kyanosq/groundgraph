@@ -214,7 +214,7 @@ fn body_reference_does_not_emit_self_loop() {
 }
 
 #[test]
-fn references_and_calls_edges_are_fact_layer() {
+fn lightweight_references_and_calls_are_candidates() {
     let tmp = pixcraft_iap_workspace();
     let view = build_graph_view(tmp.path(), GraphOptions::default()).unwrap();
 
@@ -222,8 +222,8 @@ fn references_and_calls_edges_are_fact_layer() {
         if edge.kind == "calls" || edge.kind == "references" {
             assert_eq!(
                 edge.layer,
-                groundgraph_engine::graph::GraphLayer::Fact,
-                "calls/references edges are deterministic code facts, not confirmed business: {edge:?}",
+                groundgraph_engine::graph::GraphLayer::Candidate,
+                "name-based calls/references must remain candidates: {edge:?}",
             );
         }
     }

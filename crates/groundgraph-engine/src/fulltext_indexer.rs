@@ -93,7 +93,9 @@ pub fn rebuild_fulltext_index(store: &mut Store, repo_root: &Path) -> Result<Ful
     let per_file: Vec<(usize, usize, Vec<FulltextRow>)> = by_path
         .par_iter()
         .map(|(path, spans)| {
-            let abs = repo_root.join(path);
+            let Ok(abs) = crate::source_text::resolve_source_path(repo_root, path) else {
+                return (0usize, spans.len(), Vec::new());
+            };
             // Capacity gate: skip files past the size budget rather than
             // reading them N-up across rayon workers (OOM guard).
             if crate::source_text::is_oversized_source(&abs) {

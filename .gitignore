@@ -56,3 +56,7 @@ reports/release/**/.groundgraph/
 # and gitignore the .txt to keep `git log -p` reviewable.
 reports/release/**/*.txt
 reports/release-v0.3.0a/**/*.json
+
+# Python evidence tooling bytecode.
+__pycache__/
+*.pyc

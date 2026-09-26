@@ -107,15 +107,22 @@ jobs:
         run: cargo deny check
 
   webui-audit:
-    # issues.md #102: the bundled web UI ships npm dependencies. Audit the
-    # checked-in lockfile so the release bundle's JS supply chain is gated too.
-    name: supply-chain · npm audit (webui)
+    # The viewer has no runtime npm dependencies; audit its browser test tools
+    # and exercise the same canonical assets that the CLI embeds.
+    name: webui · browser · migration evidence
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: npm audit
+      - name: Install and test workspace model
         working-directory: webui
-        run: npm audit --audit-level=high
+        run: |
+          npm ci
+          npm audit --audit-level=high
+          npm test
+          npx playwright install --with-deps chromium
+          npm run test:browser
+      - name: Migration evidence gate tests
+        run: python3 -m unittest discover -s scripts -p test_migration.py

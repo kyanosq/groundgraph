@@ -30,14 +30,9 @@ const DEFAULT_WEB_OUT: &str = ".groundgraph/export/graph-web.html";
 /// the copy byte-identical to the `webui/` source of truth.
 const VIEWER_TEMPLATE: &str = include_str!("../../webui/index.html");
 
-/// The offline viewer bundle (three + 3d-force-graph + UnrealBloomPass as one
-/// classic IIFE). The dev page loads it via `<script src>`; the `web` export
-/// inlines it so the result is a single portable file with no network at all.
-const VIEWER_BUNDLE: &str = include_str!("../../webui/vendor/groundgraph-viewer.bundle.js");
-
-/// The dev page's `<script src>` for the bundle; the export replaces it with the
-/// inlined bundle so a single file works straight from `file://`.
-const VENDOR_TAG: &str = "<script src=\"./vendor/groundgraph-viewer.bundle.js\"></script>";
+const VIEWER_STYLE: &str = include_str!("../../webui/workspace.css");
+const VIEWER_MODEL: &str = include_str!("../../webui/model.js");
+const VIEWER_SCRIPT: &str = include_str!("../../webui/workspace.js");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphFormat {
@@ -64,15 +59,14 @@ pub struct GraphRunArgs {
 }
 
 pub fn run(args: GraphRunArgs) -> Result<()> {
-    // `web` renders the *full* raw topology (the viewer degrades it at render
-    // time), so it bypasses the curated/capped business view entirely.
-    if args.format == GraphFormat::Web {
+    // Without explicit selectors web exposes every stored node. Selectors use
+    // the same curated pipeline as JSON/HTML rather than being silently ignored.
+    if args.format == GraphFormat::Web && args.view == GraphView::Overview && args.focus.is_none() && args.max_nodes.is_none() && args.include_candidates && args.include_risks {
         return emit_web(&args.repo_root, args.out.as_deref());
     }
 
-    // HTML embeds the full graph; the renderer enforces an 80-visible-node
-    // cap on top of `default_visible` so users see manageable starts even on
-    // giant repos. Engine-level `max_nodes` remains an explicit opt-in cap.
+    // Curated selectors define the exported scope; the workspace separately
+    // caps the currently drawn neighborhood and reports its omissions.
     let options = GraphOptions {
         view: args.view,
         focus: args.focus.clone(),
@@ -94,7 +88,10 @@ pub fn run(args: GraphRunArgs) -> Result<()> {
         GraphFormat::Json => emit_json(&view, args.out.as_deref(), args.pretty)?,
         GraphFormat::Mermaid => emit_mermaid(&view, args.out.as_deref())?,
         GraphFormat::Html => emit_html(&view, &args.repo_root, args.out.as_deref())?,
-        GraphFormat::Web => unreachable!("web handled above"),
+        GraphFormat::Web => {
+            let target = args.out.clone().unwrap_or_else(|| args.repo_root.join(DEFAULT_WEB_OUT));
+            emit_html(&view, &args.repo_root, Some(&target))?;
+        }
     }
     Ok(())
 }
@@ -152,7 +149,7 @@ fn emit_html(view: &GraphViewModel, repo_root: &Path, out: Option<&Path>) -> Res
         Some(p) => p.to_path_buf(),
         None => repo_root.join(DEFAULT_HTML_OUT),
     };
-    let body = render_html(view);
+    let body = render_html(view)?;
     super::output::write_atomic(&target, &body)?;
     eprintln!("wrote {}", target.display());
     Ok(())
@@ -161,11 +158,11 @@ fn emit_html(view: &GraphViewModel, repo_root: &Path, out: Option<&Path>) -> Res
 fn emit_web(repo_root: &Path, out: Option<&Path>) -> Result<()> {
     let net = build_network_graph(NetworkOptions {
         repo_root: repo_root.to_path_buf(),
-        keep_isolated: false,
+        keep_isolated: true,
     })
     .with_context(|| format!("building network graph at {}", repo_root.display()))?;
     let json = serde_json::to_string(&net).context("serialising network graph")?;
-    let html = render_web_html(&json);
+    let html = render_web_html(&json)?;
     let target = match out {
         Some(p) => p.to_path_buf(),
         None => repo_root.join(DEFAULT_WEB_OUT),
@@ -180,132 +177,50 @@ fn emit_web(repo_root: &Path, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Inline `data_json` into a copy of the viewer template at the `SS_DATA_SLOT`
-/// marker as `window.__SS_DATA__`, so the result is a single self-contained
-/// file that boots with no fetch (works from `file://`).
-fn render_web_html(data_json: &str) -> String {
-    // Neutralise any `</script>` (or other `</…`) hiding inside a string value
-    // so the embedded data can never close the host <script> tag early. `\/`
-    // is a valid JSON escape for `/`, so the payload still parses.
-    let safe = data_json.replace("</", "<\\/");
-    let data_script = format!("<script>window.__SS_DATA__ = {safe};</script>");
-    let with_data = inline_at_data_slot(VIEWER_TEMPLATE, &data_script);
-    inline_vendor_bundle(&with_data)
-}
-
-/// Replace the `SS_DATA_SLOT` marker line with the inlined data `<script>`.
-fn inline_at_data_slot(template: &str, data_script: &str) -> String {
-    if let Some(start) = template.find("<!-- SS_DATA_SLOT") {
-        if let Some(rel_end) = template[start..].find("-->") {
-            let end = start + rel_end + "-->".len();
-            let mut s = String::with_capacity(template.len() + data_script.len());
-            s.push_str(&template[..start]);
-            s.push_str(data_script);
-            s.push_str(&template[end..]);
-            return s;
-        }
+/// All HTML formats use the same offline workspace; asset drift fails explicitly.
+pub(super) fn render_web_html(data_json: &str) -> Result<String> {
+    let _: serde_json::Value = serde_json::from_str(data_json).context("invalid viewer data")?;
+    let safe = data_json.replace('<', "\\u003c");
+    let data = format!("<script id=\"groundgraph-data\" type=\"application/json\">{safe}</script>");
+    let mut html = replace_asset(VIEWER_TEMPLATE, "<!-- SS_DATA_SLOT -->", &data)?;
+    html = replace_asset(&html, "<link rel=\"stylesheet\" href=\"./workspace.css\" />", &format!("<style>{VIEWER_STYLE}</style>"))?;
+    for (tag, script) in [("<script src=\"./model.js\"></script>", VIEWER_MODEL), ("<script src=\"./workspace.js\"></script>", VIEWER_SCRIPT)] {
+        let safe_script = script.replace("</script", "<\\/script");
+        html = replace_asset(&html, tag, &format!("<script>{safe_script}</script>"))?;
     }
-    // Marker missing (template drift): inject just before the vendor bundle so it
-    // still runs before the viewer reads `window.__SS_DATA__`.
-    template.replacen(VENDOR_TAG, &format!("{data_script}\n{VENDOR_TAG}"), 1)
+    Ok(html)
 }
 
-/// Swap the dev page's `<script src=…bundle…>` for the inlined bundle so the
-/// export is a single file (the `./vendor/…` path would 404 from `/tmp`).
-fn inline_vendor_bundle(html: &str) -> String {
-    // Targeted neutralisation: `</script` can only appear inside a JS string or
-    // regex here, where `<\/script` is identical, so this never changes behaviour
-    // while guaranteeing the inlined bundle cannot close the host tag early.
-    let safe_bundle = VIEWER_BUNDLE.replace("</script", "<\\/script");
-    html.replacen(VENDOR_TAG, &format!("<script>{safe_bundle}</script>"), 1)
+fn replace_asset(template: &str, marker: &str, value: &str) -> Result<String> {
+    anyhow::ensure!(template.matches(marker).count() == 1, "viewer template must contain exactly one {marker}");
+    Ok(template.replacen(marker, value, 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn focus_miss_warns_only_when_focus_set_and_view_empty() {
-        // Typo'd focus → empty view → warn (mentions the offending id).
-        let w = focus_miss_warning(Some("python::nope"), 0).expect("should warn");
-        assert!(w.contains("python::nope"), "warning must name the id: {w}");
-        // Focus that matched nodes → silent.
-        assert!(focus_miss_warning(Some("REQ-PRICE"), 5).is_none());
-        // No focus → never warn (an empty overview is legitimate).
+        assert!(focus_miss_warning(Some("missing"), 0).unwrap().contains("missing"));
+        assert!(focus_miss_warning(Some("exists"), 5).is_none());
         assert!(focus_miss_warning(None, 0).is_none());
     }
-
     #[test]
-    fn viewer_template_has_the_data_slot_marker() {
-        // The CLI export depends on this marker living in webui/index.html.
-        assert!(
-            VIEWER_TEMPLATE.contains("<!-- SS_DATA_SLOT"),
-            "webui/index.html must keep the SS_DATA_SLOT marker for `graph --format web`"
-        );
-        assert!(VIEWER_TEMPLATE.contains("window.__SS_DATA__"));
+    fn viewer_is_self_contained_and_uses_inert_escaped_data() {
+        let html = render_web_html(r#"{"nodes":[{"id":"中文</script><!--<script>"}],"links":[]}"#).unwrap();
+        assert!(html.contains(r#"中文\u003c/script>\u003c!--\u003cscript>"#));
+        assert!(html.contains("application/json"));
+        assert!(html.contains("GroundGraphModel"));
+        assert!(html.contains("id=\"migration\""));
+        assert!(!html.contains("<script src="));
+        assert!(!html.contains("<link rel=\"stylesheet\""));
+        assert!(!html.contains("unsafe-eval"));
+        assert!(!html.contains("SS_DATA_SLOT"));
     }
-
     #[test]
-    fn viewer_template_references_the_vendor_bundle() {
-        // The export swaps this exact tag for the inlined bundle; if the dev page
-        // ever renames the bundle the export would silently keep a dead CDN-less
-        // <script src> and break offline. Pin both ends.
-        assert!(
-            VIEWER_TEMPLATE.contains(VENDOR_TAG),
-            "webui/index.html must load the vendor bundle via the exact VENDOR_TAG"
-        );
-        assert!(
-            VIEWER_BUNDLE.contains("globalThis.THREE"),
-            "bundle must expose THREE as a global for the classic viewer script"
-        );
-    }
-
-    #[test]
-    fn render_web_html_inlines_data_and_keeps_viewer() {
-        let json =
-            r#"{"meta":{"repo":"demo","nodes":1,"links":0},"nodes":[{"id":"a"}],"links":[]}"#;
-        let html = render_web_html(json);
-        assert!(
-            html.contains("window.__SS_DATA__ = {\"meta\":{\"repo\":\"demo\""),
-            "data must be inlined as the global the viewer reads"
-        );
-        // Viewer code survives and the placeholder marker is consumed.
-        assert!(
-            html.contains("ForceGraph3D({ controlType: 'orbit' })"),
-            "viewer code preserved"
-        );
-        assert!(
-            !html.contains("SS_DATA_SLOT"),
-            "marker replaced, not left behind"
-        );
-    }
-
-    #[test]
-    fn render_web_html_inlines_the_vendor_bundle_for_a_single_file() {
-        let html = render_web_html(r#"{"nodes":[],"links":[]}"#);
-        assert!(
-            !html.contains(VENDOR_TAG),
-            "the ./vendor/ <script src> must be replaced (it 404s from a /tmp export)"
-        );
-        assert!(
-            html.contains("globalThis.THREE"),
-            "the bundle itself must be inlined so the file is offline-portable"
-        );
-    }
-
-    #[test]
-    fn render_web_html_neutralises_script_close_in_data() {
-        // A node name containing `</script>` must not be able to close the host
-        // tag; it is escaped to the JSON-valid `<\/script>`.
-        let json = r#"{"nodes":[{"id":"x","name":"</script><b>"}]}"#;
-        let html = render_web_html(json);
-        assert!(
-            html.contains("<\\/script><b>"),
-            "`</` escaped inside payload"
-        );
-        assert!(
-            !html.contains("\"name\":\"</script>"),
-            "raw </script> from data must not survive"
-        );
+    fn template_drift_and_bad_json_are_errors() {
+        assert!(replace_asset("no marker", "MARKER", "value").is_err());
+        assert!(replace_asset("MARKER MARKER", "MARKER", "value").is_err());
+        assert!(render_web_html("not JSON").is_err());
     }
 }

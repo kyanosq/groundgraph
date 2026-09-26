@@ -123,15 +123,21 @@ impl EdgeSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeCertainty {
+    Candidate,
     Fact,
     Declared,
 }
 
 impl EdgeCertainty {
-    pub const ALL: &'static [EdgeCertainty] = &[EdgeCertainty::Fact, EdgeCertainty::Declared];
+    pub const ALL: &'static [EdgeCertainty] = &[
+        EdgeCertainty::Candidate,
+        EdgeCertainty::Fact,
+        EdgeCertainty::Declared,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            EdgeCertainty::Candidate => "candidate",
             EdgeCertainty::Fact => "fact",
             EdgeCertainty::Declared => "declared",
         }
@@ -147,15 +153,21 @@ impl EdgeCertainty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeStatus {
+    Proposed,
     Confirmed,
     Deprecated,
 }
 
 impl EdgeStatus {
-    pub const ALL: &'static [EdgeStatus] = &[EdgeStatus::Confirmed, EdgeStatus::Deprecated];
+    pub const ALL: &'static [EdgeStatus] = &[
+        EdgeStatus::Proposed,
+        EdgeStatus::Confirmed,
+        EdgeStatus::Deprecated,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            EdgeStatus::Proposed => "proposed",
             EdgeStatus::Confirmed => "confirmed",
             EdgeStatus::Deprecated => "deprecated",
         }

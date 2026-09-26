@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use groundgraph_engine::progress::ProgressSink;
-use groundgraph_engine::{index_repository_with_progress, IndexOptions, IndexResult, PartialFailure};
+use groundgraph_engine::{index_repository_with_progress, IndexOptions, IndexResult};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<()> {
@@ -22,7 +22,7 @@ pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<(
     progress.finish();
     // #232 — surface partial failures (parse timeouts, SCIP failures) so CI
     // does not mistake an index with gaps for a fully successful one.
-    let mut partials = result.partial_failures.clone();
+    let partials = result.partial_failures.clone();
     print!("{}", format_result(&result));
     record_index_metrics(&result);
     // Blind-spot guard: a config written when the repo was single-language
@@ -44,11 +44,7 @@ pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<(
             Err(e) => tracing::warn!("语言覆盖自检跳过：{e:#}"),
         }
     }
-    // P25: fold the persistence contract into the same graph. Best-effort —
-    // a schema scan failure must not abort a successful code/docs index.
-    if !docs_only {
-        match groundgraph_engine::schema_indexer::index_schema(repo_root) {
-            Ok(s) => {
+    if let Some(s) = &result.schema {
                 println!("Schema index:");
                 println!(
                     "  Tables (SQL {} + ORM {}, of which {} inferred from class name; + {} external schema-unknown)",
@@ -98,15 +94,6 @@ pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<(
                     "inline_sql_table_edges",
                     s.inline_sql_table_edges as i64,
                 );
-            }
-            Err(e) => {
-                tracing::warn!("Schema index skipped: {e:#}");
-                partials.push(PartialFailure {
-                    indexer: "schema".into(),
-                    reason: format!("{e:#}"),
-                });
-            }
-        }
     }
     if !partials.is_empty() {
         tracing::warn!("index completed with {} partial failure(s)", partials.len());
