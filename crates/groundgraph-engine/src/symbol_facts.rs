@@ -102,6 +102,9 @@ pub struct FactLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolFact {
     pub id: String,
+    /// Source node metadata, including framework declarations and unresolved evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
     pub kind: String,
     pub name: Option<String>,
     pub path: Option<String>,
@@ -200,6 +203,7 @@ pub fn analyze_symbol_facts_with_store(
             }
             None => SymbolFact {
                 id: node.id.to_string(),
+                metadata_json: node.metadata_json.clone(),
                 kind: node.kind.as_str().to_string(),
                 name: node.name.clone(),
                 path: node.path.clone(),
@@ -414,6 +418,7 @@ pub fn build_fact(
 
     SymbolFact {
         id: node.id.to_string(),
+        metadata_json: node.metadata_json.clone(),
         kind: node.kind.as_str().to_string(),
         name: node.name.clone(),
         path: node.path.clone(),

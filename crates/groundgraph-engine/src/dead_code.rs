@@ -563,7 +563,17 @@ pub fn implicit_entry_ids(
         // malformed payload never flips a real symbol into reachable.
         if is_code_kind(n.kind) {
             if let Some(json) = n.metadata_json.as_deref() {
-                if is_python_framework_entrypoint_metadata(json) {
+                let java_entry = n.kind == NodeKind::JavaMethod
+                    && serde_json::from_str::<serde_json::Value>(json)
+                        .ok()
+                        .is_some_and(|v| {
+                            v["java"]["framework"].as_array().is_some_and(|entries| {
+                                entries.iter().any(|e| {
+                                    e["role"] == "entrypoint" && e["resolution"] == "candidate"
+                                })
+                            })
+                        });
+                if java_entry || is_python_framework_entrypoint_metadata(json) {
                     entry_ids.insert(n.id.to_string());
                 }
             }

@@ -167,6 +167,8 @@ class GroundGraphJava {
         if(e instanceof LiteralTree && ((LiteralTree)e).getValue() instanceof String) out.add(((LiteralTree)e).getValue().toString());
         else if(e instanceof NewArrayTree && ((NewArrayTree)e).getInitializers()!=null)
             for(ExpressionTree v:((NewArrayTree)e).getInitializers()) out.addAll(values(v));
+        else if(e instanceof BinaryTree && e.getKind()==Tree.Kind.PLUS)
+            out.add(first(values(((BinaryTree)e).getLeftOperand()))+first(values(((BinaryTree)e).getRightOperand())));
         else {
             Object constant=null;
             TreePath p=TreePath.getPath(annotationUnit,e);
@@ -212,6 +214,52 @@ class GroundGraphJava {
         String path=("/"+a+"/"+b).replaceAll("/+","/");
         if(path.length()>1 && path.endsWith("/")) path=path.substring(0,path.length()-1);
         return path.replaceAll("\\{[^}]+\\}","{}");
+    }
+    String annotationName(TreePath method, AnnotationTree a) {
+        TreePath modifiers=new TreePath(method,((MethodTree)method.getLeaf()).getModifiers());
+        Element e=trees.getElement(new TreePath(new TreePath(modifiers,a),a.getAnnotationType()));
+        if(e instanceof TypeElement && !erroneous(e.asType())) return ((TypeElement)e).getQualifiedName().toString();
+        String name=a.getAnnotationType().toString();
+        if(name.contains(".")) return name;
+        // Missing jars: explicit imports still document intent. Wildcard imports
+        // are not enough to distinguish a same-package or shadowed annotation.
+        for(ImportTree i:annotationUnit.getImports()) {
+            String imported=i.getQualifiedIdentifier().toString();
+            if(!i.isStatic() && imported.endsWith("."+name)) return imported;
+        }
+        return null;
+    }
+    void frameworkAnnotations() {
+        for(TreePath p:methods) {
+            annotationUnit=p.getCompilationUnit();
+            for(AnnotationTree a:((MethodTree)p.getLeaf()).getModifiers().getAnnotations()) {
+                String shortName=head(a);
+                if(!Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider","Scheduled","EventListener","TransactionalEventListener").contains(shortName)) continue;
+                String name=annotationName(p,a);
+                boolean unknown=name==null;
+                boolean sql=(unknown || name.equals("org.apache.ibatis.annotations."+shortName)) &&
+                    Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider").contains(shortName);
+                boolean entry=Arrays.asList("org.springframework.scheduling.annotation.Scheduled", "org.springframework.context.event.EventListener", "org.springframework.transaction.event.TransactionalEventListener").contains(name) ||
+                    (unknown && Arrays.asList("Scheduled","EventListener","TransactionalEventListener").contains(shortName));
+                if(!sql && !entry) continue;
+                long pos=trees.getSourcePositions().getStartPosition(annotationUnit,a);
+                Map<String,Object> row=location(p,"");
+                row.putAll(obj("kind","framework","role",sql?"sql":"entrypoint","annotation",unknown?a.getAnnotationType().toString():name,
+                    "annotation_start",byteAt(annotationUnit,pos),"line",annotationUnit.getLineMap().getLineNumber(pos),
+                    "resolution","candidate","reason","source_annotation_runtime_binding_unverified"));
+                if(unknown) { row.put("resolution","unresolved"); row.put("reason","annotation_type_unresolved"); }
+                if(sql) {
+                    String text=String.join(" ",attr(a,"value"));
+                    row.put("stmt_kind",shortName.replace("Provider","").toLowerCase(Locale.ROOT));
+                    row.put("sql",text);
+                    String reason=shortName.endsWith("Provider")?"sql_provider_not_evaluated":
+                        text.isEmpty() || text.contains("<unresolved:")?"sql_constant_unresolved":
+                        text.contains("${")?"dynamic_sql_substitution":null;
+                    if(reason!=null) { row.put("resolution","unresolved"); row.put("reason",reason); }
+                }
+                emit(row);
+            }
+        }
     }
     void routes() {
         for(TreePath p:methods) {
@@ -275,6 +323,7 @@ class GroundGraphJava {
                 g.emit(obj("kind","diagnostic","path",path,"message",d.getCode()+" at line "+d.getLineNumber()));
             }
             g.routes();
+            g.frameworkAnnotations();
             for(TreePath p:g.methods) { Element e=g.trees.getElement(p); if(e!=null) g.declarationPaths.put(e,p); }
             for(TreePath p:g.calls) g.binding(p,completed);
             if(completed) g.overrides();

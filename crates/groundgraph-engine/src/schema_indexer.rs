@@ -145,6 +145,10 @@ pub struct MapperStmtMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub sql: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_method_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_annotation: Option<serde_json::Value>,
 }
 
 /// One HTTP endpoint route recovered from a Spring MVC controller annotation.
@@ -382,6 +386,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
                 .with_context(|| format!("upserting table {} from {rel}", t.name))?;
         }
     }
+    index_java_annotation_stmts(store, &mut stats)?;
     link_data_layer_edges(store, root, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
@@ -399,19 +404,58 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
     Ok(stats)
 }
 
-/// Stitch the data layer into the call graph so an endpoint subgraph reaches
-/// all the way to the tables it touches:
-///
-/// * `mapper-interface method --references--> SqlMapperStmt` — matched by the
-///   statement's `namespace` simple-name + `id` against the Java method node's
-///   id suffix (`...::CraftConflictMapper.selectConflictListTreeByCloth`).
-/// * `SqlMapperStmt --persists_to--> DbTable` — matched by table names parsed
-///   from the statement SQL against `DbTable` node names.
-///
-/// Both edge kinds are in [`crate::search::EXPANSION_EDGE_KINDS`], so the
-/// existing controller→service→impl→mapper traversal now extends to the SQL
-/// and the tables. Idempotent (upsert). Java methods have no `name` field, so
-/// they are keyed by their id suffix; tables/stmts carry `name`.
+/// Project javac annotation evidence into the existing SQL statement graph.
+fn index_java_annotation_stmts(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
+    for method in store.list_nodes_by_kind(NodeKind::JavaMethod)? {
+        let Some(raw) = method.metadata_json.as_deref() else {
+            continue;
+        };
+        let metadata: serde_json::Value = serde_json::from_str(raw)?;
+        let Some(entries) = metadata["java"]["framework"].as_array() else {
+            continue;
+        };
+        for entry in entries
+            .iter()
+            .filter(|e| e["role"] == "sql" && e["resolution"] == "candidate")
+        {
+            let path = entry["path"]
+                .as_str()
+                .context("annotation SQL missing source path")?;
+            let stmt = ParsedMapperStmt {
+                id: format!("{}@{}", method.id, entry["annotation_start"]),
+                stmt_kind: entry["stmt_kind"]
+                    .as_str()
+                    .context("annotation SQL missing kind")?
+                    .into(),
+                namespace: None,
+                sql: entry["sql"]
+                    .as_str()
+                    .context("annotation SQL missing text")?
+                    .into(),
+                line: u32::try_from(
+                    entry["line"]
+                        .as_u64()
+                        .context("annotation SQL missing line")?,
+                )?,
+            };
+            let mut node = mapper_stmt_node(path, &stmt);
+            node.name = method.name.clone();
+            node.metadata_json = Some(serde_json::to_string(&MapperStmtMeta {
+                stmt_kind: stmt.stmt_kind,
+                namespace: None,
+                sql: stmt.sql,
+                java_method_id: Some(method.id.to_string()),
+                java_annotation: Some(entry.clone()),
+            })?);
+            store.upsert_node(&node)?;
+            stats.mapper_stmts += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Link XML by exact namespace/method and annotations by source method identity.
+/// Table relationships describe syntactic references, not verified execution.
 fn link_data_layer_edges(
     store: &mut Store,
     _root: &Path,
@@ -458,9 +502,23 @@ fn link_data_layer_edges(
         let Some(meta_json) = &stmt.metadata_json else {
             continue;
         };
-        let Ok(meta) = serde_json::from_str::<MapperStmtMeta>(meta_json) else {
-            continue;
-        };
+        let meta: MapperStmtMeta = serde_json::from_str(meta_json)
+            .with_context(|| format!("invalid SQL metadata for {}", stmt.id))?;
+        if let Some(mid) = &meta.java_method_id {
+            let mut edge = EdgeAssertion::fact(
+                ArtifactId::new(mid),
+                stmt.id.clone(),
+                EdgeKind::References,
+                EdgeSource::LanguageAdapter,
+            );
+            edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+            edge.status = groundgraph_core::EdgeStatus::Proposed;
+            edge.confidence = groundgraph_core::Confidence::new(0.75);
+            edge.source_file = stmt.source_file.clone();
+            edge.evidence_json = meta.java_annotation.as_ref().map(ToString::to_string);
+            edges.push(edge);
+            stats.stmt_method_edges += 1;
+        }
         // method link: <namespace-simple-name>.<stmt-id>
         if let (Some(ns), Some(stmt_id)) = (&meta.namespace, &stmt.name) {
             let key = format!("{ns}.{stmt_id}");
@@ -485,6 +543,7 @@ fn link_data_layer_edges(
             }
         }
         // table links: each table parsed out of the SQL.
+        let table_edges_start = edges.len();
         for table in extract_sql_table_refs(&meta.sql) {
             if let Some(table_ids) = table_by_name.get(&table) {
                 for tid in table_ids {
@@ -519,6 +578,15 @@ fn link_data_layer_edges(
                     EdgeSource::LanguageAdapter,
                 ));
                 stats.stmt_table_edges += 1;
+            }
+        }
+        for edge in &mut edges[table_edges_start..] {
+            edge.source_file = stmt.source_file.clone();
+            edge.evidence_json = Some(serde_json::json!({"resolver":"sql_table_reference", "line":stmt.start_line, "java_annotation":meta.java_annotation, "syntactic_reference_only":true}).to_string());
+            if meta.java_annotation.is_some() {
+                edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+                edge.status = groundgraph_core::EdgeStatus::Proposed;
+                edge.confidence = groundgraph_core::Confidence::new(0.75);
             }
         }
     }
@@ -922,6 +990,8 @@ pub fn mapper_stmt_node(rel_path: &str, stmt: &ParsedMapperStmt) -> Node {
         stmt_kind: stmt.stmt_kind.clone(),
         namespace: stmt.namespace.clone(),
         sql: stmt.sql.clone(),
+        java_method_id: None,
+        java_annotation: None,
     };
     node.metadata_json = serde_json::to_string(&meta).ok();
     node

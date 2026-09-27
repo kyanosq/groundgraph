@@ -86,6 +86,8 @@ impl TraceOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraceNode {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
     pub kind: String,
     pub label: String,
     pub path: Option<String>,
@@ -226,21 +228,29 @@ fn trace_forward(
     let mut layer_counts: BTreeMap<String, usize> = BTreeMap::new();
     for (id, depth) in &depth_of {
         let aid = ArtifactId::new(id.clone());
-        let (kind, label, path) = match store.find_node(&aid)? {
+        let (kind, label, path, metadata_json) = match store.find_node(&aid)? {
             Some(n) => {
                 let kind = n.kind.as_str().to_string();
                 let label = n.name.clone().unwrap_or_else(|| display_label(id));
                 if n.kind == NodeKind::DbTable {
                     tables.insert(label.clone());
                 }
-                (kind, label, n.path.clone())
+                (
+                    kind,
+                    label,
+                    n.path.clone(),
+                    (n.kind != NodeKind::File)
+                        .then_some(n.metadata_json)
+                        .flatten(),
+                )
             }
-            None => ("unknown".to_string(), display_label(id), None),
+            None => ("unknown".to_string(), display_label(id), None, None),
         };
         let layer = classify_layer(&kind, path.as_deref(), &label);
         *layer_counts.entry(layer.clone()).or_default() += 1;
         nodes.push(TraceNode {
             id: id.clone(),
+            metadata_json,
             kind,
             label,
             path,

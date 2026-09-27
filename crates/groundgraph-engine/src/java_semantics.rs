@@ -387,8 +387,22 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
         let ids = positions.get(&key)?;
         (ids.len() == 1).then(|| ids[0].clone())
     };
+    let mut framework = BTreeMap::<String, Vec<Value>>::new();
     for r in &records {
         match r["kind"].as_str() {
+            Some("framework") => {
+                if let Some(id) = target_at(r, "") {
+                    framework.entry(id).or_default().push(r.clone());
+                } else if let Some(a) = r["path"].as_str().and_then(|p| analyses.get_mut(p)) {
+                    a.diagnostics
+                        .push(format!("framework_declaration_not_indexed: {r}"));
+                }
+                if r["resolution"] == "unresolved" {
+                    if let Some(a) = r["path"].as_str().and_then(|p| analyses.get_mut(p)) {
+                        a.diagnostics.push(format!("framework_unresolved: {r}"));
+                    }
+                }
+            }
             Some("call") => {
                 let Some(a) = r["path"].as_str().and_then(|p| analyses.get_mut(p)) else {
                     continue;
@@ -443,6 +457,25 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
             }
             _ => {}
         }
+    }
+    for mut node in nodes {
+        let Some(raw) = node.metadata_json.as_deref() else {
+            continue;
+        };
+        let mut metadata: Value = serde_json::from_str(raw)?;
+        let Some(java) = metadata.get_mut("java").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let old = java.remove("framework");
+        let entries = framework.remove(node.id.as_str());
+        if old.is_none() && entries.is_none() {
+            continue;
+        }
+        if let Some(entries) = entries {
+            java.insert("framework".into(), json!(entries));
+        }
+        node.metadata_json = Some(metadata.to_string());
+        store.upsert_node(&node)?;
     }
     store.clear_indexer_outputs("java_semantics")?;
     store.clear_indexer_outputs("java_feign")?;

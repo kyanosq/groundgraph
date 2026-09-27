@@ -397,3 +397,184 @@ fn wildcard_import_does_not_create_an_instance_receiver_and_partial_scip_keeps_c
         before
     );
 }
+
+#[test]
+fn framework_annotations_keep_exact_methods_dynamic_gaps_and_entrypoints() {
+    use groundgraph_core::EdgeKind;
+    use groundgraph_engine::dead_code::{analyze_dead_code, DeadCodeOptions};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(
+        root,
+        "src/p/Mapper.java",
+        r#"package p;
+import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.SelectProvider;
+interface Mapper {
+  String TABLE = "orders";
+  @Select({"select *", "from " + TABLE, "where id = #{id}"}) Object find(int id);
+  @Select("select * from archived_orders") Object find(String id);
+  @Select("select * from ${table}") Object dynamic();
+  @SelectProvider(type=Object.class, method="sql") Object provider();
+}
+"#,
+    );
+    write(
+        root,
+        "src/p/Jobs.java",
+        r#"package p;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.context.event.EventListener;
+class Jobs {
+  @Scheduled(fixedRate=1000) void tick() {}
+  @EventListener void event(Object event) {}
+}
+"#,
+    );
+    write(
+        root,
+        "src/q/Custom.java",
+        r#"package q;
+@interface Select { String value(); }
+@interface Scheduled {}
+class Custom {
+  @Select("select * from fake_table") Object find() { return null; }
+  @Scheduled void custom() {}
+}
+"#,
+    );
+    write(root, "src/w/Wild.java", "package w; import org.apache.ibatis.annotations.*; interface Wild { @Select(\"select * from uncertain_table\") Object find(); }");
+    write(
+        root,
+        "src/Local.java",
+        r#"@interface Select { String value(); } class Local { @Select("select * from fake") void local() {} }"#,
+    );
+    let store = index(root);
+    let stmts = store.list_nodes_by_kind(NodeKind::SqlMapperStmt).unwrap();
+    assert_eq!(stmts.len(), 2, "{stmts:#?}");
+    let edges = store.list_edges_by_kind(EdgeKind::References).unwrap();
+    for (signature, table) in [
+        ("Mapper.find(int)", "orders"),
+        ("Mapper.find(String)", "archived_orders"),
+    ] {
+        let edge = edges
+            .iter()
+            .find(|e| {
+                e.from_id.as_str().ends_with(signature) && stmts.iter().any(|s| s.id == e.to_id)
+            })
+            .unwrap();
+        assert_eq!(edge.certainty, groundgraph_core::EdgeCertainty::Candidate);
+        assert!(edge
+            .evidence_json
+            .as_deref()
+            .unwrap()
+            .contains("annotation_start"));
+        let stmt = stmts.iter().find(|s| s.id == edge.to_id).unwrap();
+        let meta: Value = serde_json::from_str(stmt.metadata_json.as_deref().unwrap()).unwrap();
+        assert!(meta["sql"].as_str().unwrap().contains(table));
+        assert!(store
+            .list_edges_by_kind(EdgeKind::PersistsTo)
+            .unwrap()
+            .iter()
+            .any(|e| e.from_id == stmt.id && e.to_id.as_str().ends_with(table)));
+    }
+    let methods = store.list_nodes_by_kind(NodeKind::JavaMethod).unwrap();
+    let local = methods
+        .iter()
+        .find(|m| m.id.as_str().ends_with("Local.local()"))
+        .unwrap();
+    let local: Value = serde_json::from_str(local.metadata_json.as_deref().unwrap()).unwrap();
+    assert!(local["java"]["framework"].is_null());
+    for signature in ["Mapper.dynamic()", "Mapper.provider()", "Wild.find()"] {
+        let method = methods
+            .iter()
+            .find(|m| m.id.as_str().ends_with(signature))
+            .unwrap();
+        let meta: Value = serde_json::from_str(method.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["java"]["framework"][0]["resolution"], "unresolved");
+    }
+    let report = analyze_dead_code(DeadCodeOptions {
+        repo_root: root.into(),
+        ..Default::default()
+    })
+    .unwrap();
+    for name in ["Jobs.tick()", "Jobs.event(Object)"] {
+        assert!(
+            !report.candidates.iter().any(|c| c.id.ends_with(name)),
+            "{report:#?}"
+        );
+    }
+    assert!(report
+        .candidates
+        .iter()
+        .any(|c| c.id.ends_with("Custom.custom()")));
+    let facts = groundgraph_engine::symbol_facts::analyze_symbol_facts(
+        groundgraph_engine::symbol_facts::SymbolFactsOptions {
+            repo_root: root.into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let job = facts
+        .facts
+        .iter()
+        .find(|f| f.id.ends_with("Jobs.tick()"))
+        .unwrap();
+    let metadata: Value = serde_json::from_str(job.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["java"]["framework"][0]["role"], "entrypoint");
+    let graph = groundgraph_engine::network::network_from_graph(
+        "test",
+        &store.list_all_nodes().unwrap(),
+        &[],
+        true,
+    );
+    let graph = serde_json::to_value(graph).unwrap();
+    let job = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"].as_str().unwrap().ends_with("Jobs.tick()"))
+        .unwrap();
+    assert!(job["metadata_json"]
+        .as_str()
+        .is_some_and(|s| s.contains("entrypoint")));
+    let trace = groundgraph_engine::trace::run_trace_with_store(
+        &store,
+        groundgraph_engine::trace::TraceOptions::new(root, "Jobs.tick"),
+    )
+    .unwrap();
+    let trace = serde_json::to_value(trace).unwrap();
+    assert!(trace["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["metadata_json"]
+            .as_str()
+            .is_some_and(|s| s.contains("entrypoint"))));
+    drop(store);
+    write(
+        root,
+        "src/p/Mapper.java",
+        "package p; interface Mapper { Object find(int id); }",
+    );
+    write(
+        root,
+        "src/p/Jobs.java",
+        "package p; class Jobs { void tick() {} }",
+    );
+    let store = index(root);
+    assert!(store
+        .list_nodes_by_kind(NodeKind::SqlMapperStmt)
+        .unwrap()
+        .is_empty());
+    let report = analyze_dead_code(DeadCodeOptions {
+        repo_root: root.into(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(report
+        .candidates
+        .iter()
+        .any(|c| c.id.ends_with("Jobs.tick()")));
+}

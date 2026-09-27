@@ -44,6 +44,16 @@ java_semantics:
 
 `Elements.overrides` 建立真实覆盖关系，包括传递继承、多实现及泛型契约；不再使用 `Impl` 命名或只按方法名连实现。MyBatis XML 使用完整、大小写敏感的 namespace 加方法名关联；有多个重载时只给候选，不跨包误连。
 
+## 注解 SQL 与非 HTTP 入口（2026-09-27）
+
+复用 JDK AST 抽取 MyBatis `@Select/Insert/Update/Delete` 的字符串、字符串数组和常量拼接，按声明源码位置绑定到具体重载方法，再投影到已有 `SqlMapperStmt → DbTable` 关系。关系均为候选：SQL 中出现表名不等于运行时一定执行，也不证明数据源身份。保留注解全名、文件、字节位置、行号和 SQL 文本。
+
+`@*Provider` 不执行；`${...}` 替换、未知常量及缺依赖时无法绑定的通配导入注解保留 `unresolved` 和原因，不生成表关系。同名自定义注解不会被当成 MyBatis/Spring 注解；显式导入只证明声明意图。动态 SQL、语言驱动和供应商方言仍需独立运行证据。
+
+Spring `@Scheduled`、`@EventListener`、`@TransactionalEventListener` 记录为入口候选，死代码分析保守地将其作为可能入口；是否启用调度、实例化 Bean 或实际收到事件尚未验证。方法节点的 `java.framework` 是权威记录，导出保留元数据；重建索引会清理已删除的注解与 SQL 关系。编译器不可用时不提供这些声明结果。
+
+框架参考：[MyBatis Java API](https://mybatis.org/mybatis-3/java-api.html)、[Spring Scheduling](https://docs.spring.io/spring-framework/reference/integration/scheduling.html)。
+
 ## 使用与验收
 
 ```sh
@@ -61,7 +71,7 @@ groundgraph graph --format web --out graph.html
 
 方法引用保留编译期目标，但导出 `references`，不冒充已经执行的 `calls`。Feign 的继承接口映射、组合注解及 params/headers/consumes 条件尚未完整建模；已有静态匹配只作候选。
 
-动态反射、运行时 Bean 选择、生成代码及缺失的私有依赖不能凭静态源码完整还原。尚未提供这些证据的结果保持未知；注解 SQL、MyBatis-Plus 表语义及非 HTTP 入口不属于本轮新增支持。
+动态反射、运行时 Bean 选择、生成代码及缺失的私有依赖不能凭静态源码完整还原。尚未提供这些证据的结果保持未知；MyBatis-Plus 表语义、MQ 入口、组合/继承注解和运行时路由仍未完整覆盖。
 
 ## 回归
 
@@ -86,3 +96,11 @@ groundgraph graph --format web --out graph.html
 这些是清单和候选数量，不是准确率、召回率或迁移完成率。缺失依赖、生成代码和源码绑定限制仍造成大量未知；只有补齐对应构建上下文并复验，才能减少这些缺口。源码、服务映射、工作包、日志和二进制哈希全部留在本地验证目录，不进入公开仓库。
 
 官方 API：[JavacTask](https://docs.oracle.com/en/java/javase/17/docs/api/jdk.compiler/com/sun/source/util/JavacTask.html)、[Trees](https://docs.oracle.com/en/java/javase/17/docs/api/jdk.compiler/com/sun/source/util/Trees.html)。
+
+### 2026-09-27 框架补齐复验
+
+同一脱敏语料、15 个源集、JDK 11.0.18、debug 构建和 3000ms 解析预算，全量索引退出 0，用时 293.91 秒。360 条注解 SQL 投影为语句节点、360 条方法关联和 878 条候选表关联；7 个调度/事件入口候选。另有 17 条 SQL 声明保留未解析（14 条注解类型未知、3 条动态替换）。调用清单仍为 227,335 条，其中已解析 57,112、未解析 170,223，未以框架启发式提高调用解析数。这些统计不代表业务等价或准确率。
+
+820 项引擎单测、10 项 Java 集成、7 项迁移 CLI、3 项死代码 CLI、12 项 Python 迁移门、6 项页面模型及浏览器回归通过；clippy、rustdoc 拒绝警告检查与格式检查通过。扩展图导出 CLI 测试在 Flutter 样例初始化阶段耗时较长而中止，不列为通过。为修正注解重复扫描，曾主动中止一次全量复验，日志单独保留；上述统计来自修正后的成功运行。
+
+实际 Mapper 工作包导出验证通过（4 个符号、3 条框架声明）。最后补充默认包同名自定义注解的反例，修复误列为未解析框架项的问题；语料索引中没有此类默认包类型，因此不影响上述语料统计。

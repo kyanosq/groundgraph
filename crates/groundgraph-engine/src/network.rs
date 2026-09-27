@@ -16,6 +16,8 @@ use crate::error::EngineResult;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetworkNode {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
     pub kind: String,
     pub name: String,
     pub path: String,
@@ -85,6 +87,10 @@ pub fn network_from_graph(
             .unwrap_or_else(|| id.rsplit("::").next().unwrap_or(id).to_string());
         out.push(NetworkNode {
             id: id.to_string(),
+            // File-level call inventories are already exported in java_analysis.
+            metadata_json: (n.kind != groundgraph_core::NodeKind::File)
+                .then(|| n.metadata_json.clone())
+                .flatten(),
             kind: n.kind.as_str().to_string(),
             name,
             path: n.path.clone().unwrap_or_default(),
