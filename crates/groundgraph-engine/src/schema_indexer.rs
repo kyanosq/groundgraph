@@ -97,6 +97,10 @@ pub struct SchemaIndexStats {
     /// This is what lets `trace` reach tables for repos that embed SQL directly
     /// instead of using MyBatis XML mappers.
     pub inline_sql_table_edges: usize,
+    /// `callable --persists_to--> DbTable` edges from MyBatis-Plus inherited
+    /// CRUD calls, resolved through the entity type argument (javac binding).
+    #[serde(default)]
+    pub inherited_crud_table_edges: usize,
     /// `HttpRoute` nodes indexed from Spring MVC controller mapping annotations
     /// (`@GetMapping`/`@PostMapping`/…/`@RequestMapping`). Lets a query for the
     /// *URL path* tailorx calls resolve to its handler method.
@@ -389,6 +393,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
     index_java_annotation_stmts(store, &mut stats)?;
     link_data_layer_edges(store, root, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
+    link_mybatis_plus_crud_edges(store, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
     link_inline_consumed_routes(store, &dart_consumed_calls, "dart", &mut stats)?;
@@ -607,6 +612,70 @@ fn link_data_layer_edges(
             )
         })?;
     }
+    Ok(())
+}
+
+/// MyBatis-Plus inherited CRUD (`BaseMapper<E>.insert`, `IService<E>.save`,
+/// `ServiceImpl<M, E>.list`…) has no XML statement: the table is the entity
+/// type argument's `@TableName`. javac records the receiver's type arguments on
+/// the declaring generic type; any argument whose source file holds an ORM
+/// table is the entity. Mapper type arguments (`M`) hold no table and drop out.
+fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
+    use std::collections::{BTreeSet, HashMap};
+    let mut orm_tables: HashMap<String, Vec<ArtifactId>> = HashMap::new();
+    for t in store.list_nodes_by_kind(NodeKind::DbTable)? {
+        let orm = t
+            .metadata_json
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<DbTableMeta>(m).ok())
+            .is_some_and(|m| m.source.starts_with("orm"));
+        if let (true, Some(path)) = (orm, &t.path) {
+            orm_tables.entry(path.clone()).or_default().push(t.id.clone());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut edges = Vec::new();
+    for file in store.list_nodes_by_kind(NodeKind::File)? {
+        let Some(meta) = file.metadata_json.as_deref() else {
+            continue;
+        };
+        let meta: serde_json::Value = serde_json::from_str(meta)?;
+        let Some(calls) = meta.get("java_analysis").and_then(|a| a.get("calls")) else {
+            continue;
+        };
+        let calls: Vec<crate::java_semantics::CallSite> = serde_json::from_value(calls.clone())?;
+        for call in calls {
+            let Some(method) = call
+                .external_target
+                .as_deref()
+                .filter(|t| t.starts_with("com.baomidou.mybatisplus."))
+            else {
+                continue;
+            };
+            for arg in &call.owner_type_args {
+                let Some(tables) = arg.path.as_ref().and_then(|p| orm_tables.get(p)) else {
+                    continue;
+                };
+                for table in tables {
+                    if !seen.insert((call.caller.clone(), table.clone())) {
+                        continue;
+                    }
+                    let mut edge = EdgeAssertion::fact(
+                        ArtifactId::new(&call.caller),
+                        table.clone(),
+                        EdgeKind::PersistsTo,
+                        EdgeSource::LanguageAdapter,
+                    );
+                    edge.source_file = Some(call.path.clone());
+                    edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+                    edge.evidence_json = Some(serde_json::json!({"resolver":"mybatis_plus_inherited_crud","call_site":call.id,"line":call.line,"method":method,"entity":arg.name,"snippet":call.expression}).to_string());
+                    edges.push(edge);
+                }
+            }
+        }
+    }
+    stats.inherited_crud_table_edges = edges.len();
+    store.upsert_edges_bulk(&edges)?;
     Ok(())
 }
 

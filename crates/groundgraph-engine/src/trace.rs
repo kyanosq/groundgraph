@@ -135,8 +135,14 @@ fn load_config(repo_root: &Path) -> crate::error::EngineResult<EngineConfig> {
 
 pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> EngineResult<TraceResult> {
     // 1. Resolve seeds via the same matching as `search`.
+    // 查询本身就是完整节点 id：只追这一个，不再走模糊匹配。
+    let id = ArtifactId::new(options.query.trim());
+    if store.find_node(&id)?.is_some() {
+        return Ok(trace_forward(store, &options, vec![id])?);
+    }
     let mut search_opts = SearchOptions::keywords(&options.repo_root, &options.query);
-    search_opts.limit = options.max_seeds.max(1);
+    // 多取一些候选，让 `Class.method` 这类精确成员名有机会排进来再被钉住。
+    search_opts.limit = options.max_seeds.max(50);
     let search = run_search_with_store(store, search_opts)
         .with_context(|| format!("resolving trace seeds for `{}`", options.query))?;
     let seeds = select_seeds(&search.matches, &options.query, options.max_seeds);
@@ -147,7 +153,8 @@ pub fn run_trace_with_store(store: &Store, options: TraceOptions) -> EngineResul
 /// Choose trace seeds from ranked search matches.
 ///
 /// When the query *exactly* names one or more symbols (case-insensitive match
-/// on the symbol label), trace ONLY those — that is the overwhelmingly common
+/// on the symbol label, the full id, or the member part of the id such as
+/// Java `Class.method` without its parameter list), trace ONLY those — that is the overwhelmingly common
 /// "trace THIS symbol" intent. Otherwise fall back to the top `max_seeds` fuzzy
 /// matches (genuinely ambiguous keyword queries still fan out).
 ///
@@ -160,7 +167,11 @@ fn select_seeds(matches: &[SearchMatch], query: &str, max_seeds: usize) -> Vec<A
     let q = query.trim();
     let exact: Vec<&SearchMatch> = matches
         .iter()
-        .filter(|m| m.label.eq_ignore_ascii_case(q))
+        .filter(|m| {
+            let member = m.id.rsplit("::").next().unwrap_or("");
+            let member = member.split('(').next().unwrap_or(member);
+            m.id == q || m.label.eq_ignore_ascii_case(q) || member.eq_ignore_ascii_case(q)
+        })
         .collect();
     let chosen: Vec<&SearchMatch> = if exact.is_empty() {
         matches.iter().take(max_seeds.max(1)).collect()
@@ -378,6 +389,32 @@ mod tests {
             vec!["python::a.py::evaluate_research_guardrails"],
             "exact-name query must pin to the single exact symbol"
         );
+    }
+
+    #[test]
+    fn qualified_java_member_query_pins_that_member() {
+        // `Class.method` 在 search 里会先命中类节点；类只带出构造器，方法本身的链路丢失。
+        let matches = vec![
+            search_match("java::a/C.java::C", "C", 90),
+            search_match("java::a/C.java::C.create(Order)", "create", 80),
+            search_match("java::a/D.java::D.create(Map)", "create", 70),
+        ];
+        let seeds = select_seeds(&matches, "C.create", 6);
+        assert_eq!(
+            seeds.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec!["java::a/C.java::C.create(Order)"]
+        );
+    }
+
+    #[test]
+    fn full_artifact_id_query_pins_exactly_that_node() {
+        let id = "java::a/C.java::C.create(Order)";
+        let matches = vec![
+            search_match("java::a/C.java::C", "C", 90),
+            search_match(id, "create", 80),
+        ];
+        let seeds = select_seeds(&matches, id, 6);
+        assert_eq!(seeds.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec![id]);
     }
 
     #[test]

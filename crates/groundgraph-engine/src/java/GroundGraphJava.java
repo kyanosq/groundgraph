@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
-/** JDK 11+ compiler adapter: parse + attribute only, never generate or execute. */
+/** JDK 11+ compiler adapter: parse + attribute only; runs annotation processors only when configured. */
 class GroundGraphJava {
     final Path root;
     final PrintWriter output;
@@ -39,6 +39,11 @@ class GroundGraphJava {
             List<String> fields = new ArrayList<>();
             ((Map<?,?>)value).forEach((k,v)->fields.add(json(k.toString())+":"+json(v)));
             return "{"+String.join(",",fields)+"}";
+        }
+        if (value instanceof List) {
+            List<String> items = new ArrayList<>();
+            for (Object v: (List<?>)value) items.add(json(v));
+            return "["+String.join(",",items)+"]";
         }
         StringBuilder s = new StringBuilder("\"");
         for (char c: value.toString().toCharArray()) {
@@ -132,6 +137,8 @@ class GroundGraphJava {
                 if(!bad) {
                     row.put("resolved",true); row.put("reason","compiler_static_binding");
                     row.put("symbol",m.getEnclosingElement()+"."+m);
+                    List<Object> args=ownerTypeArgs(p,m);
+                    if(args!=null) row.put("owner_type_args",args);
                     TreePath target=declaration(m);
                     if(target!=null && bytes.containsKey(target.getCompilationUnit()) && start(target)>=0) row.putAll(location(target,"target_"));
                 } else row.put("reason","error_type_in_binding");
@@ -139,6 +146,42 @@ class GroundGraphJava {
             else if(overlapsError(p)) row.put("reason","compiler_error_at_call");
         } catch(RuntimeException ex) { row.put("reason","binding_exception:"+ex.getClass().getSimpleName()); }
         emit(row);
+    }
+    /** 继承来的泛型方法（如 BaseMapper<T>.insert）：接收者在声明类型上的实参，带源码路径，供框架约定落到实体。 */
+    List<Object> ownerTypeArgs(TreePath p, ExecutableElement m) {
+        Element owner=m.getEnclosingElement();
+        if(!(owner instanceof TypeElement) || ((TypeElement)owner).getTypeParameters().isEmpty() || m.getModifiers().contains(Modifier.STATIC)) return null;
+        TypeMirror receiver=null;
+        ExpressionTree select=p.getLeaf() instanceof MethodInvocationTree ? ((MethodInvocationTree)p.getLeaf()).getMethodSelect() : null;
+        if(select instanceof MemberSelectTree) {
+            ExpressionTree r=((MemberSelectTree)select).getExpression();
+            if(!(r instanceof IdentifierTree && ((IdentifierTree)r).getName().contentEquals("super"))) receiver=trees.getTypeMirror(new TreePath(new TreePath(p,select),r));
+        }
+        if(receiver==null) {
+            TypeElement enclosing=trees.getScope(p).getEnclosingClass();
+            if(enclosing!=null) receiver=enclosing.asType();
+        }
+        javax.lang.model.util.Types types=task.getTypes();
+        Deque<TypeMirror> queue=new ArrayDeque<>();
+        Set<String> seen=new HashSet<>();
+        if(receiver!=null) queue.add(receiver);
+        while(!queue.isEmpty()) {
+            TypeMirror t=queue.poll();
+            if(!(t instanceof DeclaredType) || !seen.add(t.toString())) continue;
+            DeclaredType d=(DeclaredType)t;
+            if(d.asElement().equals(owner)) {
+                List<Object> out=new ArrayList<>();
+                for(TypeMirror a:d.getTypeArguments()) {
+                    TypeMirror e=types.erasure(a);
+                    Element el=types.asElement(e);
+                    TreePath decl=el==null?null:trees.getPath(el);
+                    out.add(obj("name",e.toString(),"path",decl!=null && bytes.containsKey(decl.getCompilationUnit())?path(decl.getCompilationUnit()):null));
+                }
+                return out;
+            }
+            queue.addAll(types.directSupertypes(t));
+        }
+        return null;
     }
     void overrides() {
         Map<String,List<ExecutableElement>> byName=new HashMap<>();
@@ -308,8 +351,11 @@ class GroundGraphJava {
             PrintWriter out=new PrintWriter(Files.newBufferedWriter(Paths.get(args[2]),StandardCharsets.UTF_8))) {
             List<File> sources=new ArrayList<>();
             for(String path:Files.readAllLines(Paths.get(args[1]),StandardCharsets.UTF_8)) sources.add(root.resolve(path).toFile());
-            // Annotation processors / plugins and implicit source discovery stay disabled.
-            List<String> options=Arrays.asList("-proc:none","-implicit:none","-Xlint:none","-encoding","UTF-8","-classpath",args[3],"-sourcepath","","-Xmaxerrs","1000000");
+            // Implicit source discovery stays disabled; annotation processors run only when
+            // explicitly configured (args[4]), with generated output confined to args[5].
+            List<String> options=new ArrayList<>(Arrays.asList("-implicit:none","-Xlint:none","-encoding","UTF-8","-classpath",args[3],"-sourcepath","","-Xmaxerrs","1000000"));
+            if(args[4].isEmpty()) options.add("-proc:none");
+            else options.addAll(Arrays.asList("-processorpath",args[4],"-s",args[5],"-d",args[5]));
             JavacTask task=(JavacTask)compiler.getTask(null,manager,diagnostics,options,null,manager.getJavaFileObjectsFromFiles(sources));
             GroundGraphJava g=new GroundGraphJava(root,out,task);
             for(CompilationUnitTree unit:task.parse()) g.collect(unit);

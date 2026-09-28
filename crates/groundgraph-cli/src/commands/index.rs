@@ -53,11 +53,12 @@ pub fn run(repo_root: &Path, docs_only: bool, fail_on_partial: bool) -> Result<(
                 println!("  Columns: {}", s.columns);
                 println!("  Mapper statements: {}", s.mapper_stmts);
                 println!(
-                    "  Data-layer edges: method→SQL {} + SQL→table {} + interface→impl {} + inline-SQL→table {}",
+                    "  Data-layer edges: method→SQL {} + SQL→table {} + interface→impl {} + inline-SQL→table {} + inherited-CRUD→table {}",
                     s.stmt_method_edges,
                     s.stmt_table_edges,
                     s.iface_impl_edges,
-                    s.inline_sql_table_edges
+                    s.inline_sql_table_edges,
+                    s.inherited_crud_table_edges
                 );
                 println!(
                     "  HTTP routes: {} (route→method edges {})",

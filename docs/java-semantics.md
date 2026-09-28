@@ -6,7 +6,7 @@
 
 Tree-sitter 负责结构与调用清单。每次方法调用、构造、显式构造委托和方法引用都记录文件、字节区间、行列、表达式和所属符号；重复调用、共享起始位置的链式调用、递归不会折叠。语法错误明确提示清单可能不完整。字段初始化也在清单中，归属类型或文件。
 
-JDK 的 `JavacTask.parse/analyze` 与 `Trees.getElement` 负责声明类型、同包/导入、重载、泛型、继承和静态目标绑定。直接使用 JDK API，没有增加 Java 运行库依赖，不调用 Maven/Gradle，不生成 class，不执行客户业务代码；注解处理器关闭。JDK 11+ 可启动适配器，待分析的语言特性还必须被该 JDK 支持。调用位置按 UTF-8 字节对齐，包括非 ASCII 文本。
+JDK 的 `JavacTask.parse/analyze` 与 `Trees.getElement` 负责声明类型、同包/导入、重载、泛型、继承和静态目标绑定。直接使用 JDK API，没有增加 Java 运行库依赖，不调用 Maven/Gradle，不生成 class，不执行客户业务代码；注解处理器默认关闭，只运行 `annotation_processor_path` 显式给出的处理器（如 Lombok），生成物写入临时目录。JDK 11+ 可启动适配器，待分析的语言特性还必须被该 JDK 支持。调用位置按 UTF-8 字节对齐，包括非 ASCII 文本。
 
 编译器缺失、超时、源码缺依赖、出错类型、无法映射的声明均保留为 `unresolved`，说明原因。编译器识别到的第三方/JDK 方法记录 `external_target`，不伪造本仓库节点。已解析仅表示**编译期目标**；接口实现关系仍为候选，不等于运行时唯一实例。
 
@@ -22,6 +22,7 @@ java_semantics:
   java_command: java
   timeout_seconds: 120
   classpath: [] # 已有依赖 jar；不自动下载或运行依赖构建
+  annotation_processor_path: [] # 例：[~/.m2/.../lombok-1.18.46.jar]；不从 classpath 自动发现处理器
   source_sets:
     shared:
       roots: [shared/src/main/java]
@@ -43,6 +44,12 @@ java_semantics:
 解析 `@FeignClient`、Controller 与 Request/Get/Post/Put/Delete/PatchMapping，组合类级前缀、客户端前缀、方法级路径和 HTTP 方法，按配置的服务根定位服务端。路径参数名不同可作为候选匹配；多个匹配均保留。未配置服务、没有端点、动态占位符、无法确定的常量、URL 覆盖等均留诊断。动态网关重写、条件 Bean 和实际部署版本仍需外部证据。
 
 `Elements.overrides` 建立真实覆盖关系，包括传递继承、多实现及泛型契约；不再使用 `Impl` 命名或只按方法名连实现。MyBatis XML 使用完整、大小写敏感的 namespace 加方法名关联；有多个重载时只给候选，不跨包误连。
+
+## MyBatis-Plus 继承 CRUD 与 Lombok（2026-09-28）
+
+`BaseMapper<E>.insert/selectList…`、`IService<E>.save`、`ServiceImpl<M,E>.list` 等继承方法没有 XML 语句。javac 解析时记录接收者在声明泛型类型上的实参（`owner_type_args`，含项目内源码路径）；实参所在文件有 ORM 表（`@TableName`/实体约定）时，生成 `调用方 → persists_to → 表`（`resolver: mybatis_plus_inherited_crud`，证据含方法与实体）。mapper 实参没有表，自然落空。依赖 jar 需在 classpath 中，否则调用本身无法绑定。
+
+Lombok 生成的 getter/setter 不跑处理器就解析不了，且会把包着它们的外层调用一起标成 `compiler_error_at_call`。配置 `annotation_processor_path` 后恢复这些调用。JDK 17 源码需 JDK 17+ 的 `java_command`，Lombok 版本需支持该 JDK。
 
 ## 注解 SQL 与非 HTTP 入口（2026-09-27）
 
@@ -71,7 +78,7 @@ groundgraph graph --format web --out graph.html
 
 方法引用保留编译期目标，但导出 `references`，不冒充已经执行的 `calls`。Feign 的继承接口映射、组合注解及 params/headers/consumes 条件尚未完整建模；已有静态匹配只作候选。
 
-动态反射、运行时 Bean 选择、生成代码及缺失的私有依赖不能凭静态源码完整还原。尚未提供这些证据的结果保持未知；MyBatis-Plus 表语义、MQ 入口、组合/继承注解和运行时路由仍未完整覆盖。
+动态反射、运行时 Bean 选择、生成代码及缺失的私有依赖不能凭静态源码完整还原。尚未提供这些证据的结果保持未知；MyBatis-Plus 条件构造器中的列语义、MQ 入口、组合/继承注解和运行时路由仍未完整覆盖。
 
 ## 回归
 

@@ -16,6 +16,10 @@ pub struct JavaSemanticsConfig {
     pub enabled: bool,
     pub java_command: String,
     pub classpath: Vec<String>,
+    /// Annotation processors to run (e.g. the Lombok jar). Empty = none run.
+    /// Only these jars are searched, never the classpath; generated output
+    /// goes to a temp dir, never the repository.
+    pub annotation_processor_path: Vec<String>,
     pub timeout_seconds: u64,
     /// Service identity is deployment knowledge, not inferred from package names.
     pub services: BTreeMap<String, Vec<String>>,
@@ -35,6 +39,7 @@ impl Default for JavaSemanticsConfig {
             enabled: true,
             java_command: "java".into(),
             classpath: vec![],
+            annotation_processor_path: vec![],
             timeout_seconds: 120,
             services: BTreeMap::new(),
             source_sets: BTreeMap::new(),
@@ -57,6 +62,18 @@ pub struct CallSite {
     pub reason: String,
     pub target: Option<String>,
     pub external_target: Option<String>,
+    /// Receiver's type arguments on the generic type declaring an inherited
+    /// method (e.g. `BaseMapper<Order>.insert` → `[p.Order]`), with the source
+    /// path when the argument is a project type. Lets framework conventions map
+    /// inherited CRUD to its entity without guessing from names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_type_args: Vec<OwnerTypeArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerTypeArg {
+    pub name: String,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +157,7 @@ fn inventory(path: &str, source: &str, nodes: &mut [Node]) -> Result<JavaAnalysi
                 reason: "compiler_binding_unavailable".into(),
                 target: None,
                 external_target: None,
+                owner_type_args: Vec::new(),
             });
         }
         let mut c = n.walk();
@@ -165,6 +183,14 @@ fn compiler(root: &Path, files: &[String], config: &JavaSemanticsConfig) -> Resu
     std::fs::write(&file_list, files.join("\n"))?;
     let output = temp.path().join("bindings.jsonl");
     let cp = std::env::join_paths(config.classpath.iter().map(|p| root.join(p)))?;
+    let processors = std::env::join_paths(
+        config
+            .annotation_processor_path
+            .iter()
+            .map(|p| root.join(p)),
+    )?;
+    let generated = temp.path().join("generated");
+    std::fs::create_dir(&generated)?;
     let mut cmd = std::process::Command::new(&config.java_command);
     cmd.current_dir(root)
         .arg("-Xmx1024m")
@@ -172,7 +198,9 @@ fn compiler(root: &Path, files: &[String], config: &JavaSemanticsConfig) -> Resu
         .arg(root)
         .arg(&file_list)
         .arg(&output)
-        .arg(cp);
+        .arg(cp)
+        .arg(processors)
+        .arg(&generated);
     // Reuse the existing bounded process-group runner rather than another launcher.
     let (status, stderr) = crate::scip_runner::run_with_capped_stderr_budget(
         &mut cmd,
@@ -432,6 +460,17 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                 if r["resolved"] == true {
                     call.target = target_at(r, "target_");
                     call.external_target = r["symbol"].as_str().map(str::to_string);
+                    call.owner_type_args = r["owner_type_args"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| {
+                            Some(OwnerTypeArg {
+                                name: a["name"].as_str()?.to_string(),
+                                path: a["path"].as_str().map(str::to_string),
+                            })
+                        })
+                        .collect();
                     call.resolution = "resolved".into();
                     if call.target.is_none() && r["target_path"].is_string() {
                         call.resolution = "unresolved".into();

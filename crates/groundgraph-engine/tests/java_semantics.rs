@@ -578,3 +578,88 @@ class Custom {
         .iter()
         .any(|c| c.id.ends_with("Jobs.tick()")));
 }
+
+fn mybatis_plus_stubs(root: &Path) {
+    write(root, "src/com/baomidou/mybatisplus/annotation/TableName.java", "package com.baomidou.mybatisplus.annotation; public @interface TableName { String value(); }");
+    write(root, "src/com/baomidou/mybatisplus/core/mapper/BaseMapper.java", "package com.baomidou.mybatisplus.core.mapper; public interface BaseMapper<T> { int insert(T e); java.util.List<T> selectList(Object w); }");
+    write(root, "src/com/baomidou/mybatisplus/extension/service/IService.java", "package com.baomidou.mybatisplus.extension.service; public interface IService<T> { boolean save(T e); }");
+    write(root, "src/com/baomidou/mybatisplus/extension/service/impl/ServiceImpl.java", "package com.baomidou.mybatisplus.extension.service.impl; public class ServiceImpl<M extends com.baomidou.mybatisplus.core.mapper.BaseMapper<T>, T> implements com.baomidou.mybatisplus.extension.service.IService<T> { public boolean save(T e) { return true; } }");
+}
+
+#[test]
+fn mybatis_plus_inherited_crud_reaches_the_entity_table() {
+    // 继承自 BaseMapper / IService 的 CRUD 没有 XML 语句，只有实体上的 @TableName；
+    // 以前 trace 在这里断掉，业务方法看起来不落库。
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "java_semantics:\n  enabled: true\n");
+    mybatis_plus_stubs(root);
+    write(root, "src/p/Order.java", "package p;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_order\")\npublic class Order { private Long id; }");
+    write(root, "src/p/Item.java", "package p;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_item\")\npublic class Item { private Long id; }");
+    write(root, "src/p/OrderMapper.java", "package p; public interface OrderMapper extends com.baomidou.mybatisplus.core.mapper.BaseMapper<Order> {}");
+    write(root, "src/p/ItemMapper.java", "package p; public interface ItemMapper extends com.baomidou.mybatisplus.core.mapper.BaseMapper<Item> {}");
+    write(root, "src/p/OrderService.java", "package p; public class OrderService extends com.baomidou.mybatisplus.extension.service.impl.ServiceImpl<OrderMapper, Order> { ItemMapper items; void create(Order o) { save(o); items.insert(new Item()); } void list() { items.selectList(null); } }");
+    let store = index(root);
+    let mut links: Vec<(String, String)> = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from_id.as_str().contains("OrderService"))
+        .map(|e| {
+            let from = e.from_id.as_str().rsplit("::").next().unwrap().to_string();
+            (from, e.to_id.as_str().to_string())
+        })
+        .collect();
+    links.sort();
+    assert_eq!(
+        links,
+        vec![
+            ("OrderService.create(Order)".into(), "db_table::src/p/Item.java::t_item".into()),
+            ("OrderService.create(Order)".into(), "db_table::src/p/Order.java::t_order".into()),
+            ("OrderService.list()".into(), "db_table::src/p/Item.java::t_item".into()),
+        ]
+    );
+}
+
+#[test]
+fn configured_annotation_processors_run_without_writing_into_the_repo() {
+    // Lombok 这类处理器补出的成员不跑处理器就解析不了，还会把外层调用一起拖成错误；
+    // 只跑显式配置的处理器，生成物不得落进仓库。
+    let temp = tempfile::tempdir().unwrap();
+    let proc_dir = temp.path().join("proc");
+    write(&proc_dir, "src/gen/Proc.java", r#"package gen;
+import javax.annotation.processing.*; import javax.lang.model.SourceVersion; import javax.lang.model.element.TypeElement; import java.util.Set;
+@SupportedAnnotationTypes("p.Gen") public class Proc extends AbstractProcessor {
+  boolean done;
+  public SourceVersion getSupportedSourceVersion() { return SourceVersion.latestSupported(); }
+  public boolean process(Set<? extends TypeElement> a, RoundEnvironment r) {
+    if (done || a.isEmpty()) return false; done = true;
+    try (java.io.Writer w = processingEnv.getFiler().createSourceFile("p.Generated").openWriter()) { w.write("package p; public class Generated { public static int hello() { return 1; } }"); }
+    catch (java.io.IOException e) { throw new RuntimeException(e); }
+    return false; } }"#);
+    write(&proc_dir, "classes/META-INF/services/javax.annotation.processing.Processor", "gen.Proc\n");
+    let status = std::process::Command::new("javac")
+        .arg("-d")
+        .arg(proc_dir.join("classes"))
+        .arg(proc_dir.join("src/gen/Proc.java"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let root = &temp.path().join("repo");
+    config(root, &format!("java_semantics:\n  enabled: true\n  annotation_processor_path: [{}]\n", proc_dir.join("classes").display()));
+    write(root, "src/p/Gen.java", "package p; public @interface Gen {}");
+    write(root, "src/p/Caller.java", "package p; @Gen class Caller { Other o; void run() { o.take(Generated.hello()); } }");
+    write(root, "src/p/Other.java", "package p; class Other { void take(int x) {} }");
+    let store = index(root);
+    let take = calls(&store)
+        .into_iter()
+        .find(|c| c["expression"].as_str().unwrap().starts_with("o.take"))
+        .unwrap();
+    assert_eq!(take["resolution"], "resolved", "{take:#}");
+    let stray: Vec<_> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("Generated"))
+        .collect();
+    assert!(stray.is_empty(), "processor output leaked into the repo: {stray:?}");
+}
