@@ -118,6 +118,22 @@ class GroundGraphJava {
         }
         return false;
     }
+    boolean caughtWithoutRethrow(TreePath p) {
+        TreePath child=p;
+        for(TreePath parent=p.getParentPath();parent!=null;child=parent,parent=parent.getParentPath()) {
+            if(!(parent.getLeaf() instanceof TryTree)) continue;
+            TryTree t=(TryTree)parent.getLeaf();
+            if(child.getLeaf()!=t.getBlock()) continue;
+            for(CatchTree c:t.getCatches()) {
+                Boolean throwsAgain=new TreeScanner<Boolean,Void>() {
+                    public Boolean visitThrow(ThrowTree x,Void unused) { return true; }
+                    public Boolean reduce(Boolean a,Boolean b) { return Boolean.TRUE.equals(a)||Boolean.TRUE.equals(b); }
+                }.scan(c.getBlock(),null);
+                if(!Boolean.TRUE.equals(throwsAgain)) return true;
+            }
+        }
+        return false;
+    }
     ExecutableElement uniqueReceiverMethod(TreePath p) {
         if(!(p.getLeaf() instanceof MethodInvocationTree)) return null;
         MethodInvocationTree call=(MethodInvocationTree)p.getLeaf();
@@ -138,6 +154,7 @@ class GroundGraphJava {
     }
     void binding(TreePath p, boolean completed) {
         Map<String,Object> row = location(p,""); row.put("kind","call"); row.put("resolved",false); row.put("reason","unresolved_symbol");
+        if(caughtWithoutRethrow(p)) row.put("caught_without_rethrow",true);
         row.put("end",byteAt(p.getCompilationUnit(),trees.getSourcePositions().getEndPosition(p.getCompilationUnit(),p.getLeaf())));
         try {
             Element e=trees.getElement(p);
@@ -287,8 +304,9 @@ class GroundGraphJava {
         if(path.length()>1 && path.endsWith("/")) path=path.substring(0,path.length()-1);
         return path.replaceAll("\\{[^}]+\\}","{}");
     }
-    String annotationName(TreePath method, AnnotationTree a) {
-        TreePath modifiers=new TreePath(method,((MethodTree)method.getLeaf()).getModifiers());
+    String annotationName(TreePath declaration, AnnotationTree a) {
+        Tree modifiersTree=declaration.getLeaf() instanceof MethodTree ? ((MethodTree)declaration.getLeaf()).getModifiers() : ((ClassTree)declaration.getLeaf()).getModifiers();
+        TreePath modifiers=new TreePath(declaration,modifiersTree);
         Element e=trees.getElement(new TreePath(new TreePath(modifiers,a),a.getAnnotationType()));
         if(e instanceof TypeElement && !erroneous(e.asType())) return ((TypeElement)e).getQualifiedName().toString();
         String name=a.getAnnotationType().toString();
@@ -306,19 +324,21 @@ class GroundGraphJava {
             annotationUnit=p.getCompilationUnit();
             for(AnnotationTree a:((MethodTree)p.getLeaf()).getModifiers().getAnnotations()) {
                 String shortName=head(a);
-                if(!Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider","Scheduled","EventListener","TransactionalEventListener").contains(shortName)) continue;
+                if(!Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider","Scheduled","EventListener","TransactionalEventListener","Transactional","Async").contains(shortName)) continue;
                 String name=annotationName(p,a);
                 boolean unknown=name==null;
                 boolean sql=(unknown || name.equals("org.apache.ibatis.annotations."+shortName)) &&
                     Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider").contains(shortName);
                 boolean entry=Arrays.asList("org.springframework.scheduling.annotation.Scheduled", "org.springframework.context.event.EventListener", "org.springframework.transaction.event.TransactionalEventListener").contains(name) ||
                     (unknown && Arrays.asList("Scheduled","EventListener","TransactionalEventListener").contains(shortName));
-                if(!sql && !entry) continue;
+                boolean transaction="org.springframework.transaction.annotation.Transactional".equals(name);
+                boolean async="org.springframework.scheduling.annotation.Async".equals(name);
+                if(!sql && !entry && !transaction && !async) continue;
                 long pos=trees.getSourcePositions().getStartPosition(annotationUnit,a);
                 Map<String,Object> row=location(p,"");
-                row.putAll(obj("kind","framework","role",sql?"sql":"entrypoint","annotation",unknown?a.getAnnotationType().toString():name,
+                row.putAll(obj("kind","framework","role",sql?"sql":transaction?"transaction":async?"async":"entrypoint","annotation",unknown?a.getAnnotationType().toString():name,
                     "annotation_start",byteAt(annotationUnit,pos),"line",annotationUnit.getLineMap().getLineNumber(pos),
-                    "resolution","candidate","reason","source_annotation_runtime_binding_unverified"));
+                    "resolution","candidate","reason","source_annotation_runtime_binding_unverified","args",a.toString(),"class_level",false));
                 if(unknown) { row.put("resolution","unresolved"); row.put("reason","annotation_type_unresolved"); }
                 if(sql) {
                     String text=String.join(" ",attr(a,"value"));
@@ -329,6 +349,18 @@ class GroundGraphJava {
                         text.contains("${")?"dynamic_sql_substitution":null;
                     if(reason!=null) { row.put("resolution","unresolved"); row.put("reason",reason); }
                 }
+                emit(row);
+            }
+            TreePath owner=p.getParentPath();
+            while(owner!=null && !(owner.getLeaf() instanceof ClassTree)) owner=owner.getParentPath();
+            if(owner!=null) for(AnnotationTree a:((ClassTree)owner.getLeaf()).getModifiers().getAnnotations()) {
+                String name=annotationName(owner,a);
+                String role="org.springframework.transaction.annotation.Transactional".equals(name)?"transaction":
+                    "org.springframework.scheduling.annotation.Async".equals(name)?"async":null;
+                if(role==null) continue;
+                long pos=trees.getSourcePositions().getStartPosition(annotationUnit,a);
+                Map<String,Object> row=location(p,"");
+                row.putAll(obj("kind","framework","role",role,"annotation",name,"annotation_start",byteAt(annotationUnit,pos),"line",annotationUnit.getLineMap().getLineNumber(pos),"resolution","candidate","reason","source_annotation_runtime_binding_unverified","args",a.toString(),"class_level",true));
                 emit(row);
             }
         }

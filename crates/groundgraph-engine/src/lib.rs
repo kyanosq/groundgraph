@@ -30,6 +30,7 @@ pub mod data_contract;
 pub mod dead_code;
 pub mod docs_indexer;
 pub mod edge_confidence;
+pub mod effects;
 pub mod error;
 pub mod export;
 pub mod feature_cluster;

@@ -68,6 +68,8 @@ pub struct CallSite {
     /// inherited CRUD to its entity without guessing from names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_type_args: Vec<OwnerTypeArg>,
+    #[serde(default)]
+    pub caught_without_rethrow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,7 @@ fn inventory(path: &str, source: &str, nodes: &mut [Node]) -> Result<JavaAnalysi
                 target: None,
                 external_target: None,
                 owner_type_args: Vec::new(),
+                caught_without_rethrow: false,
             });
         }
         let mut c = n.walk();
@@ -457,6 +460,7 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                     continue;
                 };
                 call.reason = r["reason"].as_str().unwrap_or("binding_missing").into();
+                call.caught_without_rethrow = r["caught_without_rethrow"] == true;
                 if r["resolved"] == true {
                     call.target = target_at(r, "target_");
                     call.external_target = r["symbol"].as_str().map(str::to_string);

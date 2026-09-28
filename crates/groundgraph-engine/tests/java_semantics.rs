@@ -411,6 +411,171 @@ fn external_client_calls_become_effect_nodes_without_matching_unrelated_types() 
 }
 
 #[test]
+fn transaction_annotations_include_class_level_propagation_and_async_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/org/springframework/transaction/annotation/Propagation.java", "package org.springframework.transaction.annotation; public enum Propagation { REQUIRED, REQUIRES_NEW }");
+    write(root, "src/org/springframework/transaction/annotation/Transactional.java", "package org.springframework.transaction.annotation; public @interface Transactional { Propagation propagation() default Propagation.REQUIRED; Class<?>[] noRollbackFor() default {}; }");
+    write(
+        root,
+        "src/org/springframework/scheduling/annotation/Async.java",
+        "package org.springframework.scheduling.annotation; public @interface Async {}",
+    );
+    write(root, "src/shop/Service.java", "package shop; import org.springframework.transaction.annotation.*; import org.springframework.scheduling.annotation.Async; @Transactional class Service { void outer() { inner(); } @Transactional(propagation=Propagation.REQUIRES_NEW, noRollbackFor=IllegalArgumentException.class) void inner() {} @Async void later() {} }");
+    let store = index(root);
+    let methods = store.list_nodes_by_kind(NodeKind::JavaMethod).unwrap();
+    let framework = |name: &str| {
+        let n = methods
+            .iter()
+            .find(|n| n.id.as_str().ends_with(name))
+            .unwrap();
+        let v: Value = serde_json::from_str(n.metadata_json.as_deref().unwrap()).unwrap();
+        v["java"]["framework"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(framework("Service.outer()")
+        .iter()
+        .any(|v| v["role"] == "transaction" && v["class_level"] == true));
+    assert!(framework("Service.inner()")
+        .iter()
+        .any(|v| v["role"] == "transaction"
+            && v["args"].as_str().unwrap_or("").contains("REQUIRES_NEW")));
+    assert!(framework("Service.later()")
+        .iter()
+        .any(|v| v["role"] == "async"));
+}
+
+#[test]
+fn self_invocation_does_not_open_transaction_but_cross_bean_call_does() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/org/springframework/transaction/annotation/Propagation.java", "package org.springframework.transaction.annotation; public enum Propagation { REQUIRED, REQUIRES_NEW }");
+    write(root, "src/org/springframework/transaction/annotation/Transactional.java", "package org.springframework.transaction.annotation; public @interface Transactional { Propagation propagation() default Propagation.REQUIRED; }");
+    write(root, "src/shop/Other.java", "package shop; import org.springframework.transaction.annotation.*; class Other { @Transactional(propagation=Propagation.REQUIRES_NEW) void write() {} }");
+    write(root, "src/shop/Action.java", "package shop; import org.springframework.transaction.annotation.*; class Action { Other other; void run() { inner(); other.write(); } @Transactional void inner() {} }");
+    let _store = index(root);
+    let trace = groundgraph_engine::trace::run_trace(groundgraph_engine::trace::TraceOptions::new(
+        root,
+        "Action.run",
+    ))
+    .unwrap();
+    let tx = groundgraph_engine::effects::analyze_transactions(&trace);
+    assert!(
+        tx.groups
+            .iter()
+            .any(|g| g.owner.ends_with("Other.write()") && g.propagation == "REQUIRES_NEW"),
+        "{tx:#?}"
+    );
+    assert!(
+        !tx.groups
+            .iter()
+            .any(|g| g.owner.ends_with("Action.inner()")),
+        "{tx:#?}"
+    );
+}
+
+#[test]
+fn nested_transactions_and_external_risks_keep_propagation_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/org/springframework/transaction/annotation/Propagation.java", "package org.springframework.transaction.annotation; public enum Propagation { REQUIRED, REQUIRES_NEW }");
+    write(root, "src/org/springframework/transaction/annotation/Transactional.java", "package org.springframework.transaction.annotation; public @interface Transactional { Propagation propagation() default Propagation.REQUIRED; Class<?>[] noRollbackFor() default {}; }");
+    write(root, "src/org/springframework/web/client/RestTemplate.java", "package org.springframework.web.client; public class RestTemplate { public Object postForEntity(String url, Object body, Class<?> type) { return null; } }");
+    write(root, "src/shop/Writer.java", "package shop; import org.springframework.transaction.annotation.*; class Writer { @Transactional(propagation=Propagation.REQUIRES_NEW, noRollbackFor=IllegalArgumentException.class) void save() {} }");
+    write(root, "src/shop/Action.java", "package shop; import org.springframework.transaction.annotation.*; class Action { Writer writer; org.springframework.web.client.RestTemplate http; @Transactional void run() { writer.save(); http.postForEntity(\"/orders\", null, Object.class); } void outside() { http.postForEntity(\"/outside\", null, Object.class); } }");
+    let _store = index(root);
+    let trace = groundgraph_engine::trace::run_trace(groundgraph_engine::trace::TraceOptions::new(
+        root,
+        "Action.run",
+    ))
+    .unwrap();
+    let tx = groundgraph_engine::effects::analyze_transactions(&trace);
+    assert_eq!(tx.groups.len(), 2, "{tx:#?}");
+    assert!(tx.groups.iter().any(|g| g.owner.ends_with("Writer.save()")
+        && g.propagation == "REQUIRES_NEW"
+        && g.no_rollback_for
+            .as_deref()
+            .unwrap_or("")
+            .contains("IllegalArgumentException")));
+    assert!(tx.risks.iter().any(|r| r.kind == "external_in_transaction"));
+    let outside = groundgraph_engine::trace::run_trace(
+        groundgraph_engine::trace::TraceOptions::new(root, "Action.outside"),
+    )
+    .unwrap();
+    assert!(!groundgraph_engine::effects::analyze_transactions(&outside)
+        .risks
+        .iter()
+        .any(|r| r.kind == "external_in_transaction"));
+}
+
+#[test]
+fn swallowed_external_failure_is_risk_but_rethrow_is_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/org/springframework/web/client/RestTemplate.java", "package org.springframework.web.client; public class RestTemplate { public Object postForEntity(String url, Object body, Class<?> type) { return null; } }");
+    write(root, "src/shop/Action.java", "package shop; class Action { org.springframework.web.client.RestTemplate http; void swallow() { try { http.postForEntity(\"/orders\", null, Object.class); } catch (RuntimeException ex) { } } void rethrow() { try { http.postForEntity(\"/orders\", null, Object.class); } catch (RuntimeException ex) { throw ex; } } }");
+    let _store = index(root);
+    for (method, expected) in [("Action.swallow", true), ("Action.rethrow", false)] {
+        let trace = groundgraph_engine::trace::run_trace(
+            groundgraph_engine::trace::TraceOptions::new(root, method),
+        )
+        .unwrap();
+        let tx = groundgraph_engine::effects::analyze_transactions(&trace);
+        assert_eq!(
+            tx.risks
+                .iter()
+                .any(|r| r.kind == "swallowed_external_failure"),
+            expected,
+            "{method}: {tx:#?}"
+        );
+    }
+}
+
+#[test]
+fn async_and_transactional_event_listener_are_visible_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(
+        root,
+        "src/org/springframework/scheduling/annotation/Async.java",
+        "package org.springframework.scheduling.annotation; public @interface Async {}",
+    );
+    write(root, "src/org/springframework/transaction/event/TransactionalEventListener.java", "package org.springframework.transaction.event; public @interface TransactionalEventListener {}");
+    write(root, "src/shop/Listener.java", "package shop; import org.springframework.transaction.event.TransactionalEventListener; class Listener { @TransactionalEventListener void receive() {} }");
+    write(root, "src/shop/Worker.java", "package shop; import org.springframework.scheduling.annotation.Async; class Worker { @Async void work() {} }");
+    write(
+        root,
+        "src/shop/Action.java",
+        "package shop; class Action { Worker worker; void run() { worker.work(); } }",
+    );
+    let _store = index(root);
+    let trace = groundgraph_engine::trace::run_trace(groundgraph_engine::trace::TraceOptions::new(
+        root,
+        "Action.run",
+    ))
+    .unwrap();
+    assert!(groundgraph_engine::effects::analyze_transactions(&trace)
+        .risks
+        .iter()
+        .any(|r| r.kind == "async_boundary"));
+    let listener = groundgraph_engine::trace::run_trace(
+        groundgraph_engine::trace::TraceOptions::new(root, "Listener.receive"),
+    )
+    .unwrap();
+    assert!(groundgraph_engine::effects::analyze_transactions(&listener)
+        .risks
+        .iter()
+        .any(|r| r.kind == "transactional_event_listener"));
+}
+
+#[test]
 fn mapper_namespaces_do_not_cross_link_identical_simple_names() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
