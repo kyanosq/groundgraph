@@ -476,6 +476,11 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                         call.resolution = "unresolved".into();
                         call.reason = "source_declaration_not_indexed".into();
                     }
+                } else if r["candidate"] == true {
+                    call.target = target_at(r, "target_");
+                    if call.target.is_some() {
+                        call.resolution = "candidate".into();
+                    }
                 }
             }
             Some("diagnostic" | "compiler_failure") => {
@@ -534,9 +539,14 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                 );
                 // Call-site identity keeps repeated calls and provenance separate.
                 edge.id = ArtifactId::new(format!("{}::{target}", call.id));
+                if call.resolution == "candidate" {
+                    edge.certainty = EdgeCertainty::Candidate;
+                    edge.status = EdgeStatus::Proposed;
+                    edge.confidence = groundgraph_core::Confidence::new(0.75);
+                }
                 edge.indexer = Some("java_semantics".into());
                 edge.source_file = Some(call.path.clone());
-                edge.evidence_json = Some(json!({"call_site":call.id,"line":call.line,"column":call.column,"resolver":"javac","resolution":call.resolution,"static_target_only":true,"snippet":call.expression}).to_string());
+                edge.evidence_json = Some(json!({"call_site":call.id,"line":call.line,"column":call.column,"resolver":"javac","resolution":call.resolution,"reason":call.reason,"static_target_only":true,"snippet":call.expression}).to_string());
                 edges.push(edge);
             }
         }

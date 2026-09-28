@@ -248,6 +248,92 @@ class All {
 }
 
 #[test]
+fn broken_argument_keeps_unique_interface_dispatch_as_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(
+        root,
+        "src/shop/Port.java",
+        "package shop; interface Port { void send(long id); }",
+    );
+    write(
+        root,
+        "src/shop/RealPort.java",
+        "package shop; class RealPort implements Port { public void send(long id) {} }",
+    );
+    write(
+        root,
+        "src/shop/Other.java",
+        "package shop; interface Other { void send(long id); }",
+    );
+    write(
+        root,
+        "src/shop/Order.java",
+        "package shop; class Order { /* generated getter absent */ }",
+    );
+    write(root, "src/shop/Action.java", "package shop; class Action { Port port; void run(Order order) { port.send(order.getId()); } }");
+    let store = index(root);
+    let edges = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::Calls)
+        .unwrap();
+    let edge = edges
+        .iter()
+        .find(|e| {
+            e.from_id.as_str().ends_with("Action.run(Order)")
+                && e.to_id.as_str().ends_with("Port.send(long)")
+        })
+        .expect("candidate edge to exact field type method");
+    assert_eq!(edge.certainty.as_str(), "candidate");
+    assert!(!edges
+        .iter()
+        .any(|e| e.from_id.as_str().ends_with("Action.run(Order)")
+            && e.to_id.as_str().ends_with("Other.send(long)")));
+    assert!(store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::DeclaresImplementation)
+        .unwrap()
+        .iter()
+        .any(|e| e.from_id.as_str().ends_with("Port.send(long)")
+            && e.to_id.as_str().ends_with("RealPort.send(long)")));
+}
+
+#[test]
+fn jdbc_update_in_private_method_reaches_table_but_unused_sql_does_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/com/baomidou/mybatisplus/annotation/TableName.java", "package com.baomidou.mybatisplus.annotation; public @interface TableName { String value(); }");
+    write(root, "src/shop/Order.java", "package shop;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_order\")\nclass Order { long id; }");
+    write(
+        root,
+        "src/shop/Jdbc.java",
+        "package shop; class Jdbc { int update(String sql) { return 1; } }",
+    );
+    write(root, "src/shop/Review.java", "package shop; class Review { Jdbc jdbc; void audit() { sync(); } private void sync() { String sql = \"UPDATE t_order SET id = 1\"; jdbc.update(sql); } void unused() { String sql = \"UPDATE t_order SET id = 2\"; } }");
+    let store = index(root);
+    let edges = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.from_id.as_str().ends_with("Review.sync()")
+                && e.to_id.as_str().ends_with("::t_order")),
+        "edges={edges:#?} tables={:#?} methods={:#?}",
+        store.list_nodes_by_kind(NodeKind::DbTable).unwrap(),
+        store
+            .list_nodes_by_kind(NodeKind::JavaMethod)
+            .unwrap()
+            .iter()
+            .map(|n| (&n.id, n.start_line, n.end_line))
+            .collect::<Vec<_>>()
+    );
+    assert!(!edges
+        .iter()
+        .any(|e| e.from_id.as_str().ends_with("Review.unused()")));
+}
+
+#[test]
 fn mapper_namespaces_do_not_cross_link_identical_simple_names() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -614,9 +700,18 @@ fn mybatis_plus_inherited_crud_reaches_the_entity_table() {
     assert_eq!(
         links,
         vec![
-            ("OrderService.create(Order)".into(), "db_table::src/p/Item.java::t_item".into()),
-            ("OrderService.create(Order)".into(), "db_table::src/p/Order.java::t_order".into()),
-            ("OrderService.list()".into(), "db_table::src/p/Item.java::t_item".into()),
+            (
+                "OrderService.create(Order)".into(),
+                "db_table::src/p/Item.java::t_item".into()
+            ),
+            (
+                "OrderService.create(Order)".into(),
+                "db_table::src/p/Order.java::t_order".into()
+            ),
+            (
+                "OrderService.list()".into(),
+                "db_table::src/p/Item.java::t_item".into()
+            ),
         ]
     );
 }
@@ -627,7 +722,10 @@ fn configured_annotation_processors_run_without_writing_into_the_repo() {
     // 只跑显式配置的处理器，生成物不得落进仓库。
     let temp = tempfile::tempdir().unwrap();
     let proc_dir = temp.path().join("proc");
-    write(&proc_dir, "src/gen/Proc.java", r#"package gen;
+    write(
+        &proc_dir,
+        "src/gen/Proc.java",
+        r#"package gen;
 import javax.annotation.processing.*; import javax.lang.model.SourceVersion; import javax.lang.model.element.TypeElement; import java.util.Set;
 @SupportedAnnotationTypes("p.Gen") public class Proc extends AbstractProcessor {
   boolean done;
@@ -636,8 +734,13 @@ import javax.annotation.processing.*; import javax.lang.model.SourceVersion; imp
     if (done || a.isEmpty()) return false; done = true;
     try (java.io.Writer w = processingEnv.getFiler().createSourceFile("p.Generated").openWriter()) { w.write("package p; public class Generated { public static int hello() { return 1; } }"); }
     catch (java.io.IOException e) { throw new RuntimeException(e); }
-    return false; } }"#);
-    write(&proc_dir, "classes/META-INF/services/javax.annotation.processing.Processor", "gen.Proc\n");
+    return false; } }"#,
+    );
+    write(
+        &proc_dir,
+        "classes/META-INF/services/javax.annotation.processing.Processor",
+        "gen.Proc\n",
+    );
     let status = std::process::Command::new("javac")
         .arg("-d")
         .arg(proc_dir.join("classes"))
@@ -646,10 +749,28 @@ import javax.annotation.processing.*; import javax.lang.model.SourceVersion; imp
         .unwrap();
     assert!(status.success());
     let root = &temp.path().join("repo");
-    config(root, &format!("java_semantics:\n  enabled: true\n  annotation_processor_path: [{}]\n", proc_dir.join("classes").display()));
-    write(root, "src/p/Gen.java", "package p; public @interface Gen {}");
-    write(root, "src/p/Caller.java", "package p; @Gen class Caller { Other o; void run() { o.take(Generated.hello()); } }");
-    write(root, "src/p/Other.java", "package p; class Other { void take(int x) {} }");
+    config(
+        root,
+        &format!(
+            "java_semantics:\n  enabled: true\n  annotation_processor_path: [{}]\n",
+            proc_dir.join("classes").display()
+        ),
+    );
+    write(
+        root,
+        "src/p/Gen.java",
+        "package p; public @interface Gen {}",
+    );
+    write(
+        root,
+        "src/p/Caller.java",
+        "package p; @Gen class Caller { Other o; void run() { o.take(Generated.hello()); } }",
+    );
+    write(
+        root,
+        "src/p/Other.java",
+        "package p; class Other { void take(int x) {} }",
+    );
     let store = index(root);
     let take = calls(&store)
         .into_iter()
@@ -661,5 +782,8 @@ import javax.annotation.processing.*; import javax.lang.model.SourceVersion; imp
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().starts_with("Generated"))
         .collect();
-    assert!(stray.is_empty(), "processor output leaked into the repo: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "processor output leaked into the repo: {stray:?}"
+    );
 }

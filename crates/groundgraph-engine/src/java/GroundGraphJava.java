@@ -118,6 +118,26 @@ class GroundGraphJava {
         }
         return false;
     }
+    TreePath uniqueReceiverMethod(TreePath p) {
+        if(!(p.getLeaf() instanceof MethodInvocationTree)) return null;
+        MethodInvocationTree call=(MethodInvocationTree)p.getLeaf();
+        if(!(call.getMethodSelect() instanceof MemberSelectTree)) return null;
+        MemberSelectTree select=(MemberSelectTree)call.getMethodSelect();
+        TreePath receiver=new TreePath(new TreePath(p,call.getMethodSelect()),select.getExpression());
+        TypeMirror type=trees.getTypeMirror(receiver);
+        if(!(type instanceof DeclaredType) || erroneous(type)) return null;
+        Element owner=((DeclaredType)type).asElement();
+        if(!(owner instanceof TypeElement)) return null;
+        TreePath found=null;
+        for(Element member:task.getElements().getAllMembers((TypeElement)owner)) {
+            if(!(member instanceof ExecutableElement) || !member.getSimpleName().contentEquals(select.getIdentifier()) || ((ExecutableElement)member).getParameters().size()!=call.getArguments().size()) continue;
+            TreePath declaration=declaration(member);
+            if(declaration==null || !bytes.containsKey(declaration.getCompilationUnit())) continue;
+            if(found!=null && (found.getCompilationUnit()!=declaration.getCompilationUnit() || start(found)!=start(declaration))) return null;
+            found=declaration;
+        }
+        return found;
+    }
     void binding(TreePath p, boolean completed) {
         Map<String,Object> row = location(p,""); row.put("kind","call"); row.put("resolved",false); row.put("reason","unresolved_symbol");
         row.put("end",byteAt(p.getCompilationUnit(),trees.getSourcePositions().getEndPosition(p.getCompilationUnit(),p.getLeaf())));
@@ -144,6 +164,10 @@ class GroundGraphJava {
                 } else row.put("reason","error_type_in_binding");
             } else if(!completed) row.put("reason","compiler_analysis_failed");
             else if(overlapsError(p)) row.put("reason","compiler_error_at_call");
+            if(completed && !Boolean.TRUE.equals(row.get("resolved"))) {
+                TreePath candidate=uniqueReceiverMethod(p);
+                if(candidate!=null) { row.putAll(location(candidate,"target_")); row.put("reason","unique_receiver_method_with_compiler_error"); row.put("candidate",true); }
+            }
         } catch(RuntimeException ex) { row.put("reason","binding_exception:"+ex.getClass().getSimpleName()); }
         emit(row);
     }

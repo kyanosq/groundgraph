@@ -630,7 +630,10 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
             .and_then(|m| serde_json::from_str::<DbTableMeta>(m).ok())
             .is_some_and(|m| m.source.starts_with("orm"));
         if let (true, Some(path)) = (orm, &t.path) {
-            orm_tables.entry(path.clone()).or_default().push(t.id.clone());
+            orm_tables
+                .entry(path.clone())
+                .or_default()
+                .push(t.id.clone());
         }
     }
     let mut seen = BTreeSet::new();
@@ -686,8 +689,9 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
 /// SQL as string literals in the method body rather than in XML, so the only
 /// way to reach the tables is to read the body span and parse the SQL.
 ///
-/// Java is intentionally skipped (the MyBatis `SqlMapperStmt` path already links
-/// it, and re-scanning every Java method body would be wasted work).
+/// Java mapper declarations use the `SqlMapperStmt` path. JDBC SQL assembled
+/// inside a Java method has no mapper declaration and is linked here as a
+/// syntactic candidate when that method also invokes JDBC update.
 ///
 /// Safety: a table edge is only emitted when the parsed table name matches an
 /// existing `DbTable` node, so the deliberately-tolerant SQL scanner cannot
@@ -717,26 +721,57 @@ fn link_inline_sql_edges(
     // Cache file contents so a file with many callables is read once.
     let mut edges: Vec<EdgeAssertion> = Vec::new();
     for &kind in NodeKind::ALL {
-        if !kind.is_callable() || kind.language() == Some("java") {
+        if !kind.is_callable() {
             continue;
         }
         for node in store.list_nodes_by_kind(kind)? {
             let Some(src) = read_node_source(root, &node) else {
                 continue;
             };
+            let java_body = if kind.language() == Some("java") {
+                let span = node
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+                let start = span.as_ref().and_then(|m| m["java"]["start_byte"].as_u64());
+                let end = span.as_ref().and_then(|m| m["java"]["end_byte"].as_u64());
+                node.path
+                    .as_deref()
+                    .and_then(|p| crate::source_text::resolve_source_path(root, p).ok())
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|s| {
+                        s.get(usize::try_from(start?).ok()?..usize::try_from(end?).ok()?)
+                            .map(str::to_string)
+                    })
+            } else {
+                None
+            };
+            let body = java_body.as_deref().unwrap_or(&src.raw);
+            let java_jdbc = kind.language() == Some("java")
+                && (body.contains("jdbcTemplate.update(") || body.contains("jdbc.update("));
+            if kind.language() == Some("java") && !java_jdbc {
+                continue;
+            }
             let mut linked: HashSet<String> = HashSet::new();
-            for table in extract_sql_table_refs(&src.raw) {
+            for table in extract_sql_table_refs(body) {
                 if !linked.insert(table.clone()) {
                     continue; // already linked this table for this callable
                 }
                 if let Some(table_ids) = table_by_name.get(&table) {
                     for tid in table_ids {
-                        edges.push(EdgeAssertion::fact(
+                        let mut edge = EdgeAssertion::fact(
                             node.id.clone(),
                             tid.clone(),
                             EdgeKind::PersistsTo,
                             EdgeSource::LanguageAdapter,
-                        ));
+                        );
+                        if java_jdbc {
+                            edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+                            edge.status = groundgraph_core::EdgeStatus::Proposed;
+                            edge.confidence = groundgraph_core::Confidence::new(0.6);
+                            edge.evidence_json = Some(serde_json::json!({"resolver":"java_jdbc_sql_syntax","source_path":node.path,"method":node.id,"operation":"update","binding_unverified":true}).to_string());
+                        }
+                        edges.push(edge);
                         stats.inline_sql_table_edges += 1;
                     }
                 }
