@@ -152,6 +152,10 @@ enum Commands {
     /// 并汇总最终触达的表。`search` 只给 1 跳、`graph --view focus` 也偏浅；
     /// `trace` 才回答「这个接口背后牵动了图里的哪些东西」。
     Trace(TraceArgs),
+    /// Report read/write tables, external effects, transactions, risks and unresolved calls.
+    Effects(EffectsArgs),
+    /// Find HTTP, scheduled, listener and MQ entrypoints that write a table.
+    Writers(WritersArgs),
     /// Generate shell completions for bash / zsh / fish / powershell / elvish.
     Completions(CompletionsArgs),
     /// Diagnose the environment: git, SCIP indexers, Dart, graph.db, config.
@@ -183,6 +187,22 @@ struct TraceArgs {
     #[arg(long)]
     include_noise: bool,
     /// 输出 JSON。
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct EffectsArgs {
+    #[arg(value_parser = non_empty_value)]
+    query: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct WritersArgs {
+    #[arg(value_parser = non_empty_value)]
+    table: String,
     #[arg(long)]
     json: bool,
 }
@@ -1217,7 +1237,7 @@ fn reset_sigpipe() {
 /// `docs/environment.md`.
 fn after_help_text() -> String {
     let mut s = String::from(
-        "Primary binary: groundgraph.\n\nCommands by category (#128):\n  Setup     init, install, index, watch, doctor, completions\n  Query     search, trace, slice, context, impact, select-tests, questions, check\n  Graph     graph, graph-diff, graph-equiv, export, dashboard\n  Analysis dead-code, similar, features, facts, purity, constants, contract, suggest-tests\n  Business  candidate, logic, propose, business-doc, connect\n  Migration port-coverage, route-coverage, schema-index, feature-pack\n  Telemetry stats\n\nExit codes (#233): 0 success · 2 user error (bad argument, no workspace/file, partial index, doctor/ check findings) · 70 internal failure. See docs/cli-exit-codes.md.",
+        "Primary binary: groundgraph.\n\nCommands by category (#128):\n  Setup     init, install, index, watch, doctor, completions\n  Query     search, trace, effects, writers, slice, context, impact, select-tests, questions, check\n  Graph     graph, graph-diff, graph-equiv, export, dashboard\n  Analysis dead-code, similar, features, facts, purity, constants, contract, suggest-tests\n  Business  candidate, logic, propose, business-doc, connect\n  Migration port-coverage, route-coverage, schema-index, feature-pack\n  Telemetry stats\n\nExit codes (#233): 0 success · 2 user error (bad argument, no workspace/file, partial index, doctor/ check findings) · 70 internal failure. See docs/cli-exit-codes.md.",
     );
     s.push_str("\n\n");
     s.push_str(&env::render_environment_help());
@@ -1309,6 +1329,8 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::FeaturePack(_) => "feature-pack",
         Commands::Stats(_) => "stats",
         Commands::Trace(_) => "trace",
+        Commands::Effects(_) => "effects",
+        Commands::Writers(_) => "writers",
         Commands::Completions(_) => "completions",
         Commands::Doctor => "doctor",
     }
@@ -1710,6 +1732,10 @@ fn dispatch(cli: Cli) -> Result<u8> {
             json: args.json,
         })
         .map(|()| exit_code::EXIT_SUCCESS),
+        Commands::Effects(args) => commands::effects::run_effects(&cli.repo_root, &args.query, args.json)
+            .map(|()| exit_code::EXIT_SUCCESS),
+        Commands::Writers(args) => commands::effects::run_writers(&cli.repo_root, &args.table, args.json)
+            .map(|()| exit_code::EXIT_SUCCESS),
         Commands::Completions(args) => {
             // #113 — emit a shell-completion script. The `Cli::command()` AST
             // is rebuilt so the generated script reflects every subcommand and
@@ -1786,6 +1812,14 @@ mod tests {
         assert!(Cli::try_parse_from(["groundgraph", "trace", "selectFoo"]).is_ok());
         assert!(Cli::try_parse_from(["groundgraph", "slice", "REQ-1"]).is_ok());
         assert!(Cli::try_parse_from(["groundgraph", "candidate", "show", "c1"]).is_ok());
+    }
+
+    #[test]
+    fn effects_and_writers_accept_json_and_reject_empty_targets() {
+        assert!(Cli::try_parse_from(["groundgraph", "effects", "shop.Action.run", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["groundgraph", "writers", "t_stock", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["groundgraph", "effects", " "]).is_err());
+        assert!(Cli::try_parse_from(["groundgraph", "writers", ""]).is_err());
     }
 
     /// #91: the file-output flag is `--out` on every command; `--output`

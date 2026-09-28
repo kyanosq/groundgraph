@@ -307,6 +307,27 @@ fn broken_argument_keeps_unique_interface_dispatch_as_candidate() {
 }
 
 #[test]
+fn broken_argument_keeps_private_same_class_call_as_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/shop/Order.java", "package shop; class Order {}");
+    write(root, "src/shop/Action.java", "package shop; class Action { void run(Order order) { finish(order.missing()); } private void finish(long id) {} }");
+    let store = index(root);
+    let calls = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::Calls)
+        .unwrap();
+    let link = calls
+        .iter()
+        .find(|e| {
+            e.from_id.as_str().ends_with("Action.run(Order)")
+                && e.to_id.as_str().ends_with("Action.finish(long)")
+        })
+        .expect("private call retained");
+    assert_eq!(link.certainty.as_str(), "candidate");
+}
+
+#[test]
 fn jdbc_update_in_private_method_reaches_table_but_unused_sql_does_not() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -376,6 +397,75 @@ fn unresolved_wrapper_update_keeps_entity_and_update_operation_as_candidate() {
         .iter()
         .any(|e| e.from_id.as_str().ends_with("Action.run()")
             && e.to_id.as_str().ends_with("::t_stock")));
+}
+
+#[test]
+fn wrapper_builder_is_not_a_write_but_ambiguous_mapper_update_is_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/com/baomidou/mybatisplus/annotation/TableName.java", "package com.baomidou.mybatisplus.annotation; public @interface TableName { String value(); }");
+    write(root, "src/com/baomidou/mybatisplus/core/mapper/BaseMapper.java", "package com.baomidou.mybatisplus.core.mapper; public interface BaseMapper<T> { int update(Object wrapper); int update(String wrapper); }");
+    write(root, "src/com/baomidou/mybatisplus/core/conditions/update/UpdateWrapper.java", "package com.baomidou.mybatisplus.core.conditions.update; public class UpdateWrapper<T> { public UpdateWrapper<T> setSql(String sql) { return this; } }");
+    write(root, "src/shop/Order.java", "package shop;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_order\")\nclass Order { long id; }");
+    write(root, "src/shop/OrderMapper.java", "package shop; interface OrderMapper extends com.baomidou.mybatisplus.core.mapper.BaseMapper<Order> {}");
+    write(root, "src/shop/Action.java", "package shop; class Action { OrderMapper mapper; void run() { mapper.update(new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<Order>().setSql(\"id=1\").broken()); } }");
+    let store = index(root);
+    let writes: Vec<_> = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from_id.as_str().ends_with("Action.run()"))
+        .collect();
+    assert_eq!(writes.len(), 1, "{writes:#?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(writes[0].metadata_json.as_deref().unwrap()).unwrap()
+            ["operation"],
+        "update"
+    );
+    assert_eq!(writes[0].certainty.as_str(), "candidate");
+}
+
+#[test]
+fn mapper_update_with_unavailable_overload_remains_a_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/com/baomidou/mybatisplus/annotation/TableName.java", "package com.baomidou.mybatisplus.annotation; public @interface TableName { String value(); }");
+    write(root, "src/com/baomidou/mybatisplus/core/mapper/BaseMapper.java", "package com.baomidou.mybatisplus.core.mapper; public interface BaseMapper<T> { int update(T entity, Object wrapper); }");
+    write(root, "src/shop/Order.java", "package shop;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_order\")\nclass Order { long id; }");
+    write(root, "src/shop/OrderMapper.java", "package shop; interface OrderMapper extends com.baomidou.mybatisplus.core.mapper.BaseMapper<Order> {}");
+    write(root, "src/shop/Action.java", "package shop; class Action { OrderMapper mapper; void run() { mapper.update(new Object()); } }");
+    let store = index(root);
+    let source = store
+        .list_nodes_by_kind(NodeKind::File)
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id.as_str().ends_with("Action.java"))
+        .unwrap();
+    let source: Value = serde_json::from_str(source.metadata_json.as_deref().unwrap()).unwrap();
+    let update = source["java_analysis"]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["expression"].as_str().unwrap_or("").starts_with("mapper.update"))
+        .unwrap();
+    assert_eq!(update["target"], Value::Null);
+    assert_eq!(update["external_target"], "com.baomidou.mybatisplus.core.mapper.BaseMapper.update(?)");
+    assert_eq!(update["reason"], "framework_crud_overload_missing_from_classpath");
+    let writes: Vec<_> = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from_id.as_str().ends_with("Action.run()"))
+        .collect();
+    assert_eq!(writes.len(), 1, "{writes:#?}");
+    assert_eq!(writes[0].certainty.as_str(), "candidate");
+    assert_eq!(
+        serde_json::from_str::<Value>(writes[0].metadata_json.as_deref().unwrap()).unwrap()
+            ["operation"],
+        "update"
+    );
 }
 
 #[test]
@@ -573,6 +663,66 @@ fn async_and_transactional_event_listener_are_visible_boundaries() {
         .risks
         .iter()
         .any(|r| r.kind == "transactional_event_listener"));
+}
+
+#[test]
+fn effects_card_and_writers_use_write_edges_and_show_unresolved_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "schema.sql", "CREATE TABLE t_stock (id BIGINT);");
+    write(
+        root,
+        "src/org/springframework/scheduling/annotation/Scheduled.java",
+        "package org.springframework.scheduling.annotation; public @interface Scheduled {}",
+    );
+    write(
+        root,
+        "src/org/springframework/kafka/annotation/KafkaListener.java",
+        "package org.springframework.kafka.annotation; public @interface KafkaListener {}",
+    );
+    write(
+        root,
+        "src/shop/StockMapper.java",
+        "package shop; interface StockMapper { void write(); void read(); }",
+    );
+    write(root, "src/shop/StockMapper.xml", "<mapper namespace=\"shop.StockMapper\"><update id=\"write\">UPDATE t_stock SET id=1</update><select id=\"read\">SELECT * FROM t_stock</select></mapper>");
+    write(root, "src/shop/First.java", "package shop; class First { StockMapper mapper; void run() { mapper.write(); missing.call(); } }");
+    write(root, "src/shop/Second.java", "package shop; import org.springframework.scheduling.annotation.Scheduled; class Second { StockMapper mapper; @Scheduled void tick() { mapper.write(); } void onlyRead() { mapper.read(); } }");
+    write(root, "src/shop/Consumer.java", "package shop; import org.springframework.kafka.annotation.KafkaListener; class Consumer { StockMapper mapper; @KafkaListener void onMessage() { mapper.write(); } }");
+    let _store = index(root);
+    let card = groundgraph_engine::effects::run_effects(
+        groundgraph_engine::trace::TraceOptions::new(root, "First.run"),
+    )
+    .unwrap();
+    assert!(card
+        .tables
+        .iter()
+        .any(|e| e.table == "t_stock" && e.operation == "update"));
+    assert!(
+        card.unresolved_count >= 1
+            && card
+                .breakpoints
+                .iter()
+                .any(|b| b.expression.contains("missing.call"))
+    );
+    let writers = groundgraph_engine::effects::run_writers(root, "t_stock").unwrap();
+    assert!(writers
+        .entries
+        .iter()
+        .any(|e| e.id.ends_with("First.run()")));
+    assert!(writers
+        .entries
+        .iter()
+        .any(|e| e.id.ends_with("Second.tick()") && e.kind == "scheduled"));
+    assert!(writers
+        .entries
+        .iter()
+        .any(|e| e.id.ends_with("Consumer.onMessage()") && e.kind == "MQ"));
+    assert!(!writers
+        .entries
+        .iter()
+        .any(|e| e.id.ends_with("Second.onlyRead()")));
 }
 
 #[test]

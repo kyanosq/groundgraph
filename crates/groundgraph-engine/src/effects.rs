@@ -4,8 +4,340 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
 use serde_json::Value;
+use std::path::Path;
+
+use groundgraph_core::{EdgeCertainty, EdgeKind, NodeKind};
+use groundgraph_store::Store;
 
 use crate::trace::{TraceNode, TraceResult};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TableEffect {
+    pub table: String,
+    pub operation: String,
+    pub columns: Vec<String>,
+    pub certainty: String,
+    pub confidence: f32,
+    pub source: Option<String>,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalCall {
+    pub id: String,
+    pub name: String,
+    pub effect: String,
+    pub source: Option<String>,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnresolvedCall {
+    pub path: String,
+    pub line: u32,
+    pub expression: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectsCard {
+    pub entry: String,
+    pub seeds: Vec<String>,
+    pub tables: Vec<TableEffect>,
+    pub external_calls: Vec<ExternalCall>,
+    pub events: Vec<ExternalCall>,
+    pub transactions: TransactionAnalysis,
+    pub unresolved_count: usize,
+    pub breakpoints: Vec<UnresolvedCall>,
+    pub breakpoints_truncated: bool,
+    pub confirmed_effect_ratio: f32,
+    pub truncated: bool,
+}
+
+pub fn run_effects(options: crate::trace::TraceOptions) -> crate::error::EngineResult<EffectsCard> {
+    let trace = crate::trace::run_trace(options)?;
+    Ok(effects_from_trace(&trace))
+}
+
+pub fn effects_from_trace(trace: &TraceResult) -> EffectsCard {
+    let transactions = analyze_transactions(trace);
+    let nodes: BTreeMap<_, _> = trace.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut tables = Vec::new();
+    let mut score = BTreeMap::<&str, f32>::new();
+    for seed in &trace.seeds {
+        score.insert(seed, 1.0);
+    }
+    for _ in 0..trace.nodes.len() {
+        let mut changed = false;
+        for edge in &trace.edges {
+            if let Some(before) = score.get(edge.from.as_str()).copied() {
+                let after = before * edge.assertion.confidence.get();
+                if after > score.get(edge.to.as_str()).copied().unwrap_or(0.0) {
+                    score.insert(&edge.to, after);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut confirmed = 0usize;
+    let mut measured = 0usize;
+    for edge in &trace.edges {
+        if edge.kind != "persists_to" {
+            continue;
+        }
+        let Some(node) = nodes.get(edge.to.as_str()) else {
+            continue;
+        };
+        if node.kind != "db_table" {
+            continue;
+        }
+        let meta: Value = edge
+            .assertion
+            .metadata_json
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or(Value::Null);
+        let op = meta["operation"].as_str().unwrap_or("unknown");
+        let certainty = edge.assertion.certainty.as_str().to_string();
+        measured += 1;
+        if edge.assertion.certainty != EdgeCertainty::Candidate
+            && score.get(edge.from.as_str()).copied().unwrap_or(0.0) >= 0.999
+        {
+            confirmed += 1;
+        }
+        tables.push(TableEffect {
+            table: node.label.clone(),
+            operation: op.into(),
+            columns: meta["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            certainty,
+            confidence: score.get(edge.from.as_str()).copied().unwrap_or(0.0)
+                * edge.assertion.confidence.get(),
+            source: edge.assertion.source_file.clone(),
+            evidence: edge.assertion.evidence_json.clone(),
+        });
+    }
+    tables.sort_by(|a, b| {
+        (&a.table, &a.operation, &a.source).cmp(&(&b.table, &b.operation, &b.source))
+    });
+    let mut external_calls = Vec::new();
+    let mut events = Vec::new();
+    for node in &trace.nodes {
+        if node.kind != "external_effect" {
+            continue;
+        }
+        let meta: Value = node
+            .metadata_json
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or(Value::Null);
+        let item = ExternalCall {
+            id: node.id.clone(),
+            name: node.label.clone(),
+            effect: meta["effect"].as_str().unwrap_or("unknown").into(),
+            source: node.path.clone(),
+            evidence: node.metadata_json.clone(),
+        };
+        measured += 1;
+        if score.get(node.id.as_str()).copied().unwrap_or(0.0) >= 0.999 {
+            confirmed += 1;
+        }
+        if item.effect == "event" {
+            events.push(item);
+        } else {
+            external_calls.push(item);
+        }
+    }
+    let unresolved: Vec<_> = trace
+        .java_analysis
+        .calls
+        .iter()
+        .filter(|c| c.resolution == "unresolved")
+        .collect();
+    let breakpoints = unresolved
+        .iter()
+        .take(30)
+        .map(|c| UnresolvedCall {
+            path: c.path.clone(),
+            line: c.line,
+            expression: c.expression.chars().take(160).collect(),
+            reason: c.reason.clone(),
+        })
+        .collect();
+    EffectsCard {
+        entry: trace.query.clone(),
+        seeds: trace.seeds.clone(),
+        tables,
+        external_calls,
+        events,
+        transactions,
+        unresolved_count: unresolved.len(),
+        breakpoints,
+        breakpoints_truncated: unresolved.len() > 30,
+        confirmed_effect_ratio: if measured == 0 {
+            0.0
+        } else {
+            confirmed as f32 / measured as f32
+        },
+        truncated: trace.truncated,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WriterEntry {
+    pub id: String,
+    pub kind: String,
+    pub path: Option<String>,
+    pub certainty: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WritersResult {
+    pub table: String,
+    pub write_edges: usize,
+    pub entries: Vec<WriterEntry>,
+    pub truncated: bool,
+}
+
+pub fn run_writers(root: &Path, table: &str) -> crate::error::EngineResult<WritersResult> {
+    let config = crate::config::load_config(root)?;
+    let path = crate::config::resolve_storage_path(root, &config)?;
+    let store = Store::open(&path)?;
+    Ok(writers_with_store(&store, table)?)
+}
+
+pub fn writers_with_store(store: &Store, table: &str) -> anyhow::Result<WritersResult> {
+    let table_ids: Vec<_> = store
+        .list_nodes_by_kind(NodeKind::DbTable)?
+        .into_iter()
+        .filter(|n| {
+            n.name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(table))
+        })
+        .map(|n| n.id)
+        .collect();
+    let mut starts = Vec::new();
+    for id in table_ids {
+        for edge in store.list_edges_to(&id)? {
+            if edge.kind != EdgeKind::PersistsTo {
+                continue;
+            }
+            let meta: Value = edge
+                .metadata_json
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or(Value::Null);
+            if matches!(
+                meta["operation"].as_str(),
+                Some("insert" | "update" | "delete")
+            ) {
+                starts.push((edge.from_id, edge.certainty));
+            }
+        }
+    }
+    let write_edges = starts.len();
+    let mut entries = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut queue: VecDeque<_> = starts.into_iter().collect();
+    let mut truncated = false;
+    while let Some((id, certainty)) = queue.pop_front() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if seen.len() > 20_000 {
+            truncated = true;
+            break;
+        }
+        let Some(node) = store.find_node(&id)? else {
+            continue;
+        };
+        let kind = writer_entry_kind(&node);
+        if let Some(kind) = kind {
+            entries.insert(
+                id.to_string(),
+                WriterEntry {
+                    id: id.to_string(),
+                    kind: kind.into(),
+                    path: node.path.clone(),
+                    certainty: certainty.as_str().into(),
+                },
+            );
+            continue;
+        }
+        let incoming: Vec<_> = store
+            .list_edges_to(&id)?
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Calls | EdgeKind::References | EdgeKind::DeclaresImplementation
+                )
+            })
+            .collect();
+        if incoming.is_empty() && node.kind.is_callable() {
+            entries.insert(
+                id.to_string(),
+                WriterEntry {
+                    id: id.to_string(),
+                    kind: "method".into(),
+                    path: node.path.clone(),
+                    certainty: certainty.as_str().into(),
+                },
+            );
+        } else {
+            for edge in incoming {
+                queue.push_back((
+                    edge.from_id,
+                    if edge.certainty == EdgeCertainty::Candidate {
+                        EdgeCertainty::Candidate
+                    } else {
+                        certainty
+                    },
+                ));
+            }
+        }
+    }
+    Ok(WritersResult {
+        table: table.into(),
+        write_edges,
+        entries: entries.into_values().collect(),
+        truncated,
+    })
+}
+
+fn writer_entry_kind(node: &groundgraph_core::Node) -> Option<&'static str> {
+    if node.kind == NodeKind::HttpRoute {
+        return Some("HTTP");
+    }
+    let meta: Value = serde_json::from_str(node.metadata_json.as_deref()?).ok()?;
+    for entry in meta["java"]["framework"].as_array()? {
+        if entry["role"] != "entrypoint" {
+            continue;
+        }
+        let name = entry["annotation"].as_str().unwrap_or("");
+        if name.ends_with("Scheduled") {
+            return Some("scheduled");
+        }
+        if name.ends_with("EventListener") {
+            return Some("listener");
+        }
+        if name.ends_with("KafkaListener")
+            || name.ends_with("RabbitListener")
+            || name.ends_with("JmsListener")
+        {
+            return Some("MQ");
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TransactionAnalysis {

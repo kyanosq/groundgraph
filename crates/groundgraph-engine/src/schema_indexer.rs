@@ -745,18 +745,26 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
         };
         let calls: Vec<crate::java_semantics::CallSite> = serde_json::from_value(calls.clone())?;
         for call in calls {
-            let Some(method) = call
-                .external_target
-                .as_deref()
-                .filter(|t| t.starts_with("com.baomidou.mybatisplus."))
-            else {
+            let Some(method) = call.external_target.as_deref().filter(|t| {
+                [
+                    "com.baomidou.mybatisplus.core.mapper.BaseMapper.",
+                    "com.baomidou.mybatisplus.extension.service.IService.",
+                    "com.baomidou.mybatisplus.extension.service.impl.ServiceImpl.",
+                ]
+                .iter()
+                .any(|owner| t.starts_with(owner))
+            }) else {
                 continue;
             };
-            let operation = method
+            let Some(operation) = method
                 .split('(')
                 .next()
                 .and_then(|name| name.rsplit('.').next())
-                .and_then(mybatis_operation);
+                .and_then(|name| name.rsplit('>').next())
+                .and_then(mybatis_operation)
+            else {
+                continue;
+            };
             for arg in &call.owner_type_args {
                 let Some(tables) = arg.path.as_ref().and_then(|p| orm_tables.get(p)) else {
                     continue;
@@ -776,14 +784,14 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
                     }
                     edge.source_file = Some(call.path.clone());
                     edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
-                    edge.metadata_json = operation.map(|op| {
-                        let columns = if op == "update" {
-                            wrapper_update_columns(&call.expression)
-                        } else {
-                            Vec::new()
-                        };
-                        serde_json::json!({"operation":op,"columns":columns}).to_string()
-                    });
+                    let columns = if operation == "update" {
+                        wrapper_update_columns(&call.expression)
+                    } else {
+                        Vec::new()
+                    };
+                    edge.metadata_json = Some(
+                        serde_json::json!({"operation":operation,"columns":columns}).to_string(),
+                    );
                     edge.evidence_json = Some(serde_json::json!({"resolver":"mybatis_plus_inherited_crud","call_site":call.id,"line":call.line,"method":method,"entity":arg.name,"snippet":call.expression}).to_string());
                     edges.push(edge);
                 }
@@ -896,6 +904,7 @@ fn link_inline_sql_edges(
                             EdgeKind::PersistsTo,
                             EdgeSource::LanguageAdapter,
                         );
+                        edge.source_file = node.path.clone();
                         if java_jdbc {
                             edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
                             edge.status = groundgraph_core::EdgeStatus::Proposed;

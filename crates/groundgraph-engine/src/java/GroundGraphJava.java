@@ -137,20 +137,70 @@ class GroundGraphJava {
     ExecutableElement uniqueReceiverMethod(TreePath p) {
         if(!(p.getLeaf() instanceof MethodInvocationTree)) return null;
         MethodInvocationTree call=(MethodInvocationTree)p.getLeaf();
-        if(!(call.getMethodSelect() instanceof MemberSelectTree)) return null;
-        MemberSelectTree select=(MemberSelectTree)call.getMethodSelect();
-        TreePath receiver=new TreePath(new TreePath(p,call.getMethodSelect()),select.getExpression());
-        TypeMirror type=trees.getTypeMirror(receiver);
+        ExpressionTree select=call.getMethodSelect();
+        Name name;
+        TypeMirror type;
+        if(select instanceof MemberSelectTree) {
+            MemberSelectTree member=(MemberSelectTree)select;
+            name=member.getIdentifier();
+            TreePath receiver=new TreePath(new TreePath(p,select),member.getExpression());
+            type=trees.getTypeMirror(receiver);
+        } else if(select instanceof IdentifierTree) {
+            name=((IdentifierTree)select).getName();
+            TypeElement enclosing=trees.getScope(p).getEnclosingClass();
+            type=enclosing==null?null:enclosing.asType();
+        } else return null;
         if(!(type instanceof DeclaredType) || erroneous(type)) return null;
         Element owner=((DeclaredType)type).asElement();
         if(!(owner instanceof TypeElement)) return null;
         ExecutableElement found=null;
         for(Element member:task.getElements().getAllMembers((TypeElement)owner)) {
-            if(!(member instanceof ExecutableElement) || !member.getSimpleName().contentEquals(select.getIdentifier()) || ((ExecutableElement)member).getParameters().size()!=call.getArguments().size()) continue;
+            if(!(member instanceof ExecutableElement) || !member.getSimpleName().contentEquals(name) || ((ExecutableElement)member).getParameters().size()!=call.getArguments().size()) continue;
             if(found!=null && !found.equals(member)) return null;
             found=(ExecutableElement)member;
         }
         return found;
+    }
+    ExecutableElement frameworkCrudMethod(TreePath p) {
+        if(!(p.getLeaf() instanceof MethodInvocationTree)) return null;
+        MethodInvocationTree call=(MethodInvocationTree)p.getLeaf();
+        ExpressionTree select=call.getMethodSelect();
+        Name name;
+        TypeMirror type;
+        if(select instanceof MemberSelectTree) {
+            MemberSelectTree member=(MemberSelectTree)select;
+            name=member.getIdentifier();
+            type=trees.getTypeMirror(new TreePath(new TreePath(p,select),member.getExpression()));
+        } else if(select instanceof IdentifierTree) {
+            name=((IdentifierTree)select).getName();
+            TypeElement enclosing=trees.getScope(p).getEnclosingClass();
+            type=enclosing==null?null:enclosing.asType();
+        } else return null;
+        if(!(type instanceof DeclaredType) || erroneous(type)) return null;
+        Deque<TypeMirror> queue=new ArrayDeque<>(); queue.add(type);
+        Set<String> seen=new HashSet<>();
+        while(!queue.isEmpty()) {
+            TypeMirror current=queue.poll();
+            if(!(current instanceof DeclaredType) || !seen.add(current.toString())) continue;
+            TypeElement owner=(TypeElement)((DeclaredType)current).asElement();
+            String qualified=owner.getQualifiedName().toString();
+            if(qualified.equals("com.baomidou.mybatisplus.core.mapper.BaseMapper") || qualified.equals("com.baomidou.mybatisplus.extension.service.IService")) {
+                ExecutableElement named=null;
+                int namedCount=0;
+                for(Element member:owner.getEnclosedElements()) {
+                    if(member instanceof ExecutableElement && member.getSimpleName().contentEquals(name)) {
+                        if(((ExecutableElement)member).getParameters().size()==call.getArguments().size()) return (ExecutableElement)member;
+                        named=(ExecutableElement)member;
+                        namedCount++;
+                    }
+                }
+                // A source call can use a CRUD overload missing from the configured dependency version.
+                // Keep a single named framework method as a candidate, never as a resolved call.
+                if(namedCount==1) return named;
+            }
+            queue.addAll(task.getTypes().directSupertypes(current));
+        }
+        return null;
     }
     void binding(TreePath p, boolean completed) {
         Map<String,Object> row = location(p,""); row.put("kind","call"); row.put("resolved",false); row.put("reason","unresolved_symbol");
@@ -181,13 +231,18 @@ class GroundGraphJava {
             else if(overlapsError(p)) row.put("reason","compiler_error_at_call");
             if(completed && !Boolean.TRUE.equals(row.get("resolved"))) {
                 ExecutableElement candidate=uniqueReceiverMethod(p);
+                boolean frameworkCandidate=candidate==null;
+                if(frameworkCandidate) candidate=frameworkCrudMethod(p);
                 if(candidate!=null) {
-                    TreePath decl=declaration(candidate);
-                    if(decl!=null && bytes.containsKey(decl.getCompilationUnit())) row.putAll(location(decl,"target_"));
-                    row.put("symbol",candidate.getEnclosingElement()+"."+candidate);
+                    boolean missingOverload=frameworkCandidate && p.getLeaf() instanceof MethodInvocationTree && candidate.getParameters().size()!=((MethodInvocationTree)p.getLeaf()).getArguments().size();
+                    if(!missingOverload) {
+                        TreePath decl=declaration(candidate);
+                        if(decl!=null && bytes.containsKey(decl.getCompilationUnit())) row.putAll(location(decl,"target_"));
+                    }
+                    row.put("symbol",missingOverload ? candidate.getEnclosingElement()+"."+candidate.getSimpleName()+"(?)" : candidate.getEnclosingElement()+"."+candidate);
                     List<Object> args=ownerTypeArgs(p,candidate);
                     if(args!=null) row.put("owner_type_args",args);
-                    row.put("reason","unique_receiver_method_with_compiler_error"); row.put("candidate",true);
+                    row.put("reason",missingOverload ? "framework_crud_overload_missing_from_classpath" : "unique_receiver_method_with_compiler_error"); row.put("candidate",true);
                 }
             }
         } catch(RuntimeException ex) { row.put("reason","binding_exception:"+ex.getClass().getSimpleName()); }
@@ -324,13 +379,13 @@ class GroundGraphJava {
             annotationUnit=p.getCompilationUnit();
             for(AnnotationTree a:((MethodTree)p.getLeaf()).getModifiers().getAnnotations()) {
                 String shortName=head(a);
-                if(!Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider","Scheduled","EventListener","TransactionalEventListener","Transactional","Async").contains(shortName)) continue;
+                if(!Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider","Scheduled","EventListener","TransactionalEventListener","KafkaListener","RabbitListener","JmsListener","Transactional","Async").contains(shortName)) continue;
                 String name=annotationName(p,a);
                 boolean unknown=name==null;
                 boolean sql=(unknown || name.equals("org.apache.ibatis.annotations."+shortName)) &&
                     Arrays.asList("Select","Insert","Update","Delete","SelectProvider","InsertProvider","UpdateProvider","DeleteProvider").contains(shortName);
-                boolean entry=Arrays.asList("org.springframework.scheduling.annotation.Scheduled", "org.springframework.context.event.EventListener", "org.springframework.transaction.event.TransactionalEventListener").contains(name) ||
-                    (unknown && Arrays.asList("Scheduled","EventListener","TransactionalEventListener").contains(shortName));
+                boolean entry=Arrays.asList("org.springframework.scheduling.annotation.Scheduled", "org.springframework.context.event.EventListener", "org.springframework.transaction.event.TransactionalEventListener", "org.springframework.kafka.annotation.KafkaListener", "org.springframework.amqp.rabbit.annotation.RabbitListener", "org.springframework.jms.annotation.JmsListener").contains(name) ||
+                    (unknown && Arrays.asList("Scheduled","EventListener","TransactionalEventListener","KafkaListener","RabbitListener","JmsListener").contains(shortName));
                 boolean transaction="org.springframework.transaction.annotation.Transactional".equals(name);
                 boolean async="org.springframework.scheduling.annotation.Async".equals(name);
                 if(!sql && !entry && !transaction && !async) continue;
