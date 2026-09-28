@@ -587,6 +587,18 @@ fn link_data_layer_edges(
         }
         for edge in &mut edges[table_edges_start..] {
             edge.source_file = stmt.source_file.clone();
+            let operation = sql_table_operation(
+                &meta.stmt_kind,
+                &meta.sql,
+                edge.to_id.as_str().rsplit("::").next().unwrap_or(""),
+            );
+            let columns = if operation == "update" {
+                sql_update_columns(&meta.sql)
+            } else {
+                Vec::new()
+            };
+            edge.metadata_json =
+                Some(serde_json::json!({"operation":operation,"columns":columns}).to_string());
             edge.evidence_json = Some(serde_json::json!({"resolver":"sql_table_reference", "line":stmt.start_line, "java_annotation":meta.java_annotation, "syntactic_reference_only":true}).to_string());
             if meta.java_annotation.is_some() {
                 edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
@@ -615,13 +627,99 @@ fn link_data_layer_edges(
     Ok(())
 }
 
+fn sql_table_operation<'a>(statement: &'a str, sql: &str, table: &str) -> &'a str {
+    let kind = statement.to_ascii_lowercase();
+    if kind == "select" {
+        return "read";
+    }
+    let lower = sql.to_ascii_lowercase();
+    let tokens: Vec<_> = lower.split_whitespace().collect();
+    let target = tokens.windows(2).find_map(|w| {
+        let head = w[0].trim_matches(|c: char| !c.is_ascii_alphabetic());
+        if (kind == "insert" && head == "into")
+            || (kind == "update" && head == "update")
+            || (kind == "delete" && head == "from")
+        {
+            Some(
+                w[1].trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(""),
+            )
+        } else {
+            None
+        }
+    });
+    if target == Some(table) {
+        match kind.as_str() {
+            "insert" => "insert",
+            "update" => "update",
+            "delete" => "delete",
+            _ => "read",
+        }
+    } else {
+        "read"
+    }
+}
+
+fn sql_update_columns(sql: &str) -> Vec<String> {
+    let lower = sql.to_ascii_lowercase();
+    let Some(start) = lower.find(" set ") else {
+        return Vec::new();
+    };
+    let assignments = &lower[start + 5..];
+    let assignments = assignments.split(" where ").next().unwrap_or(assignments);
+    assignments
+        .split(',')
+        .filter_map(|part| {
+            let left = part.split_once('=')?.0.trim();
+            let column = left.rsplit('.').next()?.trim();
+            (!column.is_empty()
+                && column
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+            .then(|| column.to_string())
+        })
+        .collect()
+}
+
+fn wrapper_update_columns(expression: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    for (marker, assignment) in [(".set(\"", false), (".setSql(\"", true)] {
+        let mut rest = expression;
+        while let Some((_, tail)) = rest.split_once(marker) {
+            let Some((value, after)) = tail.split_once('"') else {
+                break;
+            };
+            let column = if assignment {
+                value
+                    .split_once('=')
+                    .map(|(left, _)| left.trim())
+                    .unwrap_or("")
+            } else {
+                value
+            };
+            if !column.is_empty()
+                && column
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && !columns.iter().any(|c| c == column)
+            {
+                columns.push(column.to_string());
+            }
+            rest = after;
+        }
+    }
+    columns
+}
+
 /// MyBatis-Plus inherited CRUD (`BaseMapper<E>.insert`, `IService<E>.save`,
 /// `ServiceImpl<M, E>.list`…) has no XML statement: the table is the entity
 /// type argument's `@TableName`. javac records the receiver's type arguments on
 /// the declaring generic type; any argument whose source file holds an ORM
 /// table is the entity. Mapper type arguments (`M`) hold no table and drop out.
 fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
     let mut orm_tables: HashMap<String, Vec<ArtifactId>> = HashMap::new();
     for t in store.list_nodes_by_kind(NodeKind::DbTable)? {
         let orm = t
@@ -636,7 +734,6 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
                 .push(t.id.clone());
         }
     }
-    let mut seen = BTreeSet::new();
     let mut edges = Vec::new();
     for file in store.list_nodes_by_kind(NodeKind::File)? {
         let Some(meta) = file.metadata_json.as_deref() else {
@@ -655,22 +752,38 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
             else {
                 continue;
             };
+            let operation = method
+                .split('(')
+                .next()
+                .and_then(|name| name.rsplit('.').next())
+                .and_then(mybatis_operation);
             for arg in &call.owner_type_args {
                 let Some(tables) = arg.path.as_ref().and_then(|p| orm_tables.get(p)) else {
                     continue;
                 };
                 for table in tables {
-                    if !seen.insert((call.caller.clone(), table.clone())) {
-                        continue;
-                    }
                     let mut edge = EdgeAssertion::fact(
                         ArtifactId::new(&call.caller),
                         table.clone(),
                         EdgeKind::PersistsTo,
                         EdgeSource::LanguageAdapter,
                     );
+                    edge.id = ArtifactId::new(format!("schema_crud::{}::{table}", call.id));
+                    if call.resolution == "candidate" {
+                        edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+                        edge.status = groundgraph_core::EdgeStatus::Proposed;
+                        edge.confidence = groundgraph_core::Confidence::new(0.6);
+                    }
                     edge.source_file = Some(call.path.clone());
                     edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+                    edge.metadata_json = operation.map(|op| {
+                        let columns = if op == "update" {
+                            wrapper_update_columns(&call.expression)
+                        } else {
+                            Vec::new()
+                        };
+                        serde_json::json!({"operation":op,"columns":columns}).to_string()
+                    });
                     edge.evidence_json = Some(serde_json::json!({"resolver":"mybatis_plus_inherited_crud","call_site":call.id,"line":call.line,"method":method,"entity":arg.name,"snippet":call.expression}).to_string());
                     edges.push(edge);
                 }
@@ -680,6 +793,24 @@ fn link_mybatis_plus_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats)
     stats.inherited_crud_table_edges = edges.len();
     store.upsert_edges_bulk(&edges)?;
     Ok(())
+}
+
+fn mybatis_operation(method: &str) -> Option<&'static str> {
+    if method.starts_with("select")
+        || method.starts_with("get")
+        || method.starts_with("list")
+        || method == "count"
+    {
+        Some("read")
+    } else if method.starts_with("insert") || matches!(method, "save" | "saveBatch") {
+        Some("insert")
+    } else if method.starts_with("update") {
+        Some("update")
+    } else if method.starts_with("delete") || method.starts_with("remove") {
+        Some("delete")
+    } else {
+        None
+    }
 }
 
 /// Language-agnostic data-layer linker for **inline SQL**: any callable code
@@ -770,6 +901,30 @@ fn link_inline_sql_edges(
                             edge.status = groundgraph_core::EdgeStatus::Proposed;
                             edge.confidence = groundgraph_core::Confidence::new(0.6);
                             edge.evidence_json = Some(serde_json::json!({"resolver":"java_jdbc_sql_syntax","source_path":node.path,"method":node.id,"operation":"update","binding_unverified":true}).to_string());
+                        }
+                        let lower = body.to_ascii_lowercase();
+                        let statement = if lower.contains("update ") {
+                            "update"
+                        } else if lower.contains("insert into ") {
+                            "insert"
+                        } else if lower.contains("delete from ") {
+                            "delete"
+                        } else if lower.contains("select ") {
+                            "select"
+                        } else {
+                            ""
+                        };
+                        if !statement.is_empty() {
+                            let operation = sql_table_operation(statement, body, &table);
+                            let columns = if operation == "update" {
+                                sql_update_columns(body)
+                            } else {
+                                Vec::new()
+                            };
+                            edge.metadata_json = Some(
+                                serde_json::json!({"operation":operation,"columns":columns})
+                                    .to_string(),
+                            );
                         }
                         edges.push(edge);
                         stats.inline_sql_table_edges += 1;
@@ -5706,6 +5861,20 @@ public class SizeSysVO implements Serializable {
     }
 
     #[test]
+    fn sql_operation_marks_joined_table_as_read_and_set_column() {
+        let sql = "UPDATE t_order o JOIN t_stock s ON s.id=o.id SET o.status=?, o.updated_at=? WHERE s.active=1";
+        assert_eq!(sql_table_operation("update", sql, "t_order"), "update");
+        assert_eq!(sql_table_operation("update", sql, "t_stock"), "read");
+        assert_eq!(sql_update_columns(sql), vec!["status", "updated_at"]);
+        assert_eq!(wrapper_update_columns("mapper.update(new UpdateWrapper<Order>().set(\"status\", 1).setSql(\"actual_qty = actual_qty + 1\"))"), vec!["status", "actual_qty"]);
+        assert_eq!(mybatis_operation("selectList"), Some("read"));
+        assert_eq!(mybatis_operation("insert"), Some("insert"));
+        assert_eq!(mybatis_operation("updateById"), Some("update"));
+        assert_eq!(mybatis_operation("deleteById"), Some("delete"));
+        assert_eq!(mybatis_operation("savepoint"), None);
+    }
+
+    #[test]
     fn parse_java_field_rejects_degenerate_lines() {
         // Pins the contract around the `tokens.len() < 2` guard that protects
         // the `tokens.last()` extraction (#206).
@@ -5772,6 +5941,10 @@ public class SizeSysVO implements Serializable {
                 && e.to_id.as_str().ends_with("::craft_conflict")),
             "expected stmt->table PersistsTo edge, got {from_stmt:?}"
         );
+        assert!(from_stmt.iter().any(|e| e.kind == EdgeKind::PersistsTo
+            && e.metadata_json
+                .as_deref()
+                .is_some_and(|m| m.contains("\"operation\":\"read\""))));
     }
 
     #[test]
@@ -5796,6 +5969,14 @@ public class SizeSysVO implements Serializable {
         assert_eq!(stats.external_tables, 1, "one external table synthesized");
 
         let tables = store.list_nodes_by_kind(NodeKind::DbTable).unwrap();
+        assert!(store
+            .list_edges_by_kind(EdgeKind::PersistsTo)
+            .unwrap()
+            .iter()
+            .any(|e| e
+                .metadata_json
+                .as_deref()
+                .is_some_and(|m| m.contains("\"operation\":\"delete\""))));
         let ext = tables
             .iter()
             .find(|n| n.id.as_str() == "db_table::<external>::member_role")

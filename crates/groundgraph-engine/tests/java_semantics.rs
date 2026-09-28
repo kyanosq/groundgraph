@@ -331,6 +331,42 @@ fn jdbc_update_in_private_method_reaches_table_but_unused_sql_does_not() {
     assert!(!edges
         .iter()
         .any(|e| e.from_id.as_str().ends_with("Review.unused()")));
+    let write = edges
+        .iter()
+        .find(|e| e.from_id.as_str().ends_with("Review.sync()"))
+        .unwrap();
+    let metadata: Value = serde_json::from_str(write.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["operation"], "update");
+}
+
+#[test]
+fn unresolved_wrapper_update_keeps_entity_and_update_operation_as_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/com/baomidou/mybatisplus/annotation/TableName.java", "package com.baomidou.mybatisplus.annotation; public @interface TableName { String value(); }");
+    write(root, "src/com/baomidou/mybatisplus/core/mapper/BaseMapper.java", "package com.baomidou.mybatisplus.core.mapper; public interface BaseMapper<T> { int update(Object wrapper); }");
+    write(root, "src/shop/Order.java", "package shop;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_order\")\nclass Order { long id; }");
+    write(root, "src/shop/Stock.java", "package shop;\nimport com.baomidou.mybatisplus.annotation.TableName;\n@TableName(\"t_stock\")\nclass Stock { long id; }");
+    write(root, "src/shop/OrderMapper.java", "package shop; interface OrderMapper extends com.baomidou.mybatisplus.core.mapper.BaseMapper<Order> {}");
+    write(root, "src/shop/Action.java", "package shop; class Action { OrderMapper mapper; void run() { mapper.update(new Object().missing()); } }");
+    let store = index(root);
+    let edges = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap();
+    let edge = edges
+        .iter()
+        .find(|e| {
+            e.from_id.as_str().ends_with("Action.run()") && e.to_id.as_str().ends_with("::t_order")
+        })
+        .expect("candidate update reaches declared entity");
+    assert_eq!(edge.certainty.as_str(), "candidate");
+    let meta: Value = serde_json::from_str(edge.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["operation"], "update");
+    assert!(!edges
+        .iter()
+        .any(|e| e.from_id.as_str().ends_with("Action.run()")
+            && e.to_id.as_str().ends_with("::t_stock")));
 }
 
 #[test]
@@ -713,6 +749,37 @@ fn mybatis_plus_inherited_crud_reaches_the_entity_table() {
                 "db_table::src/p/Item.java::t_item".into()
             ),
         ]
+    );
+    let operations: Vec<_> = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.from_id.as_str().contains("OrderService"))
+        .map(|e| {
+            let meta: Value =
+                serde_json::from_str(e.metadata_json.as_deref().unwrap_or("{}")).unwrap();
+            (
+                e.from_id.to_string(),
+                e.to_id.to_string(),
+                meta["operation"].clone(),
+            )
+        })
+        .collect();
+    assert!(
+        operations.iter().any(
+            |(from, to, op)| from.ends_with("OrderService.create(Order)")
+                && to.ends_with("::t_item")
+                && op == "insert"
+        ),
+        "{operations:?}"
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|(from, to, op)| from.ends_with("OrderService.list()")
+                && to.ends_with("::t_item")
+                && op == "read"),
+        "{operations:?}"
     );
 }
 

@@ -478,7 +478,19 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                     }
                 } else if r["candidate"] == true {
                     call.target = target_at(r, "target_");
-                    if call.target.is_some() {
+                    call.external_target = r["symbol"].as_str().map(str::to_string);
+                    call.owner_type_args = r["owner_type_args"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| {
+                            Some(OwnerTypeArg {
+                                name: a["name"].as_str()?.to_string(),
+                                path: a["path"].as_str().map(str::to_string),
+                            })
+                        })
+                        .collect();
+                    if call.target.is_some() || call.external_target.is_some() {
                         call.resolution = "candidate".into();
                     }
                 }
