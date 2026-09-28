@@ -188,6 +188,15 @@ fn feign_links_are_service_and_verb_scoped_candidates() {
         .as_deref()
         .unwrap()
         .contains("orders"));
+    assert!(store
+        .list_nodes_by_kind(NodeKind::ExternalEffect)
+        .unwrap()
+        .iter()
+        .any(|n| n
+            .metadata_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("\"client\":\"Feign\"")));
 }
 
 #[test]
@@ -367,6 +376,38 @@ fn unresolved_wrapper_update_keeps_entity_and_update_operation_as_candidate() {
         .iter()
         .any(|e| e.from_id.as_str().ends_with("Action.run()")
             && e.to_id.as_str().ends_with("::t_stock")));
+}
+
+#[test]
+fn external_client_calls_become_effect_nodes_without_matching_unrelated_types() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    config(root, "");
+    write(root, "src/org/springframework/web/client/RestTemplate.java", "package org.springframework.web.client; public class RestTemplate { public Object postForEntity(String url, Object body, Class<?> type) { return null; } }");
+    write(root, "src/org/springframework/context/ApplicationEventPublisher.java", "package org.springframework.context; public interface ApplicationEventPublisher { void publishEvent(Object event); }");
+    write(root, "src/shop/RestTemplate.java", "package shop; class RestTemplate { void postForEntity(String url, Object body, Class<?> type) {} }");
+    write(root, "src/shop/Action.java", "package shop; class Action { org.springframework.web.client.RestTemplate http; org.springframework.context.ApplicationEventPublisher events; RestTemplate local; void run() { http.postForEntity(\"/orders\", null, Object.class); events.publishEvent(new Object()); local.postForEntity(\"local\", null, Object.class); } }");
+    let store = index(root);
+    let effects = store.list_nodes_by_kind(NodeKind::ExternalEffect).unwrap();
+    assert_eq!(effects.len(), 2, "{effects:#?}");
+    let edges = store
+        .list_edges_by_kind(groundgraph_core::EdgeKind::Calls)
+        .unwrap();
+    assert!(effects.iter().all(|n| edges.iter().any(|e| e
+        .from_id
+        .as_str()
+        .ends_with("Action.run()")
+        && e.to_id == n.id)));
+    assert!(effects.iter().any(|n| n
+        .metadata_json
+        .as_deref()
+        .unwrap_or("")
+        .contains("\"effect\":\"http\"")));
+    assert!(effects.iter().any(|n| n
+        .metadata_json
+        .as_deref()
+        .unwrap_or("")
+        .contains("\"effect\":\"event\"")));
 }
 
 #[test]

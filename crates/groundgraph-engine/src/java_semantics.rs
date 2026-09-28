@@ -536,8 +536,36 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
     store.clear_indexer_outputs("java_semantics")?;
     store.clear_indexer_outputs("java_feign")?;
     let mut edges = Vec::new();
+    let mut effect_nodes = Vec::new();
     for a in analyses.values() {
         for call in &a.calls {
+            if let Some((effect, client)) = call
+                .external_target
+                .as_deref()
+                .and_then(external_call_effect)
+            {
+                let id = ArtifactId::new(format!("external_effect::{}", call.id));
+                let mut node = Node::new(id.clone(), NodeKind::ExternalEffect);
+                node.name = Some(format!(
+                    "{client} {}",
+                    call.external_target.as_deref().unwrap_or("")
+                ));
+                node.path = Some(call.path.clone());
+                node.source_file = Some(call.path.clone());
+                node.start_line = Some(call.line);
+                node.indexer = Some("java_semantics".into());
+                node.metadata_json = Some(json!({"effect":effect,"client":client,"call_site":call.id,"symbol":call.external_target,"resolution":call.resolution}).to_string());
+                effect_nodes.push(node);
+                let mut edge = candidate(
+                    &call.caller,
+                    id.as_str(),
+                    EdgeKind::Calls,
+                    "java_semantics",
+                    &json!({"path":call.path,"line":call.line,"call_site":call.id,"resolver":"known_java_client","resolution":"candidate","static_target":call.external_target}),
+                );
+                edge.id = ArtifactId::new(format!("external_effect_edge::{}", call.id));
+                edges.push(edge);
+            }
             if let Some(target) = &call.target {
                 let mut edge = EdgeAssertion::fact(
                     ArtifactId::new(&call.caller),
@@ -563,6 +591,30 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
             }
         }
     }
+    for route in records
+        .iter()
+        .filter(|r| r["kind"] == "route" && r["role"] == "client")
+    {
+        if let Some(method) = target_at(route, "") {
+            let id = ArtifactId::new(format!("external_effect::feign::{method}"));
+            let mut node = Node::new(id.clone(), NodeKind::ExternalEffect);
+            node.name = Some(format!(
+                "Feign {} {}",
+                route["verb"].as_str().unwrap_or("ANY"),
+                route["route"].as_str().unwrap_or("<unresolved>")
+            ));
+            node.path = route["path"].as_str().map(str::to_string);
+            node.source_file = node.path.clone();
+            node.start_line = route["line"]
+                .as_u64()
+                .and_then(|line| u32::try_from(line).ok());
+            node.indexer = Some("java_semantics".into());
+            node.metadata_json = Some(json!({"effect":"http","client":"Feign","route":route["route"],"verb":route["verb"],"resolution":"candidate"}).to_string());
+            effect_nodes.push(node);
+            edges.push(candidate(&method, id.as_str(), EdgeKind::Calls, "java_semantics", &json!({"path":route["path"],"line":route["line"],"resolver":"feign_annotation","resolution":"candidate"})));
+        }
+    }
+    store.upsert_nodes_bulk(&effect_nodes)?;
     for r in records.iter().filter(|r| r["kind"] == "override") {
         if let (Some(from), Some(to)) = (target_at(r, "base_"), target_at(r, "target_")) {
             let mut edge = candidate(
@@ -594,6 +646,70 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
         store.upsert_node(&node)?;
     }
     Ok(edges.len())
+}
+
+fn external_call_effect(symbol: &str) -> Option<(&'static str, &'static str)> {
+    let name = symbol
+        .split('(')
+        .next()?
+        .rsplit('.')
+        .next()?
+        .rsplit('>')
+        .next()?;
+    if symbol.contains("springframework.web.client.RestTemplate.")
+        && [
+            "exchange",
+            "execute",
+            "getForObject",
+            "getForEntity",
+            "postForObject",
+            "postForEntity",
+            "postForLocation",
+            "put",
+            "delete",
+            "patchForObject",
+        ]
+        .contains(&name)
+    {
+        Some(("http", "RestTemplate"))
+    } else if symbol.contains("springframework.web.reactive.function.client.WebClient")
+        && ["retrieve", "exchangeToMono", "exchangeToFlux", "exchange"].contains(&name)
+    {
+        Some(("http", "WebClient"))
+    } else if symbol.contains("okhttp3.OkHttpClient.") && name == "newCall"
+        || symbol.contains("okhttp3.Call.") && ["execute", "enqueue"].contains(&name)
+    {
+        Some(("http", "OkHttp"))
+    } else if symbol.contains("cn.hutool.http.HttpUtil.")
+        && ["get", "post", "put", "delete", "request"].contains(&name)
+        || symbol.contains("cn.hutool.http.HttpRequest.") && name == "execute"
+    {
+        Some(("http", "Hutool"))
+    } else if symbol.contains("java.net.http.HttpClient.") && ["send", "sendAsync"].contains(&name)
+    {
+        Some(("http", "JDK HttpClient"))
+    } else if symbol.contains("org.springframework.kafka.core.KafkaTemplate.") && name == "send" {
+        Some(("mq", "KafkaTemplate"))
+    } else if (symbol.contains("org.springframework.amqp.rabbit.core.RabbitTemplate.")
+        || symbol.contains("org.springframework.amqp.core.AmqpTemplate."))
+        && ["send", "convertAndSend"].contains(&name)
+    {
+        Some(("mq", "RabbitTemplate"))
+    } else if symbol.contains("org.springframework.jms.core.JmsTemplate.")
+        && ["send", "convertAndSend"].contains(&name)
+    {
+        Some(("mq", "JmsTemplate"))
+    } else if symbol.contains("org.springframework.cloud.stream.function.StreamBridge.")
+        && name == "send"
+    {
+        Some(("mq", "StreamBridge"))
+    } else if symbol.contains("org.springframework.context.ApplicationEventPublisher.")
+        && name == "publishEvent"
+    {
+        Some(("event", "Spring Event"))
+    } else {
+        None
+    }
 }
 
 fn candidate(
@@ -704,6 +820,29 @@ pub fn analysis_for_files(store: &Store, files: &BTreeSet<String>) -> Result<Jav
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_java_external_clients_are_scoped_by_owner_and_method() {
+        for (symbol, effect) in [
+            ("org.springframework.web.client.RestTemplate.<T>postForEntity(java.lang.String)", "http"),
+            ("org.springframework.web.reactive.function.client.WebClient.retrieve()", "http"),
+            ("okhttp3.OkHttpClient.newCall(okhttp3.Request)", "http"),
+            ("cn.hutool.http.HttpUtil.post(java.lang.String)", "http"),
+            ("java.net.http.HttpClient.send(java.net.http.HttpRequest)", "http"),
+            ("org.springframework.kafka.core.KafkaTemplate.send(java.lang.String)", "mq"),
+            ("org.springframework.context.ApplicationEventPublisher.publishEvent(java.lang.Object)", "event"),
+        ] {
+            assert_eq!(external_call_effect(symbol).map(|(kind, _)| kind), Some(effect));
+        }
+        assert_eq!(
+            external_call_effect("shop.RestTemplate.postForEntity()"),
+            None
+        );
+        assert_eq!(
+            external_call_effect("org.springframework.web.client.RestTemplate.hashCode()"),
+            None
+        );
+    }
     #[test]
     fn inventory_does_not_require_a_compiler_or_resolvable_receiver() {
         let a = inventory(

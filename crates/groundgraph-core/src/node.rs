@@ -188,6 +188,8 @@ pub enum NodeKind {
     /// `measuresInfo`). This makes the HTTP contract first-class graph evidence,
     /// the entry-point analogue of `DbTable`/`SqlMapperStmt`.
     HttpRoute,
+    /// A statically observed HTTP, message, or application-event send site.
+    ExternalEffect,
 }
 
 impl NodeKind {
@@ -278,6 +280,7 @@ impl NodeKind {
         NodeKind::DbTable,
         NodeKind::SqlMapperStmt,
         NodeKind::HttpRoute,
+        NodeKind::ExternalEffect,
     ];
 
     /// Parse the stable snake_case string back into a [`NodeKind`]. Inverse
@@ -514,6 +517,7 @@ impl NodeKind {
             NodeKind::DbTable => "db_table",
             NodeKind::SqlMapperStmt => "sql_mapper_stmt",
             NodeKind::HttpRoute => "http_route",
+            NodeKind::ExternalEffect => "external_effect",
         }
     }
 }
