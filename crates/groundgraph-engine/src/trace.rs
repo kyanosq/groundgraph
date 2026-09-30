@@ -414,7 +414,10 @@ mod tests {
             search_match(id, "create", 80),
         ];
         let seeds = select_seeds(&matches, id, 6);
-        assert_eq!(seeds.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec![id]);
+        assert_eq!(
+            seeds.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec![id]
+        );
     }
 
     #[test]

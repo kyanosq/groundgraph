@@ -33,6 +33,8 @@ See the [offline evidence workspace](webui/README.md) and [design audit with rem
 
 Java now includes a per-call-site inventory, optional JDK compiler bindings, and service-scoped Feign candidates. See [Java semantics](docs/java-semantics.md) for configuration and signature-ID migration.
 
+Spring Data JPA inherited CRUD can project candidate table effects when the compiler proves a `JpaRepository` receiver and an exact source `@Entity` / explicit `@Table` mapping. Reads, deletes, and possible insert-or-update (`upsert`) are distinct; `save` is not proof of an INSERT or atomic SQL upsert. Shared `CrudRepository` names alone do not identify a JPA store. See the [scope and limits](docs/java-semantics.md#spring-data-jpa-crud-candidates).
+
 ## Highlights
 
 - 🔎 **`search`** — hybrid retrieval: structural scoring (ids/names/paths/evidence/adjacency) **plus a BM25 fulltext content layer** over code bodies, doc comments and markdown bodies — bilingual (CJK bigrams), with a grounding source snippet per hit. Concept queries like `byte boundary panic` or `错位竞争` hit even when no identifier contains those words.
@@ -44,7 +46,7 @@ Java now includes a per-call-site inventory, optional JDK compiler bindings, and
 - 🧠 **`propose` / `candidate` / `logic`** — AI business-logic evidence packs and a human review workflow.
 - 🔁 **`port-coverage` / `graph-equiv`** — compare source/target names and structure; these are not behavioral-equivalence checks.
 - 📊 **`dashboard`** — a single self-contained offline HTML panel aggregating overview, business modules, feature clusters, checks, dead code, open questions and purity. No server, no CDN — open it from `file://`.
-- 🔌 **MCP server** — expose the graph to AI agents via the Model Context Protocol.
+- 🔌 **MCP server** — expose the graph to AI agents via the Model Context Protocol. `get_subgraph` preserves assertion certainty, status, confidence, metadata and provenance; candidate links do not become facts at the protocol boundary.
 - 🧩 **`install` / `watch`** — configure Cursor, Claude Code and Codex for MCP, then keep the graph refreshed during agent work.
 
 Battle-tested on large codebases across languages: Redis (C, ~200k lines) indexes in ~11s, the TypeScript compiler repo (20k+ files) in ~28s (parallel parsing + a per-file parse budget that survives fixture corpora with intentional syntax errors), Django (Python), gin (Go) and gson (Java/Maven) validated end-to-end. SCIP enrichment is incremental — unchanged sources reuse the previous `.scip` instead of re-running the type-checker — and search ranking demotes tests/tools/examples so issue-style queries hit production code first (validated against real Redis issues).

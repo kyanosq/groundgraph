@@ -237,7 +237,7 @@ pub fn writers_with_store(store: &Store, table: &str) -> anyhow::Result<WritersR
                 .unwrap_or(Value::Null);
             if matches!(
                 meta["operation"].as_str(),
-                Some("insert" | "update" | "delete")
+                Some("insert" | "update" | "upsert" | "delete")
             ) {
                 starts.push((edge.from_id, edge.certainty));
             }
@@ -574,5 +574,51 @@ pub fn analyze_transactions(trace: &TraceResult) -> TransactionAnalysis {
         groups: groups.into_values().collect(),
         node_groups,
         risks: risks.into_values().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writers_with_store;
+    use groundgraph_core::{
+        ArtifactId, Confidence, EdgeAssertion, EdgeCertainty, EdgeKind, EdgeSource, EdgeStatus,
+        Node, NodeKind,
+    };
+    use groundgraph_store::Store;
+    use serde_json::json;
+
+    #[test]
+    fn writers_upsert_is_candidate_and_read_or_missing_operations_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("graph.db")).unwrap();
+        store.migrate().unwrap();
+        let mut table = Node::new(ArtifactId::new("table"), NodeKind::DbTable);
+        table.name = Some("rows".into());
+        store.upsert_node(&table).unwrap();
+        for (id, operation) in [
+            ("write", Some("upsert")),
+            ("read", Some("read")),
+            ("unknown", None),
+        ] {
+            let node = Node::new(ArtifactId::new(id), NodeKind::JavaMethod);
+            store.upsert_node(&node).unwrap();
+            let mut edge = EdgeAssertion::fact(
+                node.id,
+                table.id.clone(),
+                EdgeKind::PersistsTo,
+                EdgeSource::LanguageAdapter,
+            );
+            edge.certainty = EdgeCertainty::Candidate;
+            edge.status = EdgeStatus::Proposed;
+            edge.confidence = Confidence::new(0.6);
+            edge.metadata_json = operation.map(|op| json!({"operation":op}).to_string());
+            store.upsert_edge(&edge).unwrap();
+        }
+        let result = writers_with_store(&store, "rows").unwrap();
+        assert_eq!(result.write_edges, 1);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].id, "write");
+        assert_eq!(result.entries[0].certainty, "candidate");
+        assert!(!result.truncated);
     }
 }

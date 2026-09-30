@@ -224,6 +224,8 @@ class GroundGraphJava {
                     row.put("symbol",m.getEnclosingElement()+"."+m);
                     List<Object> args=ownerTypeArgs(p,m);
                     if(args!=null) row.put("owner_type_args",args);
+                    Map<String,Object> jpa=jpaRepositoryEvidence(p,m);
+                    if(jpa!=null) row.put("jpa_repository",jpa);
                     TreePath target=declaration(m);
                     if(target!=null && bytes.containsKey(target.getCompilationUnit()) && start(target)>=0) row.putAll(location(target,"target_"));
                 } else row.put("reason","error_type_in_binding");
@@ -242,6 +244,8 @@ class GroundGraphJava {
                     row.put("symbol",missingOverload ? candidate.getEnclosingElement()+"."+candidate.getSimpleName()+"(?)" : candidate.getEnclosingElement()+"."+candidate);
                     List<Object> args=ownerTypeArgs(p,candidate);
                     if(args!=null) row.put("owner_type_args",args);
+                    Map<String,Object> jpa=jpaRepositoryEvidence(p,candidate);
+                    if(jpa!=null) row.put("jpa_repository",jpa);
                     row.put("reason",missingOverload ? "framework_crud_overload_missing_from_classpath" : "unique_receiver_method_with_compiler_error"); row.put("candidate",true);
                 }
             }
@@ -281,6 +285,73 @@ class GroundGraphJava {
                 return out;
             }
             queue.addAll(types.directSupertypes(t));
+        }
+        return null;
+    }
+    /** Shared CrudRepository is not a JPA proof: require the actual receiver's JpaRepository supertype. */
+    Map<String,Object> jpaRepositoryEvidence(TreePath p, ExecutableElement method) {
+        // Optional framework evidence must never erase a valid compiler target.
+        try { return jpaRepository(p,method); }
+        catch(RuntimeException incompleteType) { return null; }
+    }
+    Map<String,Object> jpaRepository(TreePath p, ExecutableElement method) {
+        if(!(p.getLeaf() instanceof MethodInvocationTree) || method.getModifiers().contains(Modifier.STATIC)) return null;
+        String declaring=method.getEnclosingElement().toString();
+        if(!declaring.startsWith("org.springframework.data.repository.") && !declaring.equals("org.springframework.data.jpa.repository.JpaRepository")) return null;
+        ExpressionTree select=((MethodInvocationTree)p.getLeaf()).getMethodSelect();
+        TypeMirror receiver=null;
+        if(select instanceof MemberSelectTree) {
+            receiver=trees.getTypeMirror(new TreePath(new TreePath(p,select),((MemberSelectTree)select).getExpression()));
+        } else if(select instanceof IdentifierTree) {
+            TypeElement enclosing=trees.getScope(p).getEnclosingClass();
+            if(enclosing!=null) receiver=enclosing.asType();
+        }
+        if(receiver==null || erroneous(receiver)) return null;
+        Deque<TypeMirror> queue=new ArrayDeque<>(); queue.add(receiver);
+        Set<String> seen=new HashSet<>();
+        while(!queue.isEmpty()) {
+            TypeMirror current=queue.poll();
+            if(!(current instanceof DeclaredType) || erroneous(current) || !seen.add(current.toString())) continue;
+            DeclaredType declared=(DeclaredType)current;
+            TypeElement owner=(TypeElement)declared.asElement();
+            if(owner.getQualifiedName().contentEquals("org.springframework.data.jpa.repository.JpaRepository")) {
+                if(declared.getTypeArguments().size()!=2) return null;
+                TypeMirror entityType=declared.getTypeArguments().get(0);
+                if(!(entityType instanceof DeclaredType) || erroneous(entityType)) return null;
+                TypeElement entity=(TypeElement)((DeclaredType)entityType).asElement();
+                TreePath source=declaration(entity);
+                if(source==null || !bytes.containsKey(source.getCompilationUnit()) || start(source)<0) return null;
+                String namespace=null;
+                for(AnnotationMirror annotation:entity.getAnnotationMirrors()) {
+                    String name=annotation.getAnnotationType().toString();
+                    if(!erroneous(annotation.getAnnotationType()) &&
+                        (name.equals("jakarta.persistence.Entity") || name.equals("javax.persistence.Entity"))) {
+                        namespace=name.substring(0,name.length()-"Entity".length());
+                    }
+                }
+                if(namespace==null) return null;
+                for(AnnotationMirror annotation:entity.getAnnotationMirrors()) {
+                    if(erroneous(annotation.getAnnotationType()) || !annotation.getAnnotationType().toString().equals(namespace+"Table")) continue;
+                    String table="", schema="", catalog="";
+                    for(Map.Entry<? extends ExecutableElement,? extends AnnotationValue> entry:task.getElements().getElementValuesWithDefaults(annotation).entrySet()) {
+                        Object value=entry.getValue().getValue();
+                        if(!(value instanceof String)) continue;
+                        switch(entry.getKey().getSimpleName().toString()) {
+                            case "name": table=(String)value; break;
+                            case "schema": schema=(String)value; break;
+                            case "catalog": catalog=(String)value; break;
+                            default: break;
+                        }
+                    }
+                    // Naming strategies and schema-qualified table identity are not inferred.
+                    if(table.isEmpty() || !schema.isEmpty() || !catalog.isEmpty()) return null;
+                    return obj("repository_type",owner.getQualifiedName().toString(),"entity",entity.getQualifiedName().toString(),
+                        "entity_path",path(source.getCompilationUnit()),"entity_line",source.getCompilationUnit().getLineMap().getLineNumber(start(source)),
+                        "table",table,"entity_annotation",namespace+"Entity","table_annotation",namespace+"Table");
+                }
+                return null;
+            }
+            queue.addAll(task.getTypes().directSupertypes(current));
         }
         return null;
     }

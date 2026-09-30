@@ -80,7 +80,17 @@ groundgraph graph --format web --out graph.html
 
 动态反射、运行时 Bean 选择、生成代码及缺失的私有依赖不能凭静态源码完整还原。尚未提供这些证据的结果保持未知；MyBatis-Plus 条件构造器中的列语义、MQ 入口、组合/继承注解和运行时路由仍未完整覆盖。
 
-## 回归
+## Spring Data JPA CRUD candidates
+
+在现有调用事实中增加可选 `jpa_repository` 编译证据：接收者的 `JpaRepository` 超类型、具体泛型实体、源文件/行和真实 `jakarta.persistence` 或 `javax.persistence` 的 `Entity` / `Table` 注解。表关联按实体的**文件及显式表名**匹配，不把同文件其他类或同名自定义注解当实体；普通 `CrudRepository` 和 Mongo 接收者没有 JPA 证明时不产生此类边。
+
+继承自 Spring Data `CrudRepository`、`ListCrudRepository`、分页接口与 `JpaRepository` 的固定 CRUD 方法可产生 `persists_to` 候选边。`save/saveAll/saveAndFlush/saveAllAndFlush` 标 `upsert`（可能新增或更新，不代表数据库原子 upsert），查找/计数标 `read`，删除标 `delete`。`writers` 包含 upsert、排除 read。方法引用、自定义重写、派生查询和单独 `flush()` 不按继承 CRUD 推断。
+
+**这些关系始终为 candidate/proposed**，保留原始编译 `resolved/candidate` 状态、调用位置、精确实体和框架规则证据；不提高 `confirmed_effect_ratio`。置信度是静态证据权重，非统计准确率。运行时 Bean、事务提交、级联、脏检查、触发器、实际列变化均未获确认。
+
+当前仅覆盖已经索引的源码显式表名；没有显式表名、命名策略、非空 schema/catalog、未索引实体或缺失编译依赖保持未知，不按名称猜表。旧图必须重新索引才能取得新增证据。`cargo test -p groundgraph-engine --test spring_data_jpa --locked` 覆盖正例、负例、部分编译恢复和重新索引去除旧边。
+
+## 回归记录
 
 `cargo test -p groundgraph-engine --test java_semantics --locked` 覆盖重载、重复调用、链式调用、递归、缺编译器、缺依赖、泛型、传递继承、多实现、Feign 服务/方法隔离、mapper namespace、模块可见性、UTF-8、JUnit、初始化与 varargs、导出、部分 SCIP 保留。
 
