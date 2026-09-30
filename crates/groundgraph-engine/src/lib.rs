@@ -47,6 +47,7 @@ pub mod graph_equiv;
 pub mod impact;
 pub mod index;
 pub mod init;
+pub mod java_dispatch;
 pub mod java_indexer;
 pub mod java_semantics;
 pub mod java_treesitter;

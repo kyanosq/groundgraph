@@ -14,6 +14,8 @@ use std::path::Path;
 #[serde(default)]
 pub struct JavaSemanticsConfig {
     pub enabled: bool,
+    /// Explicit string-id dispatch conventions; none inferred from method names.
+    pub dispatch_contracts: Vec<crate::java_dispatch::DispatchContract>,
     pub java_command: String,
     pub classpath: Vec<String>,
     /// Annotation processors to run (e.g. the Lombok jar). Empty = none run.
@@ -37,6 +39,7 @@ impl Default for JavaSemanticsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            dispatch_contracts: vec![],
             java_command: "java".into(),
             classpath: vec![],
             annotation_processor_path: vec![],
@@ -74,6 +77,8 @@ pub struct CallSite {
     pub jpa_repository: Option<JpaRepositoryBinding>,
     #[serde(default)]
     pub caught_without_rethrow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_hint: Option<crate::java_dispatch::DispatchHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +182,7 @@ fn inventory(path: &str, source: &str, nodes: &mut [Node]) -> Result<JavaAnalysi
                 owner_type_args: Vec::new(),
                 jpa_repository: None,
                 caught_without_rethrow: false,
+                dispatch_hint: None,
             });
         }
         let mut c = n.walk();
@@ -347,6 +353,7 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
         Err(crate::error::EngineError::NoWorkspace { .. }) => JavaSemanticsConfig::default(),
         Err(e) => return Err(e.into()),
     };
+    crate::java_dispatch::validate(&config.dispatch_contracts)?;
     let mut nodes_by_file = BTreeMap::<String, Vec<Node>>::new();
     for node in store.list_all_nodes()? {
         if let Some(path) = &node.path {
@@ -482,6 +489,16 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                     .filter(|value| !value.is_null())
                     .map(|value| serde_json::from_value(value.clone()))
                     .transpose()?;
+                let dispatch_hint: Option<crate::java_dispatch::DispatchHint> = r
+                    .get("dispatch_hint")
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()?;
+                call.dispatch_hint = dispatch_hint.filter(|hint| {
+                    config.dispatch_contracts.iter().any(|c| {
+                        c.dispatcher_methods.contains(&hint.method)
+                            || c.registration_methods.contains(&hint.method)
+                    })
+                });
                 if r["resolved"] == true {
                     call.target = target_at(r, "target_");
                     call.external_target = r["symbol"].as_str().map(str::to_string);
@@ -560,6 +577,7 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
     }
     store.clear_indexer_outputs("java_semantics")?;
     store.clear_indexer_outputs("java_feign")?;
+    store.clear_indexer_outputs("java_dispatch")?;
     let mut edges = Vec::new();
     let mut effect_nodes = Vec::new();
     for a in analyses.values() {
@@ -654,6 +672,10 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
         }
     }
     link_feign(&records, &config, &target_at, &mut analyses, &mut edges);
+    edges.extend(crate::java_dispatch::project(
+        &config.dispatch_contracts,
+        &mut analyses,
+    )?);
     store.upsert_edges_bulk(&edges)?;
     for (path, analysis) in analyses {
         let id = groundgraph_core::artifact_id::file_id(&path);
