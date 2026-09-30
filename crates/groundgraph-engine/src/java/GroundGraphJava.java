@@ -222,6 +222,8 @@ class GroundGraphJava {
                 if(!bad) {
                     row.put("resolved",true); row.put("reason","compiler_static_binding");
                     row.put("symbol",m.getEnclosingElement()+"."+m);
+                    Map<String,Object> dispatch=dispatchHint(p,m);
+                    if(dispatch!=null) row.put("dispatch_hint",dispatch);
                     List<Object> args=ownerTypeArgs(p,m);
                     if(args!=null) row.put("owner_type_args",args);
                     Map<String,Object> jpa=jpaRepositoryEvidence(p,m);
@@ -354,6 +356,47 @@ class GroundGraphJava {
             queue.addAll(task.getTypes().directSupertypes(current));
         }
         return null;
+    }
+    /** Only compiler-bound string-id sites; no source-name matching or execution. */
+    Map<String,Object> dispatchHint(TreePath p, ExecutableElement method) {
+        if (!(p.getLeaf() instanceof MethodInvocationTree) || method.getParameters().isEmpty()
+                || !method.getParameters().get(0).asType().toString().equals("java.lang.String")) return null;
+        MethodInvocationTree call=(MethodInvocationTree)p.getLeaf();
+        if(call.getArguments().isEmpty()) return null;
+        String id=stringConstant(new TreePath(p,call.getArguments().get(0)),0);
+        Map<String,Object> hint=obj("method",method.getEnclosingElement()+"."+method.getSimpleName(),"id",id);
+        boolean returned=p.getParentPath()!=null && p.getParentPath().getLeaf() instanceof ReturnTree;
+        TreePath enclosing=p.getParentPath();
+        while(enclosing!=null && !(enclosing.getLeaf() instanceof MethodTree)) {
+            if(enclosing.getLeaf() instanceof LambdaExpressionTree || enclosing.getLeaf() instanceof ClassTree) returned=false;
+            enclosing=enclosing.getParentPath();
+        }
+        hint.put("returned",returned);
+        if(enclosing!=null) {
+            Element element=trees.getElement(enclosing);
+            if(element instanceof ExecutableElement) {
+                hint.put("return_type",task.getTypes().erasure(((ExecutableElement)element).getReturnType()).toString());
+                List<String> annotations=new ArrayList<>();
+                for(AnnotationMirror a:element.getAnnotationMirrors()) annotations.add(a.getAnnotationType().toString());
+                hint.put("annotations",annotations);
+            }
+        }
+        return hint;
+    }
+    String stringConstant(TreePath p,int depth) {
+        if(depth>16) return null;
+        Tree t=p.getLeaf();Object value=null;
+        if(t instanceof LiteralTree) value=((LiteralTree)t).getValue();
+        else if(t instanceof ParenthesizedTree) return stringConstant(new TreePath(p,((ParenthesizedTree)t).getExpression()),depth+1);
+        else if(t instanceof BinaryTree && t.getKind()==Tree.Kind.PLUS) {
+            String a=stringConstant(new TreePath(p,((BinaryTree)t).getLeftOperand()),depth+1);
+            String b=stringConstant(new TreePath(p,((BinaryTree)t).getRightOperand()),depth+1);
+            if(a!=null && b!=null && a.length()+b.length()<=512) return a+b;
+        } else {
+            Element e=trees.getElement(p);
+            if(e instanceof VariableElement) value=((VariableElement)e).getConstantValue();
+        }
+        return value instanceof String && ((String)value).length()<=512 ? (String)value : null;
     }
     void overrides() {
         Map<String,List<ExecutableElement>> byName=new HashMap<>();
