@@ -140,6 +140,10 @@ try {
   await page
     .locator("#files")
     .setInputFiles(file("invalid.json", '{"invalid":true}'));
+  // File.text() and validation finish asynchronously after the upload event.
+  // Wait for the expected UI outcome rather than sampling visibility early.
+  await page.locator("#error").waitFor({ state: "visible" });
+  assert.match(await page.locator("#error").innerText(), /Unsupported graph/);
   assert.equal(await page.locator("#error").isVisible(), true);
   assert.equal(await page.locator("#repo").innerText(), "test snapshot");
   const manifest = {
