@@ -68,6 +68,10 @@ pub struct CallSite {
     /// inherited CRUD to its entity without guessing from names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_type_args: Vec<OwnerTypeArg>,
+    /// Compiler evidence for an explicit Spring Data JPA receiver and its
+    /// exact source entity mapping. This does not confirm runtime persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jpa_repository: Option<JpaRepositoryBinding>,
     #[serde(default)]
     pub caught_without_rethrow: bool,
 }
@@ -76,6 +80,17 @@ pub struct CallSite {
 pub struct OwnerTypeArg {
     pub name: String,
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JpaRepositoryBinding {
+    pub repository_type: String,
+    pub entity: String,
+    pub entity_path: String,
+    pub entity_line: u32,
+    pub table: String,
+    pub entity_annotation: String,
+    pub table_annotation: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +175,7 @@ fn inventory(path: &str, source: &str, nodes: &mut [Node]) -> Result<JavaAnalysi
                 target: None,
                 external_target: None,
                 owner_type_args: Vec::new(),
+                jpa_repository: None,
                 caught_without_rethrow: false,
             });
         }
@@ -461,6 +477,11 @@ pub(crate) fn index_java_calls(store: &mut Store, root: &Path, files: &[String])
                 };
                 call.reason = r["reason"].as_str().unwrap_or("binding_missing").into();
                 call.caught_without_rethrow = r["caught_without_rethrow"] == true;
+                call.jpa_repository = r
+                    .get("jpa_repository")
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()?;
                 if r["resolved"] == true {
                     call.target = target_at(r, "target_");
                     call.external_target = r["symbol"].as_str().map(str::to_string);

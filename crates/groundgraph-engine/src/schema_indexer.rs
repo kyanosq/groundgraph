@@ -97,8 +97,8 @@ pub struct SchemaIndexStats {
     /// This is what lets `trace` reach tables for repos that embed SQL directly
     /// instead of using MyBatis XML mappers.
     pub inline_sql_table_edges: usize,
-    /// `callable --persists_to--> DbTable` edges from MyBatis-Plus inherited
-    /// CRUD calls, resolved through the entity type argument (javac binding).
+    /// `callable --persists_to--> DbTable` edges from inherited ORM CRUD calls.
+    /// Spring Data JPA mappings remain candidates even with javac bindings.
     #[serde(default)]
     pub inherited_crud_table_edges: usize,
     /// `HttpRoute` nodes indexed from Spring MVC controller mapping annotations
@@ -394,6 +394,7 @@ pub fn index_schema_into(store: &mut Store, root: &Path) -> EngineResult<SchemaI
     link_data_layer_edges(store, root, &mut stats)?;
     link_inline_sql_edges(store, root, &mut stats)?;
     link_mybatis_plus_crud_edges(store, &mut stats)?;
+    link_spring_data_jpa_crud_edges(store, &mut stats)?;
     link_http_route_edges(store, &mut stats)?;
     link_dart_consumed_routes(store, root, &dart_route_consts, &mut stats)?;
     link_inline_consumed_routes(store, &dart_consumed_calls, "dart", &mut stats)?;
@@ -818,6 +819,114 @@ fn mybatis_operation(method: &str) -> Option<&'static str> {
         Some("delete")
     } else {
         None
+    }
+}
+
+/// Project exact compiler receiver/entity evidence into potential table effects.
+/// JPA's provider, naming strategy, cascades and flush behavior remain runtime
+/// knowledge; neither a resolved method nor `save` proves an INSERT occurred.
+fn link_spring_data_jpa_crud_edges(store: &mut Store, stats: &mut SchemaIndexStats) -> Result<()> {
+    let mut tables = std::collections::HashMap::new();
+    for table in store.list_nodes_by_kind(NodeKind::DbTable)? {
+        let orm = table
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<DbTableMeta>(raw).ok())
+            .is_some_and(|meta| meta.source == "orm");
+        if let (true, Some(path), Some(name)) = (orm, table.path, table.name) {
+            tables.insert((path, name), table.id);
+        }
+    }
+    let mut edges = Vec::new();
+    for file in store.list_nodes_by_kind(NodeKind::File)? {
+        let Some(raw) = file.metadata_json else {
+            continue;
+        };
+        let meta: serde_json::Value = serde_json::from_str(&raw)?;
+        let Some(calls) = meta.get("java_analysis").and_then(|a| a.get("calls")) else {
+            continue;
+        };
+        let calls: Vec<crate::java_semantics::CallSite> = serde_json::from_value(calls.clone())?;
+        for call in calls {
+            if call.kind != "method_invocation"
+                || !matches!(call.resolution.as_str(), "resolved" | "candidate")
+            {
+                continue;
+            }
+            let (Some(binding), Some(method)) = (
+                call.jpa_repository.as_ref(),
+                call.external_target.as_deref(),
+            ) else {
+                continue;
+            };
+            let Some(operation) = spring_data_jpa_operation(method) else {
+                continue;
+            };
+            let Some(table) = tables.get(&(binding.entity_path.clone(), binding.table.clone()))
+            else {
+                continue;
+            };
+            let mut edge = EdgeAssertion::with_confidence(
+                ArtifactId::new(&call.caller),
+                table.clone(),
+                EdgeKind::PersistsTo,
+                EdgeSource::LanguageAdapter,
+                if call.resolution == "resolved" {
+                    0.8
+                } else {
+                    0.5
+                },
+            );
+            edge.id = ArtifactId::new(format!("schema_jpa_crud::{}::{table}", call.id));
+            edge.certainty = groundgraph_core::EdgeCertainty::Candidate;
+            edge.status = groundgraph_core::EdgeStatus::Proposed;
+            edge.source_file = Some(call.path.clone());
+            edge.indexer = Some(SCHEMA_INDEXER_NAME.to_string());
+            edge.metadata_json =
+                Some(serde_json::json!({"operation":operation,"columns":[]}).to_string());
+            edge.evidence_json = Some(
+                serde_json::json!({
+                    "resolver":"spring_data_jpa_inherited_crud", "call_site":call.id,
+                    "line":call.line, "method":method, "entity":binding.entity,
+                    "binding":binding, "snippet":call.expression,
+                    "compiler_resolution":call.resolution, "compiler_reason":call.reason,
+                    "reason":"framework_convention_runtime_persistence_unverified"
+                })
+                .to_string(),
+            );
+            edges.push(edge);
+        }
+    }
+    stats.inherited_crud_table_edges += edges.len();
+    store.upsert_edges_bulk(&edges)?;
+    Ok(())
+}
+
+fn spring_data_jpa_operation(symbol: &str) -> Option<&'static str> {
+    let name = symbol.split('(').next()?;
+    let (owner, method) = name.rsplit_once('.')?;
+    if !matches!(
+        owner,
+        "org.springframework.data.repository.CrudRepository"
+            | "org.springframework.data.repository.ListCrudRepository"
+            | "org.springframework.data.repository.PagingAndSortingRepository"
+            | "org.springframework.data.repository.ListPagingAndSortingRepository"
+            | "org.springframework.data.jpa.repository.JpaRepository"
+    ) {
+        return None;
+    }
+    match method.rsplit('>').next()? {
+        "save" | "saveAll" | "saveAndFlush" | "saveAllAndFlush" => Some("upsert"),
+        "delete"
+        | "deleteById"
+        | "deleteAll"
+        | "deleteAllById"
+        | "deleteInBatch"
+        | "deleteAllInBatch"
+        | "deleteAllByIdInBatch" => Some("delete"),
+        "findById" | "findAll" | "findAllById" | "existsById" | "count" | "getOne" | "getById"
+        | "getReferenceById" => Some("read"),
+        _ => None,
     }
 }
 

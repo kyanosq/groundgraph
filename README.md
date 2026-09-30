@@ -33,6 +33,8 @@ See the [offline evidence workspace](webui/README.md) and [design audit with rem
 
 Java now includes a per-call-site inventory, optional JDK compiler bindings, and service-scoped Feign candidates. See [Java semantics](docs/java-semantics.md) for configuration and signature-ID migration.
 
+Spring Data JPA inherited CRUD can project candidate table effects when the compiler proves a `JpaRepository` receiver and an exact source `@Entity` / explicit `@Table` mapping. Reads, deletes, and possible insert-or-update (`upsert`) are distinct; `save` is not proof of an INSERT or atomic SQL upsert. Shared `CrudRepository` names alone do not identify a JPA store. See the [scope and limits](docs/java-semantics.md#spring-data-jpa-crud-candidates).
+
 ## Highlights
 
 - 🔎 **`search`** — hybrid retrieval: structural scoring (ids/names/paths/evidence/adjacency) **plus a BM25 fulltext content layer** over code bodies, doc comments and markdown bodies — bilingual (CJK bigrams), with a grounding source snippet per hit. Concept queries like `byte boundary panic` or `错位竞争` hit even when no identifier contains those words.
