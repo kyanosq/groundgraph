@@ -44,6 +44,153 @@ fn workspace_without_links() -> TempDir {
     tmp
 }
 
+fn workspace_with_requirement() -> TempDir {
+    let tmp = workspace_without_links();
+    write(
+        &tmp.path().join(".groundgraph/links.yaml"),
+        "# Existing declaration, preserve these bytes on rejection.\nrequirements:\n  REQ-WATERMARK-001: {}\n",
+    );
+    index_repository(IndexOptions::all(tmp.path())).unwrap();
+    tmp
+}
+
+fn candidate_yaml(version: &str, requirement: &str) -> String {
+    format!(
+        "{version}candidates:\n  - requirement: {requirement}\n    implementations:\n      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService\n"
+    )
+}
+
+fn assert_requirement_rejected(requirement: &str, reason: &str) {
+    let tmp = workspace_with_requirement();
+    let manifest = tmp.path().join(".groundgraph/links.yaml");
+    let before = std::fs::read(&manifest).unwrap();
+    let candidates = tmp.path().join("ai_candidates.yaml");
+    write(&candidates, &candidate_yaml("", requirement));
+    for dry_run in [false, true] {
+        let outcome = apply_candidates(ApplyOptions {
+            repo_root: tmp.path().into(),
+            candidates_path: candidates.clone(),
+            dry_run,
+        })
+        .unwrap();
+        // Check preservation first: even a formatting-only rewrite is wrong.
+        assert_eq!(std::fs::read(&manifest).unwrap(), before);
+        assert!(outcome.accepted.is_empty(), "{:?}", outcome.accepted);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert!(outcome.rejected[0].reason.contains(reason), "{:?}", outcome);
+        assert_eq!(outcome.dry_run, dry_run);
+    }
+}
+
+#[test]
+fn apply_rejects_unknown_requirement_without_rewriting_manifest() {
+    assert_requirement_rejected("REQ-UNKNOWN", "cannot resolve requirement `REQ-UNKNOWN`");
+}
+
+#[test]
+fn apply_rejects_empty_requirement_without_rewriting_manifest() {
+    for requirement in ["\"\"", "\"  \\t  \""] {
+        assert_requirement_rejected(requirement, "requirement must not be empty");
+    }
+}
+
+#[test]
+fn apply_refuses_future_candidate_schema_without_rewriting_manifest() {
+    let tmp = workspace_with_requirement();
+    let manifest = tmp.path().join(".groundgraph/links.yaml");
+    let before = std::fs::read(&manifest).unwrap();
+    let candidates = tmp.path().join("ai_candidates.yaml");
+    for version in [2, u32::MAX] {
+        for has_candidates in [false, true] {
+            let yaml = if has_candidates {
+                candidate_yaml(&format!("schema_version: {version}\n"), "REQ-WATERMARK-001")
+            } else {
+                format!("schema_version: {version}\ncandidates: []\n")
+            };
+            write(&candidates, &yaml);
+            for dry_run in [false, true] {
+                let result = apply_candidates(ApplyOptions {
+                    repo_root: tmp.path().into(),
+                    candidates_path: candidates.clone(),
+                    dry_run,
+                });
+                assert_eq!(std::fs::read(&manifest).unwrap(), before);
+                let error = result
+                    .expect_err("future schema must be refused")
+                    .to_string();
+                assert!(
+                    error.contains("unsupported candidates schema_version"),
+                    "{error}"
+                );
+                assert!(error.contains(&version.to_string()), "{error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn apply_accepts_legacy_and_current_candidate_schemas() {
+    for version in ["", "schema_version: 0\n", "schema_version: 1\n"] {
+        let tmp = workspace_with_requirement();
+        let manifest = tmp.path().join(".groundgraph/links.yaml");
+        let before = std::fs::read(&manifest).unwrap();
+        let candidates = tmp.path().join("ai_candidates.yaml");
+        write(&candidates, &candidate_yaml(version, "REQ-WATERMARK-001"));
+        for dry_run in [true, false, false] {
+            let outcome = apply_candidates(ApplyOptions {
+                repo_root: tmp.path().into(),
+                candidates_path: candidates.clone(),
+                dry_run,
+            })
+            .unwrap();
+            assert_eq!(outcome.accepted.len(), 1, "{version}: {outcome:?}");
+            assert!(outcome.rejected.is_empty());
+            assert_eq!(outcome.dry_run, dry_run);
+            if dry_run {
+                assert_eq!(std::fs::read(&manifest).unwrap(), before);
+            } else {
+                let yaml: serde_norway::Value =
+                    serde_norway::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+                let refs = yaml["requirements"]["REQ-WATERMARK-001"]["implementations"]
+                    .as_sequence()
+                    .unwrap();
+                assert_eq!(refs.len(), 1, "repeated apply must deduplicate");
+            }
+        }
+    }
+}
+
+#[test]
+fn apply_mixed_requirements_only_merges_known_requirement() {
+    let tmp = workspace_with_requirement();
+    let manifest = tmp.path().join(".groundgraph/links.yaml");
+    let before = std::fs::read(&manifest).unwrap();
+    let candidates = tmp.path().join("ai_candidates.yaml");
+    write(
+        &candidates,
+        &(candidate_yaml("schema_version: 1\n", "REQ-WATERMARK-001")
+            + "  - requirement: REQ-UNKNOWN\n    docs:\n      - docs/watermark.md#auto-watermark-placement\n"),
+    );
+    for dry_run in [true, false] {
+        let outcome = apply_candidates(ApplyOptions {
+            repo_root: tmp.path().into(),
+            candidates_path: candidates.clone(),
+            dry_run,
+        })
+        .unwrap();
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].requirement, "REQ-UNKNOWN");
+        if dry_run {
+            assert_eq!(std::fs::read(&manifest).unwrap(), before);
+        } else {
+            let raw = std::fs::read_to_string(&manifest).unwrap();
+            assert!(raw.contains("AutoPlacementService"));
+            assert!(!raw.contains("REQ-UNKNOWN"));
+        }
+    }
+}
+
 #[test]
 fn propose_does_not_infer_requirements_from_markdown_frontmatter() {
     let tmp = workspace_without_links();
@@ -85,7 +232,7 @@ fn propose_surfaces_orphan_symbols_and_tests_as_candidates_for_ai() {
 
 #[test]
 fn apply_writes_validated_candidates_into_links_manifest() {
-    let tmp = workspace_without_links();
+    let tmp = workspace_with_requirement();
     let candidates = tmp.path().join("ai_candidates.yaml");
     std::fs::write(
         &candidates,
@@ -156,7 +303,7 @@ fn apply_rejects_candidates_whose_targets_are_not_locatable() {
 
 #[test]
 fn apply_dry_run_validates_without_writing_manifest() {
-    let tmp = workspace_without_links();
+    let tmp = workspace_with_requirement();
     let candidates = tmp.path().join("ai_candidates.yaml");
     std::fs::write(
         &candidates,
@@ -175,14 +322,14 @@ fn apply_dry_run_validates_without_writing_manifest() {
     assert_eq!(outcome.accepted.len(), 1);
     let manifest = std::fs::read_to_string(tmp.path().join(".groundgraph/links.yaml")).unwrap();
     assert!(
-        !manifest.contains("REQ-WATERMARK-001"),
+        !manifest.contains("AutoPlacementService"),
         "dry-run mutated manifest: {manifest}"
     );
 }
 
 #[test]
 fn apply_merges_into_existing_manifest_without_clobbering_other_requirements() {
-    let tmp = workspace_without_links();
+    let tmp = workspace_with_requirement();
     write(
         &tmp.path().join(".groundgraph/links.yaml"),
         "requirements:\n  REQ-OTHER-001:\n    docs:\n      - docs/watermark.md#auto-watermark-placement\n",
