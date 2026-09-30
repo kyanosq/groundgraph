@@ -448,11 +448,22 @@ fn mapper_update_with_unavailable_overload_remains_a_candidate() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["expression"].as_str().unwrap_or("").starts_with("mapper.update"))
+        .find(|c| {
+            c["expression"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("mapper.update")
+        })
         .unwrap();
     assert_eq!(update["target"], Value::Null);
-    assert_eq!(update["external_target"], "com.baomidou.mybatisplus.core.mapper.BaseMapper.update(?)");
-    assert_eq!(update["reason"], "framework_crud_overload_missing_from_classpath");
+    assert_eq!(
+        update["external_target"],
+        "com.baomidou.mybatisplus.core.mapper.BaseMapper.update(?)"
+    );
+    assert_eq!(
+        update["reason"],
+        "framework_crud_overload_missing_from_classpath"
+    );
     let writes: Vec<_> = store
         .list_edges_by_kind(groundgraph_core::EdgeKind::PersistsTo)
         .unwrap()

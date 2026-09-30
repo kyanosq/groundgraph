@@ -470,9 +470,27 @@ mod tests {
         // to append to `NodeKind::ALL` fails this test loudly.
         assert_eq!(
             ALL_KINDS.len(),
-            83,
+            84,
             "NodeKind::ALL missing a variant. Append it there and update this count."
         );
+    }
+
+    #[test]
+    fn external_effect_is_registered_once_as_a_synthetic_framework_anchor() {
+        assert_eq!(
+            ALL_KINDS
+                .iter()
+                .filter(|kind| **kind == NodeKind::ExternalEffect)
+                .count(),
+            1
+        );
+        assert_eq!(language_of(NodeKind::ExternalEffect), Language::Synthetic);
+        assert_eq!(family_of(NodeKind::ExternalEffect), SymbolFamily::Framework);
+        assert_eq!(
+            NodeKind::from_str("external_effect"),
+            Some(NodeKind::ExternalEffect)
+        );
+        assert_eq!(NodeKind::ExternalEffect.as_str(), "external_effect");
     }
 
     #[test]
