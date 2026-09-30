@@ -46,7 +46,7 @@ Spring Data JPA 继承 CRUD 现在可投影候选表副作用：须有编译器�
 - 🧠 **`propose` / `candidate` / `logic`** — AI 业务逻辑证据包与人工审阅流程。
 - 🔁 **`port-coverage` / `graph-equiv`** — 对照源图比较名称与结构，不证明业务行为等价。
 - 📊 **`dashboard`** — 单文件离线 HTML 管理面板：概览 / 业务模块 / 功能簇 / 检查 / 死代码 / 待澄清 / 纯度一页聚合，浏览器直接打开（`file://`），无服务、无 CDN。
-- 🔌 **MCP 服务** — 通过 Model Context Protocol 把图暴露给 AI 智能体。
+- 🔌 **MCP 服务** — 通过 Model Context Protocol 把图暴露给 AI 智能体；`get_subgraph` 保留断言的确定性、状态、置信度、元数据和来源，不在协议出口把候选变成事实。
 
 在多语言大型代码库上实战验证：Redis（C，约 20 万行）索引约 11 秒；TypeScript 编译器仓库（2 万+ 文件）约 28 秒——并行解析 + 单文件解析预算，能扛住带故意语法错误的 fixture 语料；Django（Python）、gin（Go）、gson（Java/Maven）端到端验证。SCIP 富集支持增量——源码未变时直接复用上次 `.scip`，免去重跑类型检查器；搜索排序对 tests/tools/examples 降权，issue 式查询优先命中生产代码（用 Redis 真实 issues 验证）。
 

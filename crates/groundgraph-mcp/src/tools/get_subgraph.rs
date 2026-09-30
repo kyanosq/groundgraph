@@ -206,6 +206,12 @@ fn edge_to_json(edge: &groundgraph_core::EdgeAssertion) -> Value {
         "from": edge.from_id.to_string(),
         "to": edge.to_id.to_string(),
         "kind": edge.kind.as_str(),
+        "certainty": edge.certainty.as_str(),
+        "status": edge.status.as_str(),
+        "confidence": edge.confidence,
+        "source": edge.source.as_str(),
+        "indexer": edge.indexer.clone(),
+        "metadata_json": edge.metadata_json.clone(),
         "source_file": edge.source_file.clone(),
         "evidence_json": edge.evidence_json.clone(),
     })
@@ -303,6 +309,65 @@ mod tests {
             indexer: indexer.map(|s| s.to_string()),
             metadata_json: None,
         }
+    }
+
+    #[test]
+    fn subgraph_preserves_candidate_assertion_and_absent_provenance_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".groundgraph")).unwrap();
+        std::fs::write(dir.path().join(".groundgraph.yaml"), "{}\n").unwrap();
+        let mut store =
+            groundgraph_store::Store::open(dir.path().join(".groundgraph/graph.db")).unwrap();
+        store.migrate().unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .upsert_node(&Node::new(ArtifactId::new(id), NodeKind::JavaMethod))
+                .unwrap();
+        }
+        let mut candidate = make_edge(Some("schema"));
+        candidate.kind = EdgeKind::PersistsTo;
+        candidate.certainty = EdgeCertainty::Candidate;
+        candidate.status = EdgeStatus::Proposed;
+        candidate.confidence = Confidence::new(0.6);
+        candidate.source_file = Some("src/Rows.java".into());
+        candidate.metadata_json = Some(r#"{"operation":"upsert","columns":[]}"#.into());
+        candidate.evidence_json =
+            Some(r#"{"resolver":"synthetic_rule","compiler_resolution":"resolved"}"#.into());
+        store.upsert_edge(&candidate).unwrap();
+        let mut fact = make_edge(None);
+        fact.id = ArtifactId::new("fact");
+        fact.to_id = ArtifactId::new("c");
+        store.upsert_edge(&fact).unwrap();
+        let out = call(
+            &Server::new(dir.path().to_path_buf()),
+            &json!({"node_id":"a","depth":1}),
+        )
+        .unwrap();
+        let rows = out["edges"].as_array().unwrap();
+        for expected in [&candidate, &fact] {
+            let row = rows
+                .iter()
+                .find(|row| row["id"] == expected.id.as_str())
+                .unwrap();
+            assert_eq!(row["from"], expected.from_id.as_str());
+            assert_eq!(row["to"], expected.to_id.as_str());
+            assert_eq!(row["kind"], expected.kind.as_str());
+            assert_eq!(row["certainty"], expected.certainty.as_str());
+            assert_eq!(row["status"], expected.status.as_str());
+            assert_eq!(row["confidence"], json!(expected.confidence));
+            assert_eq!(row["source"], expected.source.as_str());
+            assert_eq!(row["indexer"], json!(expected.indexer));
+            assert_eq!(row["metadata_json"], json!(expected.metadata_json));
+            assert_eq!(row["source_file"], json!(expected.source_file));
+            assert_eq!(row["evidence_json"], json!(expected.evidence_json));
+        }
+        let absent = rows.iter().find(|row| row["id"] == "fact").unwrap();
+        assert!(absent
+            .get("metadata_json")
+            .is_some_and(serde_json::Value::is_null));
+        assert!(absent
+            .get("indexer")
+            .is_some_and(serde_json::Value::is_null));
     }
 
     /// A dense graph must not be buffered wholesale into one JSON-RPC
