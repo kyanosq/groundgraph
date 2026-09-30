@@ -56,6 +56,87 @@ fn bootstrap(tmp_root: &std::path::Path) {
         .success();
 }
 
+fn bootstrap_with_requirement(tmp_root: &std::path::Path) {
+    bootstrap(tmp_root);
+    std::fs::write(
+        tmp_root.join(".groundgraph/links.yaml"),
+        "# Existing declaration.\nrequirements:\n  REQ-WATERMARK-001: {}\n",
+    )
+    .unwrap();
+    Command::cargo_bin("groundgraph")
+        .unwrap()
+        .current_dir(tmp_root)
+        .arg("index")
+        .assert()
+        .success();
+}
+
+#[test]
+fn connect_apply_rejects_invalid_requirements_and_preserves_manifest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_with_requirement(tmp.path());
+    let manifest = tmp.path().join(".groundgraph/links.yaml");
+    let before = std::fs::read(&manifest).unwrap();
+    let candidates = tmp.path().join("candidates.yaml");
+    for (requirement, reason) in [
+        ("REQ-UNKNOWN", "cannot resolve requirement `REQ-UNKNOWN`"),
+        ("\"\"", "requirement must not be empty"),
+        ("\"  \\t  \"", "requirement must not be empty"),
+    ] {
+        std::fs::write(
+            &candidates,
+            format!("candidates:\n  - requirement: {requirement}\n    implementations:\n      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService\n"),
+        )
+        .unwrap();
+        for dry_run in [false, true] {
+            let mut cmd = Command::cargo_bin("groundgraph").unwrap();
+            cmd.current_dir(tmp.path())
+                .args(["connect", "apply", "--json", "--candidates"])
+                .arg(&candidates);
+            if dry_run {
+                cmd.arg("--dry-run");
+            }
+            let assert = cmd.assert().code(2);
+            let outcome: serde_json::Value =
+                serde_json::from_slice(&assert.get_output().stdout).unwrap();
+            assert!(outcome["accepted"].as_array().unwrap().is_empty());
+            assert_eq!(outcome["rejected"].as_array().unwrap().len(), 1);
+            assert!(outcome["rejected"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(reason));
+            assert_eq!(std::fs::read(&manifest).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn connect_apply_refuses_future_schema_and_preserves_manifest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    bootstrap_with_requirement(tmp.path());
+    let manifest = tmp.path().join(".groundgraph/links.yaml");
+    let before = std::fs::read(&manifest).unwrap();
+    let candidates = tmp.path().join("candidates.yaml");
+    std::fs::write(
+        &candidates,
+        "schema_version: 2\ncandidates:\n  - requirement: REQ-WATERMARK-001\n    implementations:\n      - lib/domain/watermark/auto_placement_service.dart#AutoPlacementService\n",
+    )
+    .unwrap();
+    for dry_run in [false, true] {
+        let mut cmd = Command::cargo_bin("groundgraph").unwrap();
+        cmd.current_dir(tmp.path())
+            .args(["connect", "apply", "--candidates"])
+            .arg(&candidates);
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        cmd.assert()
+            .code(2)
+            .stderr(contains("unsupported candidates schema_version 2"));
+        assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    }
+}
+
 #[test]
 fn connect_propose_emits_evidence_pack_json() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -97,7 +178,7 @@ fn connect_propose_writes_to_file_when_out_given() {
 #[test]
 fn connect_apply_writes_links_manifest_from_validated_candidates() {
     let tmp = tempfile::TempDir::new().unwrap();
-    bootstrap(tmp.path());
+    bootstrap_with_requirement(tmp.path());
     let candidates = tmp.path().join("candidates.yaml");
     std::fs::write(
         &candidates,
@@ -122,7 +203,7 @@ fn connect_apply_writes_links_manifest_from_validated_candidates() {
 #[test]
 fn connect_apply_dry_run_emits_json_outcome_without_writing() {
     let tmp = tempfile::TempDir::new().unwrap();
-    bootstrap(tmp.path());
+    bootstrap_with_requirement(tmp.path());
     let candidates = tmp.path().join("candidates.yaml");
     std::fs::write(
         &candidates,
@@ -149,7 +230,7 @@ fn connect_apply_dry_run_emits_json_outcome_without_writing() {
 #[test]
 fn connect_apply_mixed_outcome_exits_nonzero_and_prints_rejected_section() {
     let tmp = tempfile::TempDir::new().unwrap();
-    bootstrap(tmp.path());
+    bootstrap_with_requirement(tmp.path());
     let candidates = tmp.path().join("candidates.yaml");
     std::fs::write(
         &candidates,

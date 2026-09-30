@@ -18,12 +18,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use groundgraph_core::artifact_id::requirement_id;
 use groundgraph_core::{ArtifactId, EdgeKind, NodeKind};
 use groundgraph_store::Store;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{resolve_storage_path, EngineConfig};
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::links_indexer::{
     strict_resolve_doc, strict_resolve_implementation, strict_resolve_test,
 };
@@ -98,6 +99,9 @@ pub struct EvidenceTest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CandidatesDocument {
+    /// Missing versions deserialize as legacy version 0. Versions up to
+    /// [`CANDIDATES_SCHEMA_VERSION`] remain compatible; newer versions are
+    /// refused by `apply_candidates` before any manifest changes.
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
@@ -142,6 +146,8 @@ pub struct ApplyOutcome {
     pub dry_run: bool,
 }
 
+/// References resolved against the indexed graph. Acceptance here does not
+/// represent human confirmation of the candidate's business meaning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcceptedCandidate {
     pub requirement: String,
@@ -395,6 +401,13 @@ pub fn apply_candidates(options: ApplyOptions) -> EngineResult<ApplyOutcome> {
             options.candidates_path.display()
         )
     })?;
+    if doc.schema_version > CANDIDATES_SCHEMA_VERSION {
+        return Err(EngineError::InvalidInput(format!(
+            "unsupported candidates schema_version {}; this build supports versions 0..={} \
+             (missing version means legacy 0)",
+            doc.schema_version, CANDIDATES_SCHEMA_VERSION,
+        )));
+    }
 
     let manifest_abs = confine_manifest_path(&options.repo_root, &config.links.path)?;
 
@@ -454,6 +467,17 @@ enum Validated {
 
 fn validate_candidate(store: &Store, candidate: &LinkCandidate) -> Result<Validated> {
     let mut reasons = Vec::new();
+    if candidate.requirement.trim().is_empty() {
+        reasons.push("requirement must not be empty".into());
+    } else if !store
+        .find_node(&requirement_id(&candidate.requirement))?
+        .is_some_and(|node| node.kind == NodeKind::Requirement)
+    {
+        reasons.push(format!(
+            "cannot resolve requirement `{}`",
+            candidate.requirement
+        ));
+    }
     let docs = validate_refs(store, &candidate.docs, RefKind::Doc, &mut reasons)?;
     let implementations = validate_refs(
         store,
@@ -617,6 +641,24 @@ mod tests {
     fn link(store: &mut Store, from: &ArtifactId, to: &ArtifactId, kind: EdgeKind) {
         let e = EdgeAssertion::fact(from.clone(), to.clone(), kind, EdgeSource::LanguageAdapter);
         store.upsert_edge(&e).unwrap();
+    }
+
+    #[test]
+    fn validate_candidate_requires_requirement_node_kind() {
+        let (mut store, _dir) = empty_store();
+        // A colliding artifact id of another kind is not a Requirement.
+        let wrong_kind = Node::new(ArtifactId::new("req::REQ-1"), NodeKind::DocSection);
+        store.upsert_node(&wrong_kind).unwrap();
+        evidence_symbol(&mut store, "doc::auth", "docs/auth.md", "Login");
+        let candidate = LinkCandidate {
+            requirement: "REQ-1".into(),
+            docs: vec!["docs/auth.md#Login".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_candidate(&store, &candidate).unwrap(),
+            Validated::Rejected(reason) if reason.contains("cannot resolve requirement `REQ-1`")
+        ));
     }
 
     /// issues.md #158: pin the per-requirement evidence buckets so the
